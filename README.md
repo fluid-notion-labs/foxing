@@ -105,7 +105,7 @@ foxing version copy /mnt/backup_drive/database.db --epoch 105432 --destination /
 
 ## Documentation & Planning
 
-* **[Failure Scenarios](docs/FAILURE_SCENARIOS.md):** How the system handles disconnects, crashes, and attacks.
+* **[Failure Scenarios](docs/FAILURE_SCENARIOS.md):** How the system handles disconnects, crashes, and reacts.
 * **[Versioning & Storage Simulation](docs/VERSIONING_SIMULATION.md):** Understand the disk space usage of snapshots under different workloads (Database vs Logs).
 * **[Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md):** Detailed breakdown of default limits and safety behaviors.
 
