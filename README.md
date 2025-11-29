@@ -1,4 +1,3 @@
-# File: foxing/README.md | Index: 20 of 24 | Function: Comprehensive documentation covering architecture, configuration, and usage.
 
 # Foxing: High-Performance Filesystem Replication Daemon
 

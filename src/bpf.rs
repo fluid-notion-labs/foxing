@@ -1,4 +1,3 @@
-// File: foxing/src/bpf.rs | Index: 17 of 21 | Function: User-space BPF loader. Fixed open() args.
 use crate::event::{Event, EventType, EventQueue};
 use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;

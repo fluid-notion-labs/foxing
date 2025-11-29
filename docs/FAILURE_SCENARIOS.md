@@ -1,4 +1,3 @@
-# File: foxing/docs/FAILURE_SCENARIOS.md | Index: 21 of 24 | Function: Documentation of synthetic failure modes and system resilience strategies.
 
 # Synthetic Failure Scenarios & System Resilience
 

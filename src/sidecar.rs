@@ -1,4 +1,3 @@
-// File: foxing/src/sidecar.rs | Index: 11 of 24 | Function: Hybrid Metadata Manager (Native Xattrs with Sidecar Fallback).
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;

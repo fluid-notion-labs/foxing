@@ -1,4 +1,3 @@
-// File: foxing/src/bpf/mirror.bpf.c | Index: 3 of 24 | Function: eBPF probes for VFS event interception.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>

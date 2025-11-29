@@ -1,4 +1,3 @@
-// File: foxing/src/buffer.rs | Index: 6 of 21 | Function: Aligned buffer with fixed DerefMut trait.
 use std::alloc::{alloc, dealloc, Layout};
 use std::{ops::{Deref, DerefMut}, slice};
 

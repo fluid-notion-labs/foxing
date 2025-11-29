@@ -1,4 +1,3 @@
-// File: foxing/src/mirror.rs | Index: 16 of 24 | Function: Manager with Opportunistic Hydration logic using TunerBoard.
 use std::{sync::{Arc, atomic::{Ordering, AtomicUsize}}, collections::HashMap, path::PathBuf, fs};
 use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event, EventType}, worker::{self, TunerBoard, TunerState}, metrics, identity, sidecar, security, Result, governor::Governor};
 use walkdir::WalkDir;

@@ -1,4 +1,3 @@
-// File: foxing/src/event.rs | Index: 8 of 21 | Function: Event types with added mode field.
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use crate::metrics;

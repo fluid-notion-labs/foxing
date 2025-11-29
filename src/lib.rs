@@ -1,4 +1,3 @@
-// File: foxing/src/lib.rs | Index: 4 of 24 | Function: Library entry point.
 pub mod error;
 pub mod buffer;
 pub mod metrics;

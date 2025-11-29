@@ -1,4 +1,3 @@
-// File: foxing/build.rs | Index: 2 of 21 | Function: Build script for compiling eBPF C code into Rust skeletons.
 use libbpf_cargo::SkeletonBuilder;
 use std::{env, path::PathBuf, process::Command, fs};
 

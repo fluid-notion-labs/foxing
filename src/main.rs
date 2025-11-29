@@ -1,4 +1,3 @@
-// File: foxing/src/main.rs | Index: 18 of 24 | Function: Entry point with I/O Priority enforcement.
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use xfs_mirror::{config::Config, mirror::Manager, bpf, metrics, versioning};

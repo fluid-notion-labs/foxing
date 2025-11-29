@@ -1,4 +1,3 @@
-# File: foxing/docs/VERSIONING_SIMULATION.md | Index: 22 of 24 | Function: Theoretical simulation of storage efficiency under various workloads.
 
 # MARS Versioning: Storage Efficiency Simulation
 

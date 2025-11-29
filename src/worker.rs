@@ -1,4 +1,3 @@
-// File: foxing/src/worker.rs | Index: 15 of 21 | Function: Worker loop. Fixed match types and error handling.
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
     collections::HashMap, 

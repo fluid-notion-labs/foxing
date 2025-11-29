@@ -1,4 +1,3 @@
-// File: foxing/src/governor.rs | Index: 19 of 21 | Function: System governor.
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 use sysinfo::{System, SystemExt}; 

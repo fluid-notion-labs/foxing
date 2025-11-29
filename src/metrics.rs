@@ -1,4 +1,3 @@
-// File: foxing/src/metrics.rs | Index: 7 of 24 | Function: Prometheus metrics.
 use prometheus::{
     Registry, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, HistogramVec, GaugeVec,
     register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry, 

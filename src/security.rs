@@ -1,4 +1,3 @@
-// File: foxing/src/security.rs | Index: 14 of 21 | Function: Security I/O operations. Fixed variable scoping and types.
 use std::path::{Path};
 use crate::error::{FoxingError, Result}; // Using FoxingError
 use crate::buffer::AlignedBuffer;

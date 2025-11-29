@@ -1,4 +1,3 @@
-// File: foxing/src/versioning.rs | Index: 12 of 24 | Function: Logic for MARS versioning including Global Emergency Pruning.
 use std::path::{Path, PathBuf};
 use crate::error::{Result, MirrorError};
 use glob::glob;

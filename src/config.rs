@@ -1,4 +1,3 @@
-// File: foxing/src/config.rs | Index: 13 of 24 | Function: Configuration parsing with I/O Priority settings.
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, fs, sync::{Arc, atomic::AtomicBool}, collections::HashSet};
 use crate::error::{Result, MirrorError};

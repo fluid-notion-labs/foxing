@@ -1,4 +1,3 @@
-// File: foxing/src/error.rs | Index: 5 of 21 | Function: Centralized error handling (FoxingError).
 use thiserror::Error;
 
 #[derive(Error, Debug)]

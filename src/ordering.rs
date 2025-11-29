@@ -1,4 +1,3 @@
-// File: foxing/src/ordering.rs | Index: 9 of 24 | Function: Sequence buffering.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use crate::event::{Event, EventType};

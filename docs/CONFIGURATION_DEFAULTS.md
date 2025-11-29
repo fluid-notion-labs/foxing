@@ -1,4 +1,3 @@
-# File: foxing/docs/CONFIGURATION_DEFAULTS.md | Index: 23 of 24 | Function: Detailed breakdown of default limits and safety behaviors.
 
 # Default Configuration & Safety Limits
 

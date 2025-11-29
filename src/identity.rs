@@ -1,4 +1,3 @@
-// File: foxing/src/identity.rs | Index: 10 of 24 | Function: Inode mapping.
 use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::Mutex;
