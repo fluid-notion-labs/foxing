@@ -65,7 +65,7 @@ path = "/mnt/data"
 Unlike block-level replication, `foxing` incurs a per-file metadata cost on the target filesystem.
 
 **The Metadata Tax:**
-* **Optimized Metadata:** `foxing` now uses Native Extended Attributes (`user.foxing.*`) by default on supported filesystems (XFS, Btrfs, Ext4). This reduces the per-file overhead to **near zero** (0 extra inodes).
+* **Optimized Metadata:** `foxing` uses Native Extended Attributes (`user.foxing.*`) by default on supported filesystems (XFS, Btrfs, Ext4). This reduces the per-file overhead to **near zero** (0 extra inodes).
 * **Legacy Fallback:** On filesystems without xattr support (FAT32, NFSv3), it falls back to creating `.foxing_meta` sidecar files, incurring a 4KB/1-inode tax per file. It's not designed or tested on these so the recommendation is a hard 'just don't'
 
 **Recommendation:**
