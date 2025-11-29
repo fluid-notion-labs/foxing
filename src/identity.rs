@@ -28,7 +28,9 @@ pub fn resolve_target(map: &InodeMap, e: &Event, target_root: &std::path::Path) 
 
     if need_creation || is_existing_synthetic {
         is_synthetic = true;
-        let identity_dir = target_root.join(".foxing").join(".by-identity");
+        // CRITICAL FIX: Changed .foxing to .mirror to match worker.rs directory creation logic.
+        // Previously this caused "No such file or directory" errors on new file creation.
+        let identity_dir = target_root.join(".mirror").join(".by-identity");
         let syn_dst = identity_dir.join(format!("{}_{}", e.inode, e.generation));
         
         if need_creation {

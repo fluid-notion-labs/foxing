@@ -155,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => { error!("Failed to load config: {}", e); return Ok(()); }
             };
             
+            // Apply Global Buffer Limit to Metrics
+            // This was missing, causing BPF to drop all events because limit was 0
+            metrics::initialize_metrics(cfg.read().await.global_buffer_limit);
+
             // Apply I/O Priority from Config
             let prio = cfg.read().await.io_priority.clone();
             set_process_priority(&prio);

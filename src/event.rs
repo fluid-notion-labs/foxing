@@ -45,7 +45,8 @@ pub struct Event {
     pub seq_num: u64, pub offset: u64, pub length: u64, pub name: String, pub new_name: Option<String>,
     pub generation: u32,
     pub projid: u32,
-    pub mode: u32, // ADDED: Required for fallocate/chmod
+    pub mode: u32, 
+    pub flags: u32, // ADDED: Now carries the flags from BPF
     pub created_at: std::time::Instant
 }
 

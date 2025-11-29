@@ -1,4 +1,5 @@
 use std::{sync::{Arc, atomic::Ordering}, collections::HashMap, path::PathBuf, fs};
+// FIX: Import TunerBoard and TunerState from worker::* and rename worker::run_worker below
 use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event, EventType}, worker::{self, TunerBoard, TunerState}, metrics, identity, sidecar, security, Result, governor::Governor};
 use walkdir::WalkDir;
 use parking_lot::Mutex;
@@ -7,7 +8,7 @@ use std::num::NonZeroUsize;
 use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
 use std::os::unix::io::AsRawFd; 
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
@@ -37,8 +38,138 @@ pub struct Manager {
     hydration_handles: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>>,
     pub queues: HashMap<u32, Vec<Arc<EventQueue>>>,
     pub governor: Arc<Governor>,
-    // SHARED STATE: Real-time tuner status for all targets
     pub tuner_board: TunerBoard,
+}
+
+/// Enhanced mount detection that handles loopback devices
+fn find_mount_point(path: &PathBuf) -> Result<(PathBuf, u32, bool)> {
+    // Get the canonical path first
+    let canonical = path.canonicalize()
+        .map_err(|e| crate::error::FoxingError::Io(e))?;
+    
+    debug!("Finding mount point for canonical path: {:?}", canonical);
+    
+    // Read /proc/mounts
+    let mounts_content = fs::read_to_string("/proc/mounts")
+        .map_err(|e| crate::error::FoxingError::Io(e))?;
+    
+    #[derive(Debug)]
+    struct MountEntry {
+        device: String,
+        mount_point: PathBuf,
+        fstype: String,
+        is_loopback: bool,
+    }
+    
+    let mut mounts: Vec<MountEntry> = Vec::new();
+    
+    for line in mounts_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        
+        let device = parts[0];
+        let mount_point = PathBuf::from(parts[1]);
+        let fstype = parts[2];
+        
+        // Check if this is a loopback device
+        let is_loopback = device.starts_with("/dev/loop");
+        
+        mounts.push(MountEntry {
+            device: device.to_string(),
+            mount_point,
+            fstype: fstype.to_string(),
+            is_loopback,
+        });
+    }
+    
+    // Sort by path depth (longest first) to find most specific mount
+    mounts.sort_by(|a, b| {
+        b.mount_point.components().count()
+            .cmp(&a.mount_point.components().count())
+    });
+    
+    // Find the mount point that contains our path
+    for mount in &mounts {
+        if canonical.starts_with(&mount.mount_point) {
+            debug!("Found mount: device={}, mount_point={:?}, fstype={}, is_loopback={}", 
+                   mount.device, mount.mount_point, mount.fstype, mount.is_loopback);
+            
+            // Get the device ID from the mount point
+            let mount_meta = fs::metadata(&mount.mount_point)
+                .map_err(|e| crate::error::FoxingError::Io(e))?;
+            
+            // CRITICAL: The kernel's dev_t uses new format encoding
+            // stat() returns: (major << 20) | (minor & 0xff) | ((minor & 0xfff00) << 12)
+            // We need to convert this to match what BPF sees
+            let raw_dev = mount_meta.dev();
+            
+            // Extract major and minor from stat's dev_t
+            let major = ((raw_dev >> 8) & 0xfff) as u32;
+            let minor = ((raw_dev & 0xff) | ((raw_dev >> 12) & 0xfff00)) as u32;
+            
+            // Reconstruct in kernel format: (major << 20) | minor
+            let kernel_dev_id = (major << 20) | minor;
+            
+            debug!("Device ID conversion: raw=0x{:016x}, major={}, minor={}, kernel_format=0x{:08x} ({})", 
+                   raw_dev, major, minor, kernel_dev_id, kernel_dev_id);
+            
+            // For loopback devices, we need to verify this is the correct device
+            if mount.is_loopback {
+                let backing_file = get_loop_backing_file(&mount.device);
+                debug!("Loopback device {} backing file: {:?}", mount.device, backing_file);
+            }
+            
+            return Ok((mount.mount_point.clone(), kernel_dev_id, mount.is_loopback));
+        }
+    }
+    
+    // Fallback: use the path itself as mount point
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| crate::error::FoxingError::Io(e))?;
+    
+    let raw_dev = meta.dev();
+    let major = ((raw_dev >> 8) & 0xfff) as u32;
+    let minor = ((raw_dev & 0xff) | ((raw_dev >> 12) & 0xfff00)) as u32;
+    let kernel_dev_id = (major << 20) | minor;
+    
+    warn!("Could not find explicit mount point for {:?}, using path itself with dev_id 0x{:08x}", 
+          canonical, kernel_dev_id);
+    
+    Ok((canonical, kernel_dev_id, false))
+}
+
+/// Get the backing file for a loopback device
+fn get_loop_backing_file(loop_device: &str) -> Option<PathBuf> {
+    // Extract loop number (e.g., "/dev/loop0" -> "0")
+    let loop_num = loop_device.strip_prefix("/dev/loop")?;
+    
+    // Try to read the backing_file from sysfs
+    let backing_file_path = format!("/sys/block/loop{}/loop/backing_file", loop_num);
+    fs::read_to_string(backing_file_path)
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+}
+
+/// Debug helper to show all device IDs in the system
+fn debug_system_devices() {
+    debug!("=== System Device Debug ===");
+    
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let mount_point = parts[1];
+                if let Ok(meta) = fs::metadata(mount_point) {
+                    let dev_id = meta.dev() as u32;
+                    debug!("Mount: {} -> dev_id=0x{:08x} ({})", mount_point, dev_id, dev_id);
+                }
+            }
+        }
+    }
+    
+    debug!("=== End Device Debug ===");
 }
 
 impl Manager {
@@ -51,47 +182,60 @@ impl Manager {
             config_reader.hydration_delay_ms
         ));
 
+        // Debug: Show all system devices
+        debug_system_devices();
+
         let mut sources = HashMap::new();
         let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize; 
         let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
         
         for sc in &config_reader.sources { 
-            if let Ok(m) = fs::metadata(&sc.path) {
-                let dev_id = m.dev() as u32;
-                let mut mount_path = sc.path.clone();
-                
-                if let Ok(txt) = fs::read_to_string("/proc/mounts") {
-                    let canonical_path = sc.path.canonicalize().unwrap_or(sc.path.clone());
-                    mount_path = txt.lines()
-                        .filter_map(|line| {
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 2 {
-                                let m = PathBuf::from(parts[1]);
-                                if canonical_path.starts_with(&m) {
-                                    return Some(m);
-                                }
-                            }
-                            None
-                        })
-                        .max_by_key(|p| p.as_os_str().len())
-                            .unwrap_or(mount_path);
-                }
+            info!("Processing source path: {:?}", sc.path);
+            
+            match find_mount_point(&sc.path) {
+                Ok((mount_path, dev_id, is_loopback)) => {
+                    info!("Source: {:?}", sc.path);
+                    info!("  Mount point: {:?}", mount_path);
+                    info!("  Device ID: 0x{:08x} ({})", dev_id, dev_id);
+                    info!("  Is loopback: {}", is_loopback);
+                    
+                    // Double-check: verify the path actually has this device ID
+                    if let Ok(meta) = fs::metadata(&sc.path) {
+                        let path_raw = meta.dev();
+                        
+                        // FIX: Convert the path's raw device ID to kernel format before comparing
+                        let p_maj = ((path_raw >> 8) & 0xfff) as u32;
+                        let p_min = ((path_raw & 0xff) | ((path_raw >> 12) & 0xfff00)) as u32;
+                        let path_kernel_dev = (p_maj << 20) | p_min;
 
-                sources.insert(dev_id, Arc::new(SourceInfo { 
-                    path: sc.path.clone(), 
-                    mount: mount_path, 
-                    dev: dev_id,
-                    hydration: Arc::new(HydrationState { 
-                        active: std::sync::atomic::AtomicBool::new(false),
-                        scanned: std::sync::atomic::AtomicU64::new(0),
-                        synced: std::sync::atomic::AtomicU64::new(0)
-                    }),
-                    inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
-                    lru_size: cache_size.get(),
-                }));
-            } else {
-                 error!("Failed to get metadata for source path: {:?}", sc.path);
+                        if path_kernel_dev != dev_id {
+                            error!("DEVICE MISMATCH: Path {:?} has dev_id 0x{:08x} (raw: 0x{:x}) but mount point has 0x{:08x}", 
+                                   sc.path, path_kernel_dev, path_raw, dev_id);
+                            error!("This will cause BPF filtering issues!");
+                        }
+                    }
+                    
+                    sources.insert(dev_id, Arc::new(SourceInfo { 
+                        path: sc.path.clone(), 
+                        mount: mount_path, 
+                        dev: dev_id,
+                        hydration: Arc::new(HydrationState { 
+                            active: std::sync::atomic::AtomicBool::new(false),
+                            scanned: std::sync::atomic::AtomicU64::new(0),
+                            synced: std::sync::atomic::AtomicU64::new(0)
+                        }),
+                        inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
+                        lru_size: cache_size.get(),
+                    }));
+                },
+                Err(e) => {
+                    error!("Failed to determine mount point for {:?}: {}", sc.path, e);
+                }
             }
+        }
+        
+        if sources.is_empty() {
+            error!("No valid sources configured! Check your config.toml paths.");
         }
         
         drop(config_reader);
@@ -114,7 +258,11 @@ impl Manager {
         let config_reader = self.config.read().await; 
         let global_queue_max = config_reader.queue_max; 
 
+        info!("Starting workers for {} sources", self.sources.len());
+
         for (dev, src) in &self.sources {
+            info!("Starting workers for device 0x{:08x} ({})", dev, dev);
+            
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 
                 let mut hydration_targets: Vec<(TargetConfig, Arc<EventQueue>)> = Vec::new();
@@ -138,7 +286,7 @@ impl Manager {
                         let h_tx = hydration_tx.clone();
                         let (sd_tx, sd_rx) = tokio::sync::mpsc::channel(1);
                         shutdowns.push(sd_tx);
-                        // Pass TunerBoard to worker
+                        // FIX: Use worker::run_worker which is publically available in src/worker.rs
                         handles.push(tokio::spawn(worker::run_worker(s, t, rx, sd_rx, h_tx, c, self.governor.clone(), self.tuner_board.clone()))); 
                     }
                     
@@ -152,7 +300,14 @@ impl Manager {
                 }
             }
         }
+        
         self.queues = queues.clone();
+        
+        info!("Worker startup complete. Monitoring {} devices", self.queues.len());
+        for (dev, qs) in &self.queues {
+            info!("  Device 0x{:08x}: {} queue(s)", dev, qs.len());
+        }
+        
         (queues, handles, shutdowns, hydration_rx)
     }
 
@@ -207,13 +362,9 @@ impl Manager {
                             for (target_cfg, q) in &targets_clone {
                                 
                                 // 2. OPPORTUNISTIC CHECK (Per Target)
-                                // If this specific target is under load, back off hydration for it.
                                 if let Some(state) = board_clone.get(&target_cfg.path) {
                                     match *state {
                                         TunerState::HighLoad | TunerState::EmergencyDrain | TunerState::GovernorThrottled => {
-                                            // Target is struggling. Slow down hydration push to this target.
-                                            // Since we are in a single loop for all targets, a simple sleep here 
-                                            // slows down everything, which is acceptable (Backpressure propagation).
                                             std::thread::sleep(Duration::from_millis(50)); 
                                         },
                                         _ => {}
@@ -224,7 +375,9 @@ impl Manager {
                                     let dst_path = target_cfg.path.join(&rel_clone);
                                     
                                     let needs_sync = sidecar::is_dirty(&dst_path) || {
-                                        let needs_sync = match fs::File::open(&dst_path) {
+                                        // CRITICAL FIX: Open with write access to allow mandatory locking check
+                                        // Previously this caused EBADF warnings during hydration
+                                        let needs_sync = match std::fs::OpenOptions::new().read(true).write(true).open(&dst_path) {
                                             Ok(df) => {
                                                 if let Err(e) = security::acquire_mandatory_lock(df.as_raw_fd()) {
                                                     warn!("Failed to lock {:?} during hydration check: {}. Assuming sync needed.", dst_path, e);
@@ -261,7 +414,8 @@ impl Manager {
                                             event_type: EventType::Write, dev_id, inode: ino, parent_inode: 0,
                                             seq_num: 0, offset: 0, length: m.len(), name: rel_clone.to_string_lossy().to_string(),
                                             new_name: None, generation: 0, projid: 0, 
-                                            mode: 0, 
+                                            mode: 0,
+                                            flags: 0, // FIX: Initialize flags to 0 for hydration events
                                             created_at: Instant::now()
                                         };
                                         q.push(Arc::new(evt));

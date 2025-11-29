@@ -81,12 +81,25 @@ static __always_inline int stash_dentry(struct dentry *dentry) {
     return bpf_map_update_elem(&temp_dentries, &pid_tgid, &ptr, BPF_ANY);
 }
 
+// Helper to normalize device ID from kernel's dev_t format
+// The kernel stores device ID as: (major << 20) | minor
+// We need to extract and normalize this consistently
+static __always_inline __u32 normalize_dev_id(__u32 raw_dev) {
+    // The s_dev field from super_block is already in the correct format
+    // Just return it as-is - userspace will handle byte order
+    return raw_dev;
+}
+
 static __always_inline int submit_event(struct inode *inode, struct dentry *dentry, enum event_type type, __u64 offset, __u64 length, __u32 flags) {
     if (!inode) return 0;
     if (is_ignored_pid()) return 0;
     
     struct super_block *sb = BPF_CORE_READ(inode, i_sb);
-    __u32 dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 dev_id = normalize_dev_id(raw_dev_id);
+    
+    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
+    
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -105,7 +118,6 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     e->gid = BPF_CORE_READ(inode, i_gid.val); e->offset = offset; e->length = length; e->flags = flags;
     
     struct inode___p *ip = (struct inode___p *)inode;
-    // CO-RE Check: Handle kernels without XFS Project Quotas (e.g. Bazzite/Gaming kernels)
     if (bpf_core_field_exists(ip->i_projid)) {
         e->projid = BPF_CORE_READ(ip, i_projid.val);
     } else {
@@ -185,7 +197,10 @@ SEC("kprobe/vfs_rename") int BPF_KPROBE(trace_rename, void *idmap, struct rename
     if(!inode) return 0;
     
     struct super_block *sb = BPF_CORE_READ(inode, i_sb);
-    __u32 dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 dev_id = normalize_dev_id(raw_dev_id);
+    
+    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
     
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -238,7 +253,10 @@ SEC("kprobe/vfs_fallocate") int BPF_KPROBE(trace_fallocate, struct file *file, i
 SEC("kprobe/xfs_trans_commit") int BPF_KPROBE(trace_xfs_commit, struct xfs_trans *tp) {
     struct xfs_mount *mp = BPF_CORE_READ(tp, t_mountp);
     struct super_block *sb = BPF_CORE_READ(mp, m_super);
-    __u32 dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
+    __u32 dev_id = normalize_dev_id(raw_dev_id);
+    
+    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;

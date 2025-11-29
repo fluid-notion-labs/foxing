@@ -9,7 +9,7 @@ use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
 use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
 use tokio::time::interval; 
-use tracing::{warn, info, error}; 
+use tracing::{warn, info, error, debug}; 
 use crate::error::FoxingError; 
 use std::io;
 use crate::metrics;
@@ -21,8 +21,14 @@ use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
 use futures::StreamExt;
 
+// Exported types required by src/mirror.rs
 // Export type for mirror.rs
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunerState { Steady=0, LatencyBackoff=1, RampUp=2, HighLoad=3, EmergencyDrain=4, GovernorThrottled=5, SpacePressure=6 }
+
+// --- Helper Structs (Internal) ---
 
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
@@ -96,9 +102,6 @@ impl ShardedLockCache {
 }
 
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TunerState { Steady=0, LatencyBackoff=1, RampUp=2, HighLoad=3, EmergencyDrain=4, GovernorThrottled=5, SpacePressure=6 }
 
 struct TargetTuner { latency_target_seconds: f64, aspiration_size: u64, current_coalesce_bytes: u64, max_burst_coalesce_bytes: u64, current_batch_size: usize, batch_size_min: usize, batch_size_max: usize, flush_multiplier: u32, flush_multiplier_min: u32, flush_multiplier_max: u32, state: TunerState }
 impl TargetTuner {
@@ -178,6 +181,8 @@ impl TargetTuner {
     }
 }
 
+// --- Main Worker Function ---
+
 pub async fn run_worker(
     source: Arc<SourceInfo>, 
     target_cfg: TargetConfig, 
@@ -217,7 +222,8 @@ pub async fn run_worker(
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         let event_poll_result = tokio::select! {
             _ = flush_interval.tick() => {
-                if let Ok(s) = statvfs(&target_cfg.path) {
+                let path_clone = target_cfg.path.clone(); // <-- FIX 2A: Clone path for statvfs
+                if let Ok(s) = statvfs(&path_clone) {
                     cur_cap_total = s.blocks() * s.block_size();
                     cur_cap_avail = s.blocks_available() * s.block_size();
                     let label = target_cfg.path.to_string_lossy();
@@ -337,12 +343,19 @@ pub async fn run_worker(
                     f_result
                 }).await;
                 if res.is_ok() {
+                    // Update map to track the new synthetic file
                     identity::update_map(&source.inode_map, e_inode, e_name, e_generation, true);
                     metrics::SYNTHETIC_IDENTITY_FILES.inc();
-                } else { error!("Failed to create synthetic file: {:?}", res.err()); io_attempt_successful = false; order.push_and_check(e); break; }
+                } else { 
+                    error!("Failed to create synthetic file: {:?}. This might indicate a missing target directory or IO issue.", res.err()); 
+                    io_attempt_successful = false; 
+                    order.push_and_check(e); 
+                    break; 
+                }
             }
 
             if e.event_type == EventType::Write || e.event_type == EventType::WriteRange {
+                // If a write comes in, mark the file dirty and update its sequence number
                 if !dirty_stats.contains_key(&e.inode) {
                     let dst_clone = dst.clone();
                     spawn_blocking(move || sidecar::set_dirty_flag(&dst_clone, true));
@@ -356,18 +369,36 @@ pub async fn run_worker(
             let res = match e.event_type {
                 EventType::Write | EventType::Create | EventType::WriteRange => {
                     let src_clone = src.clone();
-                    let dst_clone = dst.clone();
                     let target_cfg_clone = target_cfg.clone();
+                    let dst_clone = dst.clone(); // Clone `dst` once for use across this match arm
                     let e_offset = e.offset; 
                     let e_len = e.length;    
                     
-                    let metadata_result = spawn_blocking(move || { std::fs::metadata(&src_clone) }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::NotFound, "Metadata task failed")));
+                    let metadata_result = spawn_blocking(move || { 
+                        debug!("Worker: Reading metadata for source file {:?}", src_clone);
+                        std::fs::metadata(&src_clone) 
+                    }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::NotFound, "Metadata task failed")));
 
                     if let Ok(m) = metadata_result {
                         if m.is_file() {
+                            // FIX 1: Parent Directory Check (CRITICAL FOR ATOMIC RENAME)
+                            // This ensures the target folder exists before attempting to write or rename into it.
+                            if !is_synthetic {
+                                let dst_parent = dst_clone.parent().map(|p| p.to_path_buf()).unwrap_or(target_cfg_clone.path.clone());
+                                let e_clone_for_dir_err = e.clone(); 
+                                if let Err(dir_err) = spawn_blocking(move || std::fs::create_dir_all(&dst_parent)).await.unwrap_or(Ok(())) {
+                                     error!("Failed to create parent directory for non-synthetic file: {:?}", dir_err);
+                                     io_attempt_successful = false; 
+                                     order.push_and_check(e_clone_for_dir_err); 
+                                     break;
+                                }
+                            }
+                             
+                             // Optimization/Feature flags setup
                              if e.event_type == EventType::Create && (target_cfg.btrfs_compression || target_cfg.f2fs_compression || target_cfg.f2fs_pinning) {
+                                  let dst_clone_for_opt = dst_clone.clone();
                                   let res = spawn_blocking(move || {
-                                      let f_result = std::fs::OpenOptions::new().write(true).open(&dst_clone);
+                                      let f_result = std::fs::OpenOptions::new().write(true).open(&dst_clone_for_opt);
                                       if let Ok(f) = f_result {
                                           let fd = f.as_raw_fd();
                                           if target_cfg_clone.btrfs_compression || target_cfg_clone.f2fs_compression { let _ = security::enable_compression(fd); }
@@ -378,37 +409,56 @@ pub async fn run_worker(
                                   if res.is_err() { warn!("Failed compression/pinning setup: {:?}", res.err()); }
                              }
                             
+                            // Xattr Sync - Now placed correctly after potential parent dir creation
                             let sync_xattrs_src = src.clone();
-                            let sync_xattrs_dst = dst.clone();
+                            let sync_xattrs_dst = dst_clone.clone(); 
                             
                             let total_size = m.len() as usize;
                             if total_size > 0 {
+                                debug!("Worker: Starting xattr sync for {:?} (size {})", dst_clone, total_size);
                                 let chunks: Vec<usize> = (0..total_size).step_by(1024*1024).collect();
                                 futures::stream::iter(chunks).then(|_sz| {
                                     let sx = sync_xattrs_src.clone();
                                     let dx = sync_xattrs_dst.clone();
                                     async move {
-                    let _ = spawn_blocking(move || { security::sync_xattrs(&sx, &dx); }).await;
+                                        let _ = spawn_blocking(move || { security::sync_xattrs(&sx, &dx); }).await;
                                     }
                                 }).collect::<Vec<_>>().await;
                             }
 
-                            security::copy_smart(&src, &dst, &mut ring, &mut buf, &target_cfg.direct_io_ok, target_cfg.vdo_optimization, e_offset, e_len).await
-                                .map(|_sz| {
-                                    metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(e_len);
-                                    Ok(())
-                                })
+                            // IO Operation: copy_smart handles atomic rename if needed
+                            let copy_res = security::copy_smart(
+                                &src, 
+                                &dst_clone, 
+                                &mut ring, 
+                                &mut buf, 
+                                &target_cfg.direct_io_ok, 
+                                target_cfg.vdo_optimization, 
+                                e_offset, 
+                                e_len
+                            ).await;
+                            
+                            copy_res.map(|_sz| {
+                                metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(e_len);
+                                Ok(())
+                            })
                         } else { Ok(Ok(())) } 
-                    } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}.", e.inode); } Ok(Ok(())) } else { Ok(Ok(())) }
+                    } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}. Event ignored.", e.inode); } Ok(Ok(())) } else { Ok(Ok(())) }
                 },
                 EventType::Unlink => {
+                    // When an unlink is received, we assume the worker has received all prior writes.
                     dirty_stats.remove(&e.inode);
                     let dst_clone = dst.clone();
                     let source_clone = source.clone();
                     let e_clone = e.clone();
                     let res = spawn_blocking(move || {
                         if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
-                        if is_synthetic { let _ = std::fs::remove_file(&dst_clone); source_clone.inode_map.lock().pop(&e_clone.inode); metrics::SYNTHETIC_IDENTITY_FILES.dec(); }
+                        if is_synthetic { 
+                            debug!("Worker: Unlinking synthetic file {:?}", dst_clone);
+                            let _ = std::fs::remove_file(&dst_clone); 
+                            source_clone.inode_map.lock().pop(&e_clone.inode); 
+                            metrics::SYNTHETIC_IDENTITY_FILES.dec(); 
+                        }
                         std::fs::remove_file(&dst_clone)
                     }).await.unwrap_or(Ok(())).map_err(|err| err.into());
                     if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
@@ -420,23 +470,58 @@ pub async fn run_worker(
                         let new_rel = PathBuf::from(new_name);
                         let new_dst = target_cfg.path.join(&new_rel);
                         if target_cfg.allow(&new_rel) {
-                            let dst_clone = dst.clone();
-                            let new_dst_clone = new_dst.clone();
+                            let dst_clone = dst.clone(); // Old path
+                            let new_dst_clone = new_dst.clone(); // New path
                             let source_clone = source.clone();
                             let e_inode = e.inode;
                             let e_generation = e.generation;
+                            let is_synthetic_state = is_synthetic;
+                            
                             let res = spawn_blocking(move || {
-                                if let Some(parent) = new_dst_clone.parent() { if let Err(e) = std::fs::create_dir_all(parent) { return Err(e); } }
+                                // Must ensure parent directory of the *new* path exists before rename
+                                if let Some(parent) = new_dst_clone.parent() { 
+                                    if let Err(e) = std::fs::create_dir_all(parent) { 
+                                        return Err(io::Error::new(io::ErrorKind::Other, format!("Rename target dir creation failed: {}", e))); 
+                                    } 
+                                }
+                                
+                                debug!("Worker: Attempting rename from {:?} to {:?}", dst_clone, new_dst_clone);
                                 let rename_res = std::fs::rename(&dst_clone, &new_dst_clone);
+                                
                                 if rename_res.is_ok() {
-                                    identity::update_map_after_rename(&source_clone.inode_map, e_inode, new_rel, e_generation);
-                                    if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) { if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) { if old_sp.exists() { let _ = std::fs::rename(old_sp, new_sp); } } }
+                                    let new_rel_clone = new_rel.clone(); 
+                                    // Update identity map with new path/name
+                                    identity::update_map_after_rename(&source_clone.inode_map, e_inode, new_rel_clone, e_generation);
+                                    
+                                    // Move sidecar file atomically if it exists
+                                    if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) { 
+                                        if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) { 
+                                            if old_sp.exists() { 
+                                                let _ = std::fs::rename(old_sp, new_sp); 
+                                            } 
+                                        } 
+                                    }
+
+                                    // If it was synthetic, the rename resolves it to a normal path, so update the metrics
+                                    if is_synthetic_state {
+                                        metrics::SYNTHETIC_IDENTITY_FILES.dec();
+                                        // FIX 1B: Clone new_rel again for this update call, resolving E0382
+                                        identity::update_map(&source_clone.inode_map, e_inode, new_rel.clone(), e_generation, false);
+                                    }
                                 }
                                 rename_res
                             }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::Other, "Rename task failed"))).map_err(|e| e.into());
+                            
                             if res.is_ok() {
+                                // Update dirty path if still tracking
                                 if let Some(entry) = dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
-                                let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } if let Some(parent) = new_dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await;
+                                // Recalculate hash for both old and new parent directories
+                                let _ = spawn_blocking(move || { 
+                                    let dst_path_clone = dst.clone(); // Clone path for spawn_blocking
+                                    let new_dst_path_clone = new_dst.clone(); // Clone path for spawn_blocking
+                                    if let Some(parent) = dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
+                                    if let Some(parent) = new_dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
+                                }).await;
                             }
                             Ok(res)
                         } else { Ok(Ok(())) }
@@ -445,6 +530,12 @@ pub async fn run_worker(
                 EventType::Mkdir => {
                     let dst_clone = dst.clone();
                     let res = spawn_blocking(move || { std::fs::create_dir_all(&dst_clone) }).await.unwrap_or(Ok(())).map_err(|e| e.into());
+                    if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
+                    Ok(res)
+                },
+                EventType::Rmdir => {
+                    let dst_clone = dst.clone();
+                    let res = spawn_blocking(move || { std::fs::remove_dir(&dst_clone) }).await.unwrap_or(Ok(())).map_err(|e| e.into());
                     if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
                     Ok(res)
                 },
@@ -481,6 +572,8 @@ pub async fn run_worker(
                         }).await;
                          if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
                     }
+                    
+                    // Final commit of epoch and dirty state
                     let r = spawn_blocking(move || {
                         let r = security::commit_epoch(&dst_clone, seq_num, projid); 
                         if r.is_ok() { if let Some(parent) = dst_clone.parent() { if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } } }
@@ -492,7 +585,6 @@ pub async fn run_worker(
                 EventType::SetXattr | EventType::RemoveXattr => {
                     let src_clone = src.clone();
                     let dst_clone = dst.clone();
-                    // CORRECTED LOGIC: map Result to Ok(()) then unwrap inner
                     Ok(Ok(spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(())))
                 },
                 EventType::Chmod | EventType::Chown | EventType::Utimes => {
@@ -509,10 +601,14 @@ pub async fn run_worker(
                     let dst_clone = dst.clone();
                     let offset = e.offset;
                     let length = e.length;
-                    let mode = e.mode as i32;
+                    let mode = e.flags as i32;
+                    debug!("Worker: Handling Fallocate on {:?} with offset={}, len={}, mode={:#x}", dst_clone, offset, length, mode);
                     Ok(spawn_blocking(move || { security::do_fallocate(&dst_clone, offset, length, mode) }).await.unwrap_or(Ok(())))
                 },
-                _ => Ok(Ok(()))
+                _ => {
+                    debug!("Worker: Unhandled event type {:?} for {:?}", e.event_type, dst);
+                    Ok(Ok(()))
+                }
             };
 
             // Flatten the nested Result<Result<...>>
@@ -527,18 +623,27 @@ pub async fn run_worker(
                         error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
                         capacity_breaker.trip();
                         io_attempt_successful = false; 
-                        // Fix shadowed 'e' - now pushing original event_ptr
-                        order.push_and_check(event_ptr.clone()); 
+                        order.push_and_check(e); 
+                        // Emergency Prune (if disk full)
+                        // FIX: Clone target_cfg for this closure
+                        let target_cfg_clone = target_cfg.clone();
+                        if let Err(e) = spawn_blocking(move || { 
+                            let target_root = target_cfg_clone.path.parent().unwrap_or(&target_cfg_clone.path);
+                            versioning::prune_global_history(target_root, 512 * 1024 * 1024) // Try to free 512MB
+                        }).await { error!("Global prune failed: {:?}", e); }
+                        
                         break; 
                     }
                 }
                 
+                error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, err);
                 if limiter.check("io") { error!("IO Error: {:?}", err); }
                 io_attempt_successful = false; 
-                // Fix used 'evt' -> 'event_ptr'
-                order.push_and_check(event_ptr.clone());
+                order.push_and_check(e);
                 break;
-            } else { failure_state.record_success(); }
+            } else { 
+                failure_state.record_success(); 
+            }
             
             let elapsed = start.elapsed().as_secs_f64();
             let is_stressed = governor.is_system_stressed();

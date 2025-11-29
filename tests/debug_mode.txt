@@ -1,0 +1,56 @@
+import os
+
+def enable_bpf_logging():
+    path = "src/bpf/mirror.bpf.c"
+    if not os.path.exists(path):
+        print(f"Skipping {path} (not found)")
+        return
+
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    
+    # We want to insert a bpf_printk BEFORE the map lookup check.
+    # Target line: if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
+    
+    # We will log: "DEV CHECK: Kernel saw dev_id X"
+    
+    found = False
+    for line in lines:
+        if "if (!bpf_map_lookup_elem(&watched_devs, &dev_id))" in line:
+            # Add logging before the check
+            indent = line[:line.find("if")]
+            new_lines.append(f'{indent}bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u\\n", dev_id);\n')
+            new_lines.append(line)
+            found = True
+        else:
+            new_lines.append(line)
+
+    if found:
+        with open(path, "w") as f:
+            f.writelines(new_lines)
+        print(f"✅ Enabled BPF kernel debugging in {path}")
+    else:
+        print(f"ℹ️  Could not locate insertion point in {path}")
+
+if __name__ == "__main__":
+    enable_bpf_logging()
+```
+
+### Step 2: Capture the Debug Output
+
+1.  **Start the daemon** in one terminal:
+    ```bash
+    sudo ./target/release/foxing daemon --config test_config.toml
+    ```
+
+2.  **Start the Trace Pipe** in a **second terminal**:
+    This will stream logs directly from the kernel BPF subsystem.
+    ```bash
+    sudo cat /sys/kernel/debug/tracing/trace_pipe | grep "FOXING"
+    ```
+
+3.  **Generate a Write** in a **third terminal**:
+    ```bash
+    touch /tmp/foxing_test/mnt/source/debug_test.txt
