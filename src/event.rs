@@ -1,4 +1,4 @@
-// File: foxing/src/event.rs | Index: 8 of 24 | Function: Event types.
+// File: foxing/src/event.rs | Index: 8 of 21 | Function: Event types with added mode field.
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use crate::metrics;
@@ -29,27 +29,13 @@ impl From<u8> for EventType {
 impl EventType { 
     pub fn as_str(&self) -> &'static str { 
         match self { 
-            Self::Write => "write", 
-            Self::WriteRange => "writerange", 
-            Self::SetXattr => "setxattr",
-            Self::RemoveXattr => "removexattr",
-            Self::Rmdir => "rmdir",
-            Self::Fsync => "fsync", 
-            Self::Rename => "rename", 
-            Self::Create => "create", 
-            Self::Unlink => "unlink", 
-            Self::Mkdir => "mkdir", 
-            Self::Truncate => "truncate",
-            Self::Link => "link",
-            Self::Chmod => "chmod",
-            Self::Chown => "chown",
-            Self::Barrier => "barrier", 
-            Self::Mknod => "mknod",
-            Self::Symlink => "symlink",
-            Self::Fallocate => "fallocate",
-            Self::Utimes => "utimes",
-            Self::SequenceGap => "gap", 
-            Self::Unknown => "unknown" 
+            Self::Write => "write", Self::WriteRange => "writerange", Self::SetXattr => "setxattr", 
+            Self::RemoveXattr => "removexattr", Self::Rmdir => "rmdir", Self::Fsync => "fsync", 
+            Self::Rename => "rename", Self::Create => "create", Self::Unlink => "unlink", 
+            Self::Mkdir => "mkdir", Self::Truncate => "truncate", Self::Link => "link",
+            Self::Chmod => "chmod", Self::Chown => "chown", Self::Barrier => "barrier", 
+            Self::Mknod => "mknod", Self::Symlink => "symlink", Self::Fallocate => "fallocate", 
+            Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown" 
         } 
     } 
 }
@@ -60,6 +46,7 @@ pub struct Event {
     pub seq_num: u64, pub offset: u64, pub length: u64, pub name: String, pub new_name: Option<String>,
     pub generation: u32,
     pub projid: u32,
+    pub mode: u32, // ADDED: Required for fallocate/chmod
     pub created_at: std::time::Instant
 }
 
@@ -74,7 +61,6 @@ impl EventQueue {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         
         if self.senders.is_empty() { return; }
-        
         let idx = (e.inode as usize) % self.senders.len();
         
         if self.senders[idx].try_send(e).is_err() {

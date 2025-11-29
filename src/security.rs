@@ -1,6 +1,6 @@
-// File: foxing/src/security.rs | Index: 14 of 24 | Function: Secure I/O utilizing optimized metadata storage.
-use std::path::{Path, PathBuf};
-use crate::error::{MirrorError, Result};
+// File: foxing/src/security.rs | Index: 14 of 21 | Function: Security I/O operations. Fixed variable scoping and types.
+use std::path::{Path};
+use crate::error::{FoxingError, Result}; // Using FoxingError
 use crate::buffer::AlignedBuffer;
 use io_uring::{opcode, types}; 
 use std::os::unix::io::{AsRawFd, FromRawFd, BorrowedFd}; 
@@ -9,7 +9,7 @@ use libc;
 use xattr;
 use nix::sys::statvfs::statvfs;
 use std::ffi::CString;
-use tracing::{info, error, warn};
+use tracing::warn;
 use std::hash::Hasher; 
 use fxhash::FxHasher; 
 use walkdir::WalkDir;
@@ -19,9 +19,9 @@ use std::fs::File;
 use std::time::Duration;
 use chrono::Utc; 
 use uuid::Uuid; 
-use crate::sidecar; // Import Sidecar module
+use crate::sidecar;
 
-// ... [Constants and Structs Omitted, same as previous] ...
+// ... [Constants omitted] ...
 const FS_IOC_FSSETXATTR: u64 = 0x40205820; 
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
 const FS_COMPR_FL: u32 = 0x00000004;
@@ -29,7 +29,6 @@ const F2FS_IOC_SET_PIN_FILE: u64 = 0xF50D;
 const FIOCLONERANGE: u64 = 0x4020940D;
 
 #[repr(C)] struct FileCloneRange { s: i64, so: u64, l: u64, do_: u64 }
-
 #[repr(C)] #[derive(Default)]
 struct FsxAttr { fsx_xflags: u32, fsx_extsize: u32, fsx_nextents: u32, fsx_projid: u32, fsx_cowextsize: u32, fsx_pad: [u8; 8] }
 
@@ -53,10 +52,8 @@ pub fn probe_direct_io(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_dio");
     let mut buf = crate::buffer::AlignedBuffer::new(4096); 
     unsafe { buf.capacity_slice_mut()[0] = 1; }
-    
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT;
     let path_c = match CString::new(probe_file.to_string_lossy().as_bytes()) { Ok(c) => c, Err(_) => return false };
-    
     let fd = unsafe { libc::open(path_c.as_ptr(), flags, 0o644) };
     if fd < 0 { return false; }
     let _file = unsafe { File::from_raw_fd(fd) };
@@ -67,6 +64,7 @@ pub fn probe_direct_io(target_root: &Path) -> bool {
 
 pub fn preallocate(fd: i32, size: u64) {
     if size > 0 { 
+        // SAFETY: BorrowedFd required by nix 0.27+
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let _ = fallocate(&borrowed_fd, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as i64); 
     }
@@ -75,14 +73,14 @@ pub fn preallocate(fd: i32, size: u64) {
 pub fn enable_compression(fd: i32) -> Result<()> {
     let flags: u32 = FS_COMPR_FL;
     let ret = unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) };
-    if ret != 0 { return Err(MirrorError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
 
 pub fn enable_f2fs_pinning(fd: i32) -> Result<()> {
     let pin: u32 = 1;
     let ret = unsafe { libc::ioctl(fd, F2FS_IOC_SET_PIN_FILE, &pin) };
-    if ret != 0 { return Err(MirrorError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
 
@@ -91,14 +89,14 @@ pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     let mut attr: FsxAttr = Default::default();
     attr.fsx_projid = projid;
     let ret = unsafe { libc::ioctl(fd, FS_IOC_FSSETXATTR, &attr) };
-    if ret != 0 { return Err(MirrorError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
 
 pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     let lock = libc::flock { l_type: libc::F_WRLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
     if unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) } < 0 {
-        return Err(MirrorError::System(nix::Error::last()));
+        return Err(FoxingError::System(nix::Error::last()));
     }
     Ok(())
 }
@@ -168,7 +166,7 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };
         if ret != size as isize {
-             return Err(MirrorError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Fallback copy failed size mismatch"))));
+             return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Fallback copy failed size mismatch"))));
         }
     }
     dst_file.sync_all()?;
@@ -188,7 +186,7 @@ pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
         let mut off_in = 0i64;
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };
-        if ret != size as isize { return Err(MirrorError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Fallback revert failed"))); }
+        if ret != size as isize { return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Fallback revert failed"))); }
     }
     dst_file.set_len(size)?;
     dst_file.sync_all()?;
@@ -207,8 +205,9 @@ pub async fn copy_smart(
 ) -> Result<u64> {
     
     let sf = File::open(src)?;
-    let src_file_size = sf.metadata()?.len();
-    
+    let src_file_size = sf.metadata()?.len(); // Fixed variable name usage
+    let sfd = sf.as_raw_fd();
+
     let is_delta_update = length < src_file_size;
     let is_atomic = !is_delta_update && src_file_size > 0;
 
@@ -221,20 +220,21 @@ pub async fn copy_smart(
     let use_direct_io = reflink_ok.load(Ordering::Relaxed) && length > 1024 * 1024 && (length % 4096 == 0);
     let final_flags = if use_direct_io { open_flags | libc::O_DIRECT } else { open_flags };
 
-    let path_c = CString::new(target_path.to_string_lossy().as_bytes()).map_err(|_| MirrorError::Security("Invalid path".into()))?;
+    let path_c = CString::new(target_path.to_string_lossy().as_bytes()).map_err(|_| FoxingError::Security("Invalid path".into()))?;
     
     let dfd = unsafe { libc::open(path_c.as_ptr(), final_flags, 0o644) };
-    if dfd < 0 { return Err(MirrorError::Io(std::io::Error::last_os_error())); }
+    if dfd < 0 { return Err(FoxingError::Io(std::io::Error::last_os_error())); }
     let df = unsafe { File::from_raw_fd(dfd) };
     
-    preallocate(dfd, size);
+    if !is_delta_update {
+        preallocate(dfd, src_file_size); // Fixed: using src_file_size
+    }
 
     let mut reflink_success = false;
     if !is_delta_update && reflink_ok.load(Ordering::Relaxed) {
         let mut total_copied = 0usize;
         let mut off_in = 0i64;
         let mut off_out = 0i64;
-        let sfd = sf.as_raw_fd();
         for _ in 0..3 {
             let ret = unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize - total_copied, 0) };
             if ret > 0 { total_copied += ret as usize; }
@@ -252,24 +252,20 @@ pub async fn copy_smart(
     }
 
     if !reflink_success {
-        let sfd = sf.as_raw_fd();
         let mut current_offset = offset;
         let end_offset = offset + length;
         let max_chunk = buf.capacity() as u64;
         
         while current_offset < end_offset {
             let rlen = std::cmp::min(end_offset - current_offset, max_chunk) as usize;
-            
             let r_op = opcode::ReadFixed::new(types::Fd(sfd), unsafe { buf.capacity_slice_mut() }.as_mut_ptr(), rlen as u32, 0)
                 .offset(current_offset)
                 .build()
                 .user_data(current_offset as u64);
-            
-            unsafe { ring.submission().push(&r_op).map_err(|e| MirrorError::Io(e.into()))?; }
+            unsafe { ring.submission().push(&r_op).map_err(|e| FoxingError::Io(e.into()))?; }
             ring.submit_and_wait(1)?; 
-            
-            let cqe = ring.completion().next().ok_or(MirrorError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
-            if cqe.result() < 0 { return Err(MirrorError::Io(std::io::Error::from_raw_os_error(-cqe.result()))); }
+            let cqe = ring.completion().next().ok_or(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
+            if cqe.result() < 0 { return Err(FoxingError::Io(std::io::Error::from_raw_os_error(-cqe.result()))); }
             
             let write_needed = if vdo_opt && use_direct_io {
                 !is_block_zero(unsafe { &buf.capacity_slice_mut()[0..rlen] })
@@ -280,28 +276,23 @@ pub async fn copy_smart(
                     .offset(current_offset)
                     .build()
                     .user_data(current_offset as u64 | (1<<63));
-                
-                unsafe { ring.submission().push(&w_op).map_err(|e| MirrorError::Io(e.into()))?; }
+                unsafe { ring.submission().push(&w_op).map_err(|e| FoxingError::Io(e.into()))?; }
                 ring.submit_and_wait(1)?;
-                
-                let cqe_w = ring.completion().next().ok_or(MirrorError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
-                if cqe_w.result() < 0 { return Err(MirrorError::Io(std::io::Error::from_raw_os_error(-cqe_w.result()))); }
+                let cqe_w = ring.completion().next().ok_or(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
+                if cqe_w.result() < 0 { return Err(FoxingError::Io(std::io::Error::from_raw_os_error(-cqe_w.result()))); }
             }
-            
             current_offset += rlen as u64;
         }
     }
     
     df.sync_all()?;
     drop(df); 
-    
     if is_atomic {
         if let Err(e) = std::fs::rename(&target_path, dst) {
             let _ = std::fs::remove_file(&target_path); 
-            return Err(MirrorError::Io(e));
+            return Err(FoxingError::Io(e));
         }
     }
-
     Ok(length)
 }
 
@@ -328,7 +319,6 @@ pub fn sync_xattrs(src: &Path, dst: &Path) {
     }
 }
 
-// ... [Metadata Sync Helpers remain the same] ...
 pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     let m = std::fs::metadata(src)?;
     let _ = std::os::unix::fs::chown(dst, Some(m.uid()), Some(m.gid()));
@@ -351,6 +341,7 @@ pub fn truncate_file(dst: &Path, size: u64) -> Result<()> {
 pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(dst)?;
     let fd = f.as_raw_fd();
+    // SAFETY: nix 0.27 requires BorrowedFd
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let flags = FallocateFlags::from_bits_truncate(mode);
     nix::fcntl::fallocate(&borrowed, flags, offset as i64, len as i64)?;

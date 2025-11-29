@@ -1,4 +1,4 @@
-// File: foxing/src/worker.rs | Index: 15 of 24 | Function: Worker loop logic using abstract Metadata Manager.
+// File: foxing/src/worker.rs | Index: 15 of 21 | Function: Worker loop. Fixed match types and error handling.
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
     collections::HashMap, 
@@ -10,8 +10,8 @@ use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
 use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
 use tokio::time::interval; 
-use tracing::{warn, info, error}; 
-use crate::error::MirrorError; 
+use tracing::{warn, info, error, debug}; 
+use crate::error::FoxingError; 
 use std::io;
 use crate::metrics;
 use parking_lot::Mutex; 
@@ -19,8 +19,12 @@ use lru::LruCache;
 use std::path::PathBuf;
 use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
+use dashmap::DashMap;
 
-// ... [ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry omitted] ...
+// Export type for mirror.rs
+pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
+
+// ... [Structs: ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry omitted] ...
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
     fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
@@ -105,7 +109,7 @@ impl TargetTuner {
         let lat_target = cfg.autotune_target_latency_ms as f64 / 1000.0;
         Self { latency_target_seconds: lat_target, aspiration_size, current_coalesce_bytes: aspiration_size, max_burst_coalesce_bytes: 8 * 1024 * 1024, current_batch_size: cfg.batch_size, batch_size_min: 2, batch_size_max: cfg.batch_size * 4, flush_multiplier: flush_min, flush_multiplier_min: flush_min, flush_multiplier_max: flush_max, state: TunerState::Steady }
     }
-    fn tune(&mut self, elapsed: f64, cfg: &TargetConfig, is_stressed: bool, pending_events: usize, max_pending: usize, _board: &crate::worker::TunerBoard) {
+    fn tune(&mut self, elapsed: f64, cfg: &TargetConfig, is_stressed: bool, pending_events: usize, max_pending: usize, board: &TunerBoard) {
         let buffer_util = pending_events as f64 / max_pending as f64;
         let label = cfg.path.to_string_lossy();
         metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&label]).set(buffer_util);
@@ -137,6 +141,8 @@ impl TargetTuner {
         } else {
             self.state = TunerState::Steady;
         }
+        
+        board.insert(cfg.path.clone(), self.state);
 
         metrics::TARGET_BATCH_SIZE.with_label_values(&[&label]).set(self.current_batch_size as i64);
         metrics::TARGET_COALESCE_BYTES.with_label_values(&[&label]).set(self.current_coalesce_bytes as i64);
@@ -181,7 +187,7 @@ pub async fn run_worker(
     hydration_tx: mpsc::Sender<PathBuf>, 
     config: SharedConfig,
     governor: Arc<Governor>,
-    tuner_board: crate::worker::TunerBoard
+    tuner_board: TunerBoard
 ) -> Result<()> {
     let mut order = ordering::OrderBuf::new();
     let locks = Arc::new(ShardedLockCache::new()); 
@@ -189,7 +195,7 @@ pub async fn run_worker(
     let mut flush_interval = interval(Duration::from_secs(1));
     let mut ring = match IoUring::new(target_cfg.batch_size as u32) {
         Ok(r) => r,
-        Err(e) => { error!("Failed to create io_uring: {}", e); return Err(MirrorError::Io(e)); }
+        Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
     };
     let mut buf = AlignedBuffer::new(1024*1024);
     let limiter = ErrorLimiter::new();
@@ -205,7 +211,6 @@ pub async fn run_worker(
     let mut tuner = TargetTuner::new(&target_cfg);
     let mut is_hibernating = false;
     let mut last_dropped_check = 0u64;
-    
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
 
@@ -230,7 +235,6 @@ pub async fn run_worker(
                         let _ = hydration_tx.send(source.path.clone()).await; 
                         last_dropped_check = current_dropped;
                     }
-
                     let now = Instant::now();
                     let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
                     dirty_stats.retain(|&ino, entry| {
@@ -248,7 +252,7 @@ pub async fn run_worker(
             },
             Some(e) = rx.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             _ = shutdown_rx.recv() => break Ok(()),
-            else => break Err(MirrorError::System(nix::Error::last())),
+            else => break Err(FoxingError::System(nix::Error::last())),
         };
 
         if evt.is_none() { continue; }
@@ -378,10 +382,11 @@ pub async fn run_worker(
                             security::copy_smart(&src, &dst, &mut ring, &mut buf, &target_cfg.direct_io_ok, target_cfg.vdo_optimization, e_offset, e_len).await
                                 .map(|sz| {
                                     metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(sz);
-                                    let _ = spawn_blocking(move || { security::sync_xattrs(&sync_xattrs_src, &sync_xattrs_dst); });
+                                    // FIX: wrap in Ok() to match Result
+                                    Ok(spawn_blocking(move || { security::sync_xattrs(&sync_xattrs_src, &sync_xattrs_dst); }).await.unwrap_or(()))
                                 })
-                        } else { Ok(()) }
-                    } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}.", e.inode); } Ok(()) } else { Ok(()) }
+                        } else { Ok(Ok(())) } // Nested Result for consistency
+                    } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}.", e.inode); } Ok(Ok(())) } else { Ok(Ok(())) }
                 },
                 EventType::Unlink => {
                     dirty_stats.remove(&e.inode);
@@ -389,14 +394,12 @@ pub async fn run_worker(
                     let source_clone = source.clone();
                     let e_clone = e.clone();
                     let res = spawn_blocking(move || {
-                        // Optimized: No longer explicitly removing sidecar file, as it is now virtual/hybrid.
-                        // Just remove the file. If sidecar exists, it is orphaned but harmless until cleanup.
-                        // Or better: check if file exists, if so remove.
-                         if is_synthetic { let _ = std::fs::remove_file(&dst_clone); source_clone.inode_map.lock().pop(&e_clone.inode); metrics::SYNTHETIC_IDENTITY_FILES.dec(); }
+                        if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
+                        if is_synthetic { let _ = std::fs::remove_file(&dst_clone); source_clone.inode_map.lock().pop(&e_clone.inode); metrics::SYNTHETIC_IDENTITY_FILES.dec(); }
                         std::fs::remove_file(&dst_clone)
                     }).await.unwrap_or(Ok(())).map_err(|err| err.into());
                     if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
-                    res
+                    Ok(res)
                 },
                 EventType::Rename => {
                     if let Some(new_name) = &e.new_name {
@@ -414,8 +417,6 @@ pub async fn run_worker(
                                 let rename_res = std::fs::rename(&dst_clone, &new_dst_clone);
                                 if rename_res.is_ok() {
                                     identity::update_map_after_rename(&source_clone.inode_map, e_inode, new_rel, e_generation);
-                                    // Sidecar rename is now handled implicitly if xattrs move with file.
-                                    // If sidecar file exists, it needs moving.
                                     if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) { if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) { if old_sp.exists() { let _ = std::fs::rename(old_sp, new_sp); } } }
                                 }
                                 rename_res
@@ -424,15 +425,15 @@ pub async fn run_worker(
                                 if let Some(entry) = dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
                                 let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } if let Some(parent) = new_dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await;
                             }
-                            res
-                        } else { Ok(()) }
-                    } else { Ok(()) }
+                            Ok(res)
+                        } else { Ok(Ok(())) }
+                    } else { Ok(Ok(())) }
                 },
                 EventType::Mkdir => {
                     let dst_clone = dst.clone();
                     let res = spawn_blocking(move || { std::fs::create_dir_all(&dst_clone) }).await.unwrap_or(Ok(())).map_err(|e| e.into());
                     if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
-                    res
+                    Ok(res)
                 },
                 EventType::Barrier | EventType::Fsync => {
                     let dst_clone = dst.clone();
@@ -441,7 +442,6 @@ pub async fn run_worker(
                     let inode = e.inode;
                     let target_root_clone = target_cfg.path.clone();
                     let enable_versioning = target_cfg.enable_versioning;
-                    
                     let is_forced = target_cfg.is_forced_version(&dst_clone);
                     let defer_maintenance = tuner.should_defer_maintenance();
                     
@@ -464,7 +464,7 @@ pub async fn run_worker(
                             if should_cleanup {
                                 let _ = versioning::cleanup_versions(&dst_for_version, &target_root_clone, dyn_max_versions, dyn_max_mb);
                             }
-                            Ok::<(), MirrorError>(())
+                            Ok::<(), FoxingError>(())
                         }).await;
                          if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
                     }
@@ -472,37 +472,44 @@ pub async fn run_worker(
                         let r = security::commit_epoch(&dst_clone, seq_num, projid); 
                         if r.is_ok() { if let Some(parent) = dst_clone.parent() { if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } } }
                         r
-                    }).await.unwrap_or(Err(MirrorError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
+                    }).await.unwrap_or(Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
                     if r.is_ok() { dirty_stats.remove(&e.inode); }
-                    r
+                    Ok(r)
                 },
                 EventType::SetXattr | EventType::RemoveXattr => {
                     let src_clone = src.clone();
                     let dst_clone = dst.clone();
-                    spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(Ok(()))
+                    // FIX: Wrapped in Ok()
+                    Ok(spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(()).map_err(|_| FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Xattr sync failed"))).or(Ok(())))
                 },
                 EventType::Chmod | EventType::Chown | EventType::Utimes => {
                     let src_clone = src.clone();
                     let dst_clone = dst.clone();
-                    spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_clone); }).await.unwrap_or(Ok(()))
+                    Ok(spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_clone) }).await.unwrap_or(Ok(())))
                 },
                 EventType::Truncate => {
                     let dst_clone = dst.clone();
                     let length = e.length; 
-                    spawn_blocking(move || { security::truncate_file(&dst_clone, length); }).await.unwrap_or(Ok(()))
+                    Ok(spawn_blocking(move || { security::truncate_file(&dst_clone, length) }).await.unwrap_or(Ok(())))
                 },
                 EventType::Fallocate => {
                     let dst_clone = dst.clone();
                     let offset = e.offset;
                     let length = e.length;
                     let mode = e.mode as i32;
-                    spawn_blocking(move || { security::do_fallocate(&dst_clone, offset, length, mode); }).await.unwrap_or(Ok(()))
+                    Ok(spawn_blocking(move || { security::do_fallocate(&dst_clone, offset, length, mode) }).await.unwrap_or(Ok(())))
                 },
-                _ => Ok(())
+                _ => Ok(Ok(()))
             };
 
-            if let Err(err) = res {
-                if let MirrorError::Io(e) = &err {
+            // Flatten the nested Result<Result<...>>
+            let final_res = match res {
+                Ok(inner) => inner,
+                Err(e) => Err(FoxingError::Join(e))
+            };
+
+            if let Err(err) = final_res {
+                if let FoxingError::Io(e) = &err {
                     if let Some(28) = e.raw_os_error() {
                         error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
                         capacity_breaker.trip();

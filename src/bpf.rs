@@ -1,4 +1,4 @@
-// File: foxing/src/bpf.rs | Index: 17 of 24 | Function: User-space BPF loader.
+// File: foxing/src/bpf.rs | Index: 17 of 21 | Function: User-space BPF loader. Fixed open() args.
 use crate::event::{Event, EventType, EventQueue};
 use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;
@@ -30,7 +30,9 @@ struct RawEvent {
 pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
     let skel_builder = MirrorSkelBuilder::default();
     
-    let open_skel = skel_builder.open().map_err(|e| FoxingError::Bpf(e.to_string()))?;
+    // FIX: Provide OpenObject placeholder for open()
+    let mut open_obj = mem::MaybeUninit::uninit();
+    let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
     let mut skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     
     let self_pid = std::process::id();
@@ -80,6 +82,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                 event_type: EventType::SequenceGap, dev_id: raw.dev, inode: 0, 
                 parent_inode: 0, seq_num: raw.seq, offset: 0, length: 0, 
                 name: "".into(), new_name: None, generation: 0, projid: 0, 
+                mode: 0,
                 created_at: std::time::Instant::now() 
             });
             if let Some(qs) = queues.get(&raw.dev) { 
@@ -99,6 +102,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             event_type: EventType::from(raw.type_), dev_id: raw.dev, inode: raw.ino,
             parent_inode: raw.p_ino, seq_num: raw.seq, offset: raw.off, length: raw.len,
             name, new_name, generation: raw.gen, projid: raw.projid,
+            mode: raw.mode,
             created_at: std::time::Instant::now()
         });
         

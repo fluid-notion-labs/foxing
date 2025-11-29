@@ -1,4 +1,4 @@
-// File: foxing/src/buffer.rs | Index: 6 of 24 | Function: Aligned memory buffer implementation.
+// File: foxing/src/buffer.rs | Index: 6 of 21 | Function: Aligned buffer with fixed DerefMut trait.
 use std::alloc::{alloc, dealloc, Layout};
 use std::{ops::{Deref, DerefMut}, slice};
 
@@ -21,28 +21,19 @@ impl AlignedBuffer {
     pub fn capacity(&self) -> usize { self.capacity }
     pub fn set_full_len(&mut self) { self.len = self.capacity; }
     pub fn clear(&mut self) { self.len = 0; }
-    
     pub unsafe fn capacity_slice_mut(&mut self) -> &mut [u8] { 
         slice::from_raw_parts_mut(self.ptr, self.capacity) 
     }
 }
 
 impl Drop for AlignedBuffer { 
-    fn drop(&mut self) { 
-        unsafe { dealloc(self.ptr, self.layout); } 
-    } 
+    fn drop(&mut self) { unsafe { dealloc(self.ptr, self.layout); } } 
 }
-
 impl Deref for AlignedBuffer { 
     type Target = [u8]; 
-    fn deref(&self) -> &Self::Target { 
-        unsafe { slice::from_raw_parts(self.ptr, self.len) } 
-    } 
+    fn deref(&self) -> &Self::Target { unsafe { slice::from_raw_parts(self.ptr, self.len) } } 
 }
-
 impl DerefMut for AlignedBuffer { 
-    type Target = [u8]; 
-    fn deref_mut(&mut self) -> &mut Self::Target { 
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) } 
-    } 
+    // Removed invalid `type Target` here
+    fn deref_mut(&mut self) -> &mut Self::Target { unsafe { slice::from_raw_parts_mut(self.ptr, self.len) } } 
 }
