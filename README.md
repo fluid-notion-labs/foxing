@@ -152,11 +152,11 @@ cargo build --release
 # 3. Binary location
 ./target/release/foxing
 
+```
 ### Why the name?
 "Foxing" is an archival term referring to the brownish spots and rusty patina that appear on old paper, stamps, and photographs over time. Historically, it was also used to describe the desilvering or "rusting" of antique mirrors.
 
 Since this project is a Mirror written in Rust, the name fit perfectly.
 
 It also nods to the classic pangram, "The quick brown fox jumps over the lazy dog." In our case, this represents the core architectural goal: allowing the "Quick Fox" (your fast NVMe Source drive) to perform at full speed, completely decoupled from and leaping over the latency of the "Lazy Dog" (your slower backup HDD/Network Target).
-```
 
