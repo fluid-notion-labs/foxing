@@ -1,0 +1,51 @@
+# File: foxing/Cargo.toml | Index: 1 of 24 | Function: Project manifest defining dependencies, versions, and build profiles for Foxing.
+[package]
+name = "foxing"
+version = "0.1.0"
+edition = "2024"
+description = "Foxing: High-performance, eBPF-powered filesystem replication daemon with adaptive tuning and versioning."
+
+[lib]
+name = "foxing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "foxing"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full", "signal", "time", "fs"] }
+tokio-util = "0.7"
+futures = "0.3"
+libbpf-rs = "0.25"
+libbpf-sys = "1.5"
+nix = { version = "0.27", features = ["fs", "mount", "signal", "process", "user", "ioctl"] }
+libc = "0.2"
+io-uring = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.10"
+anyhow = "1.0.81"
+thiserror = "1.0"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+dashmap = "5.5"
+lazy_static = "1.4"
+lru = "0.14"
+prometheus = { version = "0.13", features = ["process"] }
+axum = "0.7"
+sysinfo = "0.30"
+xattr = "1.0"
+walkdir = "2.4"
+chrono = { version = "0.4", features = ["serde"] }
+glob = "0.3"
+fxhash = "0.2.1"
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+comfy-table = "7.0"
+uuid = { version = "1.8", features = ["v4"] }
+
+[build-dependencies]
+libbpf-cargo = "0.25"

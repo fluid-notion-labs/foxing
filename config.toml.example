@@ -1,0 +1,186 @@
+# File: foxing/config.toml.example | Index: 24 of 24 | Function: Exhaustive configuration template with Force Versioning and Filter examples.
+
+# ==============================================================================
+# Foxing Configuration Template (v0.1-alpha)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# BUILT-IN TUNING PROFILES (Reference)
+# ------------------------------------------------------------------------------
+# The 'profile' setting sets initial baselines. The Auto-Tuner then adjusts
+# these values in real-time based on the 'autotune_target_latency_ms'.
+#
+# | Profile | Batch Size | Coalesce Win | Flush Strategy | Best For           |
+# |:--------|:-----------|:-------------|:---------------|:-------------------|
+# | NVMe    | 16         | 4 MB         | Aggressive     | Local NVMe / RAID0 |
+# | SSD     | 8          | 2 MB         | Moderate       | SATA SSDs          |
+# | HDD     | 4          | 512 KB       | Conservative   | Spinning Rust      |
+# | NFS     | 8          | 1 MB         | Moderate       | Network Mounts     |
+# | Auto    | 4          | 1 MB         | Adaptive       | General Purpose    |
+#
+# *Batch Size: Number of parallel I/O requests submitted to io_uring.
+# *Coalesce Win: Max bytes buffered to merge sequential writes into one op.
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# GLOBAL SYSTEM SETTINGS
+# ------------------------------------------------------------------------------
+
+# Number of concurrent worker threads handling file I/O.
+# Default: Half of available CPU cores.
+worker_count = 4
+
+# Maximum number of events allowed in the internal ring buffer per worker.
+# If this limit is reached, new events from the kernel are DROPPED to prevent OOM.
+# Default: 200,000
+queue_max = 500000
+
+# Hard limit on total memory usage for event buffers (approximate).
+# Default: 5,000,000 events
+global_buffer_limit = 10000000
+
+# Port for the internal Prometheus metrics exporter.
+# URL: http://localhost:9100/metrics
+metrics_port = 9100
+
+# If true, the daemon will exit if it cannot bind the metrics port.
+fatal_metrics_bind = false
+
+# ------------------------------------------------------------------------------
+# GOVERNOR & SAFETY (Load Protection)
+# ------------------------------------------------------------------------------
+
+# The "Safety Valve". If the system 1-minute Load Average exceeds this value,
+# the daemon enters "Throttled Mode":
+# 1. Hydration scans pause.
+# 2. Batch sizes reduce to minimum.
+# 3. Version cleanup is deferred.
+# Default: 4.0 (Set to roughly your CPU core count)
+max_system_load_avg = 6.0
+
+# Minimum sleep time (milliseconds) between checking files during a full tree scan.
+# Increase this to reduce the "Metadata Storm" impact during startup/recovery.
+hydration_delay_ms = 10
+
+# ------------------------------------------------------------------------------
+# SOURCE 1: The Gamer/HTPC (Complex Filtering & Standard Versioning)
+# ------------------------------------------------------------------------------
+[[sources]]
+path = "/home/gamer"
+
+  [[sources.targets]]
+  path = "/mnt/backup_drive/home_mirror"
+  profile = "HDD"       # Optimized for spinning rust (larger batches, fewer fsyncs)
+  initial_sync = true   # Always scan on startup
+  
+  # --- Auto-Tuning ---
+  # Controls how aggressively the daemon scales batch sizes to meet latency goals.
+  # Lower = Faster updates but higher system load.
+  # Higher = Slower updates, lower system load.
+  # Default: 50ms
+  autotune_target_latency_ms = 100 
+  
+  # --- Filter Logic ---
+  # Regex rules to skip cache/garbage data.
+  # Rules are applied in order. If a file matches an Exclude, it is skipped
+  # UNLESS it also matches an Include (if defined).
+  excludes = [
+      # Steam: Don't mirror downloading games or shader caches (millions of tiny files)
+      ".*/.steam/steam/steamapps/downloading/.*",
+      ".*/.steam/steam/steamapps/shadercache/.*",
+      
+      # Proton/Wine: Skip "pfx" drive_c clutter, keep save games usually in user profile
+      ".*/compatdata/.*/pfx/drive_c/.*",
+      
+      # Desktop: Skip thumbnails and browser cache
+      ".*/.cache/.*",
+      ".*/.thumbnails/.*",
+      ".*/.config/google-chrome/.*",
+      ".*/.mozilla/firefox/.*cache.*",
+      
+      # Media: Don't mirror incomplete downloads
+      ".*/Downloads/.*\\.part$",
+      ".*/Downloads/.*\\.tmp$"
+  ]
+  
+  # Whitelist specific important files inside excluded directories
+  includes = [
+      ".*/.steam/steam/userdata/.*" # Keep Steam Cloud local saves
+  ]
+
+  # --- Standard Versioning ---
+  # Subject to Auto-Tuning. If disk fills > 90%, versions are pruned.
+  enable_versioning = true
+  max_versions = 5
+  max_versions_size_mb = 2048
+
+  # Don't version large media files (ISOs, MKVs) - just mirror the latest.
+  version_excludes = [
+      ".*\\.iso$",
+      ".*\\.mkv$",
+      ".*\\.mp4$"
+  ]
+
+# ------------------------------------------------------------------------------
+# SOURCE 2: The Database Server (Force Versioning)
+# ------------------------------------------------------------------------------
+[[sources]]
+path = "/var/lib/postgresql/data"
+
+  [[sources.targets]]
+  path = "/mnt/nvme_backup/pg_data"
+  profile = "NVMe"      # Aggressive IO settings
+  
+  # Aggressive tuning: We want writes acknowledged instantly (<10ms).
+  autotune_target_latency_ms = 10
+  
+  # Optimization Flags
+  vdo_optimization = true       # Skip writing blocks that are all zeros (sparse efficiency)
+  supports_reflink = true       # Critical for atomic versioning performance
+  enable_versioning = true
+  
+  # --- Force Versioning (CRITICAL DATA) ---
+  # This OVERRIDES the Governor. 
+  # Even if the system Load Avg is 50.0 and the target disk is 99% full,
+  # these files will retain their versions.
+  #
+  # WARNING: Using this disables the safety backoff. You may hit ENOSPC.
+  
+  force_versioning = false # If true, forces ALL files in this target.
+  
+  # List of regexes for specific files to force-keep.
+  force_version_includes = [
+      ".*/global/pg_control",  # Critical Postgres metadata
+      ".*/wal/.*"              # Write Ahead Logs
+  ]
+  
+  # Specific retention count for forced files (Overrides max_versions).
+  # We want exactly 20 history points for WALs, no matter what.
+  force_retention_count = 20
+  
+  # Standard limits (ignored for forced files)
+  max_versions = 5
+  max_versions_size_mb = 51200  # 50GB
+
+# ------------------------------------------------------------------------------
+# SOURCE 3: The Developer Workspace
+# ------------------------------------------------------------------------------
+[[sources]]
+path = "/home/dev/projects"
+
+  [[sources.targets]]
+  path = "/mnt/nas/dev_backup"
+  profile = "NFS"       # Tuned for network latency (larger buffers)
+  
+  # Relaxed tuning: Network lag is expected. Don't panic backoff until >200ms.
+  autotune_target_latency_ms = 200
+
+  # Ignore build artifacts to save network bandwidth
+  excludes = [
+      ".*/target/.*",           # Rust build dir
+      ".*/node_modules/.*",     # Node.js hell
+      ".*/venv/.*",             # Python virtual envs
+      ".*/__pycache__/.*",
+      ".*\\.o$",                # C objects
+      ".*\\.git/objects/.*"     # Git internals
+  ]
