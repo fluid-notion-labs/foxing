@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use crate::error::{Result, MirrorError};
+use crate::error::{Result, FoxingError as MirrorError};
 use glob::glob;
 use regex::Regex;
 use comfy_table::{Table, Row, Cell, CellAlignment};
@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use std::fs;
 use std::io::copy;
 use std::os::unix::fs::MetadataExt; 
-use tracing::{info, warn};
+use tracing::warn;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct FileVersion {

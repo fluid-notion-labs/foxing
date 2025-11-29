@@ -20,7 +20,7 @@ lazy_static::lazy_static! {
 #[derive(Copy, Clone)]
 struct RawEvent {
     type_: u8, ver: u8, _p: [u8;2], dev: u32, seq: u64, ts: u64, p_ino: u64, ino: u64,
-    np_ino: u64, gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
+    np_ino: u64, r#gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
     nlink: u32, flags: u32, sz: u64, 
     projid: u32, _pad3: u32, 
     name: [u8;256], nname: [u8;256]
@@ -100,7 +100,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         let evt = Arc::new(Event {
             event_type: EventType::from(raw.type_), dev_id: raw.dev, inode: raw.ino,
             parent_inode: raw.p_ino, seq_num: raw.seq, offset: raw.off, length: raw.len,
-            name, new_name, generation: raw.gen, projid: raw.projid,
+            name, new_name, generation: raw.r#gen, projid: raw.projid,
             mode: raw.mode,
             created_at: std::time::Instant::now()
         });

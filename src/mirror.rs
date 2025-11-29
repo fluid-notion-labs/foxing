@@ -1,4 +1,4 @@
-use std::{sync::{Arc, atomic::{Ordering, AtomicUsize}}, collections::HashMap, path::PathBuf, fs};
+use std::{sync::{Arc, atomic::Ordering}, collections::HashMap, path::PathBuf, fs};
 use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event, EventType}, worker::{self, TunerBoard, TunerState}, metrics, identity, sidecar, security, Result, governor::Governor};
 use walkdir::WalkDir;
 use parking_lot::Mutex;
@@ -7,9 +7,8 @@ use std::num::NonZeroUsize;
 use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
 use std::os::unix::io::AsRawFd; 
-use tracing::{info, error, warn, debug};
-use tokio::task::spawn_blocking;
-use std::time::{Instant, Duration};
+use tracing::{info, error, warn};
+use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
@@ -44,7 +43,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(cfg: SharedConfig) -> Self { 
-        let cloned_cfg = cfg.clone(); 
+        let _cloned_cfg = cfg.clone(); 
         
         let config_reader = cfg.blocking_read();
         let governor = Arc::new(Governor::new(
@@ -95,6 +94,7 @@ impl Manager {
             }
         }
         
+        drop(config_reader);
         Self { 
             config: cfg, 
             sources, 
@@ -106,7 +106,7 @@ impl Manager {
     }
 
     pub fn start(&mut self) -> (HashMap<u32, Vec<Arc<EventQueue>>>, Vec<tokio::task::JoinHandle<Result<()>>>, Vec<tokio::sync::mpsc::Sender<()>>, HydrationRx) {
-        let mut queues = HashMap::new();
+        let mut queues: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
         let (hydration_tx, hydration_rx) = mpsc::channel(32); 
@@ -194,7 +194,7 @@ impl Manager {
                         let dev_str_clone = dev_str.clone();
                         let board_clone = tuner_board.clone();
 
-                        let _ = spawn_blocking(move || -> Result<()> {
+                        let _ = (move || -> Result<()> {
                             // READ SOURCE METADATA ONCE
                             let m = fs::metadata(&path_clone)?;
                             let ino = m.ino();
@@ -261,6 +261,7 @@ impl Manager {
                                             event_type: EventType::Write, dev_id, inode: ino, parent_inode: 0,
                                             seq_num: 0, offset: 0, length: m.len(), name: rel_clone.to_string_lossy().to_string(),
                                             new_name: None, generation: 0, projid: 0, 
+                                            mode: 0, 
                                             created_at: Instant::now()
                                         };
                                         q.push(Arc::new(evt));
@@ -282,7 +283,7 @@ impl Manager {
                                 }
                             }
                             Ok(())
-                        }).await.unwrap_or_else(|e| {
+                        })().unwrap_or_else(|e| {
                             error!("Hydration task failed for {:?}: {:?}", path, e);
                         });
                     }

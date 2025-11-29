@@ -1,5 +1,5 @@
 use std::path::{Path};
-use crate::error::{FoxingError, Result}; // Using FoxingError
+use crate::error::{FoxingError, Result};
 use crate::buffer::AlignedBuffer;
 use io_uring::{opcode, types}; 
 use std::os::unix::io::{AsRawFd, FromRawFd, BorrowedFd}; 
@@ -15,12 +15,10 @@ use walkdir::WalkDir;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::Ordering;
 use std::fs::File;
-use std::time::Duration;
 use chrono::Utc; 
 use uuid::Uuid; 
 use crate::sidecar;
 
-// ... [Constants omitted] ...
 const FS_IOC_FSSETXATTR: u64 = 0x40205820; 
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
 const FS_COMPR_FL: u32 = 0x00000004;
@@ -65,7 +63,7 @@ pub fn preallocate(fd: i32, size: u64) {
     if size > 0 { 
         // SAFETY: BorrowedFd required by nix 0.27+
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let _ = fallocate(&borrowed_fd, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as i64); 
+        let _ = fallocate(borrowed_fd.as_raw_fd(), FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as i64); 
     }
 }
 
@@ -204,7 +202,7 @@ pub async fn copy_smart(
 ) -> Result<u64> {
     
     let sf = File::open(src)?;
-    let src_file_size = sf.metadata()?.len(); // Fixed variable name usage
+    let src_file_size = sf.metadata()?.len(); 
     let sfd = sf.as_raw_fd();
 
     let is_delta_update = length < src_file_size;
@@ -226,7 +224,7 @@ pub async fn copy_smart(
     let df = unsafe { File::from_raw_fd(dfd) };
     
     if !is_delta_update {
-        preallocate(dfd, src_file_size); // Fixed: using src_file_size
+        preallocate(dfd, src_file_size); 
     }
 
     let mut reflink_success = false;
@@ -261,7 +259,7 @@ pub async fn copy_smart(
                 .offset(current_offset)
                 .build()
                 .user_data(current_offset as u64);
-            unsafe { ring.submission().push(&r_op).map_err(|e| FoxingError::Io(e.into()))?; }
+            unsafe { ring.submission().push(&r_op).map_err(|_e| FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ Full")))?; }
             ring.submit_and_wait(1)?; 
             let cqe = ring.completion().next().ok_or(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
             if cqe.result() < 0 { return Err(FoxingError::Io(std::io::Error::from_raw_os_error(-cqe.result()))); }
@@ -275,7 +273,7 @@ pub async fn copy_smart(
                     .offset(current_offset)
                     .build()
                     .user_data(current_offset as u64 | (1<<63));
-                unsafe { ring.submission().push(&w_op).map_err(|e| FoxingError::Io(e.into()))?; }
+                unsafe { ring.submission().push(&w_op).map_err(|_e| FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "SQ Full")))?; }
                 ring.submit_and_wait(1)?;
                 let cqe_w = ring.completion().next().ok_or(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No CQE")))?;
                 if cqe_w.result() < 0 { return Err(FoxingError::Io(std::io::Error::from_raw_os_error(-cqe_w.result()))); }
@@ -343,6 +341,6 @@ pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> 
     // SAFETY: nix 0.27 requires BorrowedFd
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let flags = FallocateFlags::from_bits_truncate(mode);
-    nix::fcntl::fallocate(&borrowed, flags, offset as i64, len as i64)?;
+    nix::fcntl::fallocate(borrowed.as_raw_fd(), flags, offset as i64, len as i64)?;
     Ok(())
 }

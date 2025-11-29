@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, fs, sync::{Arc, atomic::AtomicBool}, collections::HashSet};
-use crate::error::{Result, MirrorError};
+use crate::error::{Result, FoxingError as MirrorError};
 use regex::RegexSet;
 use sysinfo::System;
 

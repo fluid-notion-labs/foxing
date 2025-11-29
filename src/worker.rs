@@ -9,7 +9,7 @@ use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
 use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
 use tokio::time::interval; 
-use tracing::{warn, info, error, debug}; 
+use tracing::{warn, info, error}; 
 use crate::error::FoxingError; 
 use std::io;
 use crate::metrics;
@@ -19,11 +19,11 @@ use std::path::PathBuf;
 use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
+use futures::StreamExt;
 
 // Export type for mirror.rs
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
-// ... [Structs: ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry omitted] ...
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
     fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
@@ -215,7 +215,7 @@ pub async fn run_worker(
 
     loop {
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
-        let evt = tokio::select! {
+        let event_poll_result = tokio::select! {
             _ = flush_interval.tick() => {
                 if let Ok(s) = statvfs(&target_cfg.path) {
                     cur_cap_total = s.blocks() * s.block_size();
@@ -254,8 +254,8 @@ pub async fn run_worker(
             else => break Err(FoxingError::System(nix::Error::last())),
         };
 
-        if evt.is_none() { continue; }
-        let evt = evt.unwrap();
+        if event_poll_result.is_none() { continue; }
+        let event_ptr = event_poll_result.unwrap();
         
         if metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed) > metrics::GLOBAL_BUFFER_LIMIT.get() as u64 {
              warn!("Worker detected global buffer overflow. Initiating immediate hibernation for {:?}", target_cfg.path);
@@ -284,22 +284,23 @@ pub async fn run_worker(
         }
         
         if is_hibernating { continue; }
-        if evt.event_type == EventType::SequenceGap {
-            tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", evt.dev_id);
+        if event_ptr.event_type == EventType::SequenceGap {
+            tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", event_ptr.dev_id);
             let _ = hydration_tx.send(source.path.clone()).await; 
             order.next = 0;
             continue;
         }
-        if order.next > 0 && evt.seq_num < order.next { crate::metrics::LATE_EVENTS.inc(); continue; }
+        if order.next > 0 && event_ptr.seq_num < order.next { crate::metrics::LATE_EVENTS.inc(); continue; }
 
-        order.push_and_check(evt);
+        order.push_and_check(event_ptr.clone());
         let current_coalesce_limit = tuner.current_coalesce_bytes;
         let mut io_attempt_successful = true;
 
         while let Some(e) = order.pop_batch(current_coalesce_limit) {
-            let target_cfg_clone = target_cfg.clone();
+            let target_cfg_cap = target_cfg.clone();
+            let target_cfg_allow = target_cfg.clone();
             let capacity_breaker_clone = capacity_breaker.clone();
-            let check_capacity_result = spawn_blocking(move || { capacity_breaker_clone.can_proceed(&target_cfg_clone.path, capacity_threshold_mb) }).await.unwrap_or(false);
+            let check_capacity_result = spawn_blocking(move || { capacity_breaker_clone.can_proceed(&target_cfg_cap.path, capacity_threshold_mb) }).await.unwrap_or(false);
 
             if !check_capacity_result {
                 if limiter.check("capacity") { error!("Target full: {:?}", target_cfg.path); }
@@ -310,7 +311,7 @@ pub async fn run_worker(
             }
             
             let e_clone = e.clone();
-            let allow_result = spawn_blocking(move || { target_cfg_clone.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
+            let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
             if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); continue; }
 
             let lock = locks.get(e.inode);
@@ -376,15 +377,28 @@ pub async fn run_worker(
                                   }).await;
                                   if res.is_err() { warn!("Failed compression/pinning setup: {:?}", res.err()); }
                              }
-                            let sync_xattrs_dst = dst.clone();
+                            
                             let sync_xattrs_src = src.clone();
+                            let sync_xattrs_dst = dst.clone();
+                            
+                            let total_size = m.len() as usize;
+                            if total_size > 0 {
+                                let chunks: Vec<usize> = (0..total_size).step_by(1024*1024).collect();
+                                futures::stream::iter(chunks).then(|_sz| {
+                                    let sx = sync_xattrs_src.clone();
+                                    let dx = sync_xattrs_dst.clone();
+                                    async move {
+                    let _ = spawn_blocking(move || { security::sync_xattrs(&sx, &dx); }).await;
+                                    }
+                                }).collect::<Vec<_>>().await;
+                            }
+
                             security::copy_smart(&src, &dst, &mut ring, &mut buf, &target_cfg.direct_io_ok, target_cfg.vdo_optimization, e_offset, e_len).await
-                                .map(|sz| {
-                                    metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(sz);
-                                    // FIX: wrap in Ok() to match Result
-                                    Ok(spawn_blocking(move || { security::sync_xattrs(&sync_xattrs_src, &sync_xattrs_dst); }).await.unwrap_or(()))
+                                .map(|_sz| {
+                                    metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(e_len);
+                                    Ok(())
                                 })
-                        } else { Ok(Ok(())) } // Nested Result for consistency
+                        } else { Ok(Ok(())) } 
                     } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}.", e.inode); } Ok(Ok(())) } else { Ok(Ok(())) }
                 },
                 EventType::Unlink => {
@@ -478,8 +492,8 @@ pub async fn run_worker(
                 EventType::SetXattr | EventType::RemoveXattr => {
                     let src_clone = src.clone();
                     let dst_clone = dst.clone();
-                    // FIX: Wrapped in Ok()
-                    Ok(spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(()).map_err(|_| FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Xattr sync failed"))).or(Ok(())))
+                    // CORRECTED LOGIC: map Result to Ok(()) then unwrap inner
+                    Ok(Ok(spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(())))
                 },
                 EventType::Chmod | EventType::Chown | EventType::Utimes => {
                     let src_clone = src.clone();
@@ -504,23 +518,25 @@ pub async fn run_worker(
             // Flatten the nested Result<Result<...>>
             let final_res = match res {
                 Ok(inner) => inner,
-                Err(e) => Err(FoxingError::Join(e))
+                Err(e) => Err(e)
             };
 
             if let Err(err) = final_res {
-                if let FoxingError::Io(e) = &err {
-                    if let Some(28) = e.raw_os_error() {
+                if let FoxingError::Io(io_err) = &err {
+                    if let Some(28) = io_err.raw_os_error() {
                         error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
                         capacity_breaker.trip();
                         io_attempt_successful = false; 
-                        order.push_and_check(e); 
+                        // Fix shadowed 'e' - now pushing original event_ptr
+                        order.push_and_check(event_ptr.clone()); 
                         break; 
                     }
                 }
                 
                 if limiter.check("io") { error!("IO Error: {:?}", err); }
                 io_attempt_successful = false; 
-                order.push_and_check(e);
+                // Fix used 'evt' -> 'event_ptr'
+                order.push_and_check(event_ptr.clone());
                 break;
             } else { failure_state.record_success(); }
             

@@ -42,16 +42,16 @@ pub fn resolve_target(map: &InodeMap, e: &Event, target_root: &std::path::Path) 
     (dst, is_synthetic, need_creation)
 }
 
-pub fn update_map(map: &InodeMap, inode: u64, rel: PathBuf, gen: u32, is_syn: bool) {
-    map.lock().put(inode, (rel, gen, is_syn));
+pub fn update_map(map: &InodeMap, inode: u64, rel: PathBuf, r#gen: u32, is_syn: bool) {
+    map.lock().put(inode, (rel, r#gen, is_syn));
 }
 
-pub fn update_map_after_rename(map: &InodeMap, inode: u64, new_rel: PathBuf, gen: u32) {
+pub fn update_map_after_rename(map: &InodeMap, inode: u64, new_rel: PathBuf, r#gen: u32) {
     let mut map = map.lock();
     if let Some((_, old_gen, is_syn)) = map.get(&inode).map(|v| v.clone()) {
-        let final_gen = if gen != 0 { gen } else { old_gen };
+        let final_gen = if r#gen != 0 { r#gen } else { old_gen };
         map.put(inode, (new_rel, final_gen, is_syn));
     } else {
-        map.put(inode, (new_rel, gen, false));
+        map.put(inode, (new_rel, r#gen, false));
     }
 }

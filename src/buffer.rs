@@ -21,7 +21,9 @@ impl AlignedBuffer {
     pub fn set_full_len(&mut self) { self.len = self.capacity; }
     pub fn clear(&mut self) { self.len = 0; }
     pub unsafe fn capacity_slice_mut(&mut self) -> &mut [u8] { 
-        slice::from_raw_parts_mut(self.ptr, self.capacity) 
+        unsafe {
+            slice::from_raw_parts_mut(self.ptr, self.capacity) 
+        }
     }
 }
 

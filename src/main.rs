@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use xfs_mirror::{config::Config, mirror::Manager, bpf, metrics, versioning};
+use foxing::{config::Config, mirror::Manager, bpf, metrics, versioning};
 use tracing::{info, error, warn};
 use axum::{Router, routing::get};
 use std::net::SocketAddr;
@@ -90,7 +90,6 @@ fn handle_reload() {
 fn set_process_priority(policy_str: &str) {
     // Constants from linux/ioprio.h
     const IOPRIO_WHO_PROCESS: i32 = 1;
-    const IOPRIO_CLASS_RT: i32 = 1;
     const IOPRIO_CLASS_BE: i32 = 2;
     const IOPRIO_CLASS_IDLE: i32 = 3;
     
