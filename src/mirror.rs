@@ -42,10 +42,10 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new(cfg: SharedConfig) -> Self { 
+    pub async fn new(cfg: SharedConfig) -> Self { 
         let _cloned_cfg = cfg.clone(); 
         
-        let config_reader = cfg.blocking_read();
+        let config_reader = cfg.read().await;
         let governor = Arc::new(Governor::new(
             config_reader.max_system_load_avg,
             config_reader.hydration_delay_ms
@@ -105,13 +105,13 @@ impl Manager {
         }
     }
 
-    pub fn start(&mut self) -> (HashMap<u32, Vec<Arc<EventQueue>>>, Vec<tokio::task::JoinHandle<Result<()>>>, Vec<tokio::sync::mpsc::Sender<()>>, HydrationRx) {
+    pub async fn start(&mut self) -> (HashMap<u32, Vec<Arc<EventQueue>>>, Vec<tokio::task::JoinHandle<Result<()>>>, Vec<tokio::sync::mpsc::Sender<()>>, HydrationRx) {
         let mut queues: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
         let (hydration_tx, hydration_rx) = mpsc::channel(32); 
 
-        let config_reader = self.config.blocking_read(); 
+        let config_reader = self.config.read().await; 
         let global_queue_max = config_reader.queue_max; 
 
         for (dev, src) in &self.sources {

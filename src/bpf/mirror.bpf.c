@@ -105,7 +105,12 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     e->gid = BPF_CORE_READ(inode, i_gid.val); e->offset = offset; e->length = length; e->flags = flags;
     
     struct inode___p *ip = (struct inode___p *)inode;
-    e->projid = BPF_CORE_READ(ip, i_projid.val);
+    // CO-RE Check: Handle kernels without XFS Project Quotas (e.g. Bazzite/Gaming kernels)
+    if (bpf_core_field_exists(ip->i_projid)) {
+        e->projid = BPF_CORE_READ(ip, i_projid.val);
+    } else {
+        e->projid = 0;
+    }
 
     if (dentry) {
         struct dentry *parent = BPF_CORE_READ(dentry, d_parent);

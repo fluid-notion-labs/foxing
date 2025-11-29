@@ -159,8 +159,8 @@ async fn main() -> anyhow::Result<()> {
             let prio = cfg.read().await.io_priority.clone();
             set_process_priority(&prio);
 
-            let mut mgr = Manager::new(cfg.clone());
-            let (queues, handles, shutdown_senders, _hydration_rx) = mgr.start();
+            let mut mgr = Manager::new(cfg.clone()).await;
+            let (queues, handles, shutdown_senders, _hydration_rx) = mgr.start().await;
             let shutdown = Arc::new(AtomicBool::new(false));
             let sd = shutdown.clone();
 

@@ -3,7 +3,7 @@ use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering, AtomicU64}};
-use libbpf_rs::skel::{SkelBuilder, OpenSkel, Skel}; 
+use libbpf_rs::skel::{SkelBuilder, OpenSkel}; 
 use dashmap::DashMap;
 use crate::metrics::{self, GLOBAL_BUFFER_LIMIT}; 
 use std::mem;
@@ -32,7 +32,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     // FIX: Provide OpenObject placeholder for open()
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    let mut skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
+    let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     
     let self_pid = std::process::id();
     let pid_val: u8 = 1;
@@ -45,9 +45,61 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         skel.maps.watched_devs.update(&key, &val.to_le_bytes(), libbpf_rs::MapFlags::ANY).map_err(|e| FoxingError::Bpf(e.to_string()))?;
     }
     
-    match skel.attach() {
-        Ok(_) => tracing::info!("BPF probes attached successfully. Filtered self PID: {}", self_pid),
-        Err(e) => return Err(FoxingError::Bpf(e.to_string())),
+    
+    
+    // Manual Feature Probing
+    let mut _held_links = Vec::new();
+    let mut attached_count = 0;
+
+    // Use the generated 'maps' to access the underlying object, or just specific fields.
+    // Since 'obj' is private, we must rely on the specific probe fields in `skel.progs`.
+    // We will manually try to attach the known ones.
+    
+    let progs = &skel.progs;
+    
+    // List of known probes from mirror.bpf.c
+    let probes = [
+        ("trace_xfs_write", &progs.trace_xfs_write),
+        ("trace_btrfs_write", &progs.trace_btrfs_write),
+        ("trace_f2fs_write", &progs.trace_f2fs_write),
+        ("trace_gen_write", &progs.trace_gen_write),
+        ("trace_vfs_fsync", &progs.trace_vfs_fsync),
+        ("trace_create_entry", &progs.trace_create_entry),
+        ("trace_create_exit", &progs.trace_create_exit),
+        ("trace_mkdir_entry", &progs.trace_mkdir_entry),
+        ("trace_mkdir_exit", &progs.trace_mkdir_exit),
+        ("trace_mknod_entry", &progs.trace_mknod_entry),
+        ("trace_mknod_exit", &progs.trace_mknod_exit),
+        ("trace_link_entry", &progs.trace_link_entry),
+        ("trace_link_exit", &progs.trace_link_exit),
+        ("trace_symlink_entry", &progs.trace_symlink_entry),
+        ("trace_symlink_exit", &progs.trace_symlink_exit),
+        ("trace_unlink", &progs.trace_unlink),
+        ("trace_rmdir", &progs.trace_rmdir),
+        ("trace_rename", &progs.trace_rename),
+        ("trace_notify_change", &progs.trace_notify_change),
+        ("trace_setxattr", &progs.trace_setxattr),
+        ("trace_removexattr", &progs.trace_removexattr),
+        ("trace_fallocate", &progs.trace_fallocate),
+        ("trace_xfs_commit", &progs.trace_xfs_commit),
+    ];
+
+    for (name, prog) in probes.iter() {
+        match prog.attach() {
+            Ok(link) => {
+                _held_links.push(link);
+                attached_count += 1;
+                tracing::info!("BPF: Attached probe {}", name);
+            }
+            Err(e) => {
+                // Ignore missing FS modules (ENOENT/EPERM)
+                tracing::warn!("BPF: Skipped probe {} (Kernel unsupported: {})", name, e);
+            }
+        }
+    }
+
+    if attached_count == 0 {
+        return Err(FoxingError::Bpf("Failed to attach ANY BPF probes.".into()));
     }
     
     let maps = skel.maps;
