@@ -18,9 +18,6 @@
 struct kprojid_t___p { int val; };
 struct inode___p { struct kprojid_t___p i_projid; } __attribute__((preserve_access_index));
 
-// Needed for i_count read (atomic_t is usually a struct with a counter int)
-struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
-
 struct xfs_mount { struct super_block *m_super; } __attribute__((preserve_access_index));
 struct xfs_trans { struct xfs_mount *t_mountp; } __attribute__((preserve_access_index));
 
@@ -45,7 +42,8 @@ struct event {
     __u32 flags; 
     __u64 file_size;
     __u32 projid; 
-    __u32 open_count; // How many processes have this file open?
+    // Removed unstable open_count
+    __u32 _pad1; 
     char name[MAX_FILENAME]; 
     char new_name[MAX_FILENAME];
     char comm[16]; 
@@ -115,11 +113,6 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     
     e->interactive = (tty != NULL) ? 1 : 0;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    
-    // Check Atomic open count (approximation of file hotness)
-    // We read it directly. >1 implies held by others (dentry cache holds 1)
-    struct atomic_t___p *ac = (struct atomic_t___p *)&inode->i_count;
-    e->open_count = BPF_CORE_READ(ac, counter);
     // ----------------------------
 
     e->type = type; e->version = EVENT_VERSION; e->dev_id = dev_id;

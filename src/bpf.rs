@@ -37,7 +37,8 @@ struct RawEvent {
     dev: u32, seq: u64, ts: u64, p_ino: u64, ino: u64,
     np_ino: u64, r#gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
     nlink: u32, flags: u32, sz: u64, 
-    projid: u32, open_count: u32, 
+    projid: u32, 
+    _pad1: u32, // Padding to match C struct
     name: [u8;256], nname: [u8;256],
     comm: [u8;16] 
 }
@@ -148,8 +149,8 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
 
         if event_count < 100 { 
-            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}, interactive={}, open_count={}", 
-                   event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino, raw.interactive, raw.open_count);
+            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}, interactive={}", 
+                   event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino, raw.interactive);
         }
         
         if !queues.contains_key(&raw.dev) {
@@ -170,7 +171,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                 event_type: EventType::SequenceGap, dev_id: raw.dev, inode: 0, 
                 parent_inode: 0, seq_num: raw.seq, offset: 0, length: 0, 
                 name: "".into(), new_name: None, generation: 0, projid: 0, 
-                mode: 0, flags: 0, process_name: "kernel".into(), interactive: false, open_count: 0,
+                mode: 0, flags: 0, process_name: "kernel".into(), interactive: false, 
                 created_at: std::time::Instant::now() 
             });
             if let Some(qs) = queues.get(&raw.dev) { 
@@ -191,7 +192,6 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             flags: raw.flags,
             process_name: comm, 
             interactive: raw.interactive == 1,
-            open_count: raw.open_count,
             created_at: std::time::Instant::now()
         });
         

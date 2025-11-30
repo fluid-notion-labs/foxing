@@ -48,8 +48,7 @@ pub struct Event {
     pub mode: u32, 
     pub flags: u32,
     pub process_name: String,
-    pub interactive: bool, // NEW: Is this from a TTY/Human?
-    pub open_count: u32,   // NEW: Is this file hot?
+    pub interactive: bool, 
     pub created_at: std::time::Instant
 }
 
