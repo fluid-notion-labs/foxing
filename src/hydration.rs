@@ -49,17 +49,16 @@ impl Hydrator {
     }
 
     pub fn full_scan(&self) {
-        // FIX: Debounce concurrent requests.
-        // If active is already true, return immediately.
+        // Debounce
         if self.source.hydration.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            info!("Hydration: Scan already in progress for {:?}, skipping request.", self.source.path);
+            warn!("Hydration: Scan requested but ALREADY ACTIVE for {:?}. Skipping.", self.source.path);
             return;
         }
 
         let dev_str = self.source.dev.to_string();
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(1);
 
-        info!("Hydration: Starting full background scan of {:?}", self.source.path);
+        warn!("Hydration: STARTED full background scan of {:?}", self.source.path);
 
         // 1. ADDITIVE SCAN
         let walk = WalkDir::new(&self.source.path).into_iter();
@@ -78,7 +77,7 @@ impl Hydrator {
 
         // 2. SUBTRACTIVE SCAN (Deletion Sync)
         if !self.governor.is_system_stressed() {
-            info!("Hydration: Starting deletion sweep.");
+            warn!("Hydration: Starting DELETION SWEEP.");
             for (target_cfg, _, q) in &self.targets {
                 let target_walk = WalkDir::new(&target_cfg.path).into_iter();
                 for entry_result in target_walk {
@@ -93,10 +92,13 @@ impl Hydrator {
                         }
 
                         if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                            // Skip root
+                            if rel.as_os_str().is_empty() { continue; }
+
                             let source_path = self.source.path.join(rel);
                             // If source missing, queue unlink
                             if !source_path.exists() {
-                                info!("Hydration: Found zombie file {:?}, queueing deletion.", rel);
+                                warn!("Hydration: Found ZOMBIE file {:?}. Queueing UNLINK.", rel);
                                 let evt = Event {
                                     event_type: EventType::Unlink,
                                     dev_id: self.source.dev,
@@ -111,9 +113,11 @@ impl Hydrator {
                     }
                 }
             }
+        } else {
+            warn!("Hydration: Skipping deletion sweep due to System Stress.");
         }
 
-        info!("Hydration: Full scan complete for {:?}", self.source.path);
+        warn!("Hydration: FINISHED full scan for {:?}", self.source.path);
         self.source.hydration.active.store(false, Ordering::SeqCst);
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0);
     }
@@ -130,7 +134,7 @@ impl Hydrator {
                 debug!("Hydration: Processor thread started.");
                 while let Ok((p, kind)) = rx.recv() {
                     if let Err(e) = s.process_path(&p, true, Some(kind)) {
-                        debug!("Inotify hydration processing error for {:?}: {:?}", p, e);
+                        warn!("Inotify hydration processing error for {:?}: {:?}", p, e);
                     }
                 }
                 debug!("Hydration: Processor thread stopped.");
@@ -226,12 +230,20 @@ impl Hydrator {
                         let integrity_hash = security::get_valid_dir_hash(src_parent);
                         let target_hash = security::get_dir_integrity_hash(dst_parent);
                         
-                        if dm.len() != m.len() { true }
+                        // STRICTER CHECK:
+                        if dm.len() != m.len() { 
+                            // warn!("Hydration: Size mismatch for {:?} (Src: {}, Dst: {}). Syncing.", rel, m.len(), dm.len());
+                            true 
+                        }
                         else if integrity_hash != 0 && integrity_hash == target_hash { 
                             metrics::HYDRATION_HASH_SKIPPED.inc();
                             false 
                         }
-                        else if target_epoch == 0 || dm.mtime() < m.mtime() { true }
+                        // STRICTER CHECK: If mtime is different at all, sync. (Assuming source is master)
+                        else if target_epoch == 0 || dm.mtime() != m.mtime() { 
+                            // warn!("Hydration: Mtime mismatch/No Epoch for {:?}. Syncing.", rel);
+                            true 
+                        }
                         else { false }
                     }
                 },
@@ -240,6 +252,7 @@ impl Hydrator {
         };
 
         if needs_sync {
+            warn!("Hydration: Queueing WRITE for {:?}", rel); // Loud log for AI context
             let evt = Event {
                 event_type: EventType::Write,
                 dev_id: self.source.dev,

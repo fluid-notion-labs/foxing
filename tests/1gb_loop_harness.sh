@@ -112,7 +112,8 @@ path = "$SOURCE_MNT"
   
   # Aggressive: Keep batch sizes small so single file writes 
   # are processed immediately rather than waiting for coalescing.
-  autotune_target_latency_ms = 10
+  # Bumped to 50ms to be slightly safer for BBR
+  autotune_target_latency_ms = 50
   
   # Enable Features
   enable_versioning = true
