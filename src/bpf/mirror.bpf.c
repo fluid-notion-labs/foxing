@@ -42,8 +42,7 @@ struct event {
     __u32 flags; 
     __u64 file_size;
     __u32 projid; 
-    // Removed unstable open_count
-    __u32 _pad1; 
+    __u32 _pad1; // Padding to replace open_count (Stability Fix)
     char name[MAX_FILENAME]; 
     char new_name[MAX_FILENAME];
     char comm[16]; 

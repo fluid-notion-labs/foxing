@@ -38,7 +38,7 @@ struct RawEvent {
     np_ino: u64, r#gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
     nlink: u32, flags: u32, sz: u64, 
     projid: u32, 
-    _pad1: u32, // Padding to match C struct
+    _pad1: u32, // Replaces open_count to match C struct
     name: [u8;256], nname: [u8;256],
     comm: [u8;16] 
 }

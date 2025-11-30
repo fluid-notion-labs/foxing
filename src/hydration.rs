@@ -49,13 +49,19 @@ impl Hydrator {
     }
 
     pub fn full_scan(&self) {
+        // FIX: Debounce concurrent requests.
+        // If active is already true, return immediately.
+        if self.source.hydration.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            info!("Hydration: Scan already in progress for {:?}, skipping request.", self.source.path);
+            return;
+        }
+
         let dev_str = self.source.dev.to_string();
-        self.source.hydration.active.store(true, Ordering::Relaxed);
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(1);
 
         info!("Hydration: Starting full background scan of {:?}", self.source.path);
 
-        // 1. ADDITIVE SCAN (Source -> Target)
+        // 1. ADDITIVE SCAN
         let walk = WalkDir::new(&self.source.path).into_iter();
         for entry_result in walk {
             self.governor.pace_hydration();
@@ -70,8 +76,7 @@ impl Hydrator {
             }
         }
 
-        // 2. SUBTRACTIVE SCAN (Target -> Source) to fix deletions
-        // Only run this if we are not under high load, as it is expensive
+        // 2. SUBTRACTIVE SCAN (Deletion Sync)
         if !self.governor.is_system_stressed() {
             info!("Hydration: Starting deletion sweep.");
             for (target_cfg, _, q) in &self.targets {
@@ -80,16 +85,17 @@ impl Hydrator {
                     if let Ok(entry) = entry_result {
                         let target_path = entry.path();
                         
-                        // Skip internal directories
-                        if target_path.to_string_lossy().contains(".mirror") || 
-                           target_path.to_string_lossy().contains(".foxing_meta") {
+                        let path_str = target_path.to_string_lossy();
+                        if path_str.contains(".mirror") || 
+                           path_str.contains(".foxing_meta") ||
+                           path_str.contains(".tmp.") {
                             continue;
                         }
 
                         if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
                             let source_path = self.source.path.join(rel);
+                            // If source missing, queue unlink
                             if !source_path.exists() {
-                                // FOUND ZOMBIE!
                                 info!("Hydration: Found zombie file {:?}, queueing deletion.", rel);
                                 let evt = Event {
                                     event_type: EventType::Unlink,
@@ -108,7 +114,7 @@ impl Hydrator {
         }
 
         info!("Hydration: Full scan complete for {:?}", self.source.path);
-        self.source.hydration.active.store(false, Ordering::Relaxed);
+        self.source.hydration.active.store(false, Ordering::SeqCst);
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0);
     }
 
