@@ -1,3 +1,4 @@
+// ... (Previous imports remain the same)
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
     collections::{HashMap, VecDeque}, 
@@ -26,6 +27,8 @@ use serde::{Serialize, Deserialize};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
+// ... (TunerState, WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry, BbrTuner, WorkerContext implementations remain the same as previous)
+
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +41,9 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// -----------------------------------------------------------------------------
-// HELPER STRUCTS
-// -----------------------------------------------------------------------------
-
+// ... (Paste helper structs WindowedFilter through BbrTuner from previous version here) ...
+// (To save space, assuming helper structs are unchanged. If you need them re-pasted, let me know)
+// RE-PASTING HELPERS FOR COMPLETENESS
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -385,7 +387,6 @@ impl BbrTuner {
     }
 }
 
-// Struct to bundle context for the processing function
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     buf: &'a mut AlignedBuffer,
@@ -398,10 +399,6 @@ struct WorkerContext<'a> {
     cur_cap_avail: u64,
     cur_cap_total: u64,
 }
-
-// -----------------------------------------------------------------------------
-// WORKER MAIN LOOP
-// -----------------------------------------------------------------------------
 
 pub async fn run_worker(
     source: Arc<SourceInfo>, 
@@ -417,7 +414,6 @@ pub async fn run_worker(
     let mut order = ordering::OrderBuf::new();
     let locks = Arc::new(ShardedLockCache::new()); 
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new(); 
-    // TRIAGE 1: Fast Heartbeat
     let mut flush_interval = interval(Duration::from_millis(100));
     
     let mut ring = match IoUring::new(target_cfg.batch_size as u32) {
@@ -436,7 +432,6 @@ pub async fn run_worker(
     let iov = libc::iovec { iov_base: unsafe { buf.capacity_slice_mut() }.as_mut_ptr() as _, iov_len: buf.capacity() };
     if unsafe { ring.submitter().register_buffers(&[iov]) }.is_err() { error!("Failed to register io_uring buffers. Falling back to standard I/O (slower)."); }
     
-    // Auto-Tuners
     let mut tuner = BbrTuner::new(&target_cfg);
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
 
@@ -449,14 +444,11 @@ pub async fn run_worker(
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         
         let event_poll_result = tokio::select! {
-            // Fair Scheduling: Removed 'biased' to prevent starvation of rx_low (Hydration)
             _ = shutdown_rx.recv() => break Ok(()),
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             
-            // Heartbeat ticks every 100ms
             _ = flush_interval.tick() => {
                 let path_clone = target_cfg.path.clone(); 
-                // Only statvfs every 1s (every 10th tick)
                 if flush_interval.period().as_millis() == 100 && (Instant::now().elapsed().as_millis() % 1000 < 150) {
                      if let Ok(s) = statvfs(&path_clone) {
                         cur_cap_total = s.blocks() * s.block_size();
@@ -477,7 +469,6 @@ pub async fn run_worker(
                         last_dropped_check = current_dropped;
                     }
                     
-                    // NEW: Check for skipped gaps inside OrderBuf
                     if order.check_timeouts() {
                         warn!("Gap detected by OrderBuf (Timeout). Triggering partial hydration.");
                         let _ = hydration_tx.send(source.path.clone()).await;
@@ -543,12 +534,11 @@ pub async fn run_worker(
         let max_pending = order.max_count;
         let pending_len = order.len();
 
-        // LOGIC CHANGE: Handle Hydration Events (seq 0) immediately, bypassing OrderBuf
         let events_to_process = if event_ptr.seq_num == 0 {
-            // Processing this directly as a vector of 1
+            // FIX: Purge pending events for this inode to prevent Time Travel overwrites
+            order.purge_inode(event_ptr.inode);
             vec![event_ptr]
         } else {
-            // CRITICAL FIX: Handle Buffer Overflow gracefully
             if !order.push_and_check(event_ptr.clone()) {
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
@@ -585,14 +575,11 @@ pub async fn run_worker(
                     batch_bytes_processed += stats.bytes_processed;
                     current_copy_stats = Some(stats);
                 },
-                Ok(None) => {}, // Success, no bytes
-                Err(_) => {
-                    // Error handled inside process_single_event
-                }
+                Ok(None) => {}, 
+                Err(_) => {}
             }
         }
         
-        // FEEDBACK LOOP: Feed pure I/O metrics back into BBR Tuner
         if batch_bytes_processed > 0 {
             if let Some(stats) = current_copy_stats {
                 let elapsed_rtt = stats.io_duration.as_secs_f64(); 
@@ -604,10 +591,7 @@ pub async fn run_worker(
     }
 }
 
-// -----------------------------------------------------------------------------
-// EVENT PROCESSOR
-// -----------------------------------------------------------------------------
-
+// ... (process_single_event function remains the same as in previous correct version) ...
 async fn process_single_event(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -633,12 +617,10 @@ async fn process_single_event(
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
     
-    // FIX: Ignore .tmp files from self
     if e.name.contains(".tmp.") {
         return Ok(None);
     }
 
-    // FIX: Lock by Path Hash instead of Inode to prevent Update/Delete races
     let lock = ctx.locks.get_by_path(&e.name);
     let _g = lock.lock().await;
     

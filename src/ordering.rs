@@ -6,8 +6,6 @@ use tracing::warn;
 use std::time::{Instant, Duration};
 
 // TRIAGE 2: Reduce from 500ms to 100ms
-// In local/loopback scenarios, if an event isn't here in 100ms, it's dropped.
-// Waiting longer just creates perceptible UI lag.
 const MAX_HOL_DELAY: Duration = Duration::from_millis(100);
 const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
 
@@ -33,7 +31,6 @@ impl OrderBuf {
         } 
     }
     
-    /// Returns true if accepted, false if dropped/full.
     pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
         if self.next_seq == 0 { 
             self.next_seq = e.seq_num; 
@@ -41,7 +38,6 @@ impl OrderBuf {
         
         if self.pending.len() >= self.max_count || self.current_bytes >= MAX_PENDING_BYTES {
             metrics::EVENTS_DROPPED.inc();
-            // Try to clear space by forcing a timeout check
             let _ = self.check_timeouts();
             if self.pending.len() >= self.max_count {
                 return false;
@@ -60,8 +56,6 @@ impl OrderBuf {
         true
     }
 
-    /// Checks for Head-of-Line blocking.
-    /// Returns `true` if a gap was detected and skipped (indicating potential data loss/need for sync).
     pub fn check_timeouts(&mut self) -> bool {
         if let Some((&first_seq, first_entry)) = self.pending.iter().next() {
             if first_seq > self.next_seq {
@@ -77,11 +71,30 @@ impl OrderBuf {
         }
         false
     }
+    
+    // NEW: Remove all pending events for a specific inode.
+    // This is called when Hydration (Source of Truth) processes a file.
+    // It prevents "Time Travel" where stale BPF events overwrite fresh Hydration data.
+    pub fn purge_inode(&mut self, inode: u64) {
+        let mut to_remove = Vec::new();
+        for (seq, entry) in self.pending.iter() {
+            if entry.event.inode == inode {
+                to_remove.push(*seq);
+            }
+        }
+        
+        for seq in to_remove {
+            if let Some(entry) = self.pending.remove(&seq) {
+                self.current_bytes -= entry.event.length;
+                // If we removed the HEAD of the line, advance next_seq to unblock
+                if seq == self.next_seq {
+                    self.next_seq += 1;
+                }
+            }
+        }
+    }
 
     pub fn pop_batch(&mut self, coalesce_limit: u64) -> Option<Arc<Event>> {
-        // We do NOT call check_timeouts here automatically anymore to allow caller to handle the bool return
-        // The worker loop calls check_timeouts explicitly now.
-
         if let Some(entry) = self.pending.remove(&self.next_seq) {
             let mut current_event = entry.event; 
             self.current_bytes -= current_event.length;

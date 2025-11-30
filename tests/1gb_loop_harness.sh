@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# Foxing: High-Performance Loopback Test Harness (Optimized)
+# Foxing: High-Performance Loopback Test Harness (Advanced)
 # ==============================================================================
 
 BASE_DIR="/tmp/foxing_test"
@@ -77,10 +77,8 @@ fi
 CONFIG_PATH="$(pwd)/test_config.toml"
 echo -e "${GREEN}==> Generating optimized config: $CONFIG_PATH${NC}"
 
-# Note: We set aggressive flush intervals and low latency targets 
-# to make the loopback test feel "instant" for the user.
 cat > "$CONFIG_PATH" <<EOF
-# Generated Test Configuration for Foxing (Loopback Optimized)
+# Generated Test Configuration for Foxing (Advanced Loopback)
 
 # --- Global ---
 worker_count = 2
@@ -90,16 +88,14 @@ global_buffer_limit = 5242880 # 5MB limit for small test
 fatal_metrics_bind = false
 
 # --- Governor (Relaxed for Test) ---
-# Don't throttle on dev laptop load spikes
 max_system_load_avg = 50.0 
 hydration_delay_ms = 1
 
 # --- Loopback Safety ---
-# Lower threshold because 512MB drives fill up fast.
 capacity_threshold_mb = 50
 
-# --- Response Tuning (The "Snappy" Settings) ---
-# Commit metadata to disk every 1 second (default is 5s)
+# --- Response Tuning ---
+# 100ms Commit for near-realtime behavior in tests
 force_flush_interval_secs = 1
 
 [[sources]]
@@ -110,9 +106,7 @@ path = "$SOURCE_MNT"
   profile = "SSD" 
   initial_sync = true
   
-  # Aggressive: Keep batch sizes small so single file writes 
-  # are processed immediately rather than waiting for coalescing.
-  # Bumped to 50ms to be slightly safer for BBR
+  # Aggressive BBR tuning
   autotune_target_latency_ms = 50
   
   # Enable Features
@@ -132,26 +126,42 @@ EOF
 echo -e "${GREEN}==> Setup Complete!${NC}"
 echo ""
 echo -e "${BLUE}==============================================================================${NC}"
-echo -e "${BLUE}                       SUGGESTED TEST COMMANDS                                ${NC}"
+echo -e "${BLUE}                       ADVANCED TEST COMMANDS                                 ${NC}"
 echo -e "${BLUE}==============================================================================${NC}"
 
-echo -e "\n${YELLOW}1. Run Daemon (With AI-Friendly Logging):${NC}"
-echo "   This captures Debug logs but filters output to a concise file for sharing."
+echo -e "\n${YELLOW}1. Run Daemon (Log Filtering):${NC}"
 echo "   RUST_LOG=foxing=debug,warn ./target/release/foxing daemon --config test_config.toml 2>&1 | tee full_log.txt | grep -E --line-buffered \"ERROR|WARN|Gap|Dropped|Worker|BPF Stats\" > ai_context.log"
 
-echo -e "\n${YELLOW}2. Generate Test Load (In another terminal):${NC}"
-echo "   # Create 10 files"
-echo "   for i in {1..10}; do echo \"data \$i\" > $SOURCE_MNT/file_\$i.txt; done"
-echo "   "
-echo "   # Modify a file (trigger versioning)"
-echo "   echo \"update\" >> $SOURCE_MNT/file_1.txt"
-echo "   "
-echo "   # Delete a file (check propagation)"
-echo "   rm $SOURCE_MNT/file_5.txt"
+echo -e "\n${YELLOW}2. Basic Load (File Creation):${NC}"
+echo "   for i in {1..5}; do echo \"data \$i\" > $SOURCE_MNT/file_\$i.txt; done"
 
-echo -e "\n${YELLOW}3. Verify Synchronization:${NC}"
+echo -e "\n${YELLOW}3. Advanced Load (SELinux & Renames):${NC}"
+echo "   # Test 1: SELinux Label Preservation"
+echo "   chcon -t httpd_sys_content_t $SOURCE_MNT/file_1.txt"
+echo "   # Test 2: Atomic Rename Overwrite"
+echo "   mv $SOURCE_MNT/file_1.txt $SOURCE_MNT/file_2.txt"
+echo "   # Test 3: Rapid Delete (The Zombie Test)"
+echo "   touch $SOURCE_MNT/zombie.txt; rm $SOURCE_MNT/zombie.txt"
+
+echo -e "\n${YELLOW}4. Versioning & Reflink Stress Test (Crucial):${NC}"
+echo "   # A. Space Efficiency (Reflink Check)"
+echo "   # Create a 100MB file. Target usage should jump ~100MB."
+echo "   dd if=/dev/urandom of=$SOURCE_MNT/blob.bin bs=1M count=100"
+echo "   sync; sleep 2; du -sh $TARGET_MNT"
+echo "   # Modify 1 byte. This creates a Version Snapshot."
+echo "   echo \"modification\" >> $SOURCE_MNT/blob.bin"
+echo "   # If Reflinks work: Usage increases by only ~4KB (Metadata), NOT another 100MB."
+echo "   sync; sleep 2; du -sh $TARGET_MNT"
+echo "   "
+echo "   # B. Version Rotation (Retention Check)"
+echo "   # Creates 10 updates. Should only keep last 5 versions in .mirror/.versions"
+echo "   for i in {1..10}; do echo \"v\$i\" >> $SOURCE_MNT/rotate.txt; sleep 1.1; done"
+echo "   ls -1 $TARGET_MNT/.mirror/.versions/ | grep rotate | wc -l"
+
+echo -e "\n${YELLOW}5. Verify:${NC}"
+echo "   # Check Diff"
 echo "   diff -r $SOURCE_MNT $TARGET_MNT"
+echo "   # Check Metadata (requires getfattr)"
+echo "   getfattr -d -m - $TARGET_MNT/file_2.txt"
 
-echo -e "\n${YELLOW}4. Inspect AI Context Log:${NC}"
-echo "   cat ai_context.log"
 echo ""
