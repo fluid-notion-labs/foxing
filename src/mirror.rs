@@ -101,14 +101,42 @@ impl Manager {
             config_reader.hydration_delay_ms
         ));
 
+        // 1. First pass: Collect all TARGET Device IDs to exclude them
+        // This prevents the "Ouroboros" feedback loop where the daemon watches its own writes.
+        let mut target_ids_to_exclude = Vec::new();
+        for sc in &config_reader.sources {
+            for tc in &sc.targets {
+                match resolve_all_device_ids(&tc.path) {
+                    Ok((_, ids)) => {
+                        debug!("Identified Target IDs to exclude for {:?}: {:?}", tc.path, ids);
+                        target_ids_to_exclude.extend(ids);
+                    },
+                    Err(e) => warn!("Failed to resolve target device ID for exclusion {:?}: {}", tc.path, e),
+                }
+            }
+        }
+
         let mut sources = HashMap::new();
         let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize; 
         let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
         
         for sc in &config_reader.sources { 
             match resolve_all_device_ids(&sc.path) {
-                Ok((mount_path, dev_ids)) => {
+                Ok((mount_path, mut dev_ids)) => {
                     if dev_ids.is_empty() { continue; }
+                    
+                    // Filter out any IDs that belong to Targets
+                    let original_count = dev_ids.len();
+                    dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
+                    
+                    if dev_ids.len() < original_count {
+                        warn!("Excluded {} device IDs that overlapped with Targets (Feedback Loop Prevention).", original_count - dev_ids.len());
+                    }
+
+                    if dev_ids.is_empty() {
+                        error!("Source {:?} has NO device IDs left after excluding Targets! Replication will fail.", sc.path);
+                        continue;
+                    }
                     
                     let primary_dev = dev_ids[0]; // Use first found as primary key
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);

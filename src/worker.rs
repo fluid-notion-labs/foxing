@@ -782,6 +782,8 @@ pub async fn run_worker(
                     let enable_versioning = target_cfg.enable_versioning;
                     let is_forced = target_cfg.is_forced_version(&dst_clone);
                     let defer_maintenance = tuner.should_defer_maintenance();
+                    let source_path_for_h = source.path.clone(); // For hydration trigger
+                    let h_tx_clone = hydration_tx.clone();
                     
                     let (dyn_max_versions, dyn_max_mb) = if is_forced {
                          let forced_count = target_cfg.force_retention_count.unwrap_or(target_cfg.max_versions);
@@ -812,8 +814,20 @@ pub async fn run_worker(
                         if r.is_ok() { if let Some(parent) = dst_clone.parent() { if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } } }
                         r
                     }).await.unwrap_or(Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
-                    if r.is_ok() { dirty_stats.remove(&e.inode); }
-                    Ok(r)
+                    
+                    // NEW: Handle NotFound caused by dropped CREATE/WRITE events
+                    if let Err(FoxingError::Io(ref io_err)) = r {
+                        if io_err.kind() == io::ErrorKind::NotFound {
+                            warn!("Fsync on {:?} failed (NotFound). CREATE/WRITE likely dropped. Triggering hydration and skipping.", dst_clone);
+                            let _ = h_tx_clone.send(source_path_for_h).await;
+                            Ok(Ok(())) // Return OK to allow worker loop to proceed
+                        } else {
+                            r // Propagate other errors
+                        }
+                    } else {
+                        if r.is_ok() { dirty_stats.remove(&e.inode); }
+                        r
+                    }
                 },
                 EventType::SetXattr | EventType::RemoveXattr => {
                     let src_clone = src.clone();
