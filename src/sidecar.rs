@@ -28,6 +28,7 @@ fn unlock_file(file: &File) -> std::io::Result<()> {
 
 pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
     // 1. OPTIMIZED: Try Native XAttr First
+    // This works on XFS, Btrfs, Ext4, ZFS, etc.
     match xattr::set(path, key, value) {
         Ok(_) => {
             // If successful, we MUST clean up any potential sidecar to prevent
@@ -35,6 +36,7 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
             // and ignores this new xattr.
             if let Some(sp) = get_sidecar_path(path) {
                 if sp.exists() {
+                    // We migrated to native, kill the sidecar
                     let _ = fs::remove_file(sp);
                 }
             }
@@ -44,7 +46,8 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
             // 2. EDGE CASE: Read-Only Filesystem (Rescue Mode)
             // If the FS is RO, writing a sidecar will also fail. 
             // Return early to avoid log spam/double errors.
-            if e.kind() == io::ErrorKind::ReadOnly {
+            // FIX: Use correct error kind ReadOnlyFilesystem
+            if e.kind() == io::ErrorKind::ReadOnlyFilesystem {
                 return;
             }
             // Continue to fallback for other errors (ENOTSUP, EPERM, etc.)
@@ -52,6 +55,7 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
     }
 
     // 3. FALLBACK: Sidecar File
+    // This path runs only if the FS returns an error (e.g., NOTSUP on FAT32/NFS)
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return,
@@ -64,6 +68,7 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
         if lock_file(&file, true).is_ok() {
             let mut map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
             
+            // Hex encode for JSON safety
             let val_str = hex::encode(value);
             map.insert(key.to_string(), val_str);
 
