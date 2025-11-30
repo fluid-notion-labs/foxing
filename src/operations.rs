@@ -10,7 +10,6 @@ use io_uring::{opcode, types, IoUring};
 use uuid::Uuid;
 use libc;
 use nix::sys::statfs;
-use std::time::{Duration, Instant};
 
 use crate::buffer::AlignedBuffer;
 use crate::error::{FoxingError, Result};
@@ -27,7 +26,6 @@ const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
 pub struct CopyStats {
     pub bytes_processed: u64,
     pub bytes_zeros: u64,
-    pub io_duration: Duration, // Exact I/O time for BBR
 }
 
 pub struct SmartCopier;
@@ -81,24 +79,18 @@ impl SmartCopier {
         }
 
         let mut transfer_done = false;
-        let mut stats = CopyStats::default();
+        let mut stats = CopyStats { bytes_processed: 0, bytes_zeros: 0 };
 
-        // 1. Attempt Reflink / Server-Side Copy
         if is_full_replace && reflink_ok.load(Ordering::Relaxed) {
             let mut off_in = 0i64;
             let mut off_out = 0i64;
-            
-            // Measure Syscall Duration Only
-            let start = Instant::now();
             let ret = unsafe { 
                 libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) 
             };
-            let duration = start.elapsed();
 
             if ret > 0 && ret == src_file_size as isize {
                 transfer_done = true;
                 stats.bytes_processed = src_file_size;
-                stats.io_duration = duration;
                 
                 let is_network_fs = match statfs::statfs(&target_path) {
                     Ok(s) => {
@@ -122,40 +114,31 @@ impl SmartCopier {
             }
         }
 
-        // 2. Fallback: io_uring / Uncached
         if !transfer_done {
             if is_full_replace {
-                // Full Sync Copy via Standard IO (Blocking)
                 metrics::COPY_METHOD_STANDARD.inc(); 
                 let sfd_raw = sfd; 
                 let dfd_raw = dfd;
                 
-                let (bytes_copied, duration) = spawn_blocking(move || {
+                let copied = spawn_blocking(move || {
                     let mut f_in = unsafe { File::from_raw_fd(sfd_raw) };
                     let mut f_out = unsafe { File::from_raw_fd(dfd_raw) };
-                    
-                    let start = Instant::now();
                     let res = f_in.seek(SeekFrom::Start(0))
                         .and_then(|_| io::copy(&mut f_in, &mut f_out));
-                    let dur = start.elapsed();
                     
                     let _ = f_in.into_raw_fd(); 
                     let _ = f_out.sync_all();
                     let _ = f_out.into_raw_fd(); 
-                    
-                    res.map(|bytes| (bytes, dur))
+                    res
                 }).await.unwrap_or_else(|e| Err(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
 
-                if bytes_copied != src_file_size {
+                if copied != src_file_size {
                     unsafe { libc::close(dfd) };
                     return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Short copy")));
                 }
                 stats.bytes_processed = src_file_size;
-                stats.io_duration = duration;
             } else {
-                // Delta Update
                 metrics::COPY_METHOD_STANDARD.inc();
-                // perform_delta_uring measures its own duration internally
                 stats = Self::perform_delta_uring(ring, buf, sfd, dfd, offset, length, vdo_opt, use_uncached_io).await?;
             }
         }
@@ -196,8 +179,6 @@ impl SmartCopier {
         let end_offset = offset + length;
         let max_chunk = buf.capacity() as u64;
         let mut stats = CopyStats::default();
-        
-        let start_time = Instant::now();
 
         while current_offset < end_offset {
             let rlen = std::cmp::min(end_offset - current_offset, max_chunk) as usize;
@@ -266,8 +247,6 @@ impl SmartCopier {
             stats.bytes_processed += rlen as u64;
             current_offset += rlen as u64;
         }
-        
-        stats.io_duration = start_time.elapsed();
         Ok(stats)
     }
 

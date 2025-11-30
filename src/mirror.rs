@@ -16,7 +16,9 @@ pub type HydrationRx = mpsc::Receiver<PathBuf>;
 pub struct SourceInfo { 
     pub path: PathBuf, 
     pub mount: PathBuf, 
-    // We now track multiple valid device IDs for this source
+    // Primary Device ID (used for metrics/logging)
+    pub dev: u32, 
+    // All associated Device IDs (used for BPF filtering)
     pub dev_ids: Vec<u32>, 
     pub hydration: Arc<crate::hydration::HydrationState>,
     pub inode_map: identity::InodeMap,
@@ -34,8 +36,6 @@ pub struct Manager {
 }
 
 /// Defense-in-Depth Device ID Resolution.
-/// Returns a list of ALL possible device IDs associated with the path to ensure BPF
-/// filters catch the event regardless of how the kernel represents the specific mount.
 fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     let canonical = path.canonicalize().map_err(|e| crate::error::FoxingError::Io(e))?;
     let mut ids = Vec::new();
@@ -54,18 +54,15 @@ fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     }
 
     // Strategy 2: Parse /proc/self/mountinfo (Kernel View)
-    // This is critical for Loopback/Btrfs where stat() ID != Superblock ID
     if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
         let mut best_len = 0;
         
         for line in mountinfo.lines() {
-            // Format: 36 35 98:0 /mnt1 /mnt2 ...
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 { continue; }
 
-            let mount_root = parts[4]; // e.g., /mnt/data
+            let mount_root = parts[4]; 
             
-            // Simple longest-prefix match to find the mount point
             if canonical.to_string_lossy().starts_with(mount_root) {
                  if mount_root.len() >= best_len {
                      best_len = mount_root.len();
@@ -120,8 +117,8 @@ impl Manager {
                     sources.insert(primary_dev, Arc::new(SourceInfo { 
                         path: sc.path.clone(), 
                         mount: mount_path, 
-                        dev_ids: dev_ids.clone(), // Store ALL IDs
-                        dev: primary_dev,
+                        dev: primary_dev, // Primary ID for metrics
+                        dev_ids: dev_ids.clone(), // All IDs for BPF
                         hydration: Arc::new(crate::hydration::HydrationState::default()),
                         inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
                         lru_size: cache_size.get(),
@@ -152,7 +149,7 @@ impl Manager {
         let config_reader = self.config.read().await; 
         let global_queue_max = config_reader.queue_max; 
 
-        for (primary_dev, src) in &self.sources {
+        for (_primary_dev, src) in &self.sources {
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets: Vec<(TargetConfig, Arc<EventQueue>, Arc<EventQueue>)> = Vec::new();
 
@@ -164,8 +161,6 @@ impl Manager {
                     let low_queue_arc = Arc::new(low_tx_raw);
 
                     // REGISTER ALL DETECTED IDS TO THE SAME QUEUE
-                    // This ensures BPF events from loopback (0x700) or XFS (0x80001) 
-                    // both route to this worker.
                     for alt_dev_id in &src.dev_ids {
                         queues.entry(*alt_dev_id).or_default().push(high_queue_arc.clone());
                     }
