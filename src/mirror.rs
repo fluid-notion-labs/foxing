@@ -1,14 +1,12 @@
-use std::{sync::{Arc, atomic::Ordering}, collections::HashMap, path::PathBuf, fs};
-use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event, EventType}, worker::{self, TunerBoard, TunerState}, metrics, identity, sidecar, security, Result, governor::Governor};
+use std::{sync::{Arc}, collections::HashMap, path::PathBuf, fs};
+use crate::{config::{Config, TargetConfig}, event::{EventQueue}, worker::{self, TunerBoard, TunerState}, identity, Result, governor::Governor};
 use crate::hydration::Hydrator;
-use walkdir::WalkDir;
 use parking_lot::Mutex;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
-use std::os::unix::io::AsRawFd; 
-use tracing::{info, error, debug}; 
+use tracing::{info, error, debug, warn}; 
 use dashmap::DashMap;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
@@ -18,7 +16,8 @@ pub type HydrationRx = mpsc::Receiver<PathBuf>;
 pub struct SourceInfo { 
     pub path: PathBuf, 
     pub mount: PathBuf, 
-    pub dev: u32,
+    // We now track multiple valid device IDs for this source
+    pub dev_ids: Vec<u32>, 
     pub hydration: Arc<crate::hydration::HydrationState>,
     pub inode_map: identity::InodeMap,
     pub lru_size: usize, 
@@ -26,7 +25,7 @@ pub struct SourceInfo {
 
 pub struct Manager {
     config: SharedConfig, 
-    sources: HashMap<u32, Arc<SourceInfo>>,
+    sources: HashMap<u32, Arc<SourceInfo>>, // Keyed by Primary ID
     watchers: Vec<notify::RecommendedWatcher>,
     hydration_handles: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>>,
     pub queues: HashMap<u32, Vec<Arc<EventQueue>>>,
@@ -34,54 +33,66 @@ pub struct Manager {
     pub tuner_board: TunerBoard,
 }
 
-fn find_mount_point(path: &PathBuf) -> Result<(PathBuf, u32, bool)> {
+/// Defense-in-Depth Device ID Resolution.
+/// Returns a list of ALL possible device IDs associated with the path to ensure BPF
+/// filters catch the event regardless of how the kernel represents the specific mount.
+fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     let canonical = path.canonicalize().map_err(|e| crate::error::FoxingError::Io(e))?;
-    debug!("Finding mount point for canonical path: {:?}", canonical);
-    let mounts_content = fs::read_to_string("/proc/mounts").map_err(|e| crate::error::FoxingError::Io(e))?;
-    
-    #[derive(Debug)]
-    struct MountEntry {
-        device: String,
-        mount_point: PathBuf,
-        fstype: String,
-        is_loopback: bool,
+    let mut ids = Vec::new();
+    let mut mount_point = canonical.clone();
+
+    debug!("Resolving device IDs for path: {:?}", canonical);
+
+    // Strategy 1: stat() the path directly (Userspace View)
+    if let Ok(meta) = fs::metadata(&canonical) {
+        let rdev = meta.dev();
+        let maj = ((rdev >> 8) & 0xfff) as u32;
+        let min = ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32;
+        let stat_id = (maj << 20) | min;
+        ids.push(stat_id);
+        debug!("Strategy 1 (stat): 0x{:08x}", stat_id);
     }
-    
-    let mut mounts: Vec<MountEntry> = Vec::new();
-    for line in mounts_content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
-        let device = parts[0];
-        let mount_point = PathBuf::from(parts[1]);
-        let fstype = parts[2];
-        let is_loopback = device.starts_with("/dev/loop");
-        mounts.push(MountEntry {
-            device: device.to_string(),
-            mount_point,
-            fstype: fstype.to_string(),
-            is_loopback,
-        });
-    }
-    
-    mounts.sort_by(|a, b| b.mount_point.components().count().cmp(&a.mount_point.components().count()));
-    
-    for mount in &mounts {
-        if canonical.starts_with(&mount.mount_point) {
-            let mount_meta = fs::metadata(&mount.mount_point).map_err(|e| crate::error::FoxingError::Io(e))?;
-            let raw_dev = mount_meta.dev();
-            let major = ((raw_dev >> 8) & 0xfff) as u32;
-            let minor = ((raw_dev & 0xff) | ((raw_dev >> 12) & 0xfff00)) as u32;
-            let kernel_dev_id = (major << 20) | minor;
-            return Ok((mount.mount_point.clone(), kernel_dev_id, mount.is_loopback));
+
+    // Strategy 2: Parse /proc/self/mountinfo (Kernel View)
+    // This is critical for Loopback/Btrfs where stat() ID != Superblock ID
+    if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
+        let mut best_len = 0;
+        
+        for line in mountinfo.lines() {
+            // Format: 36 35 98:0 /mnt1 /mnt2 ...
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 { continue; }
+
+            let mount_root = parts[4]; // e.g., /mnt/data
+            
+            // Simple longest-prefix match to find the mount point
+            if canonical.to_string_lossy().starts_with(mount_root) {
+                 if mount_root.len() >= best_len {
+                     best_len = mount_root.len();
+                     mount_point = PathBuf::from(mount_root);
+                     
+                     let maj_min = parts[2];
+                     let dev_parts: Vec<&str> = maj_min.split(':').collect();
+                     if dev_parts.len() == 2 {
+                         let major: u32 = dev_parts[0].parse().unwrap_or(0);
+                         let minor: u32 = dev_parts[1].parse().unwrap_or(0);
+                         let kernel_id = (major << 20) | minor;
+                         
+                         if !ids.contains(&kernel_id) {
+                             ids.push(kernel_id);
+                             debug!("Strategy 2 (mountinfo): 0x{:08x} for mount {:?}", kernel_id, mount_root);
+                         }
+                     }
+                 }
+            }
         }
     }
-    
-    let meta = fs::metadata(&canonical).map_err(|e| crate::error::FoxingError::Io(e))?;
-    let raw_dev = meta.dev();
-    let major = ((raw_dev >> 8) & 0xfff) as u32;
-    let minor = ((raw_dev & 0xff) | ((raw_dev >> 12) & 0xfff00)) as u32;
-    let kernel_dev_id = (major << 20) | minor;
-    Ok((canonical, kernel_dev_id, false))
+
+    if ids.is_empty() {
+        warn!("Failed to resolve ANY device IDs for {:?}. BPF capture may fail.", canonical);
+    }
+
+    Ok((mount_point, ids))
 }
 
 impl Manager {
@@ -98,19 +109,25 @@ impl Manager {
         let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
         
         for sc in &config_reader.sources { 
-            match find_mount_point(&sc.path) {
-                Ok((mount_path, dev_id, _is_loopback)) => {
-                    info!("Source: {:?} (DevID: 0x{:08x})", sc.path, dev_id);
-                    sources.insert(dev_id, Arc::new(SourceInfo { 
+            match resolve_all_device_ids(&sc.path) {
+                Ok((mount_path, dev_ids)) => {
+                    if dev_ids.is_empty() { continue; }
+                    
+                    let primary_dev = dev_ids[0]; // Use first found as primary key
+                    info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
+                    info!("  Watched Device IDs: {:?}", dev_ids.iter().map(|id| format!("0x{:08x}", id)).collect::<Vec<_>>());
+
+                    sources.insert(primary_dev, Arc::new(SourceInfo { 
                         path: sc.path.clone(), 
                         mount: mount_path, 
-                        dev: dev_id,
+                        dev_ids: dev_ids.clone(), // Store ALL IDs
+                        dev: primary_dev,
                         hydration: Arc::new(crate::hydration::HydrationState::default()),
                         inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
                         lru_size: cache_size.get(),
                     }));
                 },
-                Err(e) => error!("Failed to determine mount point for {:?}: {}", sc.path, e),
+                Err(e) => error!("Failed to resolve device IDs for {:?}: {}", sc.path, e),
             }
         }
         
@@ -135,7 +152,7 @@ impl Manager {
         let config_reader = self.config.read().await; 
         let global_queue_max = config_reader.queue_max; 
 
-        for (dev, src) in &self.sources {
+        for (primary_dev, src) in &self.sources {
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets: Vec<(TargetConfig, Arc<EventQueue>, Arc<EventQueue>)> = Vec::new();
 
@@ -146,7 +163,12 @@ impl Manager {
                     let (low_tx_raw, low_rx_raw) = crate::event::create_fanout(global_queue_max, target_workers);
                     let low_queue_arc = Arc::new(low_tx_raw);
 
-                    queues.entry(*dev).or_default().push(high_queue_arc.clone());
+                    // REGISTER ALL DETECTED IDS TO THE SAME QUEUE
+                    // This ensures BPF events from loopback (0x700) or XFS (0x80001) 
+                    // both route to this worker.
+                    for alt_dev_id in &src.dev_ids {
+                        queues.entry(*alt_dev_id).or_default().push(high_queue_arc.clone());
+                    }
                     
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
 

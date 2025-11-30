@@ -60,7 +60,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
             
-        // Pre-populate stats
+        // Pre-populate stats so Debug UI shows the device immediately (even with 0 events)
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
     }

@@ -37,7 +37,6 @@ pub enum TunerState {
 }
 
 // ... [Helper Structs: WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry] ...
-// Re-pasting WindowedFilter & VdoTuner for context as they are critical for BBR
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -497,9 +496,12 @@ pub async fn run_worker(
         }
         if order.next_seq > 0 && event_ptr.seq_num < order.next_seq { crate::metrics::LATE_EVENTS.inc(); continue; }
 
+        // CRITICAL FIX: Handle Buffer Overflow gracefully
         if !order.push_and_check(event_ptr.clone()) {
              warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
              metrics::EVENTS_DROPPED.inc();
+             // Reset sequence tracking to accept new data stream
+             order.next_seq = 0;
              let _ = hydration_tx.send(source.path.clone()).await;
              continue;
         }
