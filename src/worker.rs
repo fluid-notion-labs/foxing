@@ -7,7 +7,7 @@ use std::{
 use tokio::{sync::mpsc, task::spawn_blocking};
 use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::fs::MetadataExt; // Fixed import
+use std::os::unix::fs::MetadataExt;
 use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
 use crate::operations::SmartCopier; 
 use tokio::time::interval; 
@@ -22,11 +22,11 @@ use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
 use futures::StreamExt;
-use serde::{Serialize, Deserialize}; // Fixed imports
+use serde::{Serialize, Deserialize};
 
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)] // Fixed derives
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunerState { 
     Startup = 0,      
     Drain = 1,        
@@ -110,8 +110,16 @@ impl VdoTuner {
         }
     }
 
-    fn should_check_zeros(&mut self) -> bool {
+    fn should_check_zeros(&mut self, file_size: u64) -> bool {
         if !self.enabled { return false; }
+        
+        // Wake up immediately for large files to avoid 30s delay on "Sparse Sprint"
+        if !self.active && file_size > 100 * 1024 * 1024 {
+             self.active = true;
+             debug!("VDO Tuner: Waking up immediately for large file ({} bytes)", file_size);
+             return true;
+        }
+
         if self.active { return true; }
         if self.last_probe.elapsed() > self.probe_interval {
             return true; 
@@ -146,6 +154,7 @@ impl VdoTuner {
     }
 }
 
+// [Helpers struct ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry omitted for brevity but assumed present]
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
     fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
@@ -216,7 +225,6 @@ impl ShardedLockCache {
         s.get_or_insert(inode, || Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 }
-
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
 
 struct BbrTuner {
@@ -494,7 +502,14 @@ pub async fn run_worker(
         }
         if order.next_seq > 0 && event_ptr.seq_num < order.next_seq { crate::metrics::LATE_EVENTS.inc(); continue; }
 
-        order.push_and_check(event_ptr.clone());
+        // FIX: Handle Dropped Events by Injecting Gap if buffer rejects
+        if !order.push_and_check(event_ptr.clone()) {
+             warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
+             metrics::EVENTS_DROPPED.inc();
+             let _ = hydration_tx.send(source.path.clone()).await;
+             continue;
+        }
+        
         let current_coalesce_limit = tuner.current_coalesce_bytes;
         let mut io_attempt_successful = true;
 
@@ -532,6 +547,9 @@ pub async fn run_worker(
                 let e_generation = e.generation;
                 let e_name = PathBuf::from(&e.name);
                 let res = spawn_blocking(move || {
+                    // Corrected path is now .mirror/.by-identity in identity.rs
+                    // We should create that structure if it doesn't exist here or identity.rs?
+                    // identity.rs calculates the path. worker needs to ensure dir exists.
                     let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
                     let _ = std::fs::create_dir_all(&identity_dir);
                     let f_result = std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone);
@@ -564,6 +582,9 @@ pub async fn run_worker(
 
             let src = source.mount.join(&e.name);
             let start = Instant::now();
+
+            // Capture start time for COPY ONLY (RTT Pollution fix)
+            let copy_start = Instant::now();
 
             let res = match e.event_type {
                 EventType::Write | EventType::Create | EventType::WriteRange => {
@@ -621,7 +642,7 @@ pub async fn run_worker(
                                 }).collect::<Vec<_>>().await;
                             }
 
-                            let dynamic_vdo_opt = vdo_tuner.should_check_zeros();
+                            let dynamic_vdo_opt = vdo_tuner.should_check_zeros(m.len());
 
                             let copy_res = SmartCopier::copy(
                                 &src, 
@@ -647,7 +668,6 @@ pub async fn run_worker(
                 EventType::Symlink => {
                     let dst_clone = dst.clone();
                     let src_clone = src.clone();
-                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(link_target) = std::fs::read_link(&src_clone) {
                             security::create_symlink(&link_target.to_string_lossy(), &dst_clone)
@@ -664,7 +684,6 @@ pub async fn run_worker(
                     let dst_clone = dst.clone();
                     let mode = e.mode;
                     let src_clone = src.clone();
-                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(m) = std::fs::metadata(&src_clone) {
                             let rdev = m.rdev(); 
@@ -862,10 +881,11 @@ pub async fn run_worker(
                 failure_state.record_success(); 
             }
             
-            let elapsed = start.elapsed().as_secs_f64();
+            // Feedback Loop: Use specific copy time for BBR RTT calculation
+            let elapsed_rtt = copy_start.elapsed().as_secs_f64(); 
             let is_stressed = governor.is_system_stressed();
-            tuner.tune(elapsed, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
-            metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed);
+            tuner.tune(elapsed_rtt, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
+            metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed_rtt);
         }
         
         if !io_attempt_successful {

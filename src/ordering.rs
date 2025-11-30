@@ -14,7 +14,6 @@ struct PendingEvent {
 }
 
 pub struct OrderBuf {
-    // Field must be private if PendingEvent is private
     pending: BTreeMap<u64, PendingEvent>,
     pub next_seq: u64,
     pub max_count: usize,
@@ -31,6 +30,7 @@ impl OrderBuf {
         } 
     }
     
+    /// Returns true if accepted, false if dropped/full.
     pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
         if self.next_seq == 0 { 
             self.next_seq = e.seq_num; 

@@ -1,127 +1,91 @@
 use std::path::{Path, PathBuf};
+use std::fs::{self, File};
 use std::collections::HashMap;
+use serde_json;
 use std::os::unix::io::AsRawFd;
-use std::io::{Seek, SeekFrom};
 use libc;
-use serde_json::Value;
-use std::fs;
-use crate::metrics;
-use crate::error::{Result}; 
-use uuid::Uuid;
-use tracing::{error, debug};
 
-/// Generates the sidecar path for a given file path.
-pub fn get_sidecar_path(path: &Path) -> Option<PathBuf> {
-    path.file_name().map(|n| {
-        let mut s = String::from(".");
-        s.push_str(&n.to_string_lossy());
-        s.push_str(".foxing_meta");
-        path.with_file_name(s)
-    })
+pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
+    let file_name = target_path.file_name()?.to_str()?;
+    // Use a hidden file convention: .filename.foxing_meta
+    let sidecar_name = format!(".{}.foxing_meta", file_name);
+    Some(target_path.with_file_name(sidecar_name))
 }
 
-// Internal helper to read legacy/fallback sidecar files
-fn read_sidecar_file(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
-    if !path.exists() { return Ok(HashMap::new()); }
-    let file = fs::File::open(path)?; 
-    let map_value: HashMap<String, Value> = serde_json::from_reader(file)?;
-    let mut result_map = HashMap::new();
-    for (key, val) in map_value {
-        if let Value::String(s) = val {
-            result_map.insert(key, s.into_bytes());
-        } 
+fn lock_file(file: &File) -> std::io::Result<()> {
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+fn unlock_file(file: &File) -> std::io::Result<()> {
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
+    let sp = match get_sidecar_path(path) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // 1. Open (Create if needed)
+    let file = match fs::OpenOptions::new().read(true).write(true).create(true).open(&sp) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    // 2. Lock
+    if lock_file(&file).is_err() { return; }
+
+    // 3. Read existing
+    let mut map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
+    
+    // 4. Modify
+    // Store values as hex strings for JSON safety
+    let val_str = hex::encode(value);
+    map.insert(key.to_string(), val_str);
+
+    // 5. Write (Truncate and rewrite)
+    // We rewind and truncate to avoid temp file rename races inside the same dir if possible, 
+    // but atomic rename is better. However, rename changes the inode/lock.
+    // Better to write to temp and rename? But that breaks the lock held on 'file'.
+    // Safe approach with lock: Truncate and Write in place.
+    if file.set_len(0).is_ok() {
+        use std::io::Seek;
+        let _ = (&file).seek(std::io::SeekFrom::Start(0));
+        let _ = serde_json::to_writer(&file, &map);
     }
-    Ok(result_map)
+
+    // 6. Unlock
+    let _ = unlock_file(&file);
 }
 
-/// Sets a metadata key-value pair.
-/// STRATEGY: Try Native Xattr first. If that fails, use Sidecar file.
-pub fn set_metadata(path: &Path, key: &str, val: &[u8]) {
-    // 1. Try Native Xattr
-    if xattr::set(path, key, val).is_ok() {
-        // Success! Now checks if a legacy sidecar exists and nuke it to clean up.
-        if let Some(sp) = get_sidecar_path(path) {
-            if sp.exists() {
-                let _ = fs::remove_file(sp);
-                debug!("Cleaned up obsolete sidecar for {:?}", path);
-            }
-        }
-        return;
-    }
-
-    // 2. Fallback: Sidecar File
-    // This usually happens on NFS, FAT32, or tmpfs without xattr support.
-    update_sidecar_file(path, key, val);
-}
-
-/// Gets a metadata value.
-/// STRATEGY: Check Native Xattr first. Then check Sidecar file.
 pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
-    // 1. Try Native Xattr
-    if let Ok(Some(val)) = xattr::get(path, key) {
-        return Some(val);
-    }
+    let sp = get_sidecar_path(path)?;
+    if !sp.exists() { return None; }
 
-    // 2. Fallback: Sidecar File
-    if let Some(sp) = get_sidecar_path(path) {
-        if let Ok(map) = read_sidecar_file(&sp) {
-            return map.get(key).cloned();
-        }
-    }
-    None
+    let file = File::open(&sp).ok()?;
+    // Shared lock for reading
+    let fd = file.as_raw_fd();
+    unsafe { libc::flock(fd, libc::LOCK_SH) };
+    
+    let map: HashMap<String, String> = serde_json::from_reader(&file).ok()?;
+    
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+
+    map.get(key).and_then(|v| hex::decode(v).ok())
 }
 
 pub fn set_dirty_flag(path: &Path, dirty: bool) {
-    set_metadata(path, "user.foxing.dirty", if dirty { b"true" } else { b"false" });
+    let val = if dirty { vec![1] } else { vec![0] };
+    set_metadata(path, "user.foxing.dirty", &val);
 }
 
 pub fn is_dirty(path: &Path) -> bool {
     if let Some(val) = get_metadata(path, "user.foxing.dirty") {
-        return val == b"true";
+        return val == vec![1];
     }
     false
-}
-
-// Legacy sidecar updater (only used as fallback now)
-fn update_sidecar_file(path: &Path, key: &str, val: &[u8]) {
-    if let Some(sp) = get_sidecar_path(path) {
-        let file_exists = sp.exists();
-        match fs::OpenOptions::new().read(true).write(true).create(true).open(&sp) {
-            Ok(mut file) => {
-                let fd = file.as_raw_fd();
-                let flock = libc::flock { l_type: libc::F_WRLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
-                if unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &flock) } < 0 {
-                    error!("Failed to acquire sidecar lock for {:?}: {}", sp, std::io::Error::last_os_error());
-                    return;
-                }
-                if !file_exists { metrics::SIDECAR_FILES_CREATED.inc(); }
-                if file.seek(SeekFrom::Start(0)).is_err() { return; }
-
-                let mut map: HashMap<String, Value> = match serde_json::from_reader(&file) {
-                    Ok(m) => m,
-                    Err(_) => HashMap::new(),
-                };
-                
-                let val_string = String::from_utf8_lossy(val).to_string();
-                map.insert(key.to_string(), Value::String(val_string));
-                
-                let temp_name = format!(".{}.tmp", Uuid::new_v4());
-                let temp_path = sp.with_file_name(temp_name);
-
-                match fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temp_path) {
-                    Ok(mut temp_file) => {
-                        if serde_json::to_writer(&mut temp_file, &map).is_err() {
-                            let _ = fs::remove_file(&temp_path); return;
-                        }
-                        if temp_file.sync_all().is_err() {
-                             let _ = fs::remove_file(&temp_path); return;
-                        }
-                        let _ = fs::rename(&temp_path, &sp);
-                    },
-                    Err(_) => {}
-                }
-            },
-            Err(_) => {}
-        }
-    }
 }
