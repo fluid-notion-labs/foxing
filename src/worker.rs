@@ -36,6 +36,8 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
+// ... [Helper Structs: WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry] ...
+// Re-pasting WindowedFilter & VdoTuner for context as they are critical for BBR
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -90,7 +92,6 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
     }
 }
 
-// --- VDO Auto-Tuner ---
 struct VdoTuner {
     enabled: bool,
     active: bool,
@@ -112,14 +113,11 @@ impl VdoTuner {
 
     fn should_check_zeros(&mut self, file_size: u64) -> bool {
         if !self.enabled { return false; }
-        
-        // Wake up immediately for large files
         if !self.active && file_size > 100 * 1024 * 1024 {
              self.active = true;
              debug!("VDO Tuner: Waking up immediately for large file ({} bytes)", file_size);
              return true;
         }
-
         if self.active { return true; }
         if self.last_probe.elapsed() > self.probe_interval {
             return true; 
@@ -133,7 +131,6 @@ impl VdoTuner {
 
         let ratio = zero_bytes as f64 / total_bytes as f64;
         let now = Instant::now();
-        
         let best_ratio = self.zero_ratio_filter.update(ratio, now);
 
         if self.active {
@@ -224,7 +221,6 @@ impl ShardedLockCache {
         s.get_or_insert(inode, || Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 }
-
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
 
 struct BbrTuner {
@@ -321,7 +317,6 @@ impl BbrTuner {
         }
 
         let bdp_bytes = btl_bw * rt_prop;
-        
         let pacing_gain = match self.state {
             TunerState::Startup => 2.0, 
             TunerState::Drain => 0.5,   
@@ -502,7 +497,6 @@ pub async fn run_worker(
         }
         if order.next_seq > 0 && event_ptr.seq_num < order.next_seq { crate::metrics::LATE_EVENTS.inc(); continue; }
 
-        // FIX: Handle Dropped Events by Injecting Gap if buffer rejects
         if !order.push_and_check(event_ptr.clone()) {
              warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
              metrics::EVENTS_DROPPED.inc();
@@ -517,6 +511,9 @@ pub async fn run_worker(
         let pending_len = order.len(); 
         
         let mut batch_bytes_processed = 0u64;
+        
+        // Define 'current_copy_stats' to track I/O duration for BBR
+        let mut current_copy_stats: Option<crate::operations::CopyStats> = None;
 
         while let Some(e) = order.pop_batch(current_coalesce_limit) {
             let target_cfg_cap = target_cfg.clone();
@@ -578,10 +575,7 @@ pub async fn run_worker(
             }
 
             let src = source.mount.join(&e.name);
-            let start = Instant::now();
-
-            // Capture start time for COPY ONLY (RTT Pollution fix)
-            let _start = Instant::now(); // Fixed unused variable warning
+            let _start = Instant::now(); // Wall clock start (metadata included)
 
             let res = match e.event_type {
                 EventType::Write | EventType::Create | EventType::WriteRange => {
@@ -657,6 +651,7 @@ pub async fn run_worker(
                                 metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed);
                                 batch_bytes_processed += stats.bytes_processed;
                                 vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
+                                current_copy_stats = Some(stats); // Store for BBR tuning
                                 Ok(())
                             })
                         } else { Ok(Ok(())) } 
@@ -665,7 +660,6 @@ pub async fn run_worker(
                 EventType::Symlink => {
                     let dst_clone = dst.clone();
                     let src_clone = src.clone();
-                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(link_target) = std::fs::read_link(&src_clone) {
                             security::create_symlink(&link_target.to_string_lossy(), &dst_clone)
@@ -682,7 +676,6 @@ pub async fn run_worker(
                     let dst_clone = dst.clone();
                     let mode = e.mode;
                     let src_clone = src.clone();
-                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(m) = std::fs::metadata(&src_clone) {
                             let rdev = m.rdev(); 
@@ -880,11 +873,18 @@ pub async fn run_worker(
                 failure_state.record_success(); 
             }
             
-            // FEEDBACK LOOP: Feed metrics back into BBR Tuner
-            let elapsed = start.elapsed().as_secs_f64();
-            let is_stressed = governor.is_system_stressed();
-            tuner.tune(elapsed, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
-            metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed);
+            // FEEDBACK LOOP: Feed pure I/O metrics back into BBR Tuner
+            // Only perform tuning update if we actually processed bytes and have valid IO stats
+            if batch_bytes_processed > 0 {
+                if let Some(stats) = current_copy_stats {
+                    let elapsed_rtt = stats.io_duration.as_secs_f64(); 
+                    let is_stressed = governor.is_system_stressed();
+                    tuner.tune(elapsed_rtt, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
+                    metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed_rtt);
+                }
+            }
+            // Clear for next iteration
+            current_copy_stats = None;
         }
         
         if !io_attempt_successful {
