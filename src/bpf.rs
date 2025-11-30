@@ -18,6 +18,18 @@ lazy_static::lazy_static! {
     static ref DEVICE_EVENT_COUNTER: DashMap<u32, AtomicU64> = DashMap::new();
 }
 
+// Public accessor for debug UI
+pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
+    let mut stats = HashMap::new();
+    for r in DEVICE_EVENT_COUNTER.iter() {
+        let dev = *r.key();
+        let count = r.value().load(Ordering::Relaxed);
+        let seq = SEQUENCE_TRACKER.get(&dev).map(|v| v.load(Ordering::Relaxed)).unwrap_or(0);
+        stats.insert(dev, (seq, count));
+    }
+    stats
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct RawEvent {
@@ -42,20 +54,19 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
 
     info!("BPF: Registering {} watched device(s)", queues.len());
     for dev in queues.keys() {
-        // --- ADDED DEBUG LOGGING FOR DEVICE ID ---
-        info!("BPF: Watching device 0x{:08x} ({}) for queue fanout", dev, dev);
-        // -----------------------------------------
         let key = dev.to_ne_bytes(); 
         let val = 1u8;
         info!("BPF: Watching device 0x{:08x} ({})", dev, dev);
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
+            
+        // Pre-populate stats
+        DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
+        SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
     }
     
-    // Manual Feature Probing
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
-
     let progs = &skel.progs;
     
     let probes = [
@@ -124,22 +135,16 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
         
-        // Track events per device
         let counter = DEVICE_EVENT_COUNTER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let event_count = counter.fetch_add(1, Ordering::Relaxed);
         
-        // --- ADDED DEBUG LOGGING FOR INCOMING EVENT DEVICE ID ---
-        if event_count < 100 { // Only log the first 100 events for verbosity limit
+        if event_count < 100 { 
             debug!("BPF Event #{} (Seq {}) from device 0x{:08x} ({}): type={}, inode={}, name={:?}", 
                    event_count, raw.seq, raw.dev, raw.dev, raw.type_, raw.ino, 
                    String::from_utf8_lossy(&raw.name[..raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len())]));
         }
-        // --------------------------------------------------------
         
         if !queues.contains_key(&raw.dev) {
-            if event_count < 5 {
-                debug!("BPF: Event from unwatched device 0x{:08x} ({}) - ignoring", raw.dev, raw.dev);
-            }
             metrics::EVENTS_UNWATCHED.inc();
             return 0;
         }
@@ -178,7 +183,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             parent_inode: raw.p_ino, seq_num: raw.seq, offset: raw.off, length: raw.len,
             name, new_name, generation: raw.r#gen, projid: raw.projid,
             mode: raw.mode,
-            flags: raw.flags, // POPULATE FLAGS HERE
+            flags: raw.flags,
             created_at: std::time::Instant::now()
         });
         

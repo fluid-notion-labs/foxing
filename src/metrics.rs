@@ -5,7 +5,7 @@ use prometheus::{
     register_gauge_vec_with_registry
 };
 use lazy_static::lazy_static;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicBool};
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -60,6 +60,15 @@ lazy_static! {
     pub static ref TARGET_DYNAMIC_VERSION_LIMIT_BYTES: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_dynamic_version_limit_bytes", "Current adaptive limit for version size (MB)", &["target"], REGISTRY).unwrap();
     
     pub static ref TARGET_FORCED_VERSIONING_ACTIVE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_forced_versioning_active", "1 if Forced Versioning is overriding safety checks", &["target"], REGISTRY).unwrap();
+
+    // --- ACCELERATION & TUI METRICS ---
+    pub static ref COPY_METHOD_REFLINK: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_reflink_total", "Writes handled via local Reflink/CoW", REGISTRY).unwrap();
+    pub static ref COPY_METHOD_OFFLOAD: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_offload_total", "Writes handled via NFS/Server-Side Copy", REGISTRY).unwrap();
+    pub static ref COPY_METHOD_STANDARD: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_standard_total", "Writes handled via standard read/write", REGISTRY).unwrap();
+    pub static ref TOTAL_ITEMS_DISCOVERED: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_total_items_discovered", "Total items found during pre-scan for TUI", REGISTRY).unwrap();
+    pub static ref LIVE_ADDITIONS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_live_additions_total", "New files detected by BPF/Inotify during run", REGISTRY).unwrap();
+    
+    pub static ref DISCOVERY_COMPLETE: AtomicBool = AtomicBool::new(false);
 
     pub static ref GLOBAL_BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
     pub static ref GLOBAL_BUFFER_LIMIT: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_global_buffer_limit", "Maximum buffered events across all workers", REGISTRY).unwrap();

@@ -1,13 +1,15 @@
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
-    collections::HashMap, 
+    collections::{HashMap, VecDeque}, 
     time::{Instant, Duration}, 
     ops::Sub
 };
 use tokio::{sync::mpsc, task::spawn_blocking};
 use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::MetadataExt; // Fixed import
 use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
+use crate::operations::SmartCopier; 
 use tokio::time::interval; 
 use tracing::{warn, info, error, debug}; 
 use crate::error::FoxingError; 
@@ -20,15 +22,129 @@ use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
 use futures::StreamExt;
+use serde::{Serialize, Deserialize}; // Fixed imports
 
-// Exported types required by src/mirror.rs
-// Export type for mirror.rs
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TunerState { Steady=0, LatencyBackoff=1, RampUp=2, HighLoad=3, EmergencyDrain=4, GovernorThrottled=5, SpacePressure=6 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)] // Fixed derives
+pub enum TunerState { 
+    Startup = 0,      
+    Drain = 1,        
+    ProbeBW = 2,      
+    Muted = 3,        
+    IdleReset = 4,
+    SpacePressure = 6 
+}
 
-// --- Helper Structs (Internal) ---
+struct WindowedFilter<T> {
+    window_duration: Duration,
+    samples: VecDeque<(Instant, T)>,
+    mode: FilterMode,
+}
+
+enum FilterMode { Min, Max }
+
+impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
+    fn new(window_secs: u64, mode: FilterMode) -> Self {
+        Self {
+            window_duration: Duration::from_secs(window_secs),
+            samples: VecDeque::new(),
+            mode,
+        }
+    }
+
+    fn update(&mut self, val: T, now: Instant) -> T {
+        while let Some((time, _)) = self.samples.front() {
+            if now.duration_since(*time) > self.window_duration {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.samples.push_back((now, val));
+
+        let mut best = val;
+        for (_, v) in &self.samples {
+            match self.mode {
+                FilterMode::Min => if *v < best { best = *v; },
+                FilterMode::Max => if *v > best { best = *v; },
+            }
+        }
+        best
+    }
+    
+    fn get_best(&self) -> Option<T> {
+        if self.samples.is_empty() { return None; }
+        let mut best = self.samples[0].1;
+        for (_, v) in &self.samples {
+            match self.mode {
+                FilterMode::Min => if *v < best { best = *v; },
+                FilterMode::Max => if *v > best { best = *v; },
+            }
+        }
+        Some(best)
+    }
+    
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+}
+
+// --- VDO Auto-Tuner ---
+struct VdoTuner {
+    enabled: bool,
+    active: bool,
+    zero_ratio_filter: WindowedFilter<f64>,
+    last_probe: Instant,
+    probe_interval: Duration,
+}
+
+impl VdoTuner {
+    fn new(cfg_enabled: bool) -> Self {
+        Self {
+            enabled: cfg_enabled,
+            active: cfg_enabled, 
+            zero_ratio_filter: WindowedFilter::new(30, FilterMode::Max), 
+            last_probe: Instant::now(),
+            probe_interval: Duration::from_secs(30),
+        }
+    }
+
+    fn should_check_zeros(&mut self) -> bool {
+        if !self.enabled { return false; }
+        if self.active { return true; }
+        if self.last_probe.elapsed() > self.probe_interval {
+            return true; 
+        }
+        false
+    }
+
+    fn update(&mut self, total_bytes: u64, zero_bytes: u64) {
+        if !self.enabled { return; }
+        if total_bytes == 0 { return; }
+
+        let ratio = zero_bytes as f64 / total_bytes as f64;
+        let now = Instant::now();
+        
+        let best_ratio = self.zero_ratio_filter.update(ratio, now);
+
+        if self.active {
+            if best_ratio < 0.01 {
+                debug!("VDO Tuner: Efficiency low ({:.2}%), entering Backoff/Sleep.", best_ratio * 100.0);
+                self.active = false;
+                self.last_probe = now;
+            }
+        } else {
+            if ratio > 0.01 {
+                debug!("VDO Tuner: Probe successful ({:.2}%), Waking Up.", ratio * 100.0);
+                self.active = true;
+                self.zero_ratio_filter.reset();
+            } else {
+                self.last_probe = now; 
+            }
+        }
+    }
+}
 
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
@@ -103,57 +219,131 @@ impl ShardedLockCache {
 
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
 
-struct TargetTuner { latency_target_seconds: f64, aspiration_size: u64, current_coalesce_bytes: u64, max_burst_coalesce_bytes: u64, current_batch_size: usize, batch_size_min: usize, batch_size_max: usize, flush_multiplier: u32, flush_multiplier_min: u32, flush_multiplier_max: u32, state: TunerState }
-impl TargetTuner {
+struct BbrTuner {
+    current_batch_size: usize,
+    current_coalesce_bytes: u64,
+    flush_multiplier: u32,
+    state: TunerState,
+    btl_bw_filter: WindowedFilter<f64>,
+    rt_prop_filter: WindowedFilter<f64>,
+    batch_size_min: usize,
+    batch_size_max: usize,
+    min_coalesce_floor: u64,
+    max_burst_coalesce_bytes: u64,
+    last_cycle: Instant,
+    last_data_seen: Instant,
+}
+
+impl BbrTuner {
     fn new(cfg: &TargetConfig) -> Self {
-        let aspiration_size = crate::config::get_default_coalesce_max_bytes(&cfg.profile);
-        let (flush_min, flush_max) = get_flush_multiplier_bounds(&cfg.profile);
-        let lat_target = cfg.autotune_target_latency_ms as f64 / 1000.0;
-        Self { latency_target_seconds: lat_target, aspiration_size, current_coalesce_bytes: aspiration_size, max_burst_coalesce_bytes: 8 * 1024 * 1024, current_batch_size: cfg.batch_size, batch_size_min: 2, batch_size_max: cfg.batch_size * 4, flush_multiplier: flush_min, flush_multiplier_min: flush_min, flush_multiplier_max: flush_max, state: TunerState::Steady }
+        let (flush_min, _) = get_flush_multiplier_bounds(&cfg.profile);
+        let min_floor = match cfg.profile {
+            crate::config::TargetProfile::HDD => 512 * 1024, 
+            _ => 64 * 1024, 
+        };
+        Self { 
+            current_batch_size: cfg.batch_size, 
+            current_coalesce_bytes: min_floor * 2,
+            flush_multiplier: flush_min,
+            state: TunerState::Startup,
+            btl_bw_filter: WindowedFilter::new(10, FilterMode::Max),
+            rt_prop_filter: WindowedFilter::new(10, FilterMode::Min),
+            batch_size_min: 2,
+            batch_size_max: 128, 
+            min_coalesce_floor: min_floor,
+            max_burst_coalesce_bytes: 8 * 1024 * 1024,
+            last_cycle: Instant::now(),
+            last_data_seen: Instant::now(),
+        }
     }
-    fn tune(&mut self, elapsed: f64, cfg: &TargetConfig, is_stressed: bool, pending_events: usize, max_pending: usize, board: &TunerBoard) {
-        let buffer_util = pending_events as f64 / max_pending as f64;
-        let label = cfg.path.to_string_lossy();
-        metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&label]).set(buffer_util);
+
+    fn tune(&mut self, elapsed_secs: f64, bytes_processed: u64, is_stressed: bool, pending_len: usize, max_pending: usize, board: &TunerBoard, path_label: &str) {
+        let now = Instant::now();
+        let delivery_rate = if elapsed_secs > 0.0001 { bytes_processed as f64 / elapsed_secs } else { 0.0 };
+        
+        if bytes_processed == 0 {
+            if now.duration_since(self.last_data_seen) > Duration::from_secs(30) {
+                if self.state != TunerState::Startup {
+                    debug!("BBR: Connection idle for 30s. Resetting to Startup/Probe mode.");
+                    self.state = TunerState::IdleReset;
+                    self.btl_bw_filter.reset();
+                    self.rt_prop_filter.reset();
+                }
+            }
+            return;
+        } else {
+            self.last_data_seen = now;
+            if self.state == TunerState::IdleReset {
+                self.state = TunerState::Startup;
+            }
+        }
+
+        self.btl_bw_filter.update(delivery_rate, now);
+        self.rt_prop_filter.update(elapsed_secs, now);
+
+        let btl_bw = self.btl_bw_filter.get_best().unwrap_or(1_000_000.0);
+        let rt_prop = self.rt_prop_filter.get_best().unwrap_or(0.001);
 
         if is_stressed {
-            self.state = TunerState::GovernorThrottled;
-            self.current_batch_size = (self.current_batch_size / 2).max(self.batch_size_min);
-            self.current_coalesce_bytes = 4096; 
-            self.flush_multiplier = self.flush_multiplier_min;
-        } else if buffer_util > 0.8 {
-            self.state = TunerState::EmergencyDrain;
-            self.current_batch_size = self.batch_size_max;
-            self.current_coalesce_bytes = self.max_burst_coalesce_bytes;
-            self.flush_multiplier = self.flush_multiplier_max; 
-        } else if buffer_util > 0.5 {
-            self.state = TunerState::HighLoad;
-            self.current_batch_size = (self.current_batch_size + 1).min(self.batch_size_max);
-            self.current_coalesce_bytes = (self.current_coalesce_bytes + 512 * 1024).min(self.max_burst_coalesce_bytes);
-        } else if elapsed > self.latency_target_seconds {
-            self.state = TunerState::LatencyBackoff;
-            self.current_batch_size = (self.current_batch_size - 1).max(self.batch_size_min);
-            self.current_coalesce_bytes = (self.current_coalesce_bytes / 2).max(4096);
-            self.flush_multiplier = self.flush_multiplier.saturating_add(1).min(self.flush_multiplier_max);
-        } else if elapsed < (self.latency_target_seconds * 0.25) {
-            self.state = TunerState::RampUp;
-            if self.current_coalesce_bytes < self.aspiration_size { self.current_coalesce_bytes = (self.current_coalesce_bytes * 2).min(self.aspiration_size); }
-            if self.current_batch_size < self.batch_size_max { self.current_batch_size = (self.current_batch_size + 1).min(self.batch_size_max); }
-            if self.flush_multiplier > self.flush_multiplier_min { self.flush_multiplier = self.flush_multiplier.saturating_sub(1); }
+            self.state = TunerState::Muted;
         } else {
-            self.state = TunerState::Steady;
+            match self.state {
+                TunerState::Startup => {
+                    if now.duration_since(self.last_cycle) > Duration::from_secs(5) {
+                        self.state = TunerState::Drain;
+                        self.last_cycle = now;
+                    }
+                },
+                TunerState::Drain => {
+                    if pending_len < 2 {
+                        self.state = TunerState::ProbeBW;
+                        self.last_cycle = now;
+                    }
+                },
+                TunerState::ProbeBW | TunerState::Muted => {
+                    if now.duration_since(self.last_cycle) > Duration::from_secs(10) {
+                        self.state = TunerState::Drain;
+                        self.last_cycle = now;
+                    } else {
+                        self.state = TunerState::ProbeBW;
+                    }
+                },
+                _ => {}
+            }
         }
-        
-        board.insert(cfg.path.clone(), self.state);
 
-        metrics::TARGET_BATCH_SIZE.with_label_values(&[&label]).set(self.current_batch_size as i64);
-        metrics::TARGET_COALESCE_BYTES.with_label_values(&[&label]).set(self.current_coalesce_bytes as i64);
-        metrics::TARGET_FLUSH_MULTIPLIER.with_label_values(&[&label]).set(self.flush_multiplier as i64);
-        metrics::TUNER_STATE.with_label_values(&[&label]).set(self.state as i64);
+        let bdp_bytes = btl_bw * rt_prop;
+        
+        let pacing_gain = match self.state {
+            TunerState::Startup => 2.0, 
+            TunerState::Drain => 0.5,   
+            TunerState::ProbeBW => 1.25, 
+            TunerState::Muted => 0.75,  
+            _ => 1.0,
+        };
+
+        let target_inflight_bytes = (bdp_bytes * pacing_gain) as u64;
+        let target_op_size = (btl_bw * 0.002) as u64;
+        
+        self.current_coalesce_bytes = target_op_size
+            .max(self.min_coalesce_floor)
+            .min(self.max_burst_coalesce_bytes);
+
+        let calculated_batch = (target_inflight_bytes / self.current_coalesce_bytes.max(1)) as usize;
+        
+        self.current_batch_size = calculated_batch
+            .max(self.batch_size_min)
+            .min(self.batch_size_max);
+
+        board.insert(PathBuf::from(path_label), self.state);
+        metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_label]).set(self.current_batch_size as i64);
+        metrics::TARGET_COALESCE_BYTES.with_label_values(&[&path_label]).set(self.current_coalesce_bytes as i64);
+        metrics::TUNER_STATE.with_label_values(&[&path_label]).set(self.state as i64);
+        metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&path_label]).set(pending_len as f64 / max_pending as f64);
     }
     
     fn should_defer_maintenance(&self) -> bool {
-        matches!(self.state, TunerState::EmergencyDrain | TunerState::GovernorThrottled | TunerState::HighLoad)
+        matches!(self.state, TunerState::Startup | TunerState::Muted)
     }
 
     fn calculate_version_limits(&self, cfg: &TargetConfig, avail: u64, total: u64) -> (usize, u64) {
@@ -181,12 +371,11 @@ impl TargetTuner {
     }
 }
 
-// --- Main Worker Function ---
-
 pub async fn run_worker(
     source: Arc<SourceInfo>, 
     target_cfg: TargetConfig, 
-    mut rx: mpsc::Receiver<Arc<Event>>, 
+    mut rx_high: mpsc::Receiver<Arc<Event>>, 
+    mut rx_low: mpsc::Receiver<Arc<Event>>, 
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>, 
     hydration_tx: mpsc::Sender<PathBuf>, 
     config: SharedConfig,
@@ -212,7 +401,11 @@ pub async fn run_worker(
     let mut failure_state = FailureState::new(hibernation_threshold_secs);
     let iov = libc::iovec { iov_base: unsafe { buf.capacity_slice_mut() }.as_mut_ptr() as _, iov_len: buf.capacity() };
     if unsafe { ring.submitter().register_buffers(&[iov]) }.is_err() { error!("Failed to register io_uring buffers. Falling back to standard I/O (slower)."); }
-    let mut tuner = TargetTuner::new(&target_cfg);
+    
+    // Auto-Tuners
+    let mut tuner = BbrTuner::new(&target_cfg);
+    let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
+
     let mut is_hibernating = false;
     let mut last_dropped_check = 0u64;
     let mut cur_cap_avail = 0u64;
@@ -220,9 +413,13 @@ pub async fn run_worker(
 
     loop {
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
+        
         let event_poll_result = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => break Ok(()),
+            Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             _ = flush_interval.tick() => {
-                let path_clone = target_cfg.path.clone(); // <-- FIX 2A: Clone path for statvfs
+                let path_clone = target_cfg.path.clone(); 
                 if let Ok(s) = statvfs(&path_clone) {
                     cur_cap_total = s.blocks() * s.block_size();
                     cur_cap_avail = s.blocks_available() * s.block_size();
@@ -240,6 +437,9 @@ pub async fn run_worker(
                         let _ = hydration_tx.send(source.path.clone()).await; 
                         last_dropped_check = current_dropped;
                     }
+                    
+                    order.check_timeouts();
+
                     let now = Instant::now();
                     let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
                     dirty_stats.retain(|&ino, entry| {
@@ -255,8 +455,7 @@ pub async fn run_worker(
                 }
                 None
             },
-            Some(e) = rx.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
-            _ = shutdown_rx.recv() => break Ok(()),
+            Some(e) = rx_low.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             else => break Err(FoxingError::System(nix::Error::last())),
         };
 
@@ -271,9 +470,6 @@ pub async fn run_worker(
         if failure_state.check_hibernation_needed() {
             if !is_hibernating {
                 warn!("Target {:?} failed for {}s. Switching to Hibernation mode.", target_cfg.path, failure_state.hibernation_threshold.as_secs());
-                let events_dumped = order.pending.len();
-                order.pending.clear();
-                if events_dumped > 0 { metrics::GLOBAL_BUFFER_COUNT.fetch_sub(events_dumped as u64, Ordering::Relaxed); }
                 let _ = hydration_tx.send(source.path.clone()).await; 
                 is_hibernating = true;
             }
@@ -293,14 +489,19 @@ pub async fn run_worker(
         if event_ptr.event_type == EventType::SequenceGap {
             tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", event_ptr.dev_id);
             let _ = hydration_tx.send(source.path.clone()).await; 
-            order.next = 0;
+            order.next_seq = 0; 
             continue;
         }
-        if order.next > 0 && event_ptr.seq_num < order.next { crate::metrics::LATE_EVENTS.inc(); continue; }
+        if order.next_seq > 0 && event_ptr.seq_num < order.next_seq { crate::metrics::LATE_EVENTS.inc(); continue; }
 
         order.push_and_check(event_ptr.clone());
         let current_coalesce_limit = tuner.current_coalesce_bytes;
         let mut io_attempt_successful = true;
+
+        let max_pending = order.max_count;
+        let pending_len = order.len(); 
+        
+        let mut batch_bytes_processed = 0u64;
 
         while let Some(e) = order.pop_batch(current_coalesce_limit) {
             let target_cfg_cap = target_cfg.clone();
@@ -343,7 +544,6 @@ pub async fn run_worker(
                     f_result
                 }).await;
                 if res.is_ok() {
-                    // Update map to track the new synthetic file
                     identity::update_map(&source.inode_map, e_inode, e_name, e_generation, true);
                     metrics::SYNTHETIC_IDENTITY_FILES.inc();
                 } else { 
@@ -355,7 +555,6 @@ pub async fn run_worker(
             }
 
             if e.event_type == EventType::Write || e.event_type == EventType::WriteRange {
-                // If a write comes in, mark the file dirty and update its sequence number
                 if !dirty_stats.contains_key(&e.inode) {
                     let dst_clone = dst.clone();
                     spawn_blocking(move || sidecar::set_dirty_flag(&dst_clone, true));
@@ -370,7 +569,7 @@ pub async fn run_worker(
                 EventType::Write | EventType::Create | EventType::WriteRange => {
                     let src_clone = src.clone();
                     let target_cfg_clone = target_cfg.clone();
-                    let dst_clone = dst.clone(); // Clone `dst` once for use across this match arm
+                    let dst_clone = dst.clone(); 
                     let e_offset = e.offset; 
                     let e_len = e.length;    
                     
@@ -381,8 +580,6 @@ pub async fn run_worker(
 
                     if let Ok(m) = metadata_result {
                         if m.is_file() {
-                            // FIX 1: Parent Directory Check (CRITICAL FOR ATOMIC RENAME)
-                            // This ensures the target folder exists before attempting to write or rename into it.
                             if !is_synthetic {
                                 let dst_parent = dst_clone.parent().map(|p| p.to_path_buf()).unwrap_or(target_cfg_clone.path.clone());
                                 let e_clone_for_dir_err = e.clone(); 
@@ -394,7 +591,6 @@ pub async fn run_worker(
                                 }
                             }
                              
-                             // Optimization/Feature flags setup
                              if e.event_type == EventType::Create && (target_cfg.btrfs_compression || target_cfg.f2fs_compression || target_cfg.f2fs_pinning) {
                                   let dst_clone_for_opt = dst_clone.clone();
                                   let res = spawn_blocking(move || {
@@ -409,7 +605,6 @@ pub async fn run_worker(
                                   if res.is_err() { warn!("Failed compression/pinning setup: {:?}", res.err()); }
                              }
                             
-                            // Xattr Sync - Now placed correctly after potential parent dir creation
                             let sync_xattrs_src = src.clone();
                             let sync_xattrs_dst = dst_clone.clone(); 
                             
@@ -426,27 +621,60 @@ pub async fn run_worker(
                                 }).collect::<Vec<_>>().await;
                             }
 
-                            // IO Operation: copy_smart handles atomic rename if needed
-                            let copy_res = security::copy_smart(
+                            let dynamic_vdo_opt = vdo_tuner.should_check_zeros();
+
+                            let copy_res = SmartCopier::copy(
                                 &src, 
                                 &dst_clone, 
                                 &mut ring, 
                                 &mut buf, 
-                                &target_cfg.direct_io_ok, 
-                                target_cfg.vdo_optimization, 
+                                &target_cfg.supports_reflink, 
+                                dynamic_vdo_opt, 
                                 e_offset, 
-                                e_len
+                                e_len,
+                                target_cfg.direct_io_ok.load(Ordering::Relaxed)
                             ).await;
                             
-                            copy_res.map(|_sz| {
-                                metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(e_len);
+                            copy_res.map(|stats| {
+                                metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed);
+                                batch_bytes_processed += stats.bytes_processed;
+                                vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
                                 Ok(())
                             })
                         } else { Ok(Ok(())) } 
                     } else if is_synthetic { if limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}. Event ignored.", e.inode); } Ok(Ok(())) } else { Ok(Ok(())) }
                 },
+                EventType::Symlink => {
+                    let dst_clone = dst.clone();
+                    let src_clone = src.clone();
+                    // Fixed: Wrapped result in Ok
+                    Ok(spawn_blocking(move || {
+                        if let Ok(link_target) = std::fs::read_link(&src_clone) {
+                            security::create_symlink(&link_target.to_string_lossy(), &dst_clone)
+                        } else {
+                            Ok(())
+                        }
+                    }).await.unwrap_or(Ok(())).map_err(|e| e.into()))
+                },
+                EventType::Link => {
+                    warn!("Hardlink event received. Treating as standard create/copy for now to ensure data persistence.");
+                    Ok(Ok(()))
+                },
+                EventType::Mknod => {
+                    let dst_clone = dst.clone();
+                    let mode = e.mode;
+                    let src_clone = src.clone();
+                    // Fixed: Wrapped result in Ok
+                    Ok(spawn_blocking(move || {
+                        if let Ok(m) = std::fs::metadata(&src_clone) {
+                            let rdev = m.rdev(); 
+                            security::create_mknod(&dst_clone, mode, rdev)
+                        } else {
+                            Ok(())
+                        }
+                    }).await.unwrap_or(Ok(())).map_err(|e| e.into()))
+                },
                 EventType::Unlink => {
-                    // When an unlink is received, we assume the worker has received all prior writes.
                     dirty_stats.remove(&e.inode);
                     let dst_clone = dst.clone();
                     let source_clone = source.clone();
@@ -470,15 +698,14 @@ pub async fn run_worker(
                         let new_rel = PathBuf::from(new_name);
                         let new_dst = target_cfg.path.join(&new_rel);
                         if target_cfg.allow(&new_rel) {
-                            let dst_clone = dst.clone(); // Old path
-                            let new_dst_clone = new_dst.clone(); // New path
+                            let dst_clone = dst.clone(); 
+                            let new_dst_clone = new_dst.clone(); 
                             let source_clone = source.clone();
                             let e_inode = e.inode;
                             let e_generation = e.generation;
                             let is_synthetic_state = is_synthetic;
                             
                             let res = spawn_blocking(move || {
-                                // Must ensure parent directory of the *new* path exists before rename
                                 if let Some(parent) = new_dst_clone.parent() { 
                                     if let Err(e) = std::fs::create_dir_all(parent) { 
                                         return Err(io::Error::new(io::ErrorKind::Other, format!("Rename target dir creation failed: {}", e))); 
@@ -490,10 +717,8 @@ pub async fn run_worker(
                                 
                                 if rename_res.is_ok() {
                                     let new_rel_clone = new_rel.clone(); 
-                                    // Update identity map with new path/name
                                     identity::update_map_after_rename(&source_clone.inode_map, e_inode, new_rel_clone, e_generation);
                                     
-                                    // Move sidecar file atomically if it exists
                                     if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) { 
                                         if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) { 
                                             if old_sp.exists() { 
@@ -502,10 +727,8 @@ pub async fn run_worker(
                                         } 
                                     }
 
-                                    // If it was synthetic, the rename resolves it to a normal path, so update the metrics
                                     if is_synthetic_state {
                                         metrics::SYNTHETIC_IDENTITY_FILES.dec();
-                                        // FIX 1B: Clone new_rel again for this update call, resolving E0382
                                         identity::update_map(&source_clone.inode_map, e_inode, new_rel.clone(), e_generation, false);
                                     }
                                 }
@@ -513,12 +736,10 @@ pub async fn run_worker(
                             }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::Other, "Rename task failed"))).map_err(|e| e.into());
                             
                             if res.is_ok() {
-                                // Update dirty path if still tracking
                                 if let Some(entry) = dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
-                                // Recalculate hash for both old and new parent directories
                                 let _ = spawn_blocking(move || { 
-                                    let dst_path_clone = dst.clone(); // Clone path for spawn_blocking
-                                    let new_dst_path_clone = new_dst.clone(); // Clone path for spawn_blocking
+                                    let dst_path_clone = dst.clone(); 
+                                    let new_dst_path_clone = new_dst.clone(); 
                                     if let Some(parent) = dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
                                     if let Some(parent) = new_dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
                                 }).await;
@@ -573,7 +794,6 @@ pub async fn run_worker(
                          if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
                     }
                     
-                    // Final commit of epoch and dirty state
                     let r = spawn_blocking(move || {
                         let r = security::commit_epoch(&dst_clone, seq_num, projid); 
                         if r.is_ok() { if let Some(parent) = dst_clone.parent() { if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } } }
@@ -611,7 +831,6 @@ pub async fn run_worker(
                 }
             };
 
-            // Flatten the nested Result<Result<...>>
             let final_res = match res {
                 Ok(inner) => inner,
                 Err(e) => Err(e)
@@ -624,12 +843,10 @@ pub async fn run_worker(
                         capacity_breaker.trip();
                         io_attempt_successful = false; 
                         order.push_and_check(e); 
-                        // Emergency Prune (if disk full)
-                        // FIX: Clone target_cfg for this closure
                         let target_cfg_clone = target_cfg.clone();
                         if let Err(e) = spawn_blocking(move || { 
                             let target_root = target_cfg_clone.path.parent().unwrap_or(&target_cfg_clone.path);
-                            versioning::prune_global_history(target_root, 512 * 1024 * 1024) // Try to free 512MB
+                            versioning::prune_global_history(target_root, 512 * 1024 * 1024) 
                         }).await { error!("Global prune failed: {:?}", e); }
                         
                         break; 
@@ -647,7 +864,7 @@ pub async fn run_worker(
             
             let elapsed = start.elapsed().as_secs_f64();
             let is_stressed = governor.is_system_stressed();
-            tuner.tune(elapsed, &target_cfg, is_stressed, order.pending.len(), order.max_size, &tuner_board);
+            tuner.tune(elapsed, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
             metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed);
         }
         

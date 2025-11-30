@@ -12,6 +12,10 @@ pub mod mirror;
 pub mod bpf;
 pub mod versioning;
 pub mod governor;
+pub mod operations;
+pub mod hydration;
+pub mod api; 
+pub mod tui;
 
 pub use mirror::SharedConfig;
 pub use error::Result;

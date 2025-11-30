@@ -45,6 +45,9 @@ fxhash = "0.2.1"
 reqwest = { version = "0.11", features = ["blocking", "json"] }
 comfy-table = "7.0"
 uuid = { version = "1.8", features = ["v4"] }
+notify = "6.1.1" 
+ratatui = "0.26"
+crossterm = "0.27"
 
 [build-dependencies]
 libbpf-cargo = "0.25"
