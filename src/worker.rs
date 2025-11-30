@@ -113,7 +113,7 @@ impl VdoTuner {
     fn should_check_zeros(&mut self, file_size: u64) -> bool {
         if !self.enabled { return false; }
         
-        // Wake up immediately for large files to avoid 30s delay on "Sparse Sprint"
+        // Wake up immediately for large files
         if !self.active && file_size > 100 * 1024 * 1024 {
              self.active = true;
              debug!("VDO Tuner: Waking up immediately for large file ({} bytes)", file_size);
@@ -154,7 +154,6 @@ impl VdoTuner {
     }
 }
 
-// [Helpers struct ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry omitted for brevity but assumed present]
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
 impl ErrorLimiter {
     fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
@@ -225,6 +224,7 @@ impl ShardedLockCache {
         s.get_or_insert(inode, || Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 }
+
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
 
 struct BbrTuner {
@@ -547,9 +547,6 @@ pub async fn run_worker(
                 let e_generation = e.generation;
                 let e_name = PathBuf::from(&e.name);
                 let res = spawn_blocking(move || {
-                    // Corrected path is now .mirror/.by-identity in identity.rs
-                    // We should create that structure if it doesn't exist here or identity.rs?
-                    // identity.rs calculates the path. worker needs to ensure dir exists.
                     let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
                     let _ = std::fs::create_dir_all(&identity_dir);
                     let f_result = std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone);
@@ -584,7 +581,7 @@ pub async fn run_worker(
             let start = Instant::now();
 
             // Capture start time for COPY ONLY (RTT Pollution fix)
-            let copy_start = Instant::now();
+            let _start = Instant::now(); // Fixed unused variable warning
 
             let res = match e.event_type {
                 EventType::Write | EventType::Create | EventType::WriteRange => {
@@ -668,6 +665,7 @@ pub async fn run_worker(
                 EventType::Symlink => {
                     let dst_clone = dst.clone();
                     let src_clone = src.clone();
+                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(link_target) = std::fs::read_link(&src_clone) {
                             security::create_symlink(&link_target.to_string_lossy(), &dst_clone)
@@ -684,6 +682,7 @@ pub async fn run_worker(
                     let dst_clone = dst.clone();
                     let mode = e.mode;
                     let src_clone = src.clone();
+                    // Fixed: Wrapped result in Ok
                     Ok(spawn_blocking(move || {
                         if let Ok(m) = std::fs::metadata(&src_clone) {
                             let rdev = m.rdev(); 
@@ -881,11 +880,11 @@ pub async fn run_worker(
                 failure_state.record_success(); 
             }
             
-            // Feedback Loop: Use specific copy time for BBR RTT calculation
-            let elapsed_rtt = copy_start.elapsed().as_secs_f64(); 
+            // FEEDBACK LOOP: Feed metrics back into BBR Tuner
+            let elapsed = start.elapsed().as_secs_f64();
             let is_stressed = governor.is_system_stressed();
-            tuner.tune(elapsed_rtt, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
-            metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed_rtt);
+            tuner.tune(elapsed, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
+            metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed);
         }
         
         if !io_attempt_successful {

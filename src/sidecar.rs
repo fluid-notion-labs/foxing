@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use serde_json;
 use std::os::unix::io::AsRawFd;
 use libc;
+use std::io::{Seek, SeekFrom};
 
 pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
     let file_name = target_path.file_name()?.to_str()?;
-    // Use a hidden file convention: .filename.foxing_meta
     let sidecar_name = format!(".{}.foxing_meta", file_name);
     Some(target_path.with_file_name(sidecar_name))
 }
 
-fn lock_file(file: &File) -> std::io::Result<()> {
+fn lock_file(file: &File, exclusive: bool) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+    let ret = unsafe { libc::flock(fd, op) };
     if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
@@ -30,31 +31,28 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
         None => return,
     };
 
-    // 1. Open (Create if needed)
-    let file = match fs::OpenOptions::new().read(true).write(true).create(true).open(&sp) {
+    // 1. Open (Create if needed) - Read+Write mode required for update
+    let mut file = match fs::OpenOptions::new().read(true).write(true).create(true).open(&sp) {
         Ok(f) => f,
         Err(_) => return,
     };
 
-    // 2. Lock
-    if lock_file(&file).is_err() { return; }
+    // 2. Lock Exclusive (Blocking)
+    if lock_file(&file, true).is_err() { return; }
 
     // 3. Read existing
-    let mut map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
+    let mut map: HashMap<String, String> = match serde_json::from_reader(&file) {
+        Ok(m) => m,
+        Err(_) => HashMap::new(), // Empty if file new or corrupt
+    };
     
     // 4. Modify
-    // Store values as hex strings for JSON safety
     let val_str = hex::encode(value);
     map.insert(key.to_string(), val_str);
 
-    // 5. Write (Truncate and rewrite)
-    // We rewind and truncate to avoid temp file rename races inside the same dir if possible, 
-    // but atomic rename is better. However, rename changes the inode/lock.
-    // Better to write to temp and rename? But that breaks the lock held on 'file'.
-    // Safe approach with lock: Truncate and Write in place.
-    if file.set_len(0).is_ok() {
-        use std::io::Seek;
-        let _ = (&file).seek(std::io::SeekFrom::Start(0));
+    // 5. Rewrite In-Place (Safe because we hold the lock)
+    // Rewind -> Truncate -> Write
+    if file.seek(SeekFrom::Start(0)).is_ok() && file.set_len(0).is_ok() {
         let _ = serde_json::to_writer(&file, &map);
     }
 
@@ -67,13 +65,13 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
     if !sp.exists() { return None; }
 
     let file = File::open(&sp).ok()?;
+    
     // Shared lock for reading
-    let fd = file.as_raw_fd();
-    unsafe { libc::flock(fd, libc::LOCK_SH) };
+    if lock_file(&file, false).is_err() { return None; }
     
     let map: HashMap<String, String> = serde_json::from_reader(&file).ok()?;
     
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    let _ = unlock_file(&file);
 
     map.get(key).and_then(|v| hex::decode(v).ok())
 }

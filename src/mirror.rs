@@ -1,11 +1,13 @@
-use std::{sync::{Arc}, collections::HashMap, path::PathBuf, fs};
-use crate::{config::{Config, TargetConfig}, event::{EventQueue}, worker::{self, TunerBoard, TunerState}, identity, Result, governor::Governor};
+use std::{sync::{Arc, atomic::Ordering}, collections::HashMap, path::PathBuf, fs};
+use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event, EventType}, worker::{self, TunerBoard, TunerState}, metrics, identity, sidecar, security, Result, governor::Governor};
 use crate::hydration::Hydrator;
+use walkdir::WalkDir;
 use parking_lot::Mutex;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
+use std::os::unix::io::AsRawFd; 
 use tracing::{info, error, debug}; 
 use dashmap::DashMap;
 
@@ -39,9 +41,9 @@ fn find_mount_point(path: &PathBuf) -> Result<(PathBuf, u32, bool)> {
     
     #[derive(Debug)]
     struct MountEntry {
-        _device: String,
+        device: String,
         mount_point: PathBuf,
-        _fstype: String,
+        fstype: String,
         is_loopback: bool,
     }
     
@@ -54,9 +56,9 @@ fn find_mount_point(path: &PathBuf) -> Result<(PathBuf, u32, bool)> {
         let fstype = parts[2];
         let is_loopback = device.starts_with("/dev/loop");
         mounts.push(MountEntry {
-            _device: device.to_string(),
+            device: device.to_string(),
             mount_point,
-            _fstype: fstype.to_string(),
+            fstype: fstype.to_string(),
             is_loopback,
         });
     }
