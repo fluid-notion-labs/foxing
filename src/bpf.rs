@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::metrics::{self, GLOBAL_BUFFER_LIMIT}; 
 use std::mem;
 use libbpf_rs::MapCore;
-use tracing::{info, warn, debug, error}; // Added error!
+use tracing::{info, warn, debug}; // Removed unused 'error'
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
