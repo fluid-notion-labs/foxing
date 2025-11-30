@@ -816,17 +816,20 @@ pub async fn run_worker(
                     }).await.unwrap_or(Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
                     
                     // NEW: Handle NotFound caused by dropped CREATE/WRITE events
-                    if let Err(FoxingError::Io(ref io_err)) = r {
-                        if io_err.kind() == io::ErrorKind::NotFound {
-                            warn!("Fsync on {:?} failed (NotFound). CREATE/WRITE likely dropped. Triggering hydration and skipping.", dst_clone);
-                            let _ = h_tx_clone.send(source_path_for_h).await;
-                            Ok(Ok(())) // Return OK to allow worker loop to proceed
-                        } else {
-                            r // Propagate other errors
-                        }
+                    // Check for specific error condition without consuming r
+                    let is_not_found = if let Err(FoxingError::Io(ref io_err)) = r {
+                        io_err.kind() == io::ErrorKind::NotFound
+                    } else {
+                        false
+                    };
+
+                    if is_not_found {
+                        warn!("Fsync on {:?} failed (NotFound). CREATE/WRITE likely dropped. Triggering hydration and skipping.", dst_clone);
+                        let _ = h_tx_clone.send(source_path_for_h).await;
+                        Ok(Ok(())) // Return OK to allow worker loop to proceed
                     } else {
                         if r.is_ok() { dirty_stats.remove(&e.inode); }
-                        r
+                        Ok(r) // Wrap in Ok to match Result<Result<(), ...>, ...>
                     }
                 },
                 EventType::SetXattr | EventType::RemoveXattr => {
