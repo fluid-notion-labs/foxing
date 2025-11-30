@@ -11,7 +11,7 @@ use uuid::Uuid;
 use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
-use tracing::{warn, info, debug, error};
+use tracing::{warn, debug, error};
 
 use crate::buffer::AlignedBuffer;
 use crate::error::{FoxingError, Result};
@@ -52,6 +52,8 @@ impl Drop for TmpFileGuard {
         if self.armed {
             warn!("IO Transaction Failed: Rolling back temp file {:?}", self.path);
             if let Err(e) = std::fs::remove_file(&self.path) {
+                // It's expected to fail if the file was never created or already moved,
+                // but we log just in case.
                 if e.kind() != std::io::ErrorKind::NotFound {
                     error!("CRITICAL: Failed to clean up temp file {:?}: {}", self.path, e);
                 }
@@ -125,6 +127,7 @@ impl SmartCopier {
             let mut off_in = 0i64;
             let mut off_out = 0i64;
             
+            // Measure Syscall Duration Only
             let start = Instant::now();
             let ret = unsafe { 
                 libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) 
