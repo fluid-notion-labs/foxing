@@ -25,6 +25,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo -e "${BLUE}==> tearing down previous environment...${NC}"
+# Lazy unmount to handle busy devices
 if mountpoint -q "$SOURCE_MNT"; then umount -l "$SOURCE_MNT"; fi
 if mountpoint -q "$TARGET_MNT"; then umount -l "$TARGET_MNT"; fi
 rm -rf "$BASE_DIR"
@@ -131,35 +132,41 @@ echo -e "${BLUE}================================================================
 echo -e "\n${YELLOW}1. Run Daemon (Log Filtering):${NC}"
 echo "   RUST_LOG=foxing=debug,warn ./target/release/foxing daemon --config test_config.toml 2>&1 | tee full_log.txt | grep -E --line-buffered \"ERROR|WARN|Gap|Dropped|Worker|BPF Stats\" > ai_context.log"
 
-echo -e "\n${YELLOW}2. Torture Test (Rapid Churn):${NC}"
+echo -e "\n${YELLOW}2. Helper Function (Copy-Paste this):${NC}"
+echo "   wait_for() { for i in {1..20}; do if [ -e \"\$1\" ]; then echo \"OK: \$1 found\"; return 0; fi; sleep 0.2; done; echo \"FAIL: \$1 missing\"; return 1; }"
+
+echo -e "\n${YELLOW}3. Torture Test (Rapid Churn):${NC}"
 echo "   # Create 100 small files"
 echo "   for i in {1..100}; do echo \"torture \$i\" > $SOURCE_MNT/f_\$i.txt; done"
-echo "   sleep 2"
+echo "   wait_for $TARGET_MNT/f_100.txt"
 echo "   # Delete 50 of them"
-echo "   for i in {1..50}; do rm $SOURCE_MNT/f_\$i.txt; done"
+echo "   for i in {1..50}; do rm -f $SOURCE_MNT/f_\$i.txt; done"
 echo "   sync"
+echo "   sleep 1"
 echo "   # Count Target (Should be 50)"
 echo "   ls $TARGET_MNT/f_*.txt | wc -l"
 
-echo -e "\n${YELLOW}3. Metadata & Hierarchy:${NC}"
+echo -e "\n${YELLOW}4. Metadata & Hierarchy:${NC}"
 echo "   mkdir -p $SOURCE_MNT/deep/nested/dir"
 echo "   touch $SOURCE_MNT/deep/nested/dir/secret.dat"
 echo "   chmod 700 $SOURCE_MNT/deep/nested/dir/secret.dat"
-echo "   sleep 2"
+echo "   wait_for $TARGET_MNT/deep/nested/dir/secret.dat"
 echo "   # Verify permissions on target"
 echo "   stat -c '%a' $TARGET_MNT/deep/nested/dir/secret.dat"
 
-echo -e "\n${YELLOW}4. Large File Reflink Check:${NC}"
+echo -e "\n${YELLOW}5. Large File Reflink Check:${NC}"
 echo "   dd if=/dev/urandom of=$SOURCE_MNT/large.bin bs=1M count=50"
-echo "   sync; sleep 2; ls -lh $TARGET_MNT/large.bin"
+echo "   wait_for $TARGET_MNT/large.bin"
 echo "   # Modify tail"
 echo "   echo \"append\" >> $SOURCE_MNT/large.bin"
+echo "   sync"
 
-echo -e "\n${YELLOW}5. Rename Atomicity:${NC}"
+echo -e "\n${YELLOW}6. Rename Atomicity:${NC}"
 echo "   echo \"Atomic Content\" > $SOURCE_MNT/atomic_src.txt"
+echo "   wait_for $TARGET_MNT/atomic_src.txt"
 echo "   mv $SOURCE_MNT/atomic_src.txt $SOURCE_MNT/atomic_dest.txt"
-echo "   sleep 1"
-echo "   # Target should contain atomic_dest.txt with 'Atomic Content'"
+echo "   wait_for $TARGET_MNT/atomic_dest.txt"
+echo "   # Verify content"
 echo "   cat $TARGET_MNT/atomic_dest.txt"
 
 echo ""

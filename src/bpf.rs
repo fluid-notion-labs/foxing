@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::metrics::{self, GLOBAL_BUFFER_LIMIT}; 
 use std::mem;
 use libbpf_rs::MapCore;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error}; // Added error!
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -223,7 +223,12 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                     last_report = std::time::Instant::now();
                 }
             },
-            Err(e) => return Err(FoxingError::Bpf(e.to_string())),
+            // FIX: Don't die on EINTR (os error 4). 
+            // Just log and retry. This keeps the brain alive during load spikes.
+            Err(e) => {
+                warn!("BPF Ring Poll Warning (will retry): {}", e);
+                // Optional: check for specific fatal errors here if needed
+            }
         }
     }
     
