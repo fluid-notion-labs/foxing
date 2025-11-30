@@ -256,27 +256,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     });
 
     // NEW: Hydration Listener Task
-    // This connects the "Gap detected" signal from workers to the Hydrator logic.
-    let hydrator_clone = mgr.get_hydrator(); // We need a way to get the hydrator
-    
-    // Since we can't easily extract the hydrator from the manager after start (ownership),
-    // we should rely on the fact that Manager spawns the initial scan.
-    // Ideally, Manager should expose a method or channel to trigger it.
-    //
-    // However, given the current structure, we need to pass this signal back to the Manager's
-    // hydration logic. 
-    //
-    // HOTFIX: The current architecture makes it hard to call 'hydrator.full_scan()' from here
-    // because `hydrator` is buried in `mgr`.
-    // BUT, `mgr.start()` spins up a thread. 
-    // 
-    // Let's modify `Manager` to expose a trigger, or handle the RX loop itself.
-    // Since we are inside `run_daemon_logic` and have `mgr`, let's check `mirror.rs`.
-    //
-    // Actually, `mgr` moves into `handles`? No, `start` takes `&mut self`.
-    //
-    // We will spawn a loop here that calls a new public method on Manager.
-    
+    // This connects the "Gap detected" signal from workers to the Hydrator logic via Manager
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();
@@ -286,7 +266,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             if sd_for_hyd.load(Ordering::Relaxed) { break; }
             info!("Hydration requested for {:?}", path);
             let m = mgr_for_hydration.lock().await;
-            m.trigger_hydration(); // We need to add this method to Manager
+            m.trigger_hydration();
         }
     });
 
