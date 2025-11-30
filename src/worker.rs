@@ -36,7 +36,10 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// ... [Helper Structs: WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry] ...
+// -----------------------------------------------------------------------------
+// HELPER STRUCTS
+// -----------------------------------------------------------------------------
+
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -387,6 +390,10 @@ struct WorkerContext<'a> {
     cur_cap_total: u64,
 }
 
+// -----------------------------------------------------------------------------
+// WORKER MAIN LOOP
+// -----------------------------------------------------------------------------
+
 pub async fn run_worker(
     source: Arc<SourceInfo>, 
     target_cfg: TargetConfig, 
@@ -401,7 +408,9 @@ pub async fn run_worker(
     let mut order = ordering::OrderBuf::new();
     let locks = Arc::new(ShardedLockCache::new()); 
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new(); 
-    let mut flush_interval = interval(Duration::from_secs(1));
+    // TRIAGE 1: Fast Heartbeat
+    let mut flush_interval = interval(Duration::from_millis(100));
+    
     let mut ring = match IoUring::new(target_cfg.batch_size as u32) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
@@ -431,19 +440,24 @@ pub async fn run_worker(
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         
         let event_poll_result = tokio::select! {
-            biased;
+            // Fair Scheduling: Removed 'biased' to prevent starvation of rx_low (Hydration)
             _ = shutdown_rx.recv() => break Ok(()),
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
+            
+            // Heartbeat ticks every 100ms
             _ = flush_interval.tick() => {
                 let path_clone = target_cfg.path.clone(); 
-                if let Ok(s) = statvfs(&path_clone) {
-                    cur_cap_total = s.blocks() * s.block_size();
-                    cur_cap_avail = s.blocks_available() * s.block_size();
-                    let label = target_cfg.path.to_string_lossy();
-                    metrics::TARGET_CAPACITY_BYTES_TOTAL.with_label_values(&[&label]).set(cur_cap_total as f64);
-                    metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
-                    metrics::TARGET_CAPACITY_INODES_TOTAL.with_label_values(&[&label]).set(s.files() as f64);
-                    metrics::TARGET_CAPACITY_INODES_AVAILABLE.with_label_values(&[&label]).set(s.files_available() as f64);
+                // Only statvfs every 1s (every 10th tick)
+                if flush_interval.period().as_millis() == 100 && (Instant::now().elapsed().as_millis() % 1000 < 150) {
+                     if let Ok(s) = statvfs(&path_clone) {
+                        cur_cap_total = s.blocks() * s.block_size();
+                        cur_cap_avail = s.blocks_available() * s.block_size();
+                        let label = target_cfg.path.to_string_lossy();
+                        metrics::TARGET_CAPACITY_BYTES_TOTAL.with_label_values(&[&label]).set(cur_cap_total as f64);
+                        metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
+                        metrics::TARGET_CAPACITY_INODES_TOTAL.with_label_values(&[&label]).set(s.files() as f64);
+                        metrics::TARGET_CAPACITY_INODES_AVAILABLE.with_label_values(&[&label]).set(s.files_available() as f64);
+                    }
                 }
 
                 if !is_hibernating {
@@ -454,7 +468,11 @@ pub async fn run_worker(
                         last_dropped_check = current_dropped;
                     }
                     
-                    order.check_timeouts();
+                    // NEW: Check for skipped gaps inside OrderBuf
+                    if order.check_timeouts() {
+                        warn!("Gap detected by OrderBuf (Timeout). Triggering partial hydration.");
+                        let _ = hydration_tx.send(source.path.clone()).await;
+                    }
 
                     let now = Instant::now();
                     let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
@@ -577,7 +595,10 @@ pub async fn run_worker(
     }
 }
 
-// Extracted Event Processor to support both Ordered and Immediate execution
+// -----------------------------------------------------------------------------
+// EVENT PROCESSOR
+// -----------------------------------------------------------------------------
+
 async fn process_single_event(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -761,7 +782,12 @@ async fn process_single_event(
                     source_clone.inode_map.lock().pop(&e_clone.inode); 
                     metrics::SYNTHETIC_IDENTITY_FILES.dec(); 
                 }
-                std::fs::remove_file(&dst_clone)
+                let r = std::fs::remove_file(&dst_clone);
+                // NEW: Unlink is idempotent. NotFound is not an error.
+                if let Err(ref e) = r {
+                    if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
+                }
+                r
             }).await.unwrap_or(Ok(())).map_err(|err| err.into());
             if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
             Ok(res.map(|_| None))
@@ -830,7 +856,14 @@ async fn process_single_event(
         },
         EventType::Rmdir => {
             let dst_clone = dst.clone();
-            let res = spawn_blocking(move || { std::fs::remove_dir(&dst_clone) }).await.unwrap_or(Ok(())).map_err(|e| e.into());
+            let res = spawn_blocking(move || { 
+                let r = std::fs::remove_dir(&dst_clone);
+                // NEW: Rmdir is idempotent-ish. NotFound is not an error.
+                if let Err(ref e) = r {
+                    if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
+                }
+                r
+            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
             if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
             Ok(res.map(|_| None))
         },
@@ -897,8 +930,6 @@ async fn process_single_event(
         EventType::SetXattr | EventType::RemoveXattr => {
             let src_clone = src.clone();
             let dst_clone = dst.clone();
-            // sync_xattrs returns (), awaiting gives Result<(), JoinError>. 
-            // We ignore JoinError (panic in thread) via unwrap_or(()), then return explicit Ok(Ok(None)).
             let _ = spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await;
             Ok(Ok(None))
         },
@@ -943,6 +974,7 @@ async fn process_single_event(
                     }
                 }
                 
+                // Fixed E0609 by accessing fields directly from `e` which is still in scope
                 error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, err);
                 if ctx.limiter.check("io") { error!("IO Error: {:?}", err); }
                 ctx.failure_state.record_failure();

@@ -33,11 +33,13 @@ pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct RawEvent {
-    type_: u8, ver: u8, _p: [u8;2], dev: u32, seq: u64, ts: u64, p_ino: u64, ino: u64,
+    type_: u8, ver: u8, interactive: u8, _pad0: [u8;1], 
+    dev: u32, seq: u64, ts: u64, p_ino: u64, ino: u64,
     np_ino: u64, r#gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
     nlink: u32, flags: u32, sz: u64, 
-    projid: u32, _pad3: u32, 
-    name: [u8;256], nname: [u8;256]
+    projid: u32, open_count: u32, 
+    name: [u8;256], nname: [u8;256],
+    comm: [u8;16] 
 }
 
 pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -138,10 +140,16 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         let counter = DEVICE_EVENT_COUNTER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let event_count = counter.fetch_add(1, Ordering::Relaxed);
         
+        // Decode strings
+        let name_len = raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len());
+        let name = String::from_utf8_lossy(&raw.name[..name_len]).to_string();
+        
+        let comm_len = raw.comm.iter().position(|&c| c == 0).unwrap_or(raw.comm.len());
+        let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
+
         if event_count < 100 { 
-            debug!("BPF Event #{} (Seq {}) from device 0x{:08x} ({}): type={}, inode={}, name={:?}", 
-                   event_count, raw.seq, raw.dev, raw.dev, raw.type_, raw.ino, 
-                   String::from_utf8_lossy(&raw.name[..raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len())]));
+            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}, interactive={}, open_count={}", 
+                   event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino, raw.interactive, raw.open_count);
         }
         
         if !queues.contains_key(&raw.dev) {
@@ -162,16 +170,13 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                 event_type: EventType::SequenceGap, dev_id: raw.dev, inode: 0, 
                 parent_inode: 0, seq_num: raw.seq, offset: 0, length: 0, 
                 name: "".into(), new_name: None, generation: 0, projid: 0, 
-                mode: 0, flags: 0,
+                mode: 0, flags: 0, process_name: "kernel".into(), interactive: false, open_count: 0,
                 created_at: std::time::Instant::now() 
             });
             if let Some(qs) = queues.get(&raw.dev) { 
                 for q in qs { q.push(gap.clone()); } 
             }
         }
-        
-        let name_len = raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len());
-        let name = String::from_utf8_lossy(&raw.name[..name_len]).to_string();
         
         let new_name = if raw.type_ == 7 { 
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
@@ -184,6 +189,9 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             name, new_name, generation: raw.r#gen, projid: raw.projid,
             mode: raw.mode,
             flags: raw.flags,
+            process_name: comm, 
+            interactive: raw.interactive == 1,
+            open_count: raw.open_count,
             created_at: std::time::Instant::now()
         });
         

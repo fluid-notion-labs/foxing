@@ -4,7 +4,7 @@
 #include <bpf/bpf_core_read.h>
 
 #define MAX_FILENAME 256
-#define EVENT_VERSION 2
+#define EVENT_VERSION 3
 
 // Attributes flags from linux/fs.h
 #define ATTR_MODE   1
@@ -18,6 +18,9 @@
 struct kprojid_t___p { int val; };
 struct inode___p { struct kprojid_t___p i_projid; } __attribute__((preserve_access_index));
 
+// Needed for i_count read (atomic_t is usually a struct with a counter int)
+struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
+
 struct xfs_mount { struct super_block *m_super; } __attribute__((preserve_access_index));
 struct xfs_trans { struct xfs_mount *t_mountp; } __attribute__((preserve_access_index));
 
@@ -26,13 +29,14 @@ enum event_type {
     EVENT_RMDIR=5, EVENT_FSYNC=6, EVENT_RENAME=7, EVENT_CREATE=8, EVENT_UNLINK=9,
     EVENT_MKDIR=10, EVENT_TRUNCATE=11, EVENT_LINK=12, EVENT_CHMOD=13, EVENT_CHOWN=14,
     EVENT_BARRIER=15, EVENT_MKNOD=16, EVENT_SYMLINK=17, EVENT_FALLOCATE=18,
-    EVENT_UTIMES=19
+    EVENT_UTIMES=19, EVENT_SEQUENCE_GAP=255
 };
 
 struct event {
     __u8 type; 
     __u8 version; 
-    __u8 _pad0[2]; 
+    __u8 interactive; // 1 = Human/TTY, 0 = Background/Daemon
+    __u8 _pad0[1]; 
     __u32 dev_id; __u64 seq_num;
     __u64 timestamp_ns; __u64 parent_inode; __u64 inode; __u64 new_parent_inode;
     __u32 generation; __u32 mode; __u64 offset; __u64 length; __u32 uid;
@@ -41,9 +45,10 @@ struct event {
     __u32 flags; 
     __u64 file_size;
     __u32 projid; 
-    __u32 _pad3; 
+    __u32 open_count; // How many processes have this file open?
     char name[MAX_FILENAME]; 
     char new_name[MAX_FILENAME];
+    char comm[16]; 
 };
 
 struct stats { __u64 events_submitted; __u64 events_dropped; __u64 write_events; __u64 metadata_events; };
@@ -81,12 +86,7 @@ static __always_inline int stash_dentry(struct dentry *dentry) {
     return bpf_map_update_elem(&temp_dentries, &pid_tgid, &ptr, BPF_ANY);
 }
 
-// Helper to normalize device ID from kernel's dev_t format
-// The kernel stores device ID as: (major << 20) | minor
-// We need to extract and normalize this consistently
 static __always_inline __u32 normalize_dev_id(__u32 raw_dev) {
-    // The s_dev field from super_block is already in the correct format
-    // Just return it as-is - userspace will handle byte order
     return raw_dev;
 }
 
@@ -98,8 +98,6 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
     
-    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
-    
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -109,6 +107,21 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
         return 0;
     }
     __builtin_memset(e, 0, sizeof(*e));
+    
+    // --- SMART CLASSIFICATION ---
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct signal_struct *signal = BPF_CORE_READ(task, signal);
+    struct tty_struct *tty = BPF_CORE_READ(signal, tty);
+    
+    e->interactive = (tty != NULL) ? 1 : 0;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    
+    // Check Atomic open count (approximation of file hotness)
+    // We read it directly. >1 implies held by others (dentry cache holds 1)
+    struct atomic_t___p *ac = (struct atomic_t___p *)&inode->i_count;
+    e->open_count = BPF_CORE_READ(ac, counter);
+    // ----------------------------
+
     e->type = type; e->version = EVENT_VERSION; e->dev_id = dev_id;
     e->seq_num = next_seq(dev_id); e->timestamp_ns = bpf_ktime_get_ns();
     e->inode = BPF_CORE_READ(inode, i_ino); 
@@ -200,12 +213,20 @@ SEC("kprobe/vfs_rename") int BPF_KPROBE(trace_rename, void *idmap, struct rename
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
     
-    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
     
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
     __builtin_memset(e, 0, sizeof(*e));
+    
+    // --- SMART CLASSIFICATION (RENAME) ---
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct signal_struct *signal = BPF_CORE_READ(task, signal);
+    struct tty_struct *tty = BPF_CORE_READ(signal, tty);
+    e->interactive = (tty != NULL) ? 1 : 0;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    // -------------------------------------
+
     e->type = EVENT_RENAME; e->version = EVENT_VERSION; e->dev_id = dev_id;
     e->seq_num = next_seq(dev_id); e->timestamp_ns = bpf_ktime_get_ns();
     e->inode = BPF_CORE_READ(inode, i_ino); e->generation = BPF_CORE_READ(inode, i_generation);
@@ -256,7 +277,6 @@ SEC("kprobe/xfs_trans_commit") int BPF_KPROBE(trace_xfs_commit, struct xfs_trans
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
     
-    bpf_printk("FOXING-DEBUG: Write detected on dev_id: %u (raw: %u)\n", dev_id, raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;

@@ -46,7 +46,10 @@ pub struct Event {
     pub generation: u32,
     pub projid: u32,
     pub mode: u32, 
-    pub flags: u32, // ADDED: Now carries the flags from BPF
+    pub flags: u32,
+    pub process_name: String,
+    pub interactive: bool, // NEW: Is this from a TTY/Human?
+    pub open_count: u32,   // NEW: Is this file hot?
     pub created_at: std::time::Instant
 }
 
