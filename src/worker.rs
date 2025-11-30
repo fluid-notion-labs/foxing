@@ -560,9 +560,7 @@ pub async fn run_worker(
                 },
                 Ok(None) => {}, // Success, no bytes
                 Err(_) => {
-                    // Error handled inside process_single_event (breaker tripped etc), push back if needed?
-                    // For now process_single_event handles the error state updates
-                    // Re-queuing failed events would be complex here, relying on hydration for recovery
+                    // Error handled inside process_single_event
                 }
             }
         }
@@ -899,7 +897,10 @@ async fn process_single_event(
         EventType::SetXattr | EventType::RemoveXattr => {
             let src_clone = src.clone();
             let dst_clone = dst.clone();
-            Ok(Ok(spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await.unwrap_or(()).map(|_| None)))
+            // sync_xattrs returns (), awaiting gives Result<(), JoinError>. 
+            // We ignore JoinError (panic in thread) via unwrap_or(()), then return explicit Ok(Ok(None)).
+            let _ = spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await;
+            Ok(Ok(None))
         },
         EventType::Chmod | EventType::Chown | EventType::Utimes => {
             let src_clone = src.clone();
@@ -927,9 +928,9 @@ async fn process_single_event(
 
     match res {
         Ok(inner) => {
-            if let Err(e) = inner {
+            if let Err(err) = inner {
                 // If IO error 28 (ENOSPC)
-                if let FoxingError::Io(io_err) = &e {
+                if let FoxingError::Io(io_err) = &err {
                     if let Some(28) = io_err.raw_os_error() {
                         error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
                         ctx.capacity_breaker.trip();
@@ -942,19 +943,19 @@ async fn process_single_event(
                     }
                 }
                 
-                error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, e);
-                if ctx.limiter.check("io") { error!("IO Error: {:?}", e); }
+                error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, err);
+                if ctx.limiter.check("io") { error!("IO Error: {:?}", err); }
                 ctx.failure_state.record_failure();
-                Err(e)
+                Err(err)
             } else {
                 ctx.failure_state.record_success();
                 inner
             }
         },
-        Err(e) => {
-            // Processing error
+        Err(err) => {
+            // Processing error (e.g. breaker tripped)
             ctx.failure_state.record_failure();
-            Err(e)
+            Err(err)
         }
     }
 }
