@@ -52,6 +52,8 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     
     let self_pid = std::process::id();
     let pid_val: u8 = 1;
+    
+    info!("BPF: Registering Daemon PID {} for feedback loop filtering", self_pid);
     skel.maps.ignored_pids.update(&self_pid.to_ne_bytes(), &pid_val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .map_err(|e| FoxingError::Bpf(format!("Failed to register PID filter: {}", e)))?;
 

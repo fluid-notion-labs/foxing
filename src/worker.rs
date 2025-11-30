@@ -23,6 +23,8 @@ use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
 use futures::StreamExt;
 use serde::{Serialize, Deserialize};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
@@ -210,17 +212,27 @@ impl FailureState {
     fn check_hibernation_needed(&self) -> bool { self.is_failed.load(Ordering::Relaxed) && self.last_failure.elapsed() > self.hibernation_threshold }
 }
 
+// FIX: Switched from locking Inode (u64) to locking Path Hash (u64)
+// This prevents race conditions between Atomic Writes (updates) and Deletions,
+// which operate on the same path but potentially different inodes.
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new() -> Self {
-        let mut shards = Vec::with_capacity(64);
-        for _ in 0..64 { shards.push(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()))); }
+        let mut shards = Vec::with_capacity(128); // Increased shards
+        for _ in 0..128 { shards.push(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))); }
         Self { shards }
     }
-    fn get(&self, inode: u64) -> Arc<tokio::sync::Mutex<()>> {
-        let idx = (inode as usize) % 64;
+    
+    fn get(&self, key: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let idx = (key as usize) % 128;
         let mut s = self.shards[idx].lock();
-        s.get_or_insert(inode, || Arc::new(tokio::sync::Mutex::new(()))).clone()
+        s.get_or_insert(key, || Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+    
+    fn get_by_path(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        self.get(hasher.finish())
     }
 }
 #[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
@@ -624,8 +636,10 @@ async fn process_single_event(
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
 
-    let lock = ctx.locks.get(e.inode);
+    // FIX: Lock by Path Hash instead of Inode to prevent Update/Delete races
+    let lock = ctx.locks.get_by_path(&e.name);
     let _g = lock.lock().await;
+    
     let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
 
     if needs_creation {
