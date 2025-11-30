@@ -18,6 +18,9 @@
 struct kprojid_t___p { int val; };
 struct inode___p { struct kprojid_t___p i_projid; } __attribute__((preserve_access_index));
 
+// Needed for i_count read (atomic_t is usually a struct with a counter int)
+struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
+
 struct xfs_mount { struct super_block *m_super; } __attribute__((preserve_access_index));
 struct xfs_trans { struct xfs_mount *t_mountp; } __attribute__((preserve_access_index));
 

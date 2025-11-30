@@ -46,7 +46,6 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
             // 2. EDGE CASE: Read-Only Filesystem (Rescue Mode)
             // If the FS is RO, writing a sidecar will also fail. 
             // Return early to avoid log spam/double errors.
-            // FIX: Use correct error kind ReadOnlyFilesystem
             if e.kind() == io::ErrorKind::ReadOnlyFilesystem {
                 return;
             }

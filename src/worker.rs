@@ -212,9 +212,6 @@ impl FailureState {
     fn check_hibernation_needed(&self) -> bool { self.is_failed.load(Ordering::Relaxed) && self.last_failure.elapsed() > self.hibernation_threshold }
 }
 
-// FIX: Switched from locking Inode (u64) to locking Path Hash (u64)
-// This prevents race conditions between Atomic Writes (updates) and Deletions,
-// which operate on the same path but potentially different inodes.
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new() -> Self {
@@ -635,6 +632,11 @@ async fn process_single_event(
     let e_clone = e.clone();
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
+    
+    // FIX: Ignore .tmp files from self
+    if e.name.contains(".tmp.") {
+        return Ok(None);
+    }
 
     // FIX: Lock by Path Hash instead of Inode to prevent Update/Delete races
     let lock = ctx.locks.get_by_path(&e.name);

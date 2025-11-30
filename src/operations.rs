@@ -1,4 +1,4 @@
-use std::path::{Path};
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::fd::IntoRawFd;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 use crate::buffer::AlignedBuffer;
 use crate::error::{FoxingError, Result};
@@ -27,7 +28,37 @@ const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
 pub struct CopyStats {
     pub bytes_processed: u64,
     pub bytes_zeros: u64,
-    pub io_duration: Duration, // Restored for BBR
+    pub io_duration: Duration, 
+}
+
+// RAII Guard to ensure .tmp files are deleted if the operation fails/panics
+struct TmpFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                // It's expected to fail if the file was never created or already moved,
+                // but we log just in case.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to clean up temp file {:?}: {}", self.path, e);
+                }
+            }
+        }
+    }
 }
 
 pub struct SmartCopier;
@@ -57,6 +88,13 @@ impl SmartCopier {
             )
         } else {
             (dst.to_path_buf(), libc::O_RDWR)
+        };
+
+        // Initialize cleanup guard. If we return Err at any point, this will delete target_path.
+        let mut cleanup_guard = if is_full_replace {
+            Some(TmpFileGuard::new(target_path.clone()))
+        } else {
+            None
         };
 
         let use_direct_io = direct_io_ok && is_full_replace && length >= 4096 && (length % 4096 == 0);
@@ -159,22 +197,20 @@ impl SmartCopier {
             }
         }
 
-        if !is_full_replace {
-             unsafe { 
-                 libc::fsync(dfd);
-                 libc::close(dfd);
-             }
-        } else {
-             unsafe { 
-                 libc::fsync(dfd);
-                 libc::close(dfd); 
-             }
+        // Safe Close
+        unsafe { 
+            libc::fsync(dfd);
+            libc::close(dfd);
         }
 
         if is_full_replace {
+            // Atomic Rename
             if let Err(e) = std::fs::rename(&target_path, dst) {
-                let _ = std::fs::remove_file(&target_path);
                 return Err(FoxingError::Io(e));
+            }
+            // Success! Disarm the guard so we don't delete the file we just moved.
+            if let Some(g) = &mut cleanup_guard {
+                g.disarm();
             }
         }
 
