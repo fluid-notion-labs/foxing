@@ -809,9 +809,17 @@ pub async fn run_worker(
                          if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
                     }
                     
+                    let dst_for_commit = dst_clone.clone(); // Clone for closure to avoid E0382
                     let r = spawn_blocking(move || {
-                        let r = security::commit_epoch(&dst_clone, seq_num, projid); 
-                        if r.is_ok() { if let Some(parent) = dst_clone.parent() { if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } } }
+                        let r = security::commit_epoch(&dst_for_commit, seq_num, projid); 
+                        if r.is_ok() { 
+                            // Use cloned dst_for_commit inside closure
+                            if let Some(parent) = dst_for_commit.parent() { 
+                                if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { 
+                                    security::write_dir_integrity_hash(parent, hash); 
+                                } 
+                            } 
+                        }
                         r
                     }).await.unwrap_or(Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
                     
