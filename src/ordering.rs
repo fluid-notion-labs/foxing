@@ -5,7 +5,10 @@ use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
 
-const MAX_HOL_DELAY: Duration = Duration::from_millis(500);
+// TRIAGE 2: Reduce from 500ms to 100ms
+// In local/loopback scenarios, if an event isn't here in 100ms, it's dropped.
+// Waiting longer just creates perceptible UI lag.
+const MAX_HOL_DELAY: Duration = Duration::from_millis(100);
 const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
 
 struct PendingEvent {
@@ -38,7 +41,8 @@ impl OrderBuf {
         
         if self.pending.len() >= self.max_count || self.current_bytes >= MAX_PENDING_BYTES {
             metrics::EVENTS_DROPPED.inc();
-            self.check_timeouts();
+            // Try to clear space by forcing a timeout check
+            let _ = self.check_timeouts();
             if self.pending.len() >= self.max_count {
                 return false;
             }
@@ -56,7 +60,9 @@ impl OrderBuf {
         true
     }
 
-    pub fn check_timeouts(&mut self) {
+    /// Checks for Head-of-Line blocking.
+    /// Returns `true` if a gap was detected and skipped (indicating potential data loss/need for sync).
+    pub fn check_timeouts(&mut self) -> bool {
         if let Some((&first_seq, first_entry)) = self.pending.iter().next() {
             if first_seq > self.next_seq {
                 if first_entry.arrival.elapsed() > MAX_HOL_DELAY {
@@ -65,13 +71,16 @@ impl OrderBuf {
                           self.next_seq, first_seq, gap);
                     metrics::SEQUENCE_GAPS.with_label_values(&[&first_entry.event.dev_id.to_string()]).inc();
                     self.next_seq = first_seq;
+                    return true;
                 }
             }
         }
+        false
     }
 
     pub fn pop_batch(&mut self, coalesce_limit: u64) -> Option<Arc<Event>> {
-        self.check_timeouts();
+        // We do NOT call check_timeouts here automatically anymore to allow caller to handle the bool return
+        // The worker loop calls check_timeouts explicitly now.
 
         if let Some(entry) = self.pending.remove(&self.next_seq) {
             let mut current_event = entry.event; 

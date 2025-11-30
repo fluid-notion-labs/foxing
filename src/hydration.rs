@@ -203,6 +203,7 @@ impl Hydrator {
                 dev_id: self.source.dev,
                 inode: ino, parent_inode: 0, seq_num: 0, offset: 0, length: m.len(),
                 name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: m.mode(), flags: 0,
+                process_name: "hydration".into(), interactive: false, open_count: 0,
                 created_at: Instant::now(),
             };
             q.push(Arc::new(evt));
@@ -231,6 +232,7 @@ impl Hydrator {
                 dev_id: self.source.dev,
                 inode: ino, parent_inode: 0, seq_num: 0, offset: 0, length: 0,
                 name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0,
+                process_name: "hydration".into(), interactive: false, open_count: 0,
                 created_at: Instant::now(),
             };
             q.push(Arc::new(evt));
@@ -246,6 +248,7 @@ impl Hydrator {
                 dev_id: self.source.dev,
                 inode: ino, parent_inode: 0, seq_num: 0, offset: 0, length: 0,
                 name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: m.mode(), flags: 0,
+                process_name: "hydration".into(), interactive: false, open_count: 0,
                 created_at: Instant::now(),
             };
             q.push(Arc::new(evt));
