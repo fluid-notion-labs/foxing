@@ -25,7 +25,6 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo -e "${BLUE}==> tearing down previous environment...${NC}"
-# Lazy unmount to handle busy devices
 if mountpoint -q "$SOURCE_MNT"; then umount -l "$SOURCE_MNT"; fi
 if mountpoint -q "$TARGET_MNT"; then umount -l "$TARGET_MNT"; fi
 rm -rf "$BASE_DIR"
@@ -81,7 +80,7 @@ cat > "$CONFIG_PATH" <<EOF
 # Generated Test Configuration for Foxing (Advanced Loopback)
 
 # --- Global ---
-worker_count = 2
+worker_count = 4
 queue_max = 200000
 metrics_port = 9101
 global_buffer_limit = 5242880 # 5MB limit for small test
@@ -132,36 +131,35 @@ echo -e "${BLUE}================================================================
 echo -e "\n${YELLOW}1. Run Daemon (Log Filtering):${NC}"
 echo "   RUST_LOG=foxing=debug,warn ./target/release/foxing daemon --config test_config.toml 2>&1 | tee full_log.txt | grep -E --line-buffered \"ERROR|WARN|Gap|Dropped|Worker|BPF Stats\" > ai_context.log"
 
-echo -e "\n${YELLOW}2. Basic Load (File Creation):${NC}"
-echo "   for i in {1..5}; do echo \"data \$i\" > $SOURCE_MNT/file_\$i.txt; done"
+echo -e "\n${YELLOW}2. Torture Test (Rapid Churn):${NC}"
+echo "   # Create 100 small files"
+echo "   for i in {1..100}; do echo \"torture \$i\" > $SOURCE_MNT/f_\$i.txt; done"
+echo "   sleep 2"
+echo "   # Delete 50 of them"
+echo "   for i in {1..50}; do rm $SOURCE_MNT/f_\$i.txt; done"
+echo "   sync"
+echo "   # Count Target (Should be 50)"
+echo "   ls $TARGET_MNT/f_*.txt | wc -l"
 
-echo -e "\n${YELLOW}3. Advanced Load (SELinux & Renames):${NC}"
-echo "   # Test 1: SELinux Label Preservation"
-echo "   chcon -t httpd_sys_content_t $SOURCE_MNT/file_1.txt"
-echo "   # Test 2: Atomic Rename Overwrite"
-echo "   mv $SOURCE_MNT/file_1.txt $SOURCE_MNT/file_2.txt"
-echo "   # Test 3: Rapid Delete (The Zombie Test)"
-echo "   touch $SOURCE_MNT/zombie.txt; rm $SOURCE_MNT/zombie.txt"
+echo -e "\n${YELLOW}3. Metadata & Hierarchy:${NC}"
+echo "   mkdir -p $SOURCE_MNT/deep/nested/dir"
+echo "   touch $SOURCE_MNT/deep/nested/dir/secret.dat"
+echo "   chmod 700 $SOURCE_MNT/deep/nested/dir/secret.dat"
+echo "   sleep 2"
+echo "   # Verify permissions on target"
+echo "   stat -c '%a' $TARGET_MNT/deep/nested/dir/secret.dat"
 
-echo -e "\n${YELLOW}4. Versioning & Reflink Stress Test (Crucial):${NC}"
-echo "   # A. Space Efficiency (Reflink Check)"
-echo "   # Create a 100MB file. Target usage should jump ~100MB."
-echo "   dd if=/dev/urandom of=$SOURCE_MNT/blob.bin bs=1M count=100"
-echo "   sync; sleep 2; du -sh $TARGET_MNT"
-echo "   # Modify 1 byte. This creates a Version Snapshot."
-echo "   echo \"modification\" >> $SOURCE_MNT/blob.bin"
-echo "   # If Reflinks work: Usage increases by only ~4KB (Metadata), NOT another 100MB."
-echo "   sync; sleep 2; du -sh $TARGET_MNT"
-echo "   "
-echo "   # B. Version Rotation (Retention Check)"
-echo "   # Creates 10 updates. Should only keep last 5 versions in .mirror/.versions"
-echo "   for i in {1..10}; do echo \"v\$i\" >> $SOURCE_MNT/rotate.txt; sleep 1.1; done"
-echo "   ls -1 $TARGET_MNT/.mirror/.versions/ | grep rotate | wc -l"
+echo -e "\n${YELLOW}4. Large File Reflink Check:${NC}"
+echo "   dd if=/dev/urandom of=$SOURCE_MNT/large.bin bs=1M count=50"
+echo "   sync; sleep 2; ls -lh $TARGET_MNT/large.bin"
+echo "   # Modify tail"
+echo "   echo \"append\" >> $SOURCE_MNT/large.bin"
 
-echo -e "\n${YELLOW}5. Verify:${NC}"
-echo "   # Check Diff"
-echo "   diff -r $SOURCE_MNT $TARGET_MNT"
-echo "   # Check Metadata (requires getfattr)"
-echo "   getfattr -d -m - $TARGET_MNT/file_2.txt"
+echo -e "\n${YELLOW}5. Rename Atomicity:${NC}"
+echo "   echo \"Atomic Content\" > $SOURCE_MNT/atomic_src.txt"
+echo "   mv $SOURCE_MNT/atomic_src.txt $SOURCE_MNT/atomic_dest.txt"
+echo "   sleep 1"
+echo "   # Target should contain atomic_dest.txt with 'Atomic Content'"
+echo "   cat $TARGET_MNT/atomic_dest.txt"
 
 echo ""

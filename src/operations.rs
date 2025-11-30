@@ -11,7 +11,7 @@ use uuid::Uuid;
 use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{warn, info, debug, error};
 
 use crate::buffer::AlignedBuffer;
 use crate::error::{FoxingError, Result};
@@ -50,11 +50,10 @@ impl TmpFileGuard {
 impl Drop for TmpFileGuard {
     fn drop(&mut self) {
         if self.armed {
+            warn!("IO Transaction Failed: Rolling back temp file {:?}", self.path);
             if let Err(e) = std::fs::remove_file(&self.path) {
-                // It's expected to fail if the file was never created or already moved,
-                // but we log just in case.
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Failed to clean up temp file {:?}: {}", self.path, e);
+                    error!("CRITICAL: Failed to clean up temp file {:?}: {}", self.path, e);
                 }
             }
         }
@@ -126,7 +125,6 @@ impl SmartCopier {
             let mut off_in = 0i64;
             let mut off_out = 0i64;
             
-            // Measure Syscall Duration Only
             let start = Instant::now();
             let ret = unsafe { 
                 libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) 
@@ -151,10 +149,12 @@ impl SmartCopier {
                 } else {
                     metrics::COPY_METHOD_REFLINK.inc();
                 }
+                debug!("Reflink success for {:?}", dst);
 
             } else if ret < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno != libc::EXDEV {
+                    warn!("Reflink failed for {:?}, disabling optimization. Errno: {}", dst, errno);
                     reflink_ok.store(false, Ordering::Relaxed);
                 }
             }
@@ -190,6 +190,7 @@ impl SmartCopier {
                 }
                 stats.bytes_processed = src_file_size;
                 stats.io_duration = duration;
+                debug!("Standard copy success for {:?}", dst);
             } else {
                 // Delta Update
                 metrics::COPY_METHOD_STANDARD.inc();
@@ -205,7 +206,9 @@ impl SmartCopier {
 
         if is_full_replace {
             // Atomic Rename
+            debug!("Atomic Commit: Renaming {:?} -> {:?}", target_path, dst);
             if let Err(e) = std::fs::rename(&target_path, dst) {
+                error!("Atomic Rename Failed {:?} -> {:?}: {}", target_path, dst, e);
                 return Err(FoxingError::Io(e));
             }
             // Success! Disarm the guard so we don't delete the file we just moved.
