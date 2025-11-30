@@ -55,11 +55,10 @@ impl Hydrator {
 
         info!("Hydration: Starting full background scan of {:?}", self.source.path);
 
+        // 1. ADDITIVE SCAN (Source -> Target)
         let walk = WalkDir::new(&self.source.path).into_iter();
-
         for entry_result in walk {
             self.governor.pace_hydration();
-
             match entry_result {
                 Ok(entry) => {
                     let path = entry.path();
@@ -68,6 +67,43 @@ impl Hydrator {
                     }
                 }
                 Err(e) => warn!("Hydration walk error: {}", e),
+            }
+        }
+
+        // 2. SUBTRACTIVE SCAN (Target -> Source) to fix deletions
+        // Only run this if we are not under high load, as it is expensive
+        if !self.governor.is_system_stressed() {
+            info!("Hydration: Starting deletion sweep.");
+            for (target_cfg, _, q) in &self.targets {
+                let target_walk = WalkDir::new(&target_cfg.path).into_iter();
+                for entry_result in target_walk {
+                    if let Ok(entry) = entry_result {
+                        let target_path = entry.path();
+                        
+                        // Skip internal directories
+                        if target_path.to_string_lossy().contains(".mirror") || 
+                           target_path.to_string_lossy().contains(".foxing_meta") {
+                            continue;
+                        }
+
+                        if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                            let source_path = self.source.path.join(rel);
+                            if !source_path.exists() {
+                                // FOUND ZOMBIE!
+                                info!("Hydration: Found zombie file {:?}, queueing deletion.", rel);
+                                let evt = Event {
+                                    event_type: EventType::Unlink,
+                                    dev_id: self.source.dev,
+                                    inode: 0, parent_inode: 0, seq_num: 0, offset: 0, length: 0,
+                                    name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0,
+                                    process_name: "hydration".into(), interactive: false, 
+                                    created_at: Instant::now(),
+                                };
+                                q.push(Arc::new(evt));
+                            }
+                        }
+                    }
+                }
             }
         }
 

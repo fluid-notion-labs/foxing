@@ -16,9 +16,7 @@ pub type HydrationRx = mpsc::Receiver<PathBuf>;
 pub struct SourceInfo { 
     pub path: PathBuf, 
     pub mount: PathBuf, 
-    // Primary Device ID (used for metrics/logging)
     pub dev: u32, 
-    // All associated Device IDs (used for BPF filtering)
     pub dev_ids: Vec<u32>, 
     pub hydration: Arc<crate::hydration::HydrationState>,
     pub inode_map: identity::InodeMap,
@@ -27,9 +25,11 @@ pub struct SourceInfo {
 
 pub struct Manager {
     config: SharedConfig, 
-    sources: HashMap<u32, Arc<SourceInfo>>, // Keyed by Primary ID
+    sources: HashMap<u32, Arc<SourceInfo>>, 
     watchers: Vec<notify::RecommendedWatcher>,
     hydration_handles: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>>,
+    // NEW: Store hydrators to trigger them later
+    hydrators: Vec<Arc<Hydrator>>,
     pub queues: HashMap<u32, Vec<Arc<EventQueue>>>,
     pub governor: Arc<Governor>,
     pub tuner_board: TunerBoard,
@@ -43,52 +43,36 @@ fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
 
     debug!("Resolving device IDs for path: {:?}", canonical);
 
-    // Strategy 1: stat() the path directly (Userspace View)
     if let Ok(meta) = fs::metadata(&canonical) {
         let rdev = meta.dev();
         let maj = ((rdev >> 8) & 0xfff) as u32;
         let min = ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32;
         let stat_id = (maj << 20) | min;
         ids.push(stat_id);
-        debug!("Strategy 1 (stat): 0x{:08x}", stat_id);
     }
 
-    // Strategy 2: Parse /proc/self/mountinfo (Kernel View)
     if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
         let mut best_len = 0;
-        
         for line in mountinfo.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 { continue; }
-
             let mount_root = parts[4]; 
-            
             if canonical.to_string_lossy().starts_with(mount_root) {
                  if mount_root.len() >= best_len {
                      best_len = mount_root.len();
                      mount_point = PathBuf::from(mount_root);
-                     
                      let maj_min = parts[2];
                      let dev_parts: Vec<&str> = maj_min.split(':').collect();
                      if dev_parts.len() == 2 {
                          let major: u32 = dev_parts[0].parse().unwrap_or(0);
                          let minor: u32 = dev_parts[1].parse().unwrap_or(0);
                          let kernel_id = (major << 20) | minor;
-                         
-                         if !ids.contains(&kernel_id) {
-                             ids.push(kernel_id);
-                             debug!("Strategy 2 (mountinfo): 0x{:08x} for mount {:?}", kernel_id, mount_root);
-                         }
+                         if !ids.contains(&kernel_id) { ids.push(kernel_id); }
                      }
                  }
             }
         }
     }
-
-    if ids.is_empty() {
-        warn!("Failed to resolve ANY device IDs for {:?}. BPF capture may fail.", canonical);
-    }
-
     Ok((mount_point, ids))
 }
 
@@ -101,16 +85,11 @@ impl Manager {
             config_reader.hydration_delay_ms
         ));
 
-        // 1. First pass: Collect all TARGET Device IDs to exclude them
-        // This prevents the "Ouroboros" feedback loop where the daemon watches its own writes.
         let mut target_ids_to_exclude = Vec::new();
         for sc in &config_reader.sources {
             for tc in &sc.targets {
                 match resolve_all_device_ids(&tc.path) {
-                    Ok((_, ids)) => {
-                        debug!("Identified Target IDs to exclude for {:?}: {:?}", tc.path, ids);
-                        target_ids_to_exclude.extend(ids);
-                    },
+                    Ok((_, ids)) => target_ids_to_exclude.extend(ids),
                     Err(e) => warn!("Failed to resolve target device ID for exclusion {:?}: {}", tc.path, e),
                 }
             }
@@ -124,29 +103,18 @@ impl Manager {
             match resolve_all_device_ids(&sc.path) {
                 Ok((mount_path, mut dev_ids)) => {
                     if dev_ids.is_empty() { continue; }
-                    
-                    // Filter out any IDs that belong to Targets
-                    let original_count = dev_ids.len();
                     dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
-                    
-                    if dev_ids.len() < original_count {
-                        warn!("Excluded {} device IDs that overlapped with Targets (Feedback Loop Prevention).", original_count - dev_ids.len());
-                    }
-
                     if dev_ids.is_empty() {
-                        error!("Source {:?} has NO device IDs left after excluding Targets! Replication will fail.", sc.path);
+                        error!("Source {:?} has NO device IDs left after excluding Targets!", sc.path);
                         continue;
                     }
-                    
-                    let primary_dev = dev_ids[0]; // Use first found as primary key
+                    let primary_dev = dev_ids[0]; 
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
-                    info!("  Watched Device IDs: {:?}", dev_ids.iter().map(|id| format!("0x{:08x}", id)).collect::<Vec<_>>());
-
                     sources.insert(primary_dev, Arc::new(SourceInfo { 
                         path: sc.path.clone(), 
                         mount: mount_path, 
-                        dev: primary_dev, // Primary ID for metrics
-                        dev_ids: dev_ids.clone(), // All IDs for BPF
+                        dev: primary_dev, 
+                        dev_ids: dev_ids.clone(), 
                         hydration: Arc::new(crate::hydration::HydrationState::default()),
                         inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
                         lru_size: cache_size.get(),
@@ -163,6 +131,7 @@ impl Manager {
             watchers: Vec::new(),
             hydration_handles: Arc::new(Mutex::new(Vec::new())), 
             queues: HashMap::new(),
+            hydrators: Vec::new(),
             governor,
             tuner_board: Arc::new(DashMap::new()),
         }
@@ -188,7 +157,6 @@ impl Manager {
                     let (low_tx_raw, low_rx_raw) = crate::event::create_fanout(global_queue_max, target_workers);
                     let low_queue_arc = Arc::new(low_tx_raw);
 
-                    // REGISTER ALL DETECTED IDS TO THE SAME QUEUE
                     for alt_dev_id in &src.dev_ids {
                         queues.entry(*alt_dev_id).or_default().push(high_queue_arc.clone());
                     }
@@ -229,6 +197,9 @@ impl Manager {
                         self.watchers.push(watcher);
                     }
 
+                    // Save hydrator for manual triggering
+                    self.hydrators.push(hydrator.clone());
+
                     let h_clone = hydrator.clone();
                     let thread_handle = std::thread::spawn(move || {
                         h_clone.full_scan();
@@ -241,6 +212,18 @@ impl Manager {
         
         self.queues = queues.clone();
         (queues, handles, shutdowns, hydration_rx)
+    }
+
+    pub fn trigger_hydration(&self) {
+        // Trigger scans on all hydrators
+        for h in &self.hydrators {
+            let h_clone = h.clone();
+            let thread_handle = std::thread::spawn(move || {
+                h_clone.full_scan();
+                Ok(())
+            });
+            self.hydration_handles.lock().push(thread_handle);
+        }
     }
 
     pub fn wait_hydration(&self) {
