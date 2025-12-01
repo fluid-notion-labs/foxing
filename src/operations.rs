@@ -78,8 +78,10 @@ impl SmartCopier {
         let src_file_size = sf.metadata()?.len();
         let sfd = sf.as_raw_fd();
 
-        // LOGGING FIX: Debug why full replacement is triggered
-        let is_full_replace = offset == 0 && length == src_file_size && src_file_size > 0;
+        // FIX: Allow 0-byte files to trigger Atomic Replace (O_CREAT)
+        // Previously `&& src_file_size > 0` prevented empty files from being created.
+        let is_full_replace = offset == 0 && length == src_file_size;
+        
         if is_full_replace && src_file_size > 10 * 1024 * 1024 {
             debug!("SmartCopier: Triggering FULL ATOMIC REPLACE for {:?} (Size: {}). Reason: Offset=0, Len=Match", dst, src_file_size);
         }
@@ -128,12 +130,17 @@ impl SmartCopier {
             let mut off_out = 0i64;
             
             let start = Instant::now();
-            let ret = unsafe { 
-                libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) 
+            // Use u64::MAX for len to mean "whole file", but src_file_size works too. 
+            // Note: copy_file_range(..., 0, ...) returns 0.
+            let ret = if src_file_size > 0 {
+                 unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) }
+            } else {
+                 0 // 0-byte file "reflink" is effectively a no-op that succeeds
             };
+            
             let duration = start.elapsed();
 
-            if ret > 0 && ret == src_file_size as isize {
+            if ret >= 0 && ret == src_file_size as isize {
                 transfer_done = true;
                 stats.bytes_processed = src_file_size;
                 stats.io_duration = duration;
@@ -151,7 +158,10 @@ impl SmartCopier {
                 } else {
                     metrics::COPY_METHOD_REFLINK.inc();
                 }
-                debug!("Reflink success for {:?}", dst);
+                
+                if src_file_size > 0 {
+                    debug!("Reflink success for {:?}", dst);
+                }
 
             } else if ret < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -190,7 +200,7 @@ impl SmartCopier {
                 }
                 stats.bytes_processed = src_file_size;
                 stats.io_duration = duration;
-                debug!("Standard copy success for {:?}", dst);
+                if src_file_size > 0 { debug!("Standard copy success for {:?}", dst); }
             } else {
                 metrics::COPY_METHOD_STANDARD.inc();
                 stats = Self::perform_delta_uring(ring, buf, sfd, dfd, offset, length, vdo_opt, use_uncached_io).await?;
