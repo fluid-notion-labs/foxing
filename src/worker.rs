@@ -1,4 +1,3 @@
-// ... (Previous imports remain the same)
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
     collections::{HashMap, VecDeque}, 
@@ -26,8 +25,7 @@ use futures::StreamExt;
 use serde::{Serialize, Deserialize};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-
-// ... (TunerState, WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry, BbrTuner, WorkerContext implementations remain the same as previous)
+use tokio::time::sleep;
 
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
@@ -41,9 +39,10 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// ... (Paste helper structs WindowedFilter through BbrTuner from previous version here) ...
-// (To save space, assuming helper structs are unchanged. If you need them re-pasted, let me know)
-// RE-PASTING HELPERS FOR COMPLETENESS
+// -----------------------------------------------------------------------------
+// HELPER STRUCTS
+// -----------------------------------------------------------------------------
+
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -359,7 +358,8 @@ impl BbrTuner {
     }
     
     fn should_defer_maintenance(&self) -> bool {
-        matches!(self.state, TunerState::Startup | TunerState::Muted)
+        // FIX 1: Defer maintenance if the BBR state is stressed.
+        matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain | TunerState::SpacePressure)
     }
 
     fn calculate_version_limits(&self, cfg: &TargetConfig, avail: u64, total: u64) -> (usize, u64) {
@@ -439,6 +439,10 @@ pub async fn run_worker(
     let mut last_dropped_check = 0u64;
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
+    
+    // LAST HYDRATION REQUEST TIME (Used for Debounce)
+    let mut last_hydration_request = Instant::now().sub(Duration::from_secs(5));
+    const HYDRATION_DEBOUNCE_SECS: u64 = 5;
 
     loop {
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
@@ -446,6 +450,19 @@ pub async fn run_worker(
         let event_poll_result = tokio::select! {
             _ = shutdown_rx.recv() => break Ok(()),
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
+            
+            // LOW PRIORITY QUEUE POLLING (Hydration)
+            Some(e) = async {
+                // FIX 2: Throttling rx_low based on BBR state (prioritizing rx_high)
+                let current_state = tuner_board.get(&target_cfg.path).map(|r| *r).unwrap_or(TunerState::Startup);
+                
+                // If Draining, Muted, or Stressed, pause rx_low consumption to clear high queue backlog
+                if matches!(current_state, TunerState::Drain | TunerState::Muted | TunerState::SpacePressure) {
+                    sleep(Duration::from_millis(50)).await;
+                }
+
+                rx_low.recv().await
+            } => { if is_hibernating { order.push_and_check(e.unwrap()); continue; } e },
             
             _ = flush_interval.tick() => {
                 let path_clone = target_cfg.path.clone(); 
@@ -460,18 +477,27 @@ pub async fn run_worker(
                         metrics::TARGET_CAPACITY_INODES_AVAILABLE.with_label_values(&[&label]).set(s.files_available() as f64);
                     }
                 }
+                
+                let time_since_last_req = last_hydration_request.elapsed();
+                let should_request_hydration = time_since_last_req >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS);
 
                 if !is_hibernating {
                     let current_dropped = metrics::EVENTS_DROPPED.get();
                     if current_dropped > last_dropped_check {
                         warn!("Detect event drops ({} -> {}). Triggering partial hydration.", last_dropped_check, current_dropped);
-                        let _ = hydration_tx.send(source.path.clone()).await; 
+                        if should_request_hydration {
+                            let _ = hydration_tx.send(source.path.clone()).await; 
+                            last_hydration_request = Instant::now();
+                        }
                         last_dropped_check = current_dropped;
                     }
                     
                     if order.check_timeouts() {
                         warn!("Gap detected by OrderBuf (Timeout). Triggering partial hydration.");
-                        let _ = hydration_tx.send(source.path.clone()).await;
+                        if should_request_hydration {
+                            let _ = hydration_tx.send(source.path.clone()).await;
+                            last_hydration_request = Instant::now();
+                        }
                     }
 
                     let now = Instant::now();
@@ -489,7 +515,6 @@ pub async fn run_worker(
                 }
                 None
             },
-            Some(e) = rx_low.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             else => break Err(FoxingError::System(nix::Error::last())),
         };
 
@@ -522,7 +547,10 @@ pub async fn run_worker(
         if is_hibernating { continue; }
         if event_ptr.event_type == EventType::SequenceGap {
             tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", event_ptr.dev_id);
-            let _ = hydration_tx.send(source.path.clone()).await; 
+            if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
+                let _ = hydration_tx.send(source.path.clone()).await; 
+                last_hydration_request = Instant::now();
+            }
             order.next_seq = 0; 
             continue;
         }
@@ -543,7 +571,10 @@ pub async fn run_worker(
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
                  order.next_seq = 0;
-                 let _ = hydration_tx.send(source.path.clone()).await;
+                 if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
+                     let _ = hydration_tx.send(source.path.clone()).await;
+                     last_hydration_request = Instant::now();
+                 }
                  continue;
             }
             
@@ -591,7 +622,6 @@ pub async fn run_worker(
     }
 }
 
-// ... (process_single_event function remains the same as in previous correct version) ...
 async fn process_single_event(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -848,7 +878,14 @@ async fn process_single_event(
         },
         EventType::Mkdir => {
             let dst_clone = dst.clone();
-            let res = spawn_blocking(move || { std::fs::create_dir_all(&dst_clone) }).await.unwrap_or(Ok(())).map_err(|e| e.into());
+            let res = spawn_blocking(move || { 
+                let res = std::fs::create_dir_all(&dst_clone);
+                // Directory events must succeed even if parent already exists (race protection)
+                if res.is_err() && res.as_ref().unwrap_err().kind() == io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else { res }
+            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
+            
             if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
             Ok(res.map(|_| None))
         },
@@ -859,6 +896,7 @@ async fn process_single_event(
                 // NEW: Rmdir is idempotent-ish. NotFound is not an error.
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
+                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } // Target might be a file due to race
                 }
                 r
             }).await.unwrap_or(Ok(())).map_err(|e| e.into());
@@ -893,6 +931,8 @@ async fn process_single_event(
                 let dst_for_version = dst_clone.clone();
                  let result = spawn_blocking(move || {
                     let _ = security::create_version_snapshot(&dst_for_version, seq_num, &target_root_clone, inode);
+                    
+                    // FIX 1: Defer aggressive maintenance based on BBR state
                     if should_cleanup {
                         let _ = versioning::cleanup_versions(&dst_for_version, &target_root_clone, dyn_max_versions, dyn_max_mb);
                     }

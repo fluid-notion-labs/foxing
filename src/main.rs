@@ -13,8 +13,88 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 use libc;
 use walkdir::WalkDir;
+use nix::sched::{sched_setaffinity, CpuSet}; 
+use std::process; 
+use std::fs; 
 
 mod tui;
+
+// --- NUMA / CPU PINNING UTILITIES ---
+
+/// Helper function to retrieve the current system's CPU topology.
+fn get_available_cores() -> Vec<usize> {
+    let system = System::new_all();
+    let total_cores = system.cpus().len();
+    let mut available_cores = Vec::new();
+
+    info!("System reports {} logical cores.", total_cores);
+
+    // 1. ADVANCED LOGIC: Try to prioritize P-cores (Performance Cores)
+    let mut p_cores = Vec::new();
+    let mut e_cores = Vec::new();
+    
+    for i in 0..total_cores {
+        let core_type_path = format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", i); 
+        if let Ok(content) = fs::read_to_string(&core_type_path) {
+            if content.trim() != "0" {
+                p_cores.push(i);
+            } else {
+                e_cores.push(i);
+            }
+        } else {
+            available_cores.push(i);
+        }
+    }
+
+    if !p_cores.is_empty() || !e_cores.is_empty() {
+        info!("NUMA/Core Topology detected: P-Cores: {} E-Cores: {}", p_cores.len(), e_cores.len());
+        available_cores.extend(p_cores);
+        available_cores.extend(e_cores);
+    }
+
+    if available_cores.is_empty() {
+        available_cores = (0..total_cores).collect();
+    }
+    
+    info!("Assigned core IDs for pinning: {:?}", available_cores);
+    available_cores
+}
+
+fn set_realtime_priority() {
+    let param = libc::sched_param { sched_priority: 1 }; 
+    let pid = 0; 
+    
+    let res = unsafe {
+        libc::sched_setscheduler(
+            pid,
+            libc::SCHED_FIFO,
+            &param,
+        )
+    };
+    
+    if res == -1 {
+        warn!("Failed to set SCHED_FIFO realtime priority for BPF thread (os error: {}).", std::io::Error::last_os_error());
+    } else {
+        info!("Successfully set SCHED_FIFO priority for BPF event collector.");
+    }
+}
+
+fn pin_to_cpu(core_id: usize) {
+    let mut cpu_set = CpuSet::new();
+    if core_id >= std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) {
+         warn!("Requested CPU pin ID {} is out of bounds. Skipping pin.", core_id);
+         return;
+    }
+
+    cpu_set.set(core_id).expect("Core ID must be valid");
+    let res = sched_setaffinity(process::Pid::from_raw(0), &cpu_set); 
+    
+    if res.is_err() {
+        warn!("Failed to pin thread to CPU {}: {:?}", core_id, res.err());
+    } else {
+        info!("Thread pinned successfully to CPU {}", core_id);
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "xfs-mirror", version, about = "High-perf replication")]
@@ -68,7 +148,6 @@ async fn metrics_handler() -> String {
     String::from_utf8(buf).unwrap()
 }
 
-// --- SHARED STATS COLLECTOR ---
 fn collect_system_status(tuner_board: &worker::TunerBoard) -> api::SystemStatus {
     let mut status = api::SystemStatus::default();
     
@@ -77,7 +156,6 @@ fn collect_system_status(tuner_board: &worker::TunerBoard) -> api::SystemStatus 
     status.global_events_dropped = metrics::EVENTS_DROPPED.get();
     status.live_additions = metrics::LIVE_ADDITIONS.get();
 
-    // Populate Debug Info
     status.debug.bpf_sequence_gaps = metrics::SEQUENCE_GAPS.with_label_values(&[]).get(); 
     status.debug.bpf_events_malformed = metrics::EVENTS_MALFORMED.get();
     status.debug.bpf_events_unwatched = metrics::EVENTS_UNWATCHED.get();
@@ -241,22 +319,39 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let prio = cfg.read().await.io_priority.clone();
     set_process_priority(&prio);
 
+    // --- WORKER THREAD PINNING SETUP ---
+    let mut available_cores = get_available_cores();
+    // Reserve the best core for BPF
+    let bpf_core_id = if !available_cores.is_empty() { available_cores.remove(0) } else { 0 };
+
     let mut mgr = Manager::new(cfg.clone()).await;
-    // FIX: Captured hydration_rx to actually use it
     let (queues, handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
     
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
 
     let shutdown_bpf = shutdown.clone();
-    tokio::spawn(async move {
-        if let Err(e) = bpf::run(queues, shutdown_bpf).await { 
-            error!("BPF Error: {}", e); 
-        }
-    });
+    
+    // Apply Realtime Priority to the BPF thread before spawning
+    let bpf_thread_handle = std::thread::Builder::new()
+        .name("foxing-bpf-collector".into())
+        .spawn(move || {
+            // OPTIMIZATION: Pin BPF thread to a dedicated core
+            pin_to_cpu(bpf_core_id); 
+            set_realtime_priority(); 
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    if let Err(e) = bpf::run(queues, shutdown_bpf).await { 
+                        error!("BPF Error: {}", e); 
+                    }
+                })
+        }).unwrap();
+        
+    handles.push(tokio::task::spawn_blocking(move || bpf_thread_handle.join().unwrap()));
 
-    // NEW: Hydration Listener Task
-    // This connects the "Gap detected" signal from workers to the Hydrator logic via Manager
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();
@@ -264,7 +359,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     tokio::spawn(async move {
         while let Some(path) = hydration_rx.recv().await {
             if sd_for_hyd.load(Ordering::Relaxed) { break; }
-            warn!("Hydration REQUESTED via signal for {:?}", path); // Warn so it shows in log
+            warn!("Hydration REQUESTED via signal for {:?}", path); 
             let m = mgr_for_hydration.lock().await;
             m.trigger_hydration();
         }

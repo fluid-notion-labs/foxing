@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::metrics::{self, GLOBAL_BUFFER_LIMIT}; 
 use std::mem;
 use libbpf_rs::MapCore;
-use tracing::{info, warn, debug}; // Removed unused 'error'
+use tracing::{info, warn, debug};
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -122,12 +122,14 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     
     let mut builder = RingBufferBuilder::new();
     builder.add(events_map, move |data| {
+        // WORKER BACKPRESSURE CONTROL: Check if the global userspace buffer is full
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64; 
         
-        if current_count >= global_limit {
+        // If buffer is > 75% full, aggressively skip event acquisition in BPF
+        if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
-            metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::Relaxed);
+            // We do NOT decrement GLOBAL_BUFFER_COUNT here as the consumer should handle it
             return 0; 
         }
         
@@ -195,11 +197,11 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             created_at: std::time::Instant::now()
         });
         
+        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
+        
         if let Some(qs) = queues.get(&raw.dev) { 
             for q in qs { q.push(evt.clone()); } 
         }
-        
-        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
         
         0
     }).map_err(|e| FoxingError::Bpf(e.to_string()))?; 
