@@ -1,8 +1,8 @@
 use prometheus::{
-    Registry, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, HistogramVec, GaugeVec,
+    Registry, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, HistogramVec, GaugeVec, Histogram,
     register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry, 
     register_histogram_vec_with_registry, register_int_counter_with_registry,
-    register_gauge_vec_with_registry
+    register_gauge_vec_with_registry, register_histogram_with_registry
 };
 use lazy_static::lazy_static;
 use std::sync::atomic::{AtomicU64, AtomicBool};
@@ -73,6 +73,11 @@ lazy_static! {
     pub static ref GLOBAL_BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
     pub static ref GLOBAL_BUFFER_LIMIT: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_global_buffer_limit", "Maximum buffered events across all workers", REGISTRY).unwrap();
     pub static ref METRICS_ENABLED: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_metrics_enabled", "Status of metrics subsystem (1=enabled)", REGISTRY).unwrap();
+
+    // --- QoS SCHEDULER METRICS (NEW) ---
+    pub static ref QOS_PRIORITY_JUMPS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_qos_priority_jumps_total", "Times a Critical/Metadata event bypassed the FIFO queue", REGISTRY).unwrap();
+    pub static ref QOS_SCAN_DEPTH: Histogram = prometheus::register_histogram_with_registry!("foxing_qos_scan_depth", "Depth scanned in the ordering buffer to find the next event", vec![1.0, 10.0, 50.0, 100.0, 200.0, 500.0], REGISTRY).unwrap();
+    pub static ref QOS_EVENT_CLASS: IntCounterVec = register_int_counter_vec_with_registry!("foxing_qos_event_class_total", "Events processed by QoS Class", &["class"], REGISTRY).unwrap();
 }
 
 pub fn initialize_metrics(global_limit: u64) {

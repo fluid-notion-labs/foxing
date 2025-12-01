@@ -769,7 +769,10 @@ async fn process_single_event(
         } else { if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.seq = e.seq_num; } }
     }
 
-    let src = source.mount.join(&e.name);
+    // FIX 4: Sanitize e.name to prevent absolute path confusion or join errors
+    // If e.name starts with /, join treats it as absolute and ignores source.mount!
+    let relative_name = e.name.trim_start_matches('/');
+    let src = source.mount.join(relative_name);
     
     let res = match e.event_type {
         EventType::Write | EventType::Create | EventType::WriteRange => {
@@ -781,7 +784,7 @@ async fn process_single_event(
             
             // FIX 2: Retry loop for metadata read (Handles DD race condition)
             let metadata_result = spawn_blocking(move || { 
-                debug!("Worker: Reading metadata for source file {:?}", src_clone);
+                // debug!("Worker: Reading metadata for source file {:?}", src_clone);
                 for attempt in 0..3 {
                     match std::fs::metadata(&src_clone) {
                         Ok(m) => return Ok(m),
@@ -821,7 +824,7 @@ async fn process_single_event(
                     
                     let total_size = m.len() as usize;
                     if total_size > 0 {
-                        debug!("Worker: Starting xattr sync for {:?} (size {})", dst_clone, total_size);
+                        // debug!("Worker: Starting xattr sync for {:?} (size {})", dst_clone, total_size);
                         let chunks: Vec<usize> = (0..total_size).step_by(1024*1024).collect();
                         futures::stream::iter(chunks).then(|_sz| {
                             let sx = sync_xattrs_src.clone();
@@ -940,7 +943,8 @@ async fn process_single_event(
                             } 
                         }
                         
-                        debug!("Worker: Attempting rename from {:?} to {:?}", dst_clone, new_dst_clone);
+                        // LOG AT INFO TO DEBUG RENAME ISSUES
+                        info!("Worker: Attempting rename from {:?} to {:?}", dst_clone, new_dst_clone);
                         let rename_res = std::fs::rename(&dst_clone, &new_dst_clone);
                         
                         if rename_res.is_ok() {
@@ -973,7 +977,10 @@ async fn process_single_event(
                         }).await;
                     }
                     Ok(res.map(|_| None))
-                } else { Ok(Ok(None)) }
+                } else { 
+                    info!("Rename filtered: {:?}", new_rel);
+                    Ok(Ok(None)) 
+                }
             } else { Ok(Ok(None)) }
         },
         EventType::Mkdir => {
@@ -1015,7 +1022,7 @@ async fn process_single_event(
             
             let (dyn_max_versions, dyn_max_mb) = if is_forced {
                  let forced_count = target_cfg.force_retention_count.unwrap_or(target_cfg.max_versions);
-                 if defer_maintenance { warn!("Forcing version retention for inode {} despite high system load.", inode); }
+                 if defer_maintenance { warn!("Forcing version retention for inode {} despite high system system load.", inode); }
                  metrics::TARGET_FORCED_VERSIONING_ACTIVE.with_label_values(&[&target_cfg.path.to_string_lossy()]).set(1);
                  (forced_count, u64::MAX) 
             } else {

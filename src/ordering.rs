@@ -1,9 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use crate::event::{Event, EventType};
 use crate::metrics;
 
 const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; 
+
+// Tuning Constants
+const MIN_WINDOW: usize = 32;   // Minimal scan (fast path)
+const MAX_WINDOW: usize = 2048; // Max scan (deep search for starvation)
+const WINDOW_INC: usize = 32;   // Additive Increase (Aggressive expansion)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QoSClass {
+    Critical, // Rename, Unlink, Mkdir (Structural/Control Plane)
+    Metadata, // Chmod, Chown (Expedited Forwarding)
+    Bulk,     // Write, Falloc (Best Effort)
+}
 
 struct PendingEvent {
     event: Arc<Event>,
@@ -14,6 +26,9 @@ pub struct OrderBuf {
     pub next_seq: u64,
     pub max_count: usize,
     pub current_bytes: u64,
+    
+    // DYNAMIC TUNING STATE
+    pub qos_window: usize,
 }
 
 impl OrderBuf {
@@ -23,26 +38,50 @@ impl OrderBuf {
             next_seq: 0, 
             max_count: 100_000,
             current_bytes: 0,
+            qos_window: 128, // Start with a balanced default
         } 
     }
     
+    fn classify(etype: EventType) -> QoSClass {
+        match etype {
+            EventType::Rename | 
+            EventType::Unlink | 
+            EventType::Rmdir | 
+            EventType::Mkdir | 
+            EventType::Link | 
+            EventType::Symlink | 
+            EventType::Mknod => QoSClass::Critical,
+
+            EventType::Chmod | 
+            EventType::Chown | 
+            EventType::SetXattr | 
+            EventType::RemoveXattr | 
+            EventType::Utimes |
+            EventType::Barrier | 
+            EventType::Fsync => QoSClass::Metadata,
+
+            _ => QoSClass::Bulk,
+        }
+    }
+
+    fn class_name(class: QoSClass) -> &'static str {
+        match class {
+            QoSClass::Critical => "critical",
+            QoSClass::Metadata => "metadata",
+            QoSClass::Bulk => "bulk",
+        }
+    }
+
     pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
-        // If we are just starting or reset, accept the first seq we see
         if self.next_seq == 0 { 
             self.next_seq = e.seq_num; 
         }
         
         if self.pending.len() >= self.max_count || self.current_bytes >= MAX_PENDING_BYTES {
             metrics::EVENTS_DROPPED.inc();
-            // Force process to clear space
             return false;
         }
 
-        // ARCHITECTURAL FIX: 
-        // In sharded mode, we will receive non-contiguous sequence numbers (e.g., 1, 3, 5).
-        // We simply insert everything. The `pop_batch` logic will pull the smallest available.
-        // We trust the upstream channel is FIFO.
-        
         let size = e.length;
         if self.pending.insert(e.seq_num, PendingEvent { event: e }).is_none() {
             self.current_bytes += size;
@@ -51,23 +90,17 @@ impl OrderBuf {
         true
     }
 
-    /// Checks for Head-of-Line blocking.
-    /// 
-    /// REVISED: In sharded mode, "gaps" are expected. We only check for stuck events.
     pub fn check_timeouts(&mut self) -> bool {
-        // We no longer enforce (first_seq == next_seq) because gaps are natural in sharding.
-        // We only care if an event has been sitting in the buffer too long without being processed,
-        // which implies the worker is stalled, but `pop_batch` should handle that.
-        // This function is effectively a no-op for strict ordering now, but kept for API compat.
-        false
+        false 
     }
     
-    /// Removes all pending events for a specific inode (Time Travel Prevention)
     pub fn purge_inode(&mut self, inode: u64) {
         let mut to_remove = Vec::new();
         for (seq, entry) in self.pending.iter() {
             if entry.event.inode == inode {
-                to_remove.push(*seq);
+                if Self::classify(entry.event.event_type) == QoSClass::Bulk {
+                    to_remove.push(*seq);
+                }
             }
         }
         
@@ -78,67 +111,111 @@ impl OrderBuf {
         }
     }
 
+    /// Smart Pop with AIMD Dynamic Windowing
     pub fn pop_batch(&mut self, coalesce_limit: u64) -> Option<Arc<Event>> {
-        // REVISED: Always pop the smallest sequence number available.
-        // We rely on the channel guarantees that events arrived in order.
-        // The BTreeMap just ensures we process the "oldest" event we currently have.
+        if self.pending.is_empty() { return None; }
+
+        let mut chosen_seq = None;
+        let mut blocked_inodes = HashSet::new();
+        let mut scan_depth = 0;
+        let mut found_priority = false;
         
-        let first_key = *self.pending.keys().next()?;
+        // 1. SCAN PHASE: Variable Window
+        for (seq, entry) in self.pending.iter().take(self.qos_window) {
+            scan_depth += 1;
+            let inode = entry.event.inode;
+            let qos = Self::classify(entry.event.event_type);
+
+            if blocked_inodes.contains(&inode) {
+                continue;
+            }
+
+            if qos == QoSClass::Critical {
+                chosen_seq = Some(*seq);
+                found_priority = true;
+                break;
+            }
+
+            blocked_inodes.insert(inode);
+        }
+
+        // --- DYNAMIC TUNING LOGIC ---
+        if found_priority {
+            // Reward: We found something useful! Look deeper next time to catch more.
+            // Additive Increase
+            if self.qos_window < MAX_WINDOW {
+                self.qos_window += WINDOW_INC;
+            }
+        } else {
+            // Decay: Window was useless (pure bulk traffic). Shrink to save CPU.
+            // Multiplicative Decrease (slow decay to avoid thrashing)
+            if self.qos_window > MIN_WINDOW {
+                self.qos_window = (self.qos_window * 99) / 100;
+            }
+        }
         
-        if let Some(entry) = self.pending.remove(&first_key) {
+        // Metrics to track the "breathing" window
+        metrics::QOS_SCAN_DEPTH.observe(scan_depth as f64);
+        
+        // 2. RETRIEVAL
+        let seq_to_process = if let Some(seq) = chosen_seq {
+            if seq != *self.pending.keys().next().unwrap() {
+                metrics::QOS_PRIORITY_JUMPS.inc();
+            }
+            seq
+        } else {
+            *self.pending.keys().next().unwrap()
+        };
+        
+        if let Some(entry) = self.pending.remove(&seq_to_process) {
             let mut current_event = entry.event; 
             self.current_bytes -= current_event.length;
             
-            // Update next_seq to expect the one after this (loose tracking)
-            self.next_seq = first_key + 1;
+            if seq_to_process >= self.next_seq {
+                self.next_seq = seq_to_process + 1;
+            }
 
-            let can_coalesce = matches!(current_event.event_type, EventType::Write | EventType::WriteRange);
-            
-            if can_coalesce {
-                let mut merged_len = current_event.length;
-                let mut merged_count = 0;
-                let mut keys_to_remove = Vec::new();
+            let qos_class = Self::classify(current_event.event_type);
+            metrics::QOS_EVENT_CLASS.with_label_values(&[Self::class_name(qos_class)]).inc();
 
-                // Look ahead in the buffer for contiguous writes TO THE SAME INODE
-                // Note: In sharded mode, we might have seq 1 (Inode A) and seq 3 (Inode A).
-                // If seq 2 was for Inode B (other worker), then 1 and 3 are effectively contiguous for Inode A.
-                // However, BPF offsets must match.
+            // 3. COALESCING (Bulk Only)
+            if qos_class == QoSClass::Bulk {
+                let can_coalesce = matches!(current_event.event_type, EventType::Write | EventType::WriteRange);
                 
-                for (seq, pending) in self.pending.iter() {
-                    let next = &pending.event;
-                    
-                    if next.inode == current_event.inode && 
-                       matches!(next.event_type, EventType::Write | EventType::WriteRange) &&
-                       next.offset == current_event.offset + merged_len && 
-                       merged_len + next.length <= coalesce_limit 
-                    {
-                        merged_len += next.length;
-                        merged_count += 1;
-                        keys_to_remove.push(*seq);
-                    } else {
-                        // If we hit a non-matching event, can we skip it? 
-                        // No, that risks reordering operations on different files (consistency hazard).
-                        // Coalescing must stop at the first break in the stream to be safe.
-                        break;
-                    }
-                }
-                
-                if merged_count > 0 {
-                    metrics::COALESCED_WRITES.inc_by(merged_count as u64);
-                    
-                    let mut merged_evt = (*current_event).clone();
-                    merged_evt.length = merged_len;
-                    
-                    for k in keys_to_remove {
-                        if let Some(removed) = self.pending.remove(&k) {
-                            self.current_bytes -= removed.event.length;
+                if can_coalesce {
+                    let mut merged_len = current_event.length;
+                    let mut merged_count = 0;
+                    let mut keys_to_remove = Vec::new();
+
+                    for (seq, pending) in self.pending.range((seq_to_process + 1)..) {
+                        let next = &pending.event;
+                        
+                        if next.inode == current_event.inode && 
+                           matches!(next.event_type, EventType::Write | EventType::WriteRange) &&
+                           next.offset == current_event.offset + merged_len && 
+                           merged_len + next.length <= coalesce_limit 
+                        {
+                            merged_len += next.length;
+                            merged_count += 1;
+                            keys_to_remove.push(*seq);
+                        } else if next.inode == current_event.inode {
+                            break;
                         }
                     }
                     
-                    current_event = Arc::new(merged_evt);
+                    if merged_count > 0 {
+                        metrics::COALESCED_WRITES.inc_by(merged_count as u64);
+                        let mut merged_evt = (*current_event).clone();
+                        merged_evt.length = merged_len;
+                        
+                        for k in keys_to_remove {
+                            if let Some(removed) = self.pending.remove(&k) {
+                                self.current_bytes -= removed.event.length;
+                            }
+                        }
+                        current_event = Arc::new(merged_evt);
+                    }
                 }
-                
-                return Some(current_event);
             }
             
             return Some(current_event);
