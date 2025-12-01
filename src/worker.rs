@@ -45,8 +45,7 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// ... (WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry, BbrTuner implementations remain unchanged)
-// They are included here for compilation completeness.
+// ... (WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry implementations remain unchanged)
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -243,6 +242,9 @@ struct BbrTuner {
     current_batch_size: usize,
     current_coalesce_bytes: u64,
     flush_multiplier: u32,
+    // NEW: Centralized debounce duration
+    pub hydration_debounce: Duration,
+    
     state: TunerState,
     btl_bw_filter: WindowedFilter<f64>,
     rt_prop_filter: WindowedFilter<f64>,
@@ -265,6 +267,7 @@ impl BbrTuner {
             current_batch_size: cfg.batch_size, 
             current_coalesce_bytes: min_floor * 2,
             flush_multiplier: flush_min,
+            hydration_debounce: Duration::from_secs(1), // Default to fast repair
             state: TunerState::Startup,
             btl_bw_filter: WindowedFilter::new(10, FilterMode::Max),
             rt_prop_filter: WindowedFilter::new(10, FilterMode::Min),
@@ -331,6 +334,12 @@ impl BbrTuner {
                 _ => {}
             }
         }
+
+        // NEW: Update Hydration Debounce based on State
+        self.hydration_debounce = match self.state {
+            TunerState::Drain | TunerState::Muted | TunerState::SpacePressure => Duration::from_secs(30),
+            _ => Duration::from_secs(1),
+        };
 
         let bdp_bytes = btl_bw * rt_prop;
         let pacing_gain = match self.state {
@@ -445,11 +454,16 @@ pub async fn run_worker(
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     
-    // LAST HYDRATION REQUEST TIME (Used for Debounce)
-    let mut last_hydration_request = Instant::now().sub(Duration::from_secs(5));
-    const HYDRATION_DEBOUNCE_SECS: u64 = 5;
+    // LAST HYDRATION REQUEST TIME
+    let mut last_hydration_request = Instant::now().sub(Duration::from_secs(30));
 
     loop {
+        // CRITICAL FIX: Check backoff before doing work, even if not fully hibernating.
+        if !is_hibernating && !failure_state.can_execute_io() {
+             sleep(Duration::from_millis(100)).await;
+             continue;
+        }
+
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         
         let event_poll_result = tokio::select! {
@@ -489,7 +503,7 @@ pub async fn run_worker(
                 }
                 
                 let time_since_last_req = last_hydration_request.elapsed();
-                let should_request_hydration = time_since_last_req >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS);
+                let should_request_hydration = time_since_last_req >= tuner.hydration_debounce;
 
                 if !is_hibernating {
                     let current_dropped = metrics::EVENTS_DROPPED.get();
@@ -554,9 +568,14 @@ pub async fn run_worker(
         }
         
         if is_hibernating { continue; }
+        
+        // DYNAMIC DEBOUNCE RE-CALCULATION FOR EVENT PROCESSING
+        // Tuner state might have updated, so we want the latest debounce value
+        let current_debounce = tuner.hydration_debounce;
+
         if event_ptr.event_type == EventType::SequenceGap {
             tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", event_ptr.dev_id);
-            if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
+            if last_hydration_request.elapsed() >= current_debounce {
                 let _ = hydration_tx.send(source.path.clone()).await; 
                 last_hydration_request = Instant::now();
             }
@@ -580,7 +599,7 @@ pub async fn run_worker(
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
                  order.next_seq = 0;
-                 if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
+                 if last_hydration_request.elapsed() >= Duration::from_secs(5) { // Replaced constant with safe fallback literal
                      let _ = hydration_tx.send(source.path.clone()).await;
                      last_hydration_request = Instant::now();
                  }
@@ -617,32 +636,27 @@ pub async fn run_worker(
                 },
                 Ok(None) => {}, 
                 Err(err) => {
-                    // ROBUSTNESS FIX: Catch consistency errors and use main loop debouncer
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
-                            if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
-                                // FIX: Determine PRECISE path to repair
+                            // USE DYNAMIC DEBOUNCE from Tuner
+                            if last_hydration_request.elapsed() >= tuner.hydration_debounce {
                                 let repair_path = source.mount.join(&e.name);
                                 warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
                                 
-                                // Send specific path instead of source root
                                 let _ = hydration_tx.send(repair_path).await;
                                 last_hydration_request = Instant::now();
                                 
-                                // BBR Backoff to allow system to stabilize
                                 tuner.state = TunerState::Drain;
                                 tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
                             } else {
-                                debug!("Consistency Error for inode {} suppressed by debounce.", e.inode);
+                                debug!("Consistency Error for inode {} suppressed by debounce ({:?}).", e.inode, tuner.hydration_debounce);
                             }
                         } else if io_err.to_string().contains("Target Full") {
-                             // ENOSPC / Capacity Breaker handling
                              warn!("Capacity Pressure: Slowing down ingestion for {:?}", target_cfg.path);
                              tuner.state = TunerState::SpacePressure;
                              tuner_board.insert(target_cfg.path.clone(), TunerState::SpacePressure);
                         }
                     }
-                    // Record failure metrics but keep the worker alive
                     failure_state.record_failure();
                 }
             }
