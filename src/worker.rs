@@ -607,7 +607,7 @@ pub async fn run_worker(
                 cur_cap_total,
             };
 
-            let res = process_single_event(&mut ctx, e.clone(), &source, &target_cfg, &tuner, &hydration_tx, capacity_threshold_mb).await;
+            let res = process_single_event(&mut ctx, e.clone(), &source, &target_cfg, &tuner, capacity_threshold_mb).await;
 
             match res {
                 Ok(Some(stats)) => {
@@ -655,7 +655,6 @@ async fn process_single_event(
     source: &Arc<SourceInfo>,
     target_cfg: &TargetConfig,
     tuner: &BbrTuner,
-    hydration_tx: &mpsc::Sender<PathBuf>,
     capacity_threshold_mb: u64
 ) -> Result<Option<crate::operations::CopyStats>> {
     let target_cfg_cap = target_cfg.clone();
