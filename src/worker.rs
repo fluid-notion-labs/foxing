@@ -939,8 +939,6 @@ async fn process_single_event(
             let enable_versioning = target_cfg.enable_versioning;
             let is_forced = target_cfg.is_forced_version(&dst_clone);
             let defer_maintenance = tuner.should_defer_maintenance();
-            let source_path_for_h = source.path.clone(); 
-            let h_tx_clone = hydration_tx.clone();
             
             let (dyn_max_versions, dyn_max_mb) = if is_forced {
                  let forced_count = target_cfg.force_retention_count.unwrap_or(target_cfg.max_versions);
