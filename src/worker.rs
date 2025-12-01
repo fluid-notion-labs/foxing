@@ -615,7 +615,22 @@ pub async fn run_worker(
                     current_copy_stats = Some(stats);
                 },
                 Ok(None) => {}, 
-                Err(_) => {}
+                Err(err) => {
+                    // ROBUSTNESS FIX: Catch consistency errors and use main loop debouncer
+                    if let FoxingError::Io(ref io_err) = err {
+                        if io_err.kind() == io::ErrorKind::NotFound {
+                            if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
+                                warn!("Consistency Error (NotFound) for inode {}. Triggering debounced hydration and backing off.", e.inode);
+                                let _ = hydration_tx.send(source.path.clone()).await;
+                                last_hydration_request = Instant::now();
+                                
+                                // BBR Backoff to allow system to stabilize
+                                tuner.state = TunerState::Drain;
+                            }
+                        }
+                    }
+                    // Continue loop even on error
+                }
             }
         }
         
@@ -966,9 +981,8 @@ async fn process_single_event(
             
             if let Err(FoxingError::Io(ref io_err)) = r {
                 if io_err.kind() == io::ErrorKind::NotFound {
-                    warn!("Fsync on {:?} failed (NotFound). Triggering hydration.", dst_clone);
-                    let _ = h_tx_clone.send(source_path_for_h).await;
-                    Ok(Ok(None))
+                    // ERROR HANDLING FIX: Do not auto-hydrate here. Return error to main loop.
+                    return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "Fsync target missing")));
                 } else {
                     Ok(r.map(|_| None))
                 }
