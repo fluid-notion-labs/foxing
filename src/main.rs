@@ -350,7 +350,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let bpf_core_id = if !available_cores.is_empty() { available_cores.remove(0) } else { 0 };
 
     let mut mgr = Manager::new(cfg.clone()).await;
-    let (queues, handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
+    let (queues, mut handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
     
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();

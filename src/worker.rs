@@ -467,12 +467,10 @@ pub async fn run_worker(
                 rx_low.recv().await
             } => { 
                 if is_hibernating { 
-                    if let Some(evt) = &e {
-                        order.push_and_check(evt.clone()); 
-                    }
+                    order.push_and_check(e.clone());
                     continue; 
                 } 
-                e // Returns Option<Arc<Event>>
+                Some(e)
             },
             
             _ = flush_interval.tick() => {
@@ -526,7 +524,6 @@ pub async fn run_worker(
                 }
                 None
             },
-            else => break Err(FoxingError::System(nix::Error::last())),
         };
 
         if event_poll_result.is_none() { continue; }
