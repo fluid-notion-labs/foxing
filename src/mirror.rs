@@ -230,8 +230,10 @@ impl Manager {
                     self.hydration_handles.lock().push(thread_handle);
                 } else {
                     // Otherwise, do a targeted repair
+                    // FIX: Clone the path so we don't move the shared reference variable
+                    let repair_path = target_path.clone();
                     let thread_handle = std::thread::spawn(move || {
-                        h_clone.repair_path(target_path);
+                        h_clone.repair_path(repair_path);
                         Ok(())
                     });
                     self.hydration_handles.lock().push(thread_handle);
