@@ -644,13 +644,21 @@ pub async fn run_worker(
                             // USE DYNAMIC DEBOUNCE from Tuner
                             if last_hydration_request.elapsed() >= tuner.hydration_debounce {
                                 let repair_path = source.mount.join(&e.name);
-                                warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
                                 
-                                let _ = hydration_tx.send(repair_path).await;
-                                last_hydration_request = Instant::now();
-                                
-                                tuner.state = TunerState::Drain;
-                                tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
+                                // FIX 3: Check existence on source before triggering repair loop
+                                let repair_path_clone = repair_path.clone();
+                                let exists = spawn_blocking(move || repair_path_clone.exists()).await.unwrap_or(false);
+
+                                if exists {
+                                    warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
+                                    let _ = hydration_tx.send(repair_path).await;
+                                    last_hydration_request = Instant::now();
+                                    
+                                    tuner.state = TunerState::Drain;
+                                    tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
+                                } else {
+                                     debug!("Skipping hydration for inode {} - source file also missing", e.inode);
+                                }
                             } else {
                                 debug!("Consistency Error for inode {} suppressed by debounce ({:?}).", e.inode, tuner.hydration_debounce);
                             }
@@ -769,9 +777,20 @@ async fn process_single_event(
             let e_offset = e.offset; 
             let e_len = e.length;    
             
+            // FIX 2: Retry loop for metadata read (Handles DD race condition)
             let metadata_result = spawn_blocking(move || { 
                 debug!("Worker: Reading metadata for source file {:?}", src_clone);
-                std::fs::metadata(&src_clone) 
+                for attempt in 0..3 {
+                    match std::fs::metadata(&src_clone) {
+                        Ok(m) => return Ok(m),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound && attempt < 2 => {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(io::Error::new(io::ErrorKind::NotFound, "Retries exhausted"))
             }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::NotFound, "Metadata task failed")));
 
             if let Ok(m) = metadata_result {
@@ -890,7 +909,15 @@ async fn process_single_event(
         EventType::Rename => {
             if let Some(new_name) = &e.new_name {
                 metrics::RENAME_EVENTS.inc();
-                let new_rel = PathBuf::from(new_name);
+                
+                // FIX 1: Correctly construct path relative to the OLD parent directory
+                let old_rel = PathBuf::from(&e.name);
+                let new_rel = if let Some(parent) = old_rel.parent() {
+                    parent.join(new_name)
+                } else {
+                    PathBuf::from(new_name)
+                };
+
                 let new_dst = target_cfg.path.join(&new_rel);
                 if target_cfg.allow(&new_rel) {
                     let dst_clone = dst.clone(); 
