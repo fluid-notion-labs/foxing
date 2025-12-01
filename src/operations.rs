@@ -78,7 +78,11 @@ impl SmartCopier {
         let src_file_size = sf.metadata()?.len();
         let sfd = sf.as_raw_fd();
 
+        // LOGGING FIX: Debug why full replacement is triggered
         let is_full_replace = offset == 0 && length == src_file_size && src_file_size > 0;
+        if is_full_replace && src_file_size > 10 * 1024 * 1024 {
+            debug!("SmartCopier: Triggering FULL ATOMIC REPLACE for {:?} (Size: {}). Reason: Offset=0, Len=Match", dst, src_file_size);
+        }
 
         let (target_path, open_flags) = if is_full_replace {
             (

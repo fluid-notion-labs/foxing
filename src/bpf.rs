@@ -135,19 +135,31 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64; 
         
-        // Backpressure: If userspace buffer is > 75% full, skip acquisition
-        // This prevents the kernel ring buffer from becoming stuck if userspace halts.
-        if current_count >= global_limit * 3 / 4 {
-            metrics::EVENTS_DROPPED.inc();
-            return 0; 
-        }
-        
         if data.len() != std::mem::size_of::<RawEvent>() { 
             crate::metrics::EVENTS_MALFORMED.inc();
             return 0; 
         }
         
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
+
+        // Backpressure: If userspace buffer is > 75% full, skip event but SIGNAL GAP
+        if current_count >= global_limit * 3 / 4 {
+            metrics::EVENTS_DROPPED.inc();
+            
+            // Explicitly notify downstream of the gap so it doesn't wait for timeout
+            if let Some(qs) = queues.get(&raw.dev) {
+                let gap_evt = Arc::new(Event {
+                    event_type: EventType::SequenceGap,
+                    dev_id: raw.dev,
+                    inode: 0, parent_inode: 0, seq_num: 0, offset: 0, length: 0, 
+                    name: "".into(), new_name: None, generation: 0, projid: 0, 
+                    mode: 0, flags: 0, process_name: "backpressure".into(), interactive: false, 
+                    created_at: std::time::Instant::now() 
+                });
+                for q in qs { q.push(gap_evt.clone()); } 
+            }
+            return 0; 
+        }
         
         let counter = DEVICE_EVENT_COUNTER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let event_count = counter.fetch_add(1, Ordering::Relaxed);
