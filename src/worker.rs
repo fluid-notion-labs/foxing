@@ -14,7 +14,8 @@ use tokio::{sync::mpsc, task::spawn_blocking};
 use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, ordering, Result, versioning, governor::Governor};
+// Removed unused OsStrExt import
+use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, Result, versioning, governor::Governor};
 use crate::operations::SmartCopier; 
 use tokio::time::interval; 
 use tracing::{warn, info, error, debug}; 
@@ -33,6 +34,55 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use tokio::time::sleep;
 
+// --- NEW STRUCT: Poison Cabinet ---
+struct PoisonEntry {
+    failure_count: u32,
+    next_attempt: Instant,
+}
+
+struct PoisonCabinet {
+    cache: LruCache<u64, PoisonEntry>,
+}
+
+impl PoisonCabinet {
+    fn new() -> Self {
+        Self {
+            cache: LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
+        }
+    }
+
+    fn check_allowed(&mut self, inode: u64) -> bool {
+        if let Some(entry) = self.cache.get(&inode) {
+            if Instant::now() < entry.next_attempt {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn record_failure(&mut self, inode: u64) {
+        if let Some(entry) = self.cache.get_mut(&inode) {
+            entry.failure_count += 1;
+            // Exponential backoff: 2s, 4s, 8s... max 60s
+            let backoff_secs = (2u64.pow(entry.failure_count.min(6))) as u64; 
+            entry.next_attempt = Instant::now() + Duration::from_secs(backoff_secs);
+            debug!("Inode {} poisoned. Failure #{}. Backing off for {}s.", inode, entry.failure_count, backoff_secs);
+        } else {
+            self.cache.put(inode, PoisonEntry {
+                failure_count: 1,
+                next_attempt: Instant::now() + Duration::from_secs(2),
+            });
+        }
+    }
+
+    fn record_success(&mut self, inode: u64) {
+        if self.cache.contains(&inode) {
+            self.cache.pop(&inode);
+        }
+    }
+}
+// ----------------------------------
+
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +95,6 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// ... (WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry implementations remain unchanged)
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -123,7 +172,7 @@ impl VdoTuner {
         if !self.enabled { return false; }
         if !self.active && file_size > 100 * 1024 * 1024 {
              self.active = true;
-             debug!("VDO Tuner: Waking up immediately for large file ({} bytes)", file_size);
+             debug!("Vdo Tuner: Waking up immediately for large file ({} bytes)", file_size);
              return true;
         }
         if self.active { return true; }
@@ -143,13 +192,13 @@ impl VdoTuner {
 
         if self.active {
             if best_ratio < 0.01 {
-                debug!("VDO Tuner: Efficiency low ({:.2}%), entering Backoff/Sleep.", best_ratio * 100.0);
+                debug!("Vdo Tuner: Efficiency low ({:.2}%), entering Backoff/Sleep.", best_ratio * 100.0);
                 self.active = false;
                 self.last_probe = now;
             }
         } else {
             if ratio > 0.01 {
-                debug!("VDO Tuner: Probe successful ({:.2}%), Waking Up.", ratio * 100.0);
+                debug!("Vdo Tuner: Probe successful ({:.2}%), Waking Up.", ratio * 100.0);
                 self.active = true;
                 self.zero_ratio_filter.reset();
             } else {
@@ -219,7 +268,7 @@ impl FailureState {
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new() -> Self {
-        let mut shards = Vec::with_capacity(128); // Increased shards
+        let mut shards = Vec::with_capacity(128); 
         for _ in 0..128 { shards.push(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))); }
         Self { shards }
     }
@@ -242,7 +291,6 @@ struct BbrTuner {
     current_batch_size: usize,
     current_coalesce_bytes: u64,
     flush_multiplier: u32,
-    // NEW: Centralized debounce duration
     pub hydration_debounce: Duration,
     
     state: TunerState,
@@ -267,7 +315,7 @@ impl BbrTuner {
             current_batch_size: cfg.batch_size, 
             current_coalesce_bytes: min_floor * 2,
             flush_multiplier: flush_min,
-            hydration_debounce: Duration::from_secs(1), // Default to fast repair
+            hydration_debounce: Duration::from_secs(1), 
             state: TunerState::Startup,
             btl_bw_filter: WindowedFilter::new(10, FilterMode::Max),
             rt_prop_filter: WindowedFilter::new(10, FilterMode::Min),
@@ -335,7 +383,6 @@ impl BbrTuner {
             }
         }
 
-        // NEW: Update Hydration Debounce based on State
         self.hydration_debounce = match self.state {
             TunerState::Drain | TunerState::Muted | TunerState::SpacePressure => Duration::from_secs(30),
             _ => Duration::from_secs(1),
@@ -371,8 +418,6 @@ impl BbrTuner {
     }
     
     fn should_defer_maintenance(&self) -> bool {
-        // Defer maintenance if the BBR state is stressed.
-        // NOTE: SpacePressure is REMOVED from here. If we have space pressure, we MUST NOT defer maintenance (cleanup).
         matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain)
     }
 
@@ -410,6 +455,9 @@ struct WorkerContext<'a> {
     capacity_breaker: &'a CircuitBreaker,
     limiter: &'a ErrorLimiter,
     locks: &'a ShardedLockCache,
+    poison: &'a mut PoisonCabinet, // Add to context
+    // ADDED: Hydration Sender to trigger targeted repair from within processing path
+    hydration_tx: &'a mpsc::Sender<PathBuf>,
     cur_cap_avail: u64,
     cur_cap_total: u64,
 }
@@ -425,11 +473,12 @@ pub async fn run_worker(
     governor: Arc<Governor>,
     tuner_board: TunerBoard
 ) -> Result<()> {
-    let mut order = ordering::OrderBuf::new();
+    let mut order = crate::ordering::OrderBuf::new();
     let locks = Arc::new(ShardedLockCache::new()); 
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new(); 
     let mut flush_interval = interval(Duration::from_millis(100));
     
+    // ... (Ring setup code) ...
     let mut ring = match IoUring::new(target_cfg.batch_size as u32) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
@@ -443,22 +492,22 @@ pub async fn run_worker(
     drop(config_reader);
     let hibernation_threshold_secs = 300; 
     let mut failure_state = FailureState::new(hibernation_threshold_secs);
+    let mut poison_cabinet = PoisonCabinet::new(); // Init Poison Cabinet
+
     let iov = libc::iovec { iov_base: unsafe { buf.capacity_slice_mut() }.as_mut_ptr() as _, iov_len: buf.capacity() };
     if unsafe { ring.submitter().register_buffers(&[iov]) }.is_err() { error!("Failed to register io_uring buffers. Falling back to standard I/O (slower)."); }
     
     let mut tuner = BbrTuner::new(&target_cfg);
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
 
+    // ... (rest of init) ...
     let mut is_hibernating = false;
     let mut last_dropped_check = 0u64;
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
-    
-    // LAST HYDRATION REQUEST TIME
     let mut last_hydration_request = Instant::now().sub(Duration::from_secs(30));
 
     loop {
-        // CRITICAL FIX: Check backoff before doing work, even if not fully hibernating.
         if !is_hibernating && !failure_state.can_execute_io() {
              sleep(Duration::from_millis(100)).await;
              continue;
@@ -466,22 +515,17 @@ pub async fn run_worker(
 
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         
-        // WORKER PRIORITY FIX: Use 'biased' mode to strictly prefer High Priority events (small files/metadata)
         let event_poll_result = tokio::select! {
             biased;
             
             _ = shutdown_rx.recv() => break Ok(()),
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             
-            // LOW PRIORITY QUEUE POLLING (Hydration)
-            // Throttles rx_low based on BBR state to prioritize high-priority queue
             Some(e) = async {
                 let current_state = tuner_board.get(&target_cfg.path).map(|r| *r).unwrap_or(TunerState::Startup);
-                
                 if matches!(current_state, TunerState::Drain | TunerState::Muted | TunerState::SpacePressure) {
                     sleep(Duration::from_millis(50)).await;
                 }
-
                 rx_low.recv().await
             } => { 
                 if is_hibernating { 
@@ -572,8 +616,6 @@ pub async fn run_worker(
         
         if is_hibernating { continue; }
         
-        // DYNAMIC DEBOUNCE RE-CALCULATION FOR EVENT PROCESSING
-        // Tuner state might have updated, so we want the latest debounce value
         let current_debounce = tuner.hydration_debounce;
 
         if event_ptr.event_type == EventType::SequenceGap {
@@ -599,6 +641,7 @@ pub async fn run_worker(
             vec![event_ptr]
         } else {
             if !order.push_and_check(event_ptr.clone()) {
+                 // ... (drop logic) ...
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
                  order.next_seq = 0;
@@ -617,6 +660,13 @@ pub async fn run_worker(
         };
 
         for e in events_to_process {
+            // POISON CHECK
+            if !poison_cabinet.check_allowed(e.inode) {
+                // If it's a sequence gap or barrier, we might let it through, 
+                // but for file ops, skip to prevent log spam/looping
+                continue;
+            }
+
             let mut ctx = WorkerContext {
                 ring: &mut ring,
                 buf: &mut buf,
@@ -626,6 +676,8 @@ pub async fn run_worker(
                 capacity_breaker: &capacity_breaker,
                 limiter: &limiter,
                 locks: &locks,
+                poison: &mut poison_cabinet, // Pass it down
+                hydration_tx: &hydration_tx, // Pass tx down
                 cur_cap_avail,
                 cur_cap_total,
             };
@@ -636,44 +688,44 @@ pub async fn run_worker(
                 Ok(Some(stats)) => {
                     batch_bytes_processed += stats.bytes_processed;
                     current_copy_stats = Some(stats);
+                    // Success is recorded inside process_single_event via ctx
                 },
                 Ok(None) => {}, 
                 Err(err) => {
+                    // Centralized Error Handling for Poisoning
+                    ctx.poison.record_failure(e.inode);
+
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
-                            // USE DYNAMIC DEBOUNCE from Tuner
-                            if last_hydration_request.elapsed() >= tuner.hydration_debounce {
+                            // Loop Breaker: If we get a NotFound from a WRITE event (seq=0 implies hydration), 
+                            // it means the file is truly gone. Don't retry hydration.
+                            if e.seq_num == 0 {
+                                debug!("Worker: Hydration write failed (NotFound) for inode {}. Aborting recursion.", e.inode);
+                            } else if last_hydration_request.elapsed() >= tuner.hydration_debounce {
                                 let repair_path = source.mount.join(&e.name);
-                                
-                                // FIX 3: Check existence on source before triggering repair loop
                                 let repair_path_clone = repair_path.clone();
                                 let exists = spawn_blocking(move || repair_path_clone.exists()).await.unwrap_or(false);
 
                                 if exists {
                                     warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
+                                    source.inode_map.lock().pop(&e.inode);
                                     let _ = hydration_tx.send(repair_path).await;
                                     last_hydration_request = Instant::now();
-                                    
                                     tuner.state = TunerState::Drain;
-                                    // FORCE UPDATE DEBOUNCE to prevent rapid cycling
                                     tuner.hydration_debounce = Duration::from_secs(30); 
                                     tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
                                 } else {
                                      debug!("Skipping hydration for inode {} - source file also missing", e.inode);
                                 }
-                            } else {
-                                debug!("Consistency Error for inode {} suppressed by debounce ({:?}).", e.inode, tuner.hydration_debounce);
                             }
                         } else if io_err.to_string().contains("Target Full") {
-                             // ENOSPC / Capacity Breaker handling
+                             // ... (Space logic) ...
                              warn!("Capacity Pressure: Slowing down ingestion for {:?}", target_cfg.path);
                              tuner.state = TunerState::SpacePressure;
                              tuner_board.insert(target_cfg.path.clone(), TunerState::SpacePressure);
-                             // Force failure state for ENOSPC to trigger backoff
                              failure_state.record_failure();
                         }
                     }
-                    // DO NOT record failure for handled NotFound errors (prevents sleep loop)
                     if let FoxingError::Io(ref io_err) = err {
                          if io_err.kind() != io::ErrorKind::NotFound {
                               failure_state.record_failure();
@@ -695,10 +747,6 @@ pub async fn run_worker(
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// EVENT PROCESSOR
-// -----------------------------------------------------------------------------
 
 async fn process_single_event(
     ctx: &mut WorkerContext<'_>,
@@ -732,6 +780,33 @@ async fn process_single_event(
     let _g = lock.lock().await;
     
     let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+
+    // FIX: Derive src from dst relative path to handle deep hierarchy correctly.
+    // BPF only gives us the filename in e.name, so blindly joining e.name to source.mount fails for nested files.
+    // Since resolve_target() uses the InodeMap (populated by Hydration/Parent-tracking) to get the true path,
+    // we should trust the relative path derived from dst.
+    let src = if is_synthetic {
+        // If synthetic, we don't have a mapped path. Fallback to name.
+        source.mount.join(e.name.trim_start_matches('/'))
+    } else {
+        match dst.strip_prefix(&target_cfg.path) {
+            Ok(rel) => source.mount.join(rel),
+            Err(_) => source.mount.join(e.name.trim_start_matches('/')),
+        }
+    };
+
+    // FIX #2: Parent Directory Pre-Creation Guard
+    // Ensure the parent directory for the destination file exists before we try to 
+    // create the destination file itself (via open/mknod/rename).
+    if !is_synthetic {
+        let target_dir = dst.parent().map(|p| p.to_path_buf());
+        if let Some(target_dir) = target_dir {
+            // Only spawn creation if the path is not the root of the mirror
+            if target_dir != target_cfg.path {
+                let _ = spawn_blocking(move || std::fs::create_dir_all(&target_dir)).await;
+            }
+        }
+    }
 
     if needs_creation {
         let dst_clone = dst.clone();
@@ -769,11 +844,6 @@ async fn process_single_event(
         } else { if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.seq = e.seq_num; } }
     }
 
-    // FIX 4: Sanitize e.name to prevent absolute path confusion or join errors
-    // If e.name starts with /, join treats it as absolute and ignores source.mount!
-    let relative_name = e.name.trim_start_matches('/');
-    let src = source.mount.join(relative_name);
-    
     let res = match e.event_type {
         EventType::Write | EventType::Create | EventType::WriteRange => {
             let src_clone = src.clone();
@@ -782,9 +852,7 @@ async fn process_single_event(
             let e_offset = e.offset; 
             let e_len = e.length;    
             
-            // FIX 2: Retry loop for metadata read (Handles DD race condition)
             let metadata_result = spawn_blocking(move || { 
-                // debug!("Worker: Reading metadata for source file {:?}", src_clone);
                 for attempt in 0..3 {
                     match std::fs::metadata(&src_clone) {
                         Ok(m) => return Ok(m),
@@ -792,7 +860,12 @@ async fn process_single_event(
                             std::thread::sleep(Duration::from_millis(10));
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            if attempt == 2 {
+                                warn!("Worker: Failed to stat {:?}: {}", src_clone, e);
+                            }
+                            return Err(e)
+                        },
                     }
                 }
                 Err(io::Error::new(io::ErrorKind::NotFound, "Retries exhausted"))
@@ -800,10 +873,7 @@ async fn process_single_event(
 
             if let Ok(m) = metadata_result {
                 if m.is_file() {
-                    if !is_synthetic {
-                        let dst_parent = dst_clone.parent().map(|p| p.to_path_buf()).unwrap_or(target_cfg_clone.path.clone());
-                        let _ = spawn_blocking(move || std::fs::create_dir_all(&dst_parent)).await;
-                    }
+                    // NOTE: Parent directory creation is handled above.
                      
                      if e.event_type == EventType::Create && (target_cfg.btrfs_compression || target_cfg.f2fs_compression || target_cfg.f2fs_pinning) {
                           let dst_clone_for_opt = dst_clone.clone();
@@ -824,7 +894,6 @@ async fn process_single_event(
                     
                     let total_size = m.len() as usize;
                     if total_size > 0 {
-                        // debug!("Worker: Starting xattr sync for {:?} (size {})", dst_clone, total_size);
                         let chunks: Vec<usize> = (0..total_size).step_by(1024*1024).collect();
                         futures::stream::iter(chunks).then(|_sz| {
                             let sx = sync_xattrs_src.clone();
@@ -853,12 +922,59 @@ async fn process_single_event(
                         Ok(stats) => {
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
+                            
+                            // FIX: Force Metadata Apply after Write success to prevent "naked file" issue in Hydration
+                            let apply_dst = dst_clone.clone();
+                            let apply_src = src.clone();
+                            let _ = spawn_blocking(move || security::apply_metadata(&apply_src, &apply_dst)).await;
+
                             Ok(Ok(Some(stats)))
                         },
                         Err(e) => Err(e)
                     }
                 } else { Ok(Ok(None)) } 
-            } else if is_synthetic { if ctx.limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}. Event ignored.", e.inode); } Ok(Ok(None)) } else { Ok(Ok(None)) }
+            } else if is_synthetic { 
+                if ctx.limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}. Event ignored.", e.inode); } 
+                Ok(Ok(None)) 
+            } else { 
+                // --- CRITICAL FIX: Aggressive Cache Refresh on Source Not Found ---
+                if let Err(e) = &metadata_result {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        warn!("Worker: Source file for inode {} (mapped path {:?}) not found. Assuming stale map entry and forcing targeted repair.", e.inode, src_clone);
+                        
+                        // 1. Force cache purge locally
+                        source.inode_map.lock().pop(&e.inode);
+                        
+                        // 2. Trigger FAST PATH RESOLUTION (synchronous blocking call)
+                        let fast_resolve_res = spawn_blocking({
+                            let source_map = source.inode_map.clone();
+                            let source_root = source.mount.clone();
+                            move || identity::resolve_and_update_path(&source_map, &source_root, e.inode)
+                        }).await;
+
+                        match fast_resolve_res {
+                            Ok(Ok(new_path)) => {
+                                // Success! Map is updated. Abort this event and let the next retry succeed.
+                                debug!("Fast resolve succeeded, new path: {:?}", new_path);
+                                return Ok(Ok(None)); 
+                            },
+                            _ => {
+                                // Fast resolve failed (file still missing, maybe being deleted).
+                                // Trigger the slow hydration sweep only if debounce allows.
+                                if ctx.hydration_tx.is_closed() { return Ok(Ok(None)); }
+
+                                if let Some(parent) = src_clone.parent() {
+                                    let _ = ctx.hydration_tx.send(parent.to_path_buf()).await;
+                                }
+                                return Err(FoxingError::Io(io::Error::new(io::ErrorKind::NotFound, "Fast Path resolution failed, triggering full repair.")));
+                            }
+                        }
+                    } else {
+                        warn!("Worker: Skipping Write for {:?} - Source access failed: {}", dst_clone, e);
+                    }
+                }
+                Ok(Ok(None)) 
+            }
         },
         EventType::Symlink => {
             let dst_clone = dst.clone();
@@ -890,19 +1006,21 @@ async fn process_single_event(
         },
         EventType::Unlink => {
             ctx.dirty_stats.remove(&e.inode);
+            
+            // FIX: Eagerly remove from map to prevent stale lookups on inode reuse
+            source.inode_map.lock().pop(&e.inode);
+            
             let dst_clone = dst.clone();
-            let source_clone = source.clone();
-            let e_clone = e.clone();
+            // Prefix e_clone with underscore to silence unused variable warning
+            let _e_clone = e.clone();
             let res = spawn_blocking(move || {
                 if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
+                
                 if is_synthetic { 
                     debug!("Worker: Unlinking synthetic file {:?}", dst_clone);
-                    let _ = std::fs::remove_file(&dst_clone); 
-                    source_clone.inode_map.lock().pop(&e_clone.inode); 
                     metrics::SYNTHETIC_IDENTITY_FILES.dec(); 
                 }
                 let r = std::fs::remove_file(&dst_clone);
-                // NEW: Unlink is idempotent. NotFound is not an error.
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
                 }
@@ -915,17 +1033,14 @@ async fn process_single_event(
             if let Some(new_name) = &e.new_name {
                 metrics::RENAME_EVENTS.inc();
                 
-                // NEW FIX: Use 'dst' (resolved from inode map) to find the parent directory.
-                // 'e.name' from BPF is just the filename and lacks directory context.
                 let new_dst = if let Some(parent) = dst.parent() {
                     parent.join(new_name)
                 } else {
                     target_cfg.path.join(new_name)
                 };
                 
-                // Calculate relative path for checking allow-lists
                 let new_rel = new_dst.strip_prefix(&target_cfg.path)
-                    .unwrap_or_else(|_| Path::new(new_name)) // Fallback
+                    .unwrap_or_else(|_| Path::new(new_name)) 
                     .to_path_buf();
 
                 if target_cfg.allow(&new_rel) {
@@ -937,13 +1052,8 @@ async fn process_single_event(
                     let is_synthetic_state = is_synthetic;
                     
                     let res = spawn_blocking(move || {
-                        if let Some(parent) = new_dst_clone.parent() { 
-                            if let Err(e) = std::fs::create_dir_all(parent) { 
-                                return Err(io::Error::new(io::ErrorKind::Other, format!("Rename target dir creation failed: {}", e))); 
-                            } 
-                        }
+                        // NOTE: Parent directory creation is handled above.
                         
-                        // LOG AT INFO TO DEBUG RENAME ISSUES
                         info!("Worker: Attempting rename from {:?} to {:?}", dst_clone, new_dst_clone);
                         let rename_res = std::fs::rename(&dst_clone, &new_dst_clone);
                         
@@ -985,9 +1095,9 @@ async fn process_single_event(
         },
         EventType::Mkdir => {
             let dst_clone = dst.clone();
+            // Parent creation is handled outside, just attempt directory creation here.
             let res = spawn_blocking(move || { 
                 let res = std::fs::create_dir_all(&dst_clone);
-                // Directory events must succeed even if parent already exists (race protection)
                 if res.is_err() && res.as_ref().unwrap_err().kind() == io::ErrorKind::AlreadyExists {
                     Ok(())
                 } else { res }
@@ -1000,10 +1110,9 @@ async fn process_single_event(
             let dst_clone = dst.clone();
             let res = spawn_blocking(move || { 
                 let r = std::fs::remove_dir(&dst_clone);
-                // NEW: Rmdir is idempotent-ish. NotFound is not an error.
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
-                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } // Target might be a file due to race
+                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } 
                 }
                 r
             }).await.unwrap_or(Ok(())).map_err(|e| e.into());
@@ -1037,7 +1146,6 @@ async fn process_single_event(
                  let result = spawn_blocking(move || {
                     let _ = security::create_version_snapshot(&dst_for_version, seq_num, &target_root_clone, inode);
                     
-                    // FIX 1: Defer aggressive maintenance based on BBR state
                     if should_cleanup {
                         let _ = versioning::cleanup_versions(&dst_for_version, &target_root_clone, dyn_max_versions, dyn_max_mb);
                     }
@@ -1059,7 +1167,6 @@ async fn process_single_event(
             
             if let Err(FoxingError::Io(ref io_err)) = r {
                 if io_err.kind() == io::ErrorKind::NotFound {
-                    // ERROR HANDLING FIX: Do not auto-hydrate here. Return error to main loop.
                     return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "Fsync target missing")));
                 } else {
                     Ok(r.map(|_| None))
@@ -1078,7 +1185,21 @@ async fn process_single_event(
         EventType::Chmod | EventType::Chown | EventType::Utimes => {
             let src_clone = src.clone();
             let dst_clone = dst.clone();
-            Ok(spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_clone) }).await.unwrap_or(Ok(())).map(|_| None))
+            
+            let dst_for_closure = dst_clone.clone();
+            let res = spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_for_closure) }).await;
+            
+            match res {
+                Ok(inner_res) => {
+                    if let Err(e) = inner_res {
+                        warn!("Worker: Metadata apply failed for {:?}: {}", dst_clone, e);
+                    }
+                },
+                Err(e) => {
+                    warn!("Worker: Metadata task panicked for {:?}: {}", dst_clone, e);
+                }
+            }
+            Ok(Ok(None))
         },
         EventType::Truncate => {
             let dst_clone = dst.clone();
@@ -1102,7 +1223,6 @@ async fn process_single_event(
     match res {
         Ok(inner) => {
             if let Err(err) = inner {
-                // If IO error 28 (ENOSPC)
                 if let FoxingError::Io(io_err) = &err {
                     if let Some(28) = io_err.raw_os_error() {
                         error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
@@ -1116,18 +1236,18 @@ async fn process_single_event(
                     }
                 }
                 
-                // Fixed E0609 by accessing fields directly from `e` which is still in scope
                 error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, err);
                 if ctx.limiter.check("io") { error!("IO Error: {:?}", err); }
                 ctx.failure_state.record_failure();
+                // NOTE: We don't record poison here because we do it in the loop
                 Err(err)
             } else {
                 ctx.failure_state.record_success();
+                ctx.poison.record_success(e.inode); // Clear poison on success
                 inner
             }
         },
         Err(err) => {
-            // Processing error (e.g. breaker tripped)
             ctx.failure_state.record_failure();
             Err(err)
         }

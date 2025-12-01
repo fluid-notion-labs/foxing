@@ -1,3 +1,10 @@
+//! # Ordering Buffer and QoS Logic
+//! 
+//! This module implements the QoS-aware ordering buffer (OrderBuf). It is
+//! responsible for reconstructing the sequential event stream from the 
+//! non-guaranteed BPF stream, prioritizing critical metadata events, and 
+//! coalescing writes.
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use crate::event::{Event, EventType};
@@ -6,15 +13,15 @@ use crate::metrics;
 const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; 
 
 // Tuning Constants
-const MIN_WINDOW: usize = 32;   // Minimal scan (fast path)
-const MAX_WINDOW: usize = 2048; // Max scan (deep search for starvation)
-const WINDOW_INC: usize = 32;   // Additive Increase (Aggressive expansion)
+const MIN_WINDOW: usize = 32;   
+const MAX_WINDOW: usize = 2048; 
+const WINDOW_INC: usize = 32;   
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QoSClass {
-    Critical, // Rename, Unlink, Mkdir (Structural/Control Plane)
-    Metadata, // Chmod, Chown (Expedited Forwarding)
-    Bulk,     // Write, Falloc (Best Effort)
+    Bulk = 0,     // Lowest Priority (Writes/Data)
+    Metadata = 1, // Medium Priority (Chmod/Fsync/Truncate)
+    Critical = 2, // Highest Priority (Create/Rename/Unlink - Structural changes)
 }
 
 struct PendingEvent {
@@ -26,8 +33,6 @@ pub struct OrderBuf {
     pub next_seq: u64,
     pub max_count: usize,
     pub current_bytes: u64,
-    
-    // DYNAMIC TUNING STATE
     pub qos_window: usize,
 }
 
@@ -38,28 +43,33 @@ impl OrderBuf {
             next_seq: 0, 
             max_count: 100_000,
             current_bytes: 0,
-            qos_window: 128, // Start with a balanced default
+            qos_window: 128, 
         } 
     }
     
     fn classify(etype: EventType) -> QoSClass {
         match etype {
+            // CRITICAL: Structural changes that determine existence
             EventType::Rename | 
             EventType::Unlink | 
             EventType::Rmdir | 
             EventType::Mkdir | 
             EventType::Link | 
             EventType::Symlink | 
-            EventType::Mknod => QoSClass::Critical,
+            EventType::Mknod |
+            EventType::Create => QoSClass::Critical, // Create is fundamental
 
+            // METADATA: Attributes (Must happen after creation)
             EventType::Chmod | 
             EventType::Chown | 
             EventType::SetXattr | 
             EventType::RemoveXattr | 
             EventType::Utimes |
             EventType::Barrier | 
-            EventType::Fsync => QoSClass::Metadata,
+            EventType::Fsync |
+            EventType::Truncate => QoSClass::Metadata, 
 
+            // BULK: Data content (Can be coalesced/purged)
             _ => QoSClass::Bulk,
         }
     }
@@ -90,20 +100,19 @@ impl OrderBuf {
         true
     }
 
-    pub fn check_timeouts(&mut self) -> bool {
-        false 
-    }
+    pub fn check_timeouts(&mut self) -> bool { false }
     
     pub fn purge_inode(&mut self, inode: u64) {
         let mut to_remove = Vec::new();
         for (seq, entry) in self.pending.iter() {
             if entry.event.inode == inode {
+                // Only purge BULK events (Writes).
+                // Critical/Metadata events must remain.
                 if Self::classify(entry.event.event_type) == QoSClass::Bulk {
                     to_remove.push(*seq);
                 }
             }
         }
-        
         for seq in to_remove {
             if let Some(entry) = self.pending.remove(&seq) {
                 self.current_bytes -= entry.event.length;
@@ -111,62 +120,65 @@ impl OrderBuf {
         }
     }
 
-    /// Smart Pop with AIMD Dynamic Windowing
+    /// Tiered Priority Pop with Strict Flow Isolation
     pub fn pop_batch(&mut self, coalesce_limit: u64) -> Option<Arc<Event>> {
         if self.pending.is_empty() { return None; }
 
-        let mut chosen_seq = None;
+        let mut best_seq = None;
+        let mut best_qos = QoSClass::Bulk;
         let mut blocked_inodes = HashSet::new();
         let mut scan_depth = 0;
-        let mut found_priority = false;
         
-        // 1. SCAN PHASE: Variable Window
+        // 1. SCAN PHASE
         for (seq, entry) in self.pending.iter().take(self.qos_window) {
             scan_depth += 1;
             let inode = entry.event.inode;
-            let qos = Self::classify(entry.event.event_type);
+            let current_qos = Self::classify(entry.event.event_type);
 
+            // Flow Isolation & Causal Ordering:
+            // If we have already seen ANY event for this inode in this scan,
+            // subsequent events for this inode are BLOCKED.
             if blocked_inodes.contains(&inode) {
                 continue;
             }
 
-            if qos == QoSClass::Critical {
-                chosen_seq = Some(*seq);
-                found_priority = true;
-                break;
+            // Selection Logic:
+            if current_qos > best_qos {
+                best_seq = Some(*seq);
+                best_qos = current_qos;
+                
+                if current_qos == QoSClass::Critical {
+                    break;
+                }
+            } else if best_seq.is_none() {
+                // Default to the first unblocked event we see (Head of Line)
+                best_seq = Some(*seq);
             }
 
+            // Mark inode as seen/blocked for future iterations in this window
             blocked_inodes.insert(inode);
         }
 
-        // --- DYNAMIC TUNING LOGIC ---
-        if found_priority {
-            // Reward: We found something useful! Look deeper next time to catch more.
-            // Additive Increase
+        // --- ADAPTIVE TUNING ---
+        if best_qos > QoSClass::Bulk {
             if self.qos_window < MAX_WINDOW {
                 self.qos_window += WINDOW_INC;
             }
         } else {
-            // Decay: Window was useless (pure bulk traffic). Shrink to save CPU.
-            // Multiplicative Decrease (slow decay to avoid thrashing)
             if self.qos_window > MIN_WINDOW {
                 self.qos_window = (self.qos_window * 99) / 100;
             }
         }
         
-        // Metrics to track the "breathing" window
         metrics::QOS_SCAN_DEPTH.observe(scan_depth as f64);
         
         // 2. RETRIEVAL
-        let seq_to_process = if let Some(seq) = chosen_seq {
-            if seq != *self.pending.keys().next().unwrap() {
-                metrics::QOS_PRIORITY_JUMPS.inc();
-            }
-            seq
-        } else {
-            *self.pending.keys().next().unwrap()
-        };
+        let seq_to_process = best_seq.unwrap_or_else(|| *self.pending.keys().next().unwrap());
         
+        if seq_to_process != *self.pending.keys().next().unwrap() {
+            metrics::QOS_PRIORITY_JUMPS.inc();
+        }
+
         if let Some(entry) = self.pending.remove(&seq_to_process) {
             let mut current_event = entry.event; 
             self.current_bytes -= current_event.length;
@@ -175,11 +187,10 @@ impl OrderBuf {
                 self.next_seq = seq_to_process + 1;
             }
 
-            let qos_class = Self::classify(current_event.event_type);
-            metrics::QOS_EVENT_CLASS.with_label_values(&[Self::class_name(qos_class)]).inc();
+            metrics::QOS_EVENT_CLASS.with_label_values(&[Self::class_name(best_qos)]).inc();
 
             // 3. COALESCING (Bulk Only)
-            if qos_class == QoSClass::Bulk {
+            if best_qos == QoSClass::Bulk {
                 let can_coalesce = matches!(current_event.event_type, EventType::Write | EventType::WriteRange);
                 
                 if can_coalesce {

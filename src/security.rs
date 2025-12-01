@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::fs::File;
 use chrono::Utc; 
 use crate::sidecar;
-use tracing::warn;
+use tracing::warn; // Removed unused 'debug'
 
 const FS_IOC_FSSETXATTR: u64 = 0x40205820; 
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
@@ -233,22 +233,28 @@ pub fn sync_xattrs(src: &Path, dst: &Path) {
 }
 
 pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
-    if let Ok(m) = std::fs::symlink_metadata(src) {
-        if !m.is_symlink() {
-            let _ = std::os::unix::fs::chown(dst, Some(m.uid()), Some(m.gid()));
-            let _ = std::fs::set_permissions(dst, m.permissions());
-        } else {
-             let dst_c = CString::new(dst.to_string_lossy().as_bytes()).unwrap();
-             unsafe { libc::lchown(dst_c.as_ptr(), m.uid(), m.gid()) };
-        }
-        
-        let times = [
-            libc::timespec { tv_sec: m.atime(), tv_nsec: m.atime_nsec() },
-            libc::timespec { tv_sec: m.mtime(), tv_nsec: m.mtime_nsec() },
-        ];
-        let dst_c = CString::new(dst.to_string_lossy().as_bytes()).unwrap();
-        unsafe { libc::utimensat(libc::AT_FDCWD, dst_c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    // FIX: Propagate errors instead of swallowing them with `if let Ok`
+    let m = std::fs::symlink_metadata(src).map_err(FoxingError::Io)?;
+    
+    if !m.is_symlink() {
+        std::os::unix::fs::chown(dst, Some(m.uid()), Some(m.gid())).map_err(FoxingError::Io)?;
+        std::fs::set_permissions(dst, m.permissions()).map_err(FoxingError::Io)?;
+    } else {
+         let dst_c = CString::new(dst.to_string_lossy().as_bytes()).unwrap();
+         if unsafe { libc::lchown(dst_c.as_ptr(), m.uid(), m.gid()) } < 0 {
+             return Err(FoxingError::Io(std::io::Error::last_os_error()));
+         }
     }
+    
+    let times = [
+        libc::timespec { tv_sec: m.atime(), tv_nsec: m.atime_nsec() },
+        libc::timespec { tv_sec: m.mtime(), tv_nsec: m.mtime_nsec() },
+    ];
+    let dst_c = CString::new(dst.to_string_lossy().as_bytes()).unwrap();
+    if unsafe { libc::utimensat(libc::AT_FDCWD, dst_c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+         return Err(FoxingError::Io(std::io::Error::last_os_error()));
+    }
+    
     Ok(())
 }
 

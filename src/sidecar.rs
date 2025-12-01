@@ -6,6 +6,7 @@ use std::os::unix::io::AsRawFd;
 use libc;
 use std::io::{self, Seek, SeekFrom};
 use xattr;
+use tracing::warn;
 
 pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
     let file_name = target_path.file_name()?.to_str()?;
@@ -30,6 +31,7 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
     // 1. OPTIMIZED: Try Native XAttr First
     match xattr::set(path, key, value) {
         Ok(_) => {
+            // Clean up legacy sidecar if it exists to avoid confusion
             if let Some(sp) = get_sidecar_path(path) {
                 if sp.exists() {
                     let _ = fs::remove_file(sp);
@@ -38,13 +40,35 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
             return;
         },
         Err(e) => {
-            if e.kind() == io::ErrorKind::ReadOnlyFilesystem {
-                return;
+            // STRICT FALLBACK: Only use sidecars if the FS truly doesn't support xattrs.
+            // If the file is missing (ENOENT) or busy, creating a sidecar is the wrong move.
+            // We also ignore ReadOnlyFilesystem as we can't write sidecars there anyway usually.
+            match e.kind() {
+                io::ErrorKind::ReadOnlyFilesystem => return,
+                io::ErrorKind::NotFound => {
+                    // File is gone; don't create a ghost sidecar
+                    return; 
+                },
+                _ => {
+                    // Check raw OS error for EOPNOTSUPP (95 on Linux usually)
+                    if let Some(code) = e.raw_os_error() {
+                        if code != libc::EOPNOTSUPP && code != libc::ENOTSUP {
+                            warn!("xattr::set failed for {:?} (Key: {}): {}. NOT falling back to sidecar.", path, key, e);
+                            return;
+                        }
+                    } else {
+                        // If we can't determine the error, log it and abort fallback to be safe
+                        warn!("xattr::set failed for {:?} with unknown error: {}. Aborting metadata save.", path, e);
+                        return;
+                    }
+                }
             }
+            // If we are here, it's EOPNOTSUPP/ENOTSUP, so we proceed to sidecar.
         }
     }
 
     // 3. FALLBACK: Sidecar File
+    // Only reachable if xattrs are explicitly unsupported by the filesystem.
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return,
@@ -66,6 +90,12 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) {
 }
 
 pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
+    // Check native xattr first (Read priority)
+    if let Ok(Some(val)) = xattr::get(path, key) {
+        return Some(val);
+    }
+
+    // Fallback to sidecar check
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {
             if let Ok(file) = File::open(&sp) {
@@ -75,8 +105,10 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
                     
                     if let Some(val_str) = map.get(key) {
                         if let Ok(val) = hex::decode(val_str) {
+                            // Opportunistic Migration: If we read from sidecar but xattr works now, migrate it.
                             if xattr::set(path, key, &val).is_ok() {
-                                let _ = fs::remove_file(sp);
+                                // We don't delete the sidecar immediately here as it might contain other keys,
+                                // but `set_metadata` will clean it up on next write if xattr works.
                             }
                             return Some(val);
                         }
@@ -84,10 +116,6 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
                 }
             }
         }
-    }
-
-    if let Ok(Some(val)) = xattr::get(path, key) {
-        return Some(val);
     }
 
     None
