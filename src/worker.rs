@@ -636,6 +636,7 @@ pub async fn run_worker(
                 },
                 Ok(None) => {}, 
                 Err(err) => {
+                    // ROBUSTNESS FIX: Catch consistency errors and use main loop debouncer
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
                             // USE DYNAMIC DEBOUNCE from Tuner
@@ -652,12 +653,22 @@ pub async fn run_worker(
                                 debug!("Consistency Error for inode {} suppressed by debounce ({:?}).", e.inode, tuner.hydration_debounce);
                             }
                         } else if io_err.to_string().contains("Target Full") {
+                             // ENOSPC / Capacity Breaker handling
                              warn!("Capacity Pressure: Slowing down ingestion for {:?}", target_cfg.path);
                              tuner.state = TunerState::SpacePressure;
                              tuner_board.insert(target_cfg.path.clone(), TunerState::SpacePressure);
+                             // Force failure state for ENOSPC to trigger backoff
+                             failure_state.record_failure();
                         }
                     }
-                    failure_state.record_failure();
+                    // DO NOT record failure for handled NotFound errors (prevents sleep loop)
+                    if let FoxingError::Io(ref io_err) = err {
+                         if io_err.kind() != io::ErrorKind::NotFound {
+                              failure_state.record_failure();
+                         }
+                    } else {
+                         failure_state.record_failure();
+                    }
                 }
             }
         }
