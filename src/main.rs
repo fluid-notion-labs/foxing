@@ -1,3 +1,12 @@
+//! # Foxing Daemon Entry Point
+//!
+//! This module handles the command-line interface, configuration loading,
+//! system topology discovery (NUMA/CPU), and the initialization of the
+//! primary synchronization manager.
+//!
+//! It is responsible for pinning critical threads (BPF) to high-performance
+//! cores and setting process priority to ensure stability under load.
+
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use foxing::{config::Config, mirror::Manager, bpf, metrics, versioning, api, worker};
@@ -14,15 +23,18 @@ use tokio::sync::RwLock;
 use libc;
 use walkdir::WalkDir;
 use std::fs;
-// FIX: Imports for CPU Pinning now working thanks to Cargo.toml update
 use nix::sched::{sched_setaffinity, CpuSet}; 
 use nix::unistd::Pid; 
 
 mod tui;
 
-// --- NUMA / CPU PINNING UTILITIES ---
-
-/// Helper function to retrieve the current system's CPU topology.
+/// Retrieves the current system's CPU topology to assist in thread pinning.
+///
+/// This function attempts to distinguish Performance (P) cores from Efficiency (E) cores
+/// using sysfs attributes common on modern Linux kernels (ARM big.LITTLE, Intel Hybrid).
+///
+/// # Returns
+/// A vector of `usize` representing the logical core IDs best suited for high-priority tasks.
 fn get_available_cores() -> Vec<usize> {
     let system = System::new_all();
     let total_cores = system.cpus().len();
@@ -30,13 +42,14 @@ fn get_available_cores() -> Vec<usize> {
 
     info!("System reports {} logical cores.", total_cores);
 
-    // 1. ADVANCED LOGIC: Try to prioritize P-cores (Performance Cores)
+    // Attempt to prioritize P-cores by reading cpu_capacity
     let mut p_cores = Vec::new();
     let mut e_cores = Vec::new();
     
     for i in 0..total_cores {
         let core_type_path = format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", i); 
         if let Ok(content) = fs::read_to_string(&core_type_path) {
+            // Heuristic: Non-zero or high capacity usually indicates a P-core
             if content.trim() != "0" {
                 p_cores.push(i);
             } else {
@@ -61,9 +74,13 @@ fn get_available_cores() -> Vec<usize> {
     available_cores
 }
 
+/// Sets the current thread's scheduling policy to Real-Time (SCHED_FIFO).
+///
+/// This reduces jitter and prevents the BPF collector from being preempted
+/// during high system load, which is critical for preventing ring buffer drops.
 fn set_realtime_priority() {
     let param = libc::sched_param { sched_priority: 1 }; 
-    let pid = 0; 
+    let pid = 0; // 0 indicates the current thread
     
     let res = unsafe {
         libc::sched_setscheduler(
@@ -80,6 +97,10 @@ fn set_realtime_priority() {
     }
 }
 
+/// Pins the current thread to a specific CPU core.
+///
+/// # Arguments
+/// * `core_id` - The logical processor ID to pin this thread to.
 fn pin_to_cpu(core_id: usize) {
     let mut cpu_set = CpuSet::new();
     if core_id >= std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) {
@@ -92,6 +113,7 @@ fn pin_to_cpu(core_id: usize) {
          return;
     }
 
+    // Pid::from_raw(0) refers to the current thread in nix
     if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
         warn!("Failed to pin thread to CPU {}: {}", core_id, e);
     } else {
@@ -322,13 +344,12 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let prio = cfg.read().await.io_priority.clone();
     set_process_priority(&prio);
 
-    // --- WORKER THREAD PINNING SETUP ---
+    // Pinning setup
     let mut available_cores = get_available_cores();
-    // Reserve the best core for BPF
+    // Reserve the best core for BPF (P-core if available)
     let bpf_core_id = if !available_cores.is_empty() { available_cores.remove(0) } else { 0 };
 
     let mut mgr = Manager::new(cfg.clone()).await;
-    // FIX: Captured hydration_rx to actually use it
     let (queues, handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
     
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -340,7 +361,6 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let bpf_thread_handle = std::thread::Builder::new()
         .name("foxing-bpf-collector".into())
         .spawn(move || {
-            // OPTIMIZATION: Pin BPF thread to a dedicated core
             pin_to_cpu(bpf_core_id); 
             set_realtime_priority(); 
             tokio::runtime::Builder::new_current_thread()
@@ -359,7 +379,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
         Ok(())
     }));
 
-    // NEW: Hydration Listener Task
+    // Hydration Listener Task
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();

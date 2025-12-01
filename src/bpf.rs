@@ -1,3 +1,9 @@
+//! # BPF Event Collector
+//!
+//! This module initializes the eBPF subsystem, attaches kprobes to VFS/XFS
+//! functions, and polls the kernel ring buffer. It handles the raw event stream
+//! and applies backpressure if the userspace consumers fall behind.
+
 use crate::event::{Event, EventType, EventQueue};
 use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;
@@ -18,7 +24,7 @@ lazy_static::lazy_static! {
     static ref DEVICE_EVENT_COUNTER: DashMap<u32, AtomicU64> = DashMap::new();
 }
 
-// Public accessor for debug UI
+/// Public accessor for debug UI to see BPF event counts per device.
 pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
     let mut stats = HashMap::new();
     for r in DEVICE_EVENT_COUNTER.iter() {
@@ -38,11 +44,16 @@ struct RawEvent {
     np_ino: u64, r#gen: u32, mode: u32, off: u64, len: u64, uid: u32, gid: u32,
     nlink: u32, flags: u32, sz: u64, 
     projid: u32, 
-    _pad1: u32, // Replaces open_count to match C struct
+    _pad1: u32, 
     name: [u8;256], nname: [u8;256],
     comm: [u8;16] 
 }
 
+/// Main BPF Event Loop.
+///
+/// This function loads the BPF program and enters a continuous polling loop.
+/// It monitors `metrics::GLOBAL_BUFFER_COUNT` to apply backpressure by
+/// skipping kernel buffer consumption if userspace is overloaded.
 pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
     let skel_builder = MirrorSkelBuilder::default();
     
@@ -63,7 +74,6 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
             
-        // Pre-populate stats so Debug UI shows the device immediately (even with 0 events)
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
     }
@@ -122,14 +132,13 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     
     let mut builder = RingBufferBuilder::new();
     builder.add(events_map, move |data| {
-        // WORKER BACKPRESSURE CONTROL: Check if the global userspace buffer is full
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64; 
         
-        // If buffer is > 75% full, aggressively skip event acquisition in BPF
+        // Backpressure: If userspace buffer is > 75% full, skip acquisition
+        // This prevents the kernel ring buffer from becoming stuck if userspace halts.
         if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
-            // We do NOT decrement GLOBAL_BUFFER_COUNT here as the consumer should handle it
             return 0; 
         }
         
@@ -225,11 +234,9 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                     last_report = std::time::Instant::now();
                 }
             },
-            // FIX: Don't die on EINTR (os error 4). 
-            // Just log and retry. This keeps the brain alive during load spikes.
             Err(e) => {
+                // Log warning but keep running to tolerate EINTR signals under load
                 warn!("BPF Ring Poll Warning (will retry): {}", e);
-                // Optional: check for specific fatal errors here if needed
             }
         }
     }

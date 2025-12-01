@@ -1,3 +1,9 @@
+//! # Worker Module
+//! 
+//! The worker is the core I/O executor. It consumes events from the ordering buffer,
+//! applies them to the target filesystem, and manages consistency via locking.
+//! It features a BBR-inspired congestion control mechanism to optimize throughput.
+
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}}, 
     collections::{HashMap, VecDeque}, 
@@ -39,10 +45,8 @@ pub enum TunerState {
     SpacePressure = 6 
 }
 
-// -----------------------------------------------------------------------------
-// HELPER STRUCTS
-// -----------------------------------------------------------------------------
-
+// ... (WindowedFilter, VdoTuner, ErrorLimiter, CircuitBreaker, FailureState, ShardedLockCache, DirtyEntry, BbrTuner implementations remain unchanged)
+// They are included here for compilation completeness.
 struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
@@ -358,7 +362,7 @@ impl BbrTuner {
     }
     
     fn should_defer_maintenance(&self) -> bool {
-        // FIX 1: Defer maintenance if the BBR state is stressed.
+        // Defer maintenance if the BBR state is stressed.
         matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain | TunerState::SpacePressure)
     }
 
@@ -452,29 +456,23 @@ pub async fn run_worker(
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             
             // LOW PRIORITY QUEUE POLLING (Hydration)
+            // Throttles rx_low based on BBR state to prioritize high-priority queue
             Some(e) = async {
-                // FIX 2: Throttling rx_low based on BBR state (prioritizing rx_high)
                 let current_state = tuner_board.get(&target_cfg.path).map(|r| *r).unwrap_or(TunerState::Startup);
                 
-                // If Draining, Muted, or Stressed, pause rx_low consumption to clear high queue backlog
                 if matches!(current_state, TunerState::Drain | TunerState::Muted | TunerState::SpacePressure) {
                     sleep(Duration::from_millis(50)).await;
                 }
 
                 rx_low.recv().await
             } => { 
-                // FIX: e is already Arc<Event> because rx_low.recv() returns Option<Arc<Event>>
-                // We match on it to handle the Option
-                match e {
-                    Some(evt) => {
-                         if is_hibernating { 
-                             order.push_and_check(evt.clone()); 
-                             continue; 
-                         }
-                         Some(evt)
-                    },
-                    None => None
-                }
+                if is_hibernating { 
+                    if let Some(evt) = &e {
+                        order.push_and_check(evt.clone()); 
+                    }
+                    continue; 
+                } 
+                e // Returns Option<Arc<Event>>
             },
             
             _ = flush_interval.tick() => {
@@ -664,12 +662,10 @@ async fn process_single_event(
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
     
-    // FIX: Ignore .tmp files from self
     if e.name.contains(".tmp.") {
         return Ok(None);
     }
 
-    // FIX: Lock by Path Hash instead of Inode to prevent Update/Delete races
     let lock = ctx.locks.get_by_path(&e.name);
     let _g = lock.lock().await;
     
@@ -833,10 +829,9 @@ async fn process_single_event(
                 // NEW: Unlink is idempotent. NotFound is not an error.
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
-                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } // Target might be a file due to race
                 }
                 r
-            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
+            }).await.unwrap_or(Ok(())).map_err(|err| err.into());
             if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
             Ok(res.map(|_| None))
         },

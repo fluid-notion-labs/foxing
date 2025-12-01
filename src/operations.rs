@@ -52,8 +52,6 @@ impl Drop for TmpFileGuard {
         if self.armed {
             warn!("IO Transaction Failed: Rolling back temp file {:?}", self.path);
             if let Err(e) = std::fs::remove_file(&self.path) {
-                // It's expected to fail if the file was never created or already moved,
-                // but we log just in case.
                 if e.kind() != std::io::ErrorKind::NotFound {
                     error!("CRITICAL: Failed to clean up temp file {:?}: {}", self.path, e);
                 }
@@ -91,7 +89,6 @@ impl SmartCopier {
             (dst.to_path_buf(), libc::O_RDWR)
         };
 
-        // Initialize cleanup guard. If we return Err at any point, this will delete target_path.
         let mut cleanup_guard = if is_full_replace {
             Some(TmpFileGuard::new(target_path.clone()))
         } else {
@@ -122,12 +119,10 @@ impl SmartCopier {
         let mut transfer_done = false;
         let mut stats = CopyStats::default();
 
-        // 1. Attempt Reflink / Server-Side Copy
         if is_full_replace && reflink_ok.load(Ordering::Relaxed) {
             let mut off_in = 0i64;
             let mut off_out = 0i64;
             
-            // Measure Syscall Duration Only
             let start = Instant::now();
             let ret = unsafe { 
                 libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) 
@@ -163,10 +158,8 @@ impl SmartCopier {
             }
         }
 
-        // 2. Fallback: io_uring / Uncached
         if !transfer_done {
             if is_full_replace {
-                // Full Sync Copy via Standard IO (Blocking)
                 metrics::COPY_METHOD_STANDARD.inc(); 
                 let sfd_raw = sfd; 
                 let dfd_raw = dfd;
@@ -195,26 +188,22 @@ impl SmartCopier {
                 stats.io_duration = duration;
                 debug!("Standard copy success for {:?}", dst);
             } else {
-                // Delta Update
                 metrics::COPY_METHOD_STANDARD.inc();
                 stats = Self::perform_delta_uring(ring, buf, sfd, dfd, offset, length, vdo_opt, use_uncached_io).await?;
             }
         }
 
-        // Safe Close
         unsafe { 
             libc::fsync(dfd);
             libc::close(dfd);
         }
 
         if is_full_replace {
-            // Atomic Rename
             debug!("Atomic Commit: Renaming {:?} -> {:?}", target_path, dst);
             if let Err(e) = std::fs::rename(&target_path, dst) {
                 error!("Atomic Rename Failed {:?} -> {:?}: {}", target_path, dst, e);
                 return Err(FoxingError::Io(e));
             }
-            // Success! Disarm the guard so we don't delete the file we just moved.
             if let Some(g) = &mut cleanup_guard {
                 g.disarm();
             }

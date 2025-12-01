@@ -5,9 +5,9 @@ use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
 
-// TRIAGE 2: Reduce from 500ms to 100ms
+// Relaxed HoL Timeout (500ms) for XFS loopback environments
 const MAX_HOL_DELAY: Duration = Duration::from_millis(500);
-const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024; 
 
 struct PendingEvent {
     event: Arc<Event>,
@@ -31,7 +31,6 @@ impl OrderBuf {
         } 
     }
     
-    /// Returns true if accepted, false if dropped/full.
     pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
         if self.next_seq == 0 { 
             self.next_seq = e.seq_num; 
@@ -58,13 +57,12 @@ impl OrderBuf {
     }
 
     /// Checks for Head-of-Line blocking.
-    /// Returns `true` if a gap was detected and skipped (indicating potential data loss/need for sync).
     pub fn check_timeouts(&mut self) -> bool {
         if let Some((&first_seq, first_entry)) = self.pending.iter().next() {
             if first_seq > self.next_seq {
                 let gap = first_seq - self.next_seq;
                 
-                // FIX 4: Aggressive Gap Reset (if gap > 1000 or delayed > 500ms)
+                // Aggressive Gap Reset if gap > 1000 OR timeout > 500ms
                 if gap > 1000 || first_entry.arrival.elapsed() > MAX_HOL_DELAY {
                     warn!("HoL Blocking detected: Waiting for seq {} but have {} (Gap: {}). Skipping gap.", 
                           self.next_seq, first_seq, gap);
@@ -77,7 +75,7 @@ impl OrderBuf {
         false
     }
     
-    /// Remove all pending events for a specific inode.
+    /// Removes all pending events for a specific inode (Time Travel Prevention)
     pub fn purge_inode(&mut self, inode: u64) {
         let mut to_remove = Vec::new();
         for (seq, entry) in self.pending.iter() {
@@ -89,7 +87,6 @@ impl OrderBuf {
         for seq in to_remove {
             if let Some(entry) = self.pending.remove(&seq) {
                 self.current_bytes -= entry.event.length;
-                // If we removed the HEAD of the line, advance next_seq to unblock
                 if seq == self.next_seq {
                     self.next_seq += 1;
                 }

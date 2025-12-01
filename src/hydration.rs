@@ -49,7 +49,7 @@ impl Hydrator {
     }
 
     pub fn full_scan(&self) {
-        // Debounce
+        // Debounce: Ensure only one scan runs at a time
         if self.source.hydration.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             warn!("Hydration: Scan requested but ALREADY ACTIVE for {:?}. Skipping.", self.source.path);
             return;
@@ -65,7 +65,7 @@ impl Hydrator {
         for entry_result in walk {
             self.governor.pace_hydration();
             
-            // TUNER FEEDBACK INTEGRATION: Adaptive Yielding
+            // Adaptive Yielding based on Worker Stress
             let yield_now = self.targets.iter().any(|(cfg, _, _)| {
                 self.tuner_board.get(&cfg.path).map(|state| {
                     matches!(*state, TunerState::Muted | TunerState::Drain | TunerState::SpacePressure)
@@ -73,10 +73,8 @@ impl Hydrator {
             });
 
             if yield_now {
-                // If any worker is stressed, yield immediately to give them CPU time.
                 std::thread::yield_now();
             } else if self.source.hydration.scanned.load(Ordering::Relaxed) % 100 == 0 {
-                // Otherwise, yield less frequently (every 100 files) to maintain forward progress.
                  std::thread::yield_now();
             }
 
@@ -108,20 +106,18 @@ impl Hydrator {
                         }
 
                         if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
-                            // Skip root
                             if rel.as_os_str().is_empty() { continue; }
 
                             let source_path = self.source.path.join(rel);
-                            // If source missing, queue unlink
+                            // If missing in source, queue Unlink
                             if !source_path.exists() {
                                 
-                                // METADATA SYNC ON DIR (Pre-check): Ensure parent exists before queuing UNLINK
+                                // Pre-check: Ensure parent dir exists to avoid failure
                                 if let Some(parent_rel) = rel.parent() {
                                     let parent_path = target_cfg.path.join(parent_rel);
                                     if !parent_path.exists() {
-                                        // Create missing hierarchy to prevent worker failure on path resolution
                                         let _ = fs::create_dir_all(&parent_path).map_err(|e| {
-                                            warn!("Hydration: Failed to create missing parent directory {:?} for deletion target: {}", parent_path, e);
+                                            warn!("Hydration: Failed to create missing parent directory {:?}: {}", parent_path, e);
                                             e
                                         });
                                     }
@@ -218,7 +214,7 @@ impl Hydrator {
         }
 
         for (target_cfg, high_q, low_q) in &self.targets {
-            // FIX 3: Push Metadata/Directory events to the HIGH priority queue regardless.
+            // FIX 3: Prioritize Directory/Structure events
             let is_dir_meta = m.is_dir() || m.is_symlink();
             let q = if urgent || is_dir_meta { high_q } else { low_q };
 
@@ -246,8 +242,7 @@ impl Hydrator {
     fn sync_file(&self, src_path: &Path, rel: &Path, m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig, q: &Arc<EventQueue>) -> Result<()> {
         let dst_path = target_cfg.path.join(rel);
         
-        // Final sanity check before queuing the expensive WRITE: does the source still exist?
-        // This mitigates the race between BPF event generation and Hydration scan.
+        // Source sanity check to mitigate race conditions
         if !src_path.exists() {
             warn!("Hydration: Source file {:?} disappeared during scan, aborting WRITE.", rel);
             return Ok(());
@@ -268,20 +263,12 @@ impl Hydrator {
                         let integrity_hash = security::get_valid_dir_hash(src_parent);
                         let target_hash = security::get_dir_integrity_hash(dst_parent);
                         
-                        // STRICTER CHECK:
-                        if dm.len() != m.len() { 
-                            // warn!("Hydration: Size mismatch for {:?} (Src: {}, Dst: {}). Syncing.", rel, m.len(), dm.len());
-                            true 
-                        }
+                        if dm.len() != m.len() { true }
                         else if integrity_hash != 0 && integrity_hash == target_hash { 
                             metrics::HYDRATION_HASH_SKIPPED.inc();
                             false 
                         }
-                        // STRICTER CHECK: If mtime is different at all, sync. (Assuming source is master)
-                        else if target_epoch == 0 || dm.mtime() != m.mtime() { 
-                            // warn!("Hydration: Mtime mismatch/No Epoch for {:?}. Syncing.", rel);
-                            true 
-                        }
+                        else if target_epoch == 0 || dm.mtime() != m.mtime() { true }
                         else { false }
                     }
                 },
@@ -290,7 +277,7 @@ impl Hydrator {
         };
 
         if needs_sync {
-            warn!("Hydration: Queueing WRITE for {:?}", rel); // Loud log for AI context
+            warn!("Hydration: Queueing WRITE for {:?}", rel);
             let evt = Event {
                 event_type: EventType::Write,
                 dev_id: self.source.dev,
@@ -352,19 +339,11 @@ impl Hydrator {
     fn sync_dir_hash(&self, rel: &Path, target_cfg: &TargetConfig) -> Result<()> {
         let dst_dir_path = target_cfg.path.join(rel);
         
-        // METADATA SYNC ON DIR: Check existence and create if missing before calculating hash
         if !dst_dir_path.exists() {
-            // Check if parent exists before trying to create.
+            // Recursively verify hierarchy
             if let Some(parent) = dst_dir_path.parent() {
                 if !parent.exists() {
-                    // This implies the parent was missed; queue its creation (which should hit the high queue)
                     warn!("Hydration: Missing parent directory {:?} for target dir {:?}. Queueing MKDIR for parent.", parent, rel);
-                    // Note: Since this is MKDIR on a parent, and MKDIR events already go to the high queue,
-                    // we queue the parent directory creation explicitly via an event (if possible)
-                    // or rely on create_dir_all in the worker/sync function. Here, we rely on the implicit 
-                    // creation later in the worker via create_dir_all on the parent path.
-
-                    // For now, let's just create the missing directory here if required.
                     let _ = fs::create_dir_all(&dst_dir_path).map_err(|e| {
                          warn!("Hydration: Failed to create missing directory {:?}: {}", dst_dir_path, e);
                          e
