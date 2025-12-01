@@ -466,7 +466,10 @@ pub async fn run_worker(
 
         let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
         
+        // WORKER PRIORITY FIX: Use 'biased' mode to strictly prefer High Priority events (small files/metadata)
         let event_poll_result = tokio::select! {
+            biased;
+            
             _ = shutdown_rx.recv() => break Ok(()),
             Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
             
@@ -599,7 +602,7 @@ pub async fn run_worker(
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
                  order.next_seq = 0;
-                 if last_hydration_request.elapsed() >= Duration::from_secs(5) { // Replaced constant with safe fallback literal
+                 if last_hydration_request.elapsed() >= current_debounce {
                      let _ = hydration_tx.send(source.path.clone()).await;
                      last_hydration_request = Instant::now();
                  }
@@ -636,7 +639,6 @@ pub async fn run_worker(
                 },
                 Ok(None) => {}, 
                 Err(err) => {
-                    // ROBUSTNESS FIX: Catch consistency errors and use main loop debouncer
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
                             // USE DYNAMIC DEBOUNCE from Tuner

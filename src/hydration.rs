@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 use tracing::{info, warn, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 
-use crate::config::TargetConfig;
+use crate::config::{TargetConfig, TargetProfile};
 use crate::event::{Event, EventType, EventQueue};
 use crate::mirror::SourceInfo;
 use crate::governor::Governor;
@@ -248,9 +248,41 @@ impl Hydrator {
         }
 
         for (target_cfg, high_q, low_q) in &self.targets {
-            // FIX 3: Prioritize Directory/Structure events
+            // 1. Determine Hardware Capabilities
+            let (low_limit, high_limit) = match target_cfg.profile {
+                 TargetProfile::HDD => (1 * 1024 * 1024, 8 * 1024 * 1024),       // 1MB - 8MB
+                 _                  => (5 * 1024 * 1024, 64 * 1024 * 1024),      // 5MB - 64MB (Default/SSD)
+            };
+
+            // 2. Determine System State (Hysteresis / Gear Shifting)
+            let current_state = self.tuner_board.get(&target_cfg.path).map(|s| *s).unwrap_or(TunerState::Startup);
+            
+            let large_file_threshold = match current_state {
+                // High Gear: Healthy system
+                TunerState::Startup | TunerState::ProbeBW | TunerState::IdleReset => high_limit,
+                
+                // Middle Gear: Transient issues (Drain)
+                TunerState::Drain => (high_limit + low_limit) / 2,
+                
+                // Low Gear: Critical stress
+                TunerState::Muted | TunerState::SpacePressure => low_limit,
+            };
+
             let is_dir_meta = m.is_dir() || m.is_symlink();
-            let q = if urgent || is_dir_meta { high_q } else { low_q };
+            let is_large_file = m.is_file() && m.len() > large_file_threshold;
+            
+            // 3. Route to Queue
+            let q = if is_dir_meta {
+                high_q // Metadata always fast lane
+            } else if is_large_file {
+                debug!("Hydration: Demoting file {:?} (>{} bytes) to Low Priority (State: {:?})", 
+                        rel, large_file_threshold, current_state);
+                low_q
+            } else if urgent {
+                high_q
+            } else {
+                low_q
+            };
 
             if !urgent {
                 self.check_tuner_pause(target_cfg);
