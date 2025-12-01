@@ -23,7 +23,7 @@ use std::io;
 use crate::metrics;
 use parking_lot::Mutex; 
 use lru::LruCache; 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
@@ -655,6 +655,8 @@ pub async fn run_worker(
                                     last_hydration_request = Instant::now();
                                     
                                     tuner.state = TunerState::Drain;
+                                    // FORCE UPDATE DEBOUNCE to prevent rapid cycling
+                                    tuner.hydration_debounce = Duration::from_secs(30); 
                                     tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
                                 } else {
                                      debug!("Skipping hydration for inode {} - source file also missing", e.inode);
@@ -910,15 +912,19 @@ async fn process_single_event(
             if let Some(new_name) = &e.new_name {
                 metrics::RENAME_EVENTS.inc();
                 
-                // FIX 1: Correctly construct path relative to the OLD parent directory
-                let old_rel = PathBuf::from(&e.name);
-                let new_rel = if let Some(parent) = old_rel.parent() {
+                // NEW FIX: Use 'dst' (resolved from inode map) to find the parent directory.
+                // 'e.name' from BPF is just the filename and lacks directory context.
+                let new_dst = if let Some(parent) = dst.parent() {
                     parent.join(new_name)
                 } else {
-                    PathBuf::from(new_name)
+                    target_cfg.path.join(new_name)
                 };
+                
+                // Calculate relative path for checking allow-lists
+                let new_rel = new_dst.strip_prefix(&target_cfg.path)
+                    .unwrap_or_else(|_| Path::new(new_name)) // Fallback
+                    .to_path_buf();
 
-                let new_dst = target_cfg.path.join(&new_rel);
                 if target_cfg.allow(&new_rel) {
                     let dst_clone = dst.clone(); 
                     let new_dst_clone = new_dst.clone(); 
