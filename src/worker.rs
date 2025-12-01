@@ -363,7 +363,8 @@ impl BbrTuner {
     
     fn should_defer_maintenance(&self) -> bool {
         // Defer maintenance if the BBR state is stressed.
-        matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain | TunerState::SpacePressure)
+        // NOTE: SpacePressure is REMOVED from here. If we have space pressure, we MUST NOT defer maintenance (cleanup).
+        matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain)
     }
 
     fn calculate_version_limits(&self, cfg: &TargetConfig, avail: u64, total: u64) -> (usize, u64) {
@@ -620,15 +621,25 @@ pub async fn run_worker(
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
                             if last_hydration_request.elapsed() >= Duration::from_secs(HYDRATION_DEBOUNCE_SECS) {
-                                warn!("Consistency Error (NotFound) for inode {}. Triggering debounced hydration and backing off.", e.inode);
-                                let _ = hydration_tx.send(source.path.clone()).await;
+                                // FIX: Determine PRECISE path to repair
+                                let repair_path = source.mount.join(&e.name);
+                                warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
+                                
+                                // Send specific path instead of source root
+                                let _ = hydration_tx.send(repair_path).await;
                                 last_hydration_request = Instant::now();
                                 
                                 // BBR Backoff to allow system to stabilize
                                 tuner.state = TunerState::Drain;
+                                tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
                             } else {
                                 debug!("Consistency Error for inode {} suppressed by debounce.", e.inode);
                             }
+                        } else if io_err.to_string().contains("Target Full") {
+                             // ENOSPC / Capacity Breaker handling
+                             warn!("Capacity Pressure: Slowing down ingestion for {:?}", target_cfg.path);
+                             tuner.state = TunerState::SpacePressure;
+                             tuner_board.insert(target_cfg.path.clone(), TunerState::SpacePressure);
                         }
                     }
                     // Record failure metrics but keep the worker alive

@@ -32,7 +32,7 @@ impl Default for HydrationState {
 }
 
 pub struct Hydrator {
-    source: Arc<SourceInfo>,
+    pub source: Arc<SourceInfo>,
     targets: Vec<(TargetConfig, Arc<EventQueue>, Arc<EventQueue>)>,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -46,6 +46,40 @@ impl Hydrator {
         tuner_board: TunerBoard,
     ) -> Self {
         Self { source, targets, governor, tuner_board }
+    }
+
+    /// Business As Usual: Surgically repair a single file or directory.
+    pub fn repair_path(&self, path: PathBuf) {
+        debug!("Hydration: Targeted repair requested for {:?}", path);
+        
+        // If it doesn't exist on source, it might be a deletion that was missed
+        if !path.exists() {
+             // If path is inside our source root, trigger the deletion logic
+             if let Ok(rel) = path.strip_prefix(&self.source.path) {
+                 if !rel.as_os_str().is_empty() {
+                     self.queue_deletion(rel);
+                 }
+             }
+             return;
+        }
+
+        if let Err(e) = self.process_path(&path, true, None) {
+            warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
+        }
+    }
+
+    fn queue_deletion(&self, rel: &Path) {
+        for (_, _, q) in &self.targets {
+            let evt = Event {
+                event_type: EventType::Unlink,
+                dev_id: self.source.dev,
+                inode: 0, parent_inode: 0, seq_num: 0, offset: 0, length: 0,
+                name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0,
+                process_name: "hydration_repair".into(), interactive: false, 
+                created_at: Instant::now(),
+            };
+            q.push(Arc::new(evt));
+        }
     }
 
     pub fn full_scan(&self) {

@@ -387,9 +387,11 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     tokio::spawn(async move {
         while let Some(path) = hydration_rx.recv().await {
             if sd_for_hyd.load(Ordering::Relaxed) { break; }
+            
+            // UPDATE: Pass the path to the manager (supports targeted repair now)
             warn!("Hydration REQUESTED via signal for {:?}", path); 
             let m = mgr_for_hydration.lock().await;
-            m.trigger_hydration();
+            m.trigger_hydration(path);
         }
     });
 

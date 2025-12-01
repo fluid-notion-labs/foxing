@@ -214,15 +214,29 @@ impl Manager {
         (queues, handles, shutdowns, hydration_rx)
     }
 
-    pub fn trigger_hydration(&self) {
-        // Trigger scans on all hydrators
+    // UPDATED: Accepts a path to distinguish Full Scan vs Targeted Repair
+    pub fn trigger_hydration(&self, target_path: PathBuf) {
         for h in &self.hydrators {
-            let h_clone = h.clone();
-            let thread_handle = std::thread::spawn(move || {
-                h_clone.full_scan();
-                Ok(())
-            });
-            self.hydration_handles.lock().push(thread_handle);
+            // Check if the requested path belongs to this hydrator's source root
+            if target_path.starts_with(&h.source.path) {
+                let h_clone = h.clone();
+                
+                // If the request IS the root, do a full scan.
+                if target_path == h.source.path {
+                    let thread_handle = std::thread::spawn(move || {
+                        h_clone.full_scan();
+                        Ok(())
+                    });
+                    self.hydration_handles.lock().push(thread_handle);
+                } else {
+                    // Otherwise, do a targeted repair
+                    let thread_handle = std::thread::spawn(move || {
+                        h_clone.repair_path(target_path);
+                        Ok(())
+                    });
+                    self.hydration_handles.lock().push(thread_handle);
+                }
+            }
         }
     }
 
