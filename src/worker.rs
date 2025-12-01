@@ -626,10 +626,13 @@ pub async fn run_worker(
                                 
                                 // BBR Backoff to allow system to stabilize
                                 tuner.state = TunerState::Drain;
+                            } else {
+                                debug!("Consistency Error for inode {} suppressed by debounce.", e.inode);
                             }
                         }
                     }
-                    // Continue loop even on error
+                    // Record failure metrics but keep the worker alive
+                    failure_state.record_failure();
                 }
             }
         }
