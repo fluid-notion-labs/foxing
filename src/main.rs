@@ -13,9 +13,10 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 use libc;
 use walkdir::WalkDir;
+use std::fs;
+// FIX: Imports for CPU Pinning now working thanks to Cargo.toml update
 use nix::sched::{sched_setaffinity, CpuSet}; 
-use std::process; 
-use std::fs; 
+use nix::unistd::Pid; 
 
 mod tui;
 
@@ -86,11 +87,13 @@ fn pin_to_cpu(core_id: usize) {
          return;
     }
 
-    cpu_set.set(core_id).expect("Core ID must be valid");
-    let res = sched_setaffinity(process::Pid::from_raw(0), &cpu_set); 
-    
-    if res.is_err() {
-        warn!("Failed to pin thread to CPU {}: {:?}", core_id, res.err());
+    if let Err(e) = cpu_set.set(core_id) {
+         warn!("Failed to add core {} to CpuSet: {}", core_id, e);
+         return;
+    }
+
+    if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+        warn!("Failed to pin thread to CPU {}: {}", core_id, e);
     } else {
         info!("Thread pinned successfully to CPU {}", core_id);
     }
@@ -325,6 +328,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let bpf_core_id = if !available_cores.is_empty() { available_cores.remove(0) } else { 0 };
 
     let mut mgr = Manager::new(cfg.clone()).await;
+    // FIX: Captured hydration_rx to actually use it
     let (queues, handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
     
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -350,8 +354,12 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
                 })
         }).unwrap();
         
-    handles.push(tokio::task::spawn_blocking(move || bpf_thread_handle.join().unwrap()));
+    handles.push(tokio::task::spawn_blocking(move || {
+        bpf_thread_handle.join().unwrap();
+        Ok(())
+    }));
 
+    // NEW: Hydration Listener Task
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();

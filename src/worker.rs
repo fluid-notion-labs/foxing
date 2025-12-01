@@ -462,7 +462,20 @@ pub async fn run_worker(
                 }
 
                 rx_low.recv().await
-            } => { if is_hibernating { order.push_and_check(e.unwrap()); continue; } e },
+            } => { 
+                // FIX: e is already Arc<Event> because rx_low.recv() returns Option<Arc<Event>>
+                // We match on it to handle the Option
+                match e {
+                    Some(evt) => {
+                         if is_hibernating { 
+                             order.push_and_check(evt.clone()); 
+                             continue; 
+                         }
+                         Some(evt)
+                    },
+                    None => None
+                }
+            },
             
             _ = flush_interval.tick() => {
                 let path_clone = target_cfg.path.clone(); 
@@ -622,6 +635,10 @@ pub async fn run_worker(
     }
 }
 
+// -----------------------------------------------------------------------------
+// EVENT PROCESSOR
+// -----------------------------------------------------------------------------
+
 async fn process_single_event(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -647,10 +664,12 @@ async fn process_single_event(
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
     
+    // FIX: Ignore .tmp files from self
     if e.name.contains(".tmp.") {
         return Ok(None);
     }
 
+    // FIX: Lock by Path Hash instead of Inode to prevent Update/Delete races
     let lock = ctx.locks.get_by_path(&e.name);
     let _g = lock.lock().await;
     
@@ -814,9 +833,10 @@ async fn process_single_event(
                 // NEW: Unlink is idempotent. NotFound is not an error.
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
+                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } // Target might be a file due to race
                 }
                 r
-            }).await.unwrap_or(Ok(())).map_err(|err| err.into());
+            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
             if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
             Ok(res.map(|_| None))
         },
