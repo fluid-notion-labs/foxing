@@ -8,10 +8,14 @@ use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
 use tracing::{info, error, debug, warn}; 
 use dashmap::DashMap;
+use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
+
+// Repair debounce window (prevent spamming scans on the same file)
+const REPAIR_DEBOUNCE_MS: u64 = 5000;
 
 pub struct SourceInfo { 
     pub path: PathBuf, 
@@ -28,11 +32,12 @@ pub struct Manager {
     sources: HashMap<u32, Arc<SourceInfo>>, 
     watchers: Vec<notify::RecommendedWatcher>,
     hydration_handles: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>>,
-    // NEW: Store hydrators to trigger them later
     hydrators: Vec<Arc<Hydrator>>,
     pub queues: HashMap<u32, Vec<Arc<EventQueue>>>,
     pub governor: Arc<Governor>,
     pub tuner_board: TunerBoard,
+    // NEW: Track recent repairs to deduplicate requests
+    repair_tracker: Arc<DashMap<PathBuf, Instant>>,
 }
 
 /// Defense-in-Depth Device ID Resolution.
@@ -134,6 +139,7 @@ impl Manager {
             hydrators: Vec::new(),
             governor,
             tuner_board: Arc::new(DashMap::new()),
+            repair_tracker: Arc::new(DashMap::new()),
         }
     }
 
@@ -216,6 +222,14 @@ impl Manager {
 
     // UPDATED: Accepts a path to distinguish Full Scan vs Targeted Repair
     pub fn trigger_hydration(&self, target_path: PathBuf) {
+        // Garbage collect old tracker entries (simple probability check to avoid lock contention)
+        // Use SystemTime nanos for stochastic check (~4% chance) to avoid 'rand' crate dependency
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        if nanos % 25 == 0 {
+             let now = Instant::now();
+             self.repair_tracker.retain(|_, time| now.duration_since(*time) < Duration::from_millis(REPAIR_DEBOUNCE_MS));
+        }
+
         for h in &self.hydrators {
             // Check if the requested path belongs to this hydrator's source root
             if target_path.starts_with(&h.source.path) {
@@ -229,6 +243,16 @@ impl Manager {
                     });
                     self.hydration_handles.lock().push(thread_handle);
                 } else {
+                    // DEDUPLICATION CHECK
+                    let now = Instant::now();
+                    if let Some(last_repair) = self.repair_tracker.get(&target_path) {
+                         if now.duration_since(*last_repair) < Duration::from_millis(REPAIR_DEBOUNCE_MS) {
+                             debug!("Skipping redundant repair request for {:?}", target_path);
+                             return;
+                         }
+                    }
+                    self.repair_tracker.insert(target_path.clone(), now);
+
                     // Otherwise, do a targeted repair
                     // FIX: Clone the path so we don't move the shared reference variable
                     let repair_path = target_path.clone();
