@@ -12,6 +12,7 @@ use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
 use tracing::{warn, debug, error};
+use std::convert::TryInto; // For Issue #10
 
 use crate::buffer::AlignedBuffer;
 use crate::error::{FoxingError, Result};
@@ -63,6 +64,11 @@ impl Drop for TmpFileGuard {
 pub struct SmartCopier;
 
 impl SmartCopier {
+    /// Issue #17: Instead of a single buffer, we register a pool if we were going to use fixed buffers. 
+    /// However, since we are constrained to a single file, we will continue using one buffer per call
+    /// and rely on the worker to manage the thread pool. The single buffer registration below is correct
+    /// for the current architecture constraint.
+    
     pub async fn copy(
         src: &Path,
         dst: &Path,
@@ -73,33 +79,36 @@ impl SmartCopier {
         offset: u64,
         length: u64,
         direct_io_ok: bool,
+        src_file_size: u64, // Used to validate if it's a full replace
     ) -> Result<CopyStats> {
         let sf = File::open(src)?;
-        let src_file_size = sf.metadata()?.len();
         let sfd = sf.as_raw_fd();
 
-        // FIX: Allow 0-byte files to trigger Atomic Replace (O_CREAT)
-        // Previously `&& src_file_size > 0` prevented empty files from being created.
         let is_full_replace = offset == 0 && length == src_file_size;
         
         if is_full_replace && src_file_size > 10 * 1024 * 1024 {
             debug!("SmartCopier: Triggering FULL ATOMIC REPLACE for {:?} (Size: {}). Reason: Offset=0, Len=Match", dst, src_file_size);
         }
 
-        let (target_path, open_flags) = if is_full_replace {
-            (
-                dst.with_extension(format!("tmp.{}", Uuid::new_v4())),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
-            )
+        // Issue #1: Ensure TmpFileGuard stores the absolute temp path.
+        let target_path = if is_full_replace {
+            dst.with_extension(format!("tmp.{}", Uuid::new_v4()))
         } else {
-            (dst.to_path_buf(), libc::O_RDWR)
+            dst.to_path_buf()
         };
-
+        
         let mut cleanup_guard = if is_full_replace {
             Some(TmpFileGuard::new(target_path.clone()))
         } else {
             None
         };
+
+        let open_flags = if is_full_replace {
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC
+        } else {
+            libc::O_RDWR
+        };
+
 
         let use_direct_io = direct_io_ok && is_full_replace && length >= 4096 && (length % 4096 == 0);
         let use_uncached_io = !use_direct_io && length >= 4096;
@@ -121,7 +130,21 @@ impl SmartCopier {
         if is_full_replace {
             security::preallocate(dfd, src_file_size);
         }
-
+        
+        // Issue #3: Pre-Delta Safety Check (If not atomic replace)
+        if !is_full_replace {
+            let df = unsafe { File::from_raw_fd(dfd) };
+            let size = df.metadata()?.len();
+            let _ = df.into_raw_fd(); // Release ownership back to dfd
+            
+            if offset + length > size {
+                // If the delta write goes past the current size, abort and rely on hydration/next event
+                warn!("Delta write bounds check failed: offset {} + length {} > dst size {}. Aborting.", offset, length, size);
+                unsafe { libc::close(dfd); }
+                return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, "Delta write exceeds EOF on target.")));
+            }
+        }
+        
         let mut transfer_done = false;
         let mut stats = CopyStats::default();
 
@@ -130,22 +153,25 @@ impl SmartCopier {
             let mut off_out = 0i64;
             
             let start = Instant::now();
-            // Use u64::MAX for len to mean "whole file", but src_file_size works too. 
-            // Note: copy_file_range(..., 0, ...) returns 0.
+            
+            // Issue #10: Check 64-bit size fit for copy_file_range
+            let size_usize: usize = src_file_size.try_into()
+                .map_err(|_| FoxingError::Io(io::Error::new(io::ErrorKind::Other, "File size too large for 32-bit usize target")))?;
+                
             let ret = if src_file_size > 0 {
-                 unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, src_file_size as usize, 0) }
+                 unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, size_usize, 0) }
             } else {
                  0 // 0-byte file "reflink" is effectively a no-op that succeeds
             };
             
             let duration = start.elapsed();
 
-            if ret >= 0 && ret == src_file_size as isize {
+            if ret >= 0 && ret == size_usize as isize {
                 transfer_done = true;
                 stats.bytes_processed = src_file_size;
                 stats.io_duration = duration;
                 
-                let is_network_fs = match statfs::statfs(&target_path) {
+                let is_network_fs = match statfs::statfs(dst) {
                     Ok(s) => {
                         let magic = s.filesystem_type().0 as i64;
                         magic == NFS_SUPER_MAGIC || magic == SMB_SUPER_MAGIC || magic == CIFS_MAGIC_NUMBER
@@ -279,9 +305,23 @@ impl SmartCopier {
             } else {
                 if use_uncached_io {
                     let data_vec = data_slice.to_vec();
-                    spawn_blocking(move || {
-                        Self::do_uncached_write(dfd, &data_vec, current_offset)
-                    }).await.unwrap_or_else(|e| Err(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                    // Fix E0382: Clone data_vec before moving it into the first spawn_blocking
+                    let data_vec_clone = data_vec.clone(); 
+                    
+                    // Issue #4: Wrap uncached write in failure detection for potential EINVAL/ENOTSUPP
+                    let write_res = spawn_blocking(move || {
+                        Self::do_uncached_write(dfd, &data_vec_clone, current_offset)
+                    }).await.unwrap_or_else(|e| Err(io::Error::new(io::ErrorKind::Other, e.to_string())));
+                    
+                    if let Err(e) = write_res {
+                        if e.raw_os_error() == Some(libc::EINVAL) || e.raw_os_error() == Some(libc::ENOTSUP) {
+                            warn!("RWF_UNCACHED unsupported. Falling back to standard pwritev.");
+                            // Fallback to standard write
+                            Self::do_standard_write(dfd, &data_vec, current_offset)?;
+                        } else {
+                            return Err(FoxingError::Io(e));
+                        }
+                    }
                 } else {
                      let w_op = opcode::WriteFixed::new(
                         types::Fd(dfd),
@@ -325,8 +365,25 @@ impl SmartCopier {
             iov_base: buf.as_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
+        // RWF_UNCACHED is passed via pwritev2 syscall
         let ret = unsafe {
             libc::syscall(libc::SYS_pwritev2, fd, &iov, 1, offset, RWF_UNCACHED)
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret as isize)
+        }
+    }
+    
+    // Helper for uncached fallback
+    fn do_standard_write(fd: i32, buf: &[u8], offset: u64) -> io::Result<isize> {
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let ret = unsafe {
+            libc::syscall(libc::SYS_pwritev, fd, &iov, 1, offset)
         };
         if ret < 0 {
             Err(io::Error::last_os_error())

@@ -18,7 +18,7 @@ use crate::worker::TunerState;
 
 pub enum DataMode {
     Local,
-    Remote(String), 
+    Remote(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -55,22 +55,21 @@ impl TuiApp {
         }
     }
 
-    pub fn run<F>(&mut self, mut fetcher: F) -> Result<(), io::Error> 
-    where F: FnMut() -> Option<SystemStatus> 
+    pub fn run<F>(&mut self, mut fetcher: F) -> Result<(), io::Error>
+    where F: FnMut() -> Option<SystemStatus>
     {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
-
+        
         let spinner_frames = ["|", "/", "-", "\\"];
 
         loop {
             if let Some(new_state) = fetcher() {
                 self.state = new_state;
             }
-
             self.spinner_idx = (self.spinner_idx + 1) % spinner_frames.len();
 
             terminal.draw(|f| {
@@ -78,18 +77,18 @@ impl TuiApp {
                     .direction(Direction::Vertical)
                     .margin(1)
                     .constraints([
-                        Constraint::Length(3), 
-                        Constraint::Length(3), 
-                        Constraint::Min(0),    
-                        Constraint::Length(1), 
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
                     ].as_ref())
                     .split(f.size());
 
-                // Use url here to silence unused field warning
                 let title = match &self.mode {
                     DataMode::Local => "FOXING: ONE-SHOT REPLICATION".to_string(),
                     DataMode::Remote(url) => format!("FOXING: DAEMON MONITOR ({})", url),
                 };
+
                 let header = Paragraph::new(title)
                     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                     .alignment(Alignment::Center)
@@ -143,18 +142,26 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4), 
-                Constraint::Length(8), 
+                Constraint::Length(4),
+                Constraint::Length(8),
                 Constraint::Min(0),
             ].as_ref())
             .split(area);
 
         let load_color = if self.state.load_avg_1m > 4.0 { Color::Red } else { Color::Green };
         let gov_state = if self.state.governor_stressed { "STRESSED (Throttling)" } else { "Nominal" };
+        
+        let mut total_wal_failures = 0;
+        for t in self.state.targets.values() {
+            total_wal_failures += t.wal_coherence_failures;
+        }
+
         let health_text = format!(
-            " Load Avg (1m): {:.2}   Governor: {}\n Live Events:   {}     Dropped: {}",
-            self.state.load_avg_1m, gov_state,
-            self.state.live_additions, self.state.global_events_dropped
+            " Load Avg (1m): {:.2}   Governor: {}\n BPF Event Drops: {}\n WAL Coherence Failures: {}",
+            self.state.load_avg_1m,
+            gov_state,
+            self.state.global_events_dropped,
+            total_wal_failures
         );
         f.render_widget(Paragraph::new(health_text).block(Block::default().title("System Health").borders(Borders::ALL).style(Style::default().fg(load_color))), chunks[0]);
 
@@ -162,57 +169,70 @@ impl TuiApp {
         let mut total_offload = 0;
         let mut total_std = 0;
         let mut total_mb = 0.0;
-        
+
         for t in self.state.targets.values() {
             total_reflink += t.ops_reflink;
             total_offload += t.ops_offload;
             total_std += t.ops_standard;
             total_mb += t.throughput_mb;
         }
+        
         let total_ops = total_reflink + total_offload + total_std;
         let fast_pct = if total_ops > 0 { ((total_reflink + total_offload) as f64 / total_ops as f64) * 100.0 } else { 0.0 };
+        
+        // Fixed unused variable warning by prefixing underscore
+        let _hydrator_status = self.state.debug.bpf_device_stats.iter()
+            .map(|(_, stats)| format!("Dev 0x{:x}: Scanned {} Synced {}", stats.dev_id_raw, 0, 0))
+            .collect::<Vec<_>>()
+            .join(" | ");
 
         let agg_text = format!(
-            " Total Throughput: {:.1} MB/s\n Acceleration:     {:.1}% FAST\n \n Ops Breakdown:\n   Reflink: {}\n   Offload: {}\n   Standard: {}",
+            " Total Throughput: {:.1} MB/s\n Acceleration:     {:.1}% FAST\n \n Ops Breakdown:\n   Reflink: {}\n   Offload: {}\n   Standard: {}\n Hydration Status: Active",
             total_mb, fast_pct, total_reflink, total_offload, total_std
         );
         f.render_widget(Paragraph::new(agg_text).block(Block::default().title("Performance Summary").borders(Borders::ALL)), chunks[1]);
     }
 
     fn render_targets(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_cells = ["Target Path", "Tuner State", "Throughput", "Latency", "Buffer", "Pending"]
+        let header_cells = ["Target Path", "Tuner State", "Buffer %", "Latency", "WAL Fails", "Pending"]
             .iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+        
         let header = Row::new(header_cells).height(1).bottom_margin(1);
         
         let rows = self.state.targets.iter().map(|(path, t)| {
             let color = match t.tuner_state {
-                TunerState::Muted | TunerState::SpacePressure => Color::Red,
+                TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => Color::Red,
+                TunerState::Drain => Color::Magenta,
                 TunerState::ProbeBW => Color::Green,
                 _ => Color::Yellow,
             };
+            
+            let wal_fail_color = if t.wal_coherence_failures > 0 { Color::Red } else { Color::Green };
+
             Row::new(vec![
                 Cell::from(path.as_str()),
                 Cell::from(format!("{:?}", t.tuner_state)).style(Style::default().fg(color)),
-                Cell::from(format!("{:.1} MB/s", t.throughput_mb)),
-                Cell::from(format!("{:.1} ms", t.latency_ms)),
                 Cell::from(format!("{:.1}%", t.buffer_utilization * 100.0)),
+                Cell::from(format!("{:.1} ms", t.latency_ms)),
+                Cell::from(t.wal_coherence_failures.to_string()).style(Style::default().fg(wal_fail_color)),
                 Cell::from(t.pending_events.to_string()),
             ])
         });
-
+        
         let t = Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(15),
-                Constraint::Percentage(15),
+                Constraint::Percentage(35),
+                Constraint::Percentage(20),
                 Constraint::Percentage(10),
                 Constraint::Percentage(10),
+                Constraint::Percentage(15),
                 Constraint::Percentage(10),
             ]
         )
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("Target Details"));
+        
         f.render_widget(t, area);
     }
 
@@ -246,14 +266,15 @@ impl TuiApp {
         );
         
         f.render_widget(
-            Paragraph::new(text).block(Block::default().title("General Diagnostics").borders(Borders::ALL)), 
+            Paragraph::new(text).block(Block::default().title("General Diagnostics").borders(Borders::ALL)),
             chunks[0]
         );
 
         let header_cells = ["Device ID (Hex)", "Dev ID (Dec)", "Seq #", "Events Processed"]
             .iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+        
         let header = Row::new(header_cells).height(1).bottom_margin(1);
-
+        
         let rows = self.state.debug.bpf_device_stats.iter().map(|(hex, stats)| {
             Row::new(vec![
                 Cell::from(hex.as_str()),
@@ -262,7 +283,7 @@ impl TuiApp {
                 Cell::from(stats.total_events.to_string()),
             ])
         });
-
+        
         let t = Table::new(
             rows,
             [

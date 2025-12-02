@@ -1,12 +1,3 @@
-//! # Foxing Daemon Entry Point
-//!
-//! This module handles the command-line interface, configuration loading,
-//! system topology discovery (NUMA/CPU), and the initialization of the
-//! primary synchronization manager.
-//!
-//! It is responsible for pinning critical threads (BPF) to high-performance
-//! cores and setting process priority to ensure stability under load.
-
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use foxing::{config::Config, mirror::Manager, bpf, metrics, versioning, api, worker};
@@ -23,33 +14,19 @@ use tokio::sync::RwLock;
 use libc;
 use walkdir::WalkDir;
 use std::fs;
-use nix::sched::{sched_setaffinity, CpuSet}; 
-use nix::unistd::Pid; 
-
+use nix::sched::{sched_setaffinity, CpuSet};
+use nix::unistd::Pid;
 mod tui;
-
-/// Retrieves the current system's CPU topology to assist in thread pinning.
-///
-/// This function attempts to distinguish Performance (P) cores from Efficiency (E) cores
-/// using sysfs attributes common on modern Linux kernels (ARM big.LITTLE, Intel Hybrid).
-///
-/// # Returns
-/// A vector of `usize` representing the logical core IDs best suited for high-priority tasks.
 fn get_available_cores() -> Vec<usize> {
     let system = System::new_all();
     let total_cores = system.cpus().len();
     let mut available_cores = Vec::new();
-
     info!("System reports {} logical cores.", total_cores);
-
-    // Attempt to prioritize P-cores by reading cpu_capacity
     let mut p_cores = Vec::new();
     let mut e_cores = Vec::new();
-    
     for i in 0..total_cores {
-        let core_type_path = format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", i); 
+        let core_type_path = format!("/sys/devices/system/cpu/cpu{}/cpu_capacity", i);
         if let Ok(content) = fs::read_to_string(&core_type_path) {
-            // Heuristic: Non-zero or high capacity usually indicates a P-core
             if content.trim() != "0" {
                 p_cores.push(i);
             } else {
@@ -59,29 +36,20 @@ fn get_available_cores() -> Vec<usize> {
             available_cores.push(i);
         }
     }
-
     if !p_cores.is_empty() || !e_cores.is_empty() {
         info!("NUMA/Core Topology detected: P-Cores: {} E-Cores: {}", p_cores.len(), e_cores.len());
         available_cores.extend(p_cores);
         available_cores.extend(e_cores);
     }
-
     if available_cores.is_empty() {
         available_cores = (0..total_cores).collect();
     }
-    
     info!("Assigned core IDs for pinning: {:?}", available_cores);
     available_cores
 }
-
-/// Sets the current thread's scheduling policy to Real-Time (SCHED_FIFO).
-///
-/// This reduces jitter and prevents the BPF collector from being preempted
-/// during high system load, which is critical for preventing ring buffer drops.
 fn set_realtime_priority() {
-    let param = libc::sched_param { sched_priority: 1 }; 
-    let pid = 0; // 0 indicates the current thread
-    
+    let param = libc::sched_param { sched_priority: 1 };
+    let pid = 0;
     let res = unsafe {
         libc::sched_setscheduler(
             pid,
@@ -89,51 +57,40 @@ fn set_realtime_priority() {
             &param,
         )
     };
-    
     if res == -1 {
         warn!("Failed to set SCHED_FIFO realtime priority for BPF thread (os error: {}).", std::io::Error::last_os_error());
     } else {
         info!("Successfully set SCHED_FIFO priority for BPF event collector.");
     }
 }
-
-/// Pins the current thread to a specific CPU core.
-///
-/// # Arguments
-/// * `core_id` - The logical processor ID to pin this thread to.
 fn pin_to_cpu(core_id: usize) {
     let mut cpu_set = CpuSet::new();
     if core_id >= std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) {
          warn!("Requested CPU pin ID {} is out of bounds. Skipping pin.", core_id);
          return;
     }
-
     if let Err(e) = cpu_set.set(core_id) {
          warn!("Failed to add core {} to CpuSet: {}", core_id, e);
          return;
     }
-
-    // Pid::from_raw(0) refers to the current thread in nix
     if let Err(e) = sched_setaffinity(Pid::from_raw(0), &cpu_set) {
         warn!("Failed to pin thread to CPU {}: {}", core_id, e);
     } else {
         info!("Thread pinned successfully to CPU {}", core_id);
     }
 }
-
 #[derive(Parser)]
 #[command(name = "xfs-mirror", version, about = "High-perf replication")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-
 #[derive(Subcommand)]
 enum Commands {
     Daemon { #[arg(long, default_value = "config.toml")] config: String },
     Status { #[arg(short, long, default_value_t = 9100)] port: u16 },
-    Metrics { 
-        #[arg(short, long, default_value_t = 9100)] port: u16,
+    Metrics {
+        #[arg(short, long)] port: u16,
         #[arg(long)] json: bool,
         #[arg(short, long)] watch: bool,
     },
@@ -141,7 +98,6 @@ enum Commands {
     Version { #[command(subcommand)] sub: VersionCommands },
     Oneshot { #[arg(long, default_value = "config.toml")] config: String },
 }
-
 #[derive(Subcommand)]
 enum VersionCommands {
     List {
@@ -159,12 +115,10 @@ enum VersionCommands {
         #[arg(value_parser)] destination: PathBuf,
     },
 }
-
 #[derive(Clone)]
 struct AppState {
     tuner_board: worker::TunerBoard,
 }
-
 async fn metrics_handler() -> String {
     let encoder = TextEncoder::new();
     let families = metrics::REGISTRY.gather();
@@ -172,22 +126,18 @@ async fn metrics_handler() -> String {
     encoder.encode(&families, &mut buf).unwrap();
     String::from_utf8(buf).unwrap()
 }
-
 fn collect_system_status(tuner_board: &worker::TunerBoard) -> api::SystemStatus {
     let mut status = api::SystemStatus::default();
-    
     status.load_avg_1m = metrics::GOVERNOR_LOAD_AVERAGE.with_label_values(&["1m"]).get();
     status.governor_stressed = metrics::GOVERNOR_STRESSED.get() == 1;
     status.global_events_dropped = metrics::EVENTS_DROPPED.get();
     status.live_additions = metrics::LIVE_ADDITIONS.get();
-
-    status.debug.bpf_sequence_gaps = metrics::SEQUENCE_GAPS.with_label_values(&[]).get(); 
+    status.debug.bpf_sequence_gaps = metrics::SEQUENCE_GAPS.with_label_values(&[]).get();
     status.debug.bpf_events_malformed = metrics::EVENTS_MALFORMED.get();
     status.debug.bpf_events_unwatched = metrics::EVENTS_UNWATCHED.get();
     status.debug.worker_shutdown_timeouts = metrics::WORKER_SHUTDOWN_TIMEOUTS.get();
     status.debug.sidecars_created = metrics::SIDECAR_FILES_CREATED.get();
     status.debug.generation_mismatches = metrics::GENERATION_MISMATCHES.get();
-    
     let bpf_stats = bpf::get_device_stats();
     for (dev_id, (seq, count)) in bpf_stats {
         let hex_id = format!("0x{:08x}", dev_id);
@@ -197,7 +147,6 @@ fn collect_system_status(tuner_board: &worker::TunerBoard) -> api::SystemStatus 
             total_events: count,
         });
     }
-
     for r in tuner_board.iter() {
         let path_str = r.key().to_string_lossy().to_string();
         let tuner_state = *r.value();
@@ -205,26 +154,27 @@ fn collect_system_status(tuner_board: &worker::TunerBoard) -> api::SystemStatus 
         let lat = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_sum();
         let count = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_count();
         let avg_lat = if count > 0 { (lat / count as f64) * 1000.0 } else { 0.0 };
+        
+        let wal_failures = metrics::WAL_COHERENCE_FAILURES.with_label_values(&[&path_str]).get();
 
         let t_status = api::TargetStatus {
             tuner_state,
-            throughput_mb: 0.0, 
+            throughput_mb: 0.0,
             latency_ms: avg_lat,
             buffer_utilization: metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&path_str]).get(),
             ops_reflink: metrics::COPY_METHOD_REFLINK.get(),
             ops_offload: metrics::COPY_METHOD_OFFLOAD.get(),
             ops_standard: metrics::COPY_METHOD_STANDARD.get(),
             pending_events: 0,
+            wal_coherence_failures: wal_failures, // NEW: Expose WAL failures
         };
         status.targets.insert(path_str, t_status);
     }
     status
 }
-
 async fn status_json_handler(State(state): State<AppState>) -> Json<api::SystemStatus> {
     Json(collect_system_status(&state.tuner_board))
 }
-
 fn handle_status(port: u16) {
     match http_get(format!("http://127.0.0.1:{}/metrics", port)) {
         Ok(r) => {
@@ -232,7 +182,7 @@ fn handle_status(port: u16) {
             let mut table = Table::new();
             table.set_header(vec!["Metric", "Value"]);
             for line in r.text().unwrap().lines() {
-                if line.starts_with("foxing") { 
+                if line.starts_with("foxing") {
                     table.add_row(line.split_whitespace().collect::<Vec<&str>>());
                 }
             }
@@ -241,10 +191,8 @@ fn handle_status(port: u16) {
         Err(_) => println!("Daemon: OFFLINE")
     }
 }
-
 fn handle_metrics_command(port: u16, json_mode: bool, watch_mode: bool) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{}/status", port);
-
     if watch_mode {
         let mut app = tui::TuiApp::new(tui::DataMode::Remote(url.clone()));
         app.run(| | {
@@ -262,7 +210,6 @@ fn handle_metrics_command(port: u16, json_mode: bool, watch_mode: bool) -> anyho
     }
     Ok(())
 }
-
 fn handle_reload() {
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -276,33 +223,28 @@ fn handle_reload() {
     }
     println!("Daemon not found.");
 }
-
 fn set_process_priority(policy_str: &str) {
     const IOPRIO_WHO_PROCESS: i32 = 1;
     const IOPRIO_CLASS_BE: i32 = 2;
     const IOPRIO_CLASS_IDLE: i32 = 3;
-    
     let (class, data) = match policy_str {
         "Idle" => (IOPRIO_CLASS_IDLE, 0),
-        "Low" => (IOPRIO_CLASS_BE, 7), 
-        "Normal" => (IOPRIO_CLASS_BE, 4), 
-        "High" => (IOPRIO_CLASS_BE, 0), 
+        "Low" => (IOPRIO_CLASS_BE, 7),
+        "Normal" => (IOPRIO_CLASS_BE, 4),
+        "High" => (IOPRIO_CLASS_BE, 0),
         _ => {
             warn!("Unknown io_priority '{}'. Using Normal.", policy_str);
             (IOPRIO_CLASS_BE, 4)
         }
     };
-
     let ioprio = (class << 13) | data;
     let res = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio) };
-    
     if res < 0 {
         warn!("Failed to set I/O priority to {}: {}", policy_str, std::io::Error::last_os_error());
     } else {
         info!("Set process I/O priority to {}", policy_str);
     }
 }
-
 async fn handle_version_commands(cmd: VersionCommands) -> anyhow::Result<()> {
     match cmd {
         VersionCommands::List { target_file, limit } => {
@@ -324,81 +266,60 @@ async fn handle_version_commands(cmd: VersionCommands) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Result<()> {
     if !start_tui {
         tracing_subscriber::fmt().init();
     }
-
     let cfg = match Config::load(&config_path) {
-        Ok(c) => Arc::new(RwLock::new(c)), 
+        Ok(c) => Arc::new(RwLock::new(c)),
         Err(e) => { error!("Failed to load config: {}", e); return Ok(()); }
     };
-    
     if start_tui {
-        cfg.write().await.max_system_load_avg = 100.0; 
+        cfg.write().await.max_system_load_avg = 100.0;
     }
-    
     metrics::initialize_metrics(cfg.read().await.global_buffer_limit);
-
     let prio = cfg.read().await.io_priority.clone();
     set_process_priority(&prio);
-
-    // Pinning setup
     let mut available_cores = get_available_cores();
-    // Reserve the best core for BPF (P-core if available)
     let bpf_core_id = if !available_cores.is_empty() { available_cores.remove(0) } else { 0 };
-
     let mut mgr = Manager::new(cfg.clone()).await;
     let (queues, mut handles, shutdown_senders, mut hydration_rx) = mgr.start().await;
-    
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
-
     let shutdown_bpf = shutdown.clone();
-    
-    // Apply Realtime Priority to the BPF thread before spawning
     let bpf_thread_handle = std::thread::Builder::new()
         .name("foxing-bpf-collector".into())
         .spawn(move || {
-            pin_to_cpu(bpf_core_id); 
-            set_realtime_priority(); 
+            pin_to_cpu(bpf_core_id);
+            set_realtime_priority();
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    if let Err(e) = bpf::run(queues, shutdown_bpf).await { 
-                        error!("BPF Error: {}", e); 
+                    if let Err(e) = bpf::run(queues, shutdown_bpf).await {
+                        error!("BPF Error: {}", e);
                     }
                 })
         }).unwrap();
-        
     handles.push(tokio::task::spawn_blocking(move || {
         bpf_thread_handle.join().unwrap();
         Ok(())
     }));
-
-    // Hydration Listener Task
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();
-
     tokio::spawn(async move {
         while let Some(path) = hydration_rx.recv().await {
             if sd_for_hyd.load(Ordering::Relaxed) { break; }
-            
-            // UPDATE: Pass the path to the manager (supports targeted repair now)
-            warn!("Hydration REQUESTED via signal for {:?}", path); 
+            warn!("Hydration REQUESTED via signal for {:?}", path);
             let m = mgr_for_hydration.lock().await;
             m.trigger_hydration(path);
         }
     });
-
     if start_tui {
-        let source_path = cfg.read().await.sources[0].path.clone(); 
+        let source_path = cfg.read().await.sources[0].path.clone();
         metrics::DISCOVERY_COMPLETE.store(false, Ordering::Relaxed);
-
         std::thread::spawn(move || {
             let walker = WalkDir::new(source_path).into_iter();
             let mut count = 0;
@@ -409,27 +330,22 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             metrics::TOTAL_ITEMS_DISCOVERED.set(count);
             metrics::DISCOVERY_COMPLETE.store(true, Ordering::Relaxed);
         });
-
         let mut app = tui::TuiApp::new(tui::DataMode::Local);
         let board = mgr_arc.lock().await.tuner_board.clone();
-        
         app.run(move || {
             Some(collect_system_status(&board))
         }).unwrap_or_else(|e| eprintln!("TUI Error: {}", e));
-
         sd.store(true, Ordering::Relaxed);
     } else {
-        let m_port = cfg.read().await.metrics_port; 
+        let m_port = cfg.read().await.metrics_port;
         let fatal = cfg.read().await.fatal_metrics_bind;
         let tuner_board = mgr_arc.lock().await.tuner_board.clone();
         let app_state = AppState { tuner_board };
-
         tokio::spawn(async move {
             let app = Router::new()
                 .route("/metrics", get(metrics_handler))
                 .route("/status", get(status_json_handler))
                 .with_state(app_state);
-                
             let addr = SocketAddr::from(([0, 0, 0, 0], m_port));
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -442,7 +358,6 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
                 }
             }
         });
-
         let mut sighup = signal(SignalKind::hangup()).unwrap();
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
         loop {
@@ -452,29 +367,24 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             }
         }
     }
-
     info!("Draining workers...");
     for tx in shutdown_senders { let _ = tx.send(()).await; }
-
     let timeout_secs = cfg.read().await.shutdown_timeout_secs;
     let timeout = std::time::Duration::from_secs(timeout_secs);
     for h in handles {
         let _ = tokio::time::timeout(timeout, h).await;
     }
-    
     mgr_arc.lock().await.wait_hydration();
     Ok(())
 }
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    
     match cli.command {
         Commands::Status { port } => { handle_status(port); return Ok(()); },
-        Commands::Metrics { port, json, watch } => { 
+        Commands::Metrics { port, json, watch } => {
             handle_metrics_command(port, json, watch)?;
-            return Ok(()); 
+            return Ok(());
         },
         Commands::Reload => { handle_reload(); return Ok(()); },
         Commands::Version { sub } => { handle_version_commands(sub).await?; return Ok(()) },
@@ -485,6 +395,5 @@ async fn main() -> anyhow::Result<()> {
             run_daemon_logic(config, true).await?;
         }
     }
-
     Ok(())
 }

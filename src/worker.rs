@@ -1,40 +1,65 @@
-//! # Worker Module
-//! 
-//! The worker is the core I/O executor. It consumes events from the ordering buffer,
-//! applies them to the target filesystem, and manages consistency via locking.
-//! It features a BBR-inspired congestion control mechanism to optimize throughput.
-
 use std::{
-    sync::{Arc, atomic::{AtomicBool, Ordering}}, 
-    collections::{HashMap, VecDeque}, 
-    time::{Instant, Duration}, 
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    collections::{HashMap, VecDeque},
+    time::{Instant, Duration},
     ops::Sub
 };
 use tokio::{sync::mpsc, task::spawn_blocking};
 use io_uring::IoUring;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-// Removed unused OsStrExt import
-use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, Result, versioning, governor::Governor};
-use crate::operations::SmartCopier; 
-use tokio::time::interval; 
-use tracing::{warn, info, error, debug}; 
-use crate::error::FoxingError; 
+use crate::{event::{Event, EventType}, mirror::{SourceInfo, SharedConfig, REPAIR_DEBOUNCE_MS}, config::{TargetConfig, get_flush_multiplier_bounds}, buffer::AlignedBuffer, security, sidecar, identity, Result, versioning, governor::Governor};
+use crate::operations::SmartCopier;
+use tokio::time::interval;
+use tracing::{warn, info, error, debug};
+use crate::error::{FoxingError}; // Removed unused alias Result as RError
 use std::io;
 use crate::metrics;
-use parking_lot::Mutex; 
-use lru::LruCache; 
+use parking_lot::Mutex;
+use lru::LruCache;
 use std::path::{Path, PathBuf};
 use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
 use nix::sys::statvfs::statvfs;
 use dashmap::DashMap;
-use futures::StreamExt;
 use serde::{Serialize, Deserialize};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use tokio::time::sleep;
 
-// --- NEW STRUCT: Poison Cabinet ---
+/// Represents the current phase of the 3-Tier WAL for a specific inode.
+/// Tier 1: WriteBulk (Accumulating data in buffer/cache)
+/// Tier 2: FsyncCommit (Data flushed, waiting for metadata/barrier)
+/// Tier 3: Committed (Rename/Link finalization)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum ExpectedState {
+    None,
+    WriteBulk,
+    FsyncCommit,
+}
+
+/// Tracks the in-memory WAL state for a specific inode.
+/// WARNING: This is volatile. Crash recovery relies on the 'dirty' xattr sidecar.
+#[derive(Clone, Debug)]
+struct DirtyEntry {
+    first_dirty: Instant,
+    path: PathBuf,
+    seq: u64,
+    projid: u32,
+    expected_state: ExpectedState,
+}
+
+impl Default for DirtyEntry {
+    fn default() -> Self {
+        Self {
+            first_dirty: Instant::now(),
+            path: PathBuf::new(),
+            seq: 0,
+            projid: 0,
+            expected_state: ExpectedState::None,
+        }
+    }
+}
+
 struct PoisonEntry {
     failure_count: u32,
     next_attempt: Instant,
@@ -50,7 +75,7 @@ impl PoisonCabinet {
             cache: LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
         }
     }
-
+    
     fn check_allowed(&mut self, inode: u64) -> bool {
         if let Some(entry) = self.cache.get(&inode) {
             if Instant::now() < entry.next_attempt {
@@ -63,8 +88,7 @@ impl PoisonCabinet {
     fn record_failure(&mut self, inode: u64) {
         if let Some(entry) = self.cache.get_mut(&inode) {
             entry.failure_count += 1;
-            // Exponential backoff: 2s, 4s, 8s... max 60s
-            let backoff_secs = (2u64.pow(entry.failure_count.min(6))) as u64; 
+            let backoff_secs = (2u64.pow(entry.failure_count.min(6))) as u64;
             entry.next_attempt = Instant::now() + Duration::from_secs(backoff_secs);
             debug!("Inode {} poisoned. Failure #{}. Backing off for {}s.", inode, entry.failure_count, backoff_secs);
         } else {
@@ -81,18 +105,18 @@ impl PoisonCabinet {
         }
     }
 }
-// ----------------------------------
 
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TunerState { 
-    Startup = 0,      
-    Drain = 1,        
-    ProbeBW = 2,      
-    Muted = 3,        
+pub enum TunerState {
+    Startup = 0,
+    Drain = 1,
+    ProbeBW = 2,
+    Muted = 3,
     IdleReset = 4,
-    SpacePressure = 6 
+    SpacePressure = 6,
+    CriticalDrain = 7,
 }
 
 struct WindowedFilter<T> {
@@ -121,7 +145,6 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
             }
         }
         self.samples.push_back((now, val));
-
         let mut best = val;
         for (_, v) in &self.samples {
             match self.mode {
@@ -131,7 +154,7 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
         }
         best
     }
-    
+
     fn get_best(&self) -> Option<T> {
         if self.samples.is_empty() { return None; }
         let mut best = self.samples[0].1;
@@ -143,7 +166,7 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
         }
         Some(best)
     }
-    
+
     fn reset(&mut self) {
         self.samples.clear();
     }
@@ -161,8 +184,8 @@ impl VdoTuner {
     fn new(cfg_enabled: bool) -> Self {
         Self {
             enabled: cfg_enabled,
-            active: cfg_enabled, 
-            zero_ratio_filter: WindowedFilter::new(30, FilterMode::Max), 
+            active: cfg_enabled,
+            zero_ratio_filter: WindowedFilter::new(30, FilterMode::Max),
             last_probe: Instant::now(),
             probe_interval: Duration::from_secs(30),
         }
@@ -177,7 +200,7 @@ impl VdoTuner {
         }
         if self.active { return true; }
         if self.last_probe.elapsed() > self.probe_interval {
-            return true; 
+            return true;
         }
         false
     }
@@ -185,11 +208,10 @@ impl VdoTuner {
     fn update(&mut self, total_bytes: u64, zero_bytes: u64) {
         if !self.enabled { return; }
         if total_bytes == 0 { return; }
-
         let ratio = zero_bytes as f64 / total_bytes as f64;
         let now = Instant::now();
         let best_ratio = self.zero_ratio_filter.update(ratio, now);
-
+        
         if self.active {
             if best_ratio < 0.01 {
                 debug!("Vdo Tuner: Efficiency low ({:.2}%), entering Backoff/Sleep.", best_ratio * 100.0);
@@ -202,19 +224,21 @@ impl VdoTuner {
                 self.active = true;
                 self.zero_ratio_filter.reset();
             } else {
-                self.last_probe = now; 
+                self.last_probe = now;
             }
         }
     }
 }
 
 struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
+
 impl ErrorLimiter {
     fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
+    
     fn check(&self, key: &'static str) -> bool {
         let mut map = self.last.lock();
         let now = Instant::now();
-        let entry = map.entry(key).or_insert(now.sub(Duration::from_secs(ERROR_LIMITER_SECS + 1))); 
+        let entry = map.entry(key).or_insert(now.sub(Duration::from_secs(ERROR_LIMITER_SECS + 1)));
         if now.duration_since(*entry) < Duration::from_secs(ERROR_LIMITER_SECS) { return false; }
         *entry = now;
         true
@@ -222,13 +246,16 @@ impl ErrorLimiter {
 }
 
 struct CircuitBreaker { tripped: AtomicBool, last_check: Mutex<Instant>, interval: Duration }
+
 impl Clone for CircuitBreaker {
     fn clone(&self) -> Self {
         Self { tripped: AtomicBool::new(self.tripped.load(Ordering::Relaxed)), last_check: Mutex::new(*self.last_check.lock()), interval: self.interval }
     }
 }
+
 impl CircuitBreaker {
     fn new(interval_secs: u64) -> Self { Self { tripped: AtomicBool::new(false), last_check: Mutex::new(Instant::now()), interval: Duration::from_secs(interval_secs) } }
+    
     fn can_proceed(&self, path: &std::path::Path, threshold: u64) -> bool {
         let mut last = self.last_check.lock();
         let now = Instant::now();
@@ -240,35 +267,41 @@ impl CircuitBreaker {
         if !security::check_capacity(path, threshold) { self.tripped.store(true, Ordering::Relaxed); *last = now; return false; }
         true
     }
+    
     fn trip(&self) { self.tripped.store(true, Ordering::Relaxed); }
 }
 
 #[derive(Debug)]
 struct FailureState { is_failed: AtomicBool, last_failure: Instant, retry_interval: Duration, hibernation_threshold: Duration, max_backoff: Duration }
+
 impl Clone for FailureState {
     fn clone(&self) -> Self { Self { is_failed: AtomicBool::new(self.is_failed.load(Ordering::Relaxed)), last_failure: self.last_failure, retry_interval: self.retry_interval, hibernation_threshold: self.hibernation_threshold, max_backoff: self.max_backoff } }
 }
+
 impl FailureState {
     fn new(interval_secs: u64) -> Self {
         let max_backoff_duration = Duration::from_secs(MAX_FAILURE_BACKOFF);
         Self { is_failed: AtomicBool::new(false), last_failure: Instant::now().sub(max_backoff_duration), retry_interval: Duration::from_secs(5), hibernation_threshold: Duration::from_secs(interval_secs), max_backoff: max_backoff_duration }
     }
+    
     fn record_failure(&mut self) {
         self.is_failed.store(true, Ordering::Relaxed);
         let now = Instant::now();
-        if now.duration_since(self.last_failure) > self.max_backoff { self.retry_interval = Duration::from_secs(5); } 
+        if now.duration_since(self.last_failure) > self.max_backoff { self.retry_interval = Duration::from_secs(5); }
         else { self.retry_interval = (self.retry_interval * 2).min(self.max_backoff); }
         self.last_failure = now;
     }
+    
     fn record_success(&mut self) { self.is_failed.store(false, Ordering::Relaxed); self.retry_interval = Duration::from_secs(5); }
     fn can_execute_io(&self) -> bool { if !self.is_failed.load(Ordering::Relaxed) { return true; } self.last_failure.elapsed() >= self.retry_interval }
     fn check_hibernation_needed(&self) -> bool { self.is_failed.load(Ordering::Relaxed) && self.last_failure.elapsed() > self.hibernation_threshold }
 }
 
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
+
 impl ShardedLockCache {
     fn new() -> Self {
-        let mut shards = Vec::with_capacity(128); 
+        let mut shards = Vec::with_capacity(128);
         for _ in 0..128 { shards.push(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(100).unwrap()))); }
         Self { shards }
     }
@@ -285,14 +318,12 @@ impl ShardedLockCache {
         self.get(hasher.finish())
     }
 }
-#[derive(Clone)] struct DirtyEntry { first_dirty: Instant, path: PathBuf, seq: u64, projid: u32 }
 
 struct BbrTuner {
     current_batch_size: usize,
     current_coalesce_bytes: u64,
     flush_multiplier: u32,
     pub hydration_debounce: Duration,
-    
     state: TunerState,
     btl_bw_filter: WindowedFilter<f64>,
     rt_prop_filter: WindowedFilter<f64>,
@@ -308,19 +339,19 @@ impl BbrTuner {
     fn new(cfg: &TargetConfig) -> Self {
         let (flush_min, _) = get_flush_multiplier_bounds(&cfg.profile);
         let min_floor = match cfg.profile {
-            crate::config::TargetProfile::HDD => 512 * 1024, 
-            _ => 64 * 1024, 
+            crate::config::TargetProfile::HDD => 512 * 1024,
+            _ => 64 * 1024,
         };
-        Self { 
-            current_batch_size: cfg.batch_size, 
+        Self {
+            current_batch_size: cfg.batch_size,
             current_coalesce_bytes: min_floor * 2,
             flush_multiplier: flush_min,
-            hydration_debounce: Duration::from_secs(1), 
+            hydration_debounce: Duration::from_secs(1),
             state: TunerState::Startup,
             btl_bw_filter: WindowedFilter::new(10, FilterMode::Max),
             rt_prop_filter: WindowedFilter::new(10, FilterMode::Min),
             batch_size_min: 2,
-            batch_size_max: 128, 
+            batch_size_max: 128,
             min_coalesce_floor: min_floor,
             max_burst_coalesce_bytes: 8 * 1024 * 1024,
             last_cycle: Instant::now(),
@@ -379,36 +410,52 @@ impl BbrTuner {
                         self.state = TunerState::ProbeBW;
                     }
                 },
+                TunerState::CriticalDrain => {
+                    if pending_len < 100 {
+                         debug!("Critical drain lifted. Buffer cleared to {} events.", pending_len);
+                         self.state = TunerState::Drain;
+                    }
+                }
                 _ => {}
             }
         }
 
+        let effective_state = board.get(Path::new(path_label)).map_or(self.state, |r| *r.value());
+        
+        let (batch_override, coalesce_override) = match effective_state {
+            TunerState::CriticalDrain => {
+                (1, self.min_coalesce_floor)
+            },
+            _ => {
+                let bdp_bytes = btl_bw * rt_prop;
+                let pacing_gain = match self.state {
+                    TunerState::Startup => 2.0,
+                    TunerState::Drain => 0.5,
+                    TunerState::ProbeBW => 1.25,
+                    TunerState::Muted => 0.75,
+                    _ => 1.0,
+                };
+
+                let target_inflight_bytes = (bdp_bytes * pacing_gain) as u64;
+                let target_op_size = (btl_bw * 0.002) as u64;
+
+                let calculated_coalesce = target_op_size
+                    .max(self.min_coalesce_floor)
+                    .min(self.max_burst_coalesce_bytes);
+                    
+                let calculated_batch = (target_inflight_bytes / calculated_coalesce.max(1)) as usize;
+                
+                (calculated_batch.max(self.batch_size_min).min(self.batch_size_max), calculated_coalesce)
+            }
+        };
+
+        self.current_batch_size = batch_override;
+        self.current_coalesce_bytes = coalesce_override;
+        
         self.hydration_debounce = match self.state {
-            TunerState::Drain | TunerState::Muted | TunerState::SpacePressure => Duration::from_secs(30),
+            TunerState::Drain | TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => Duration::from_secs(30),
             _ => Duration::from_secs(1),
         };
-
-        let bdp_bytes = btl_bw * rt_prop;
-        let pacing_gain = match self.state {
-            TunerState::Startup => 2.0, 
-            TunerState::Drain => 0.5,   
-            TunerState::ProbeBW => 1.25, 
-            TunerState::Muted => 0.75,  
-            _ => 1.0,
-        };
-
-        let target_inflight_bytes = (bdp_bytes * pacing_gain) as u64;
-        let target_op_size = (btl_bw * 0.002) as u64;
-        
-        self.current_coalesce_bytes = target_op_size
-            .max(self.min_coalesce_floor)
-            .min(self.max_burst_coalesce_bytes);
-
-        let calculated_batch = (target_inflight_bytes / self.current_coalesce_bytes.max(1)) as usize;
-        
-        self.current_batch_size = calculated_batch
-            .max(self.batch_size_min)
-            .min(self.batch_size_max);
 
         board.insert(PathBuf::from(path_label), self.state);
         metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_label]).set(self.current_batch_size as i64);
@@ -416,32 +463,34 @@ impl BbrTuner {
         metrics::TUNER_STATE.with_label_values(&[&path_label]).set(self.state as i64);
         metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&path_label]).set(pending_len as f64 / max_pending as f64);
     }
-    
+
     fn should_defer_maintenance(&self) -> bool {
-        matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain)
+        matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain | TunerState::CriticalDrain)
     }
 
     fn calculate_version_limits(&self, cfg: &TargetConfig, avail: u64, total: u64) -> (usize, u64) {
         let label = cfg.path.to_string_lossy();
         if total == 0 { return (cfg.max_versions, cfg.max_versions_size_mb); }
-
+        
         let usage_pct = 1.0 - (avail as f64 / total as f64);
+        
         let max_versions = cfg.max_versions as f64;
         let max_mb = cfg.max_versions_size_mb as f64;
 
-        let (dyn_count, dyn_mb) = if usage_pct > 0.98 { (0.0, 0.0) } 
-        else if usage_pct > 0.90 { (1.0, 100.0) } 
+        let (dyn_count, dyn_mb) = if usage_pct > 0.98 { (0.0, 0.0) }
+        else if usage_pct > 0.90 { (1.0, 100.0) }
         else if usage_pct > 0.75 {
-            let scale = 1.0 - ((usage_pct - 0.75) / 0.15); 
-            let effective_scale = scale.max(0.1); 
+            let scale = 1.0 - ((usage_pct - 0.75) / 0.15);
+            let effective_scale = scale.max(0.1);
             (max_versions * effective_scale, max_mb * effective_scale)
         } else { (max_versions, max_mb) };
 
         let count_final = dyn_count.floor() as usize;
         let mb_final = dyn_mb.floor() as u64;
+
         metrics::TARGET_DYNAMIC_VERSION_LIMIT_COUNT.with_label_values(&[&label]).set(count_final as i64);
         metrics::TARGET_DYNAMIC_VERSION_LIMIT_BYTES.with_label_values(&[&label]).set(mb_final as i64);
-
+        
         (count_final, mb_final)
     }
 }
@@ -454,31 +503,30 @@ struct WorkerContext<'a> {
     failure_state: &'a mut FailureState,
     capacity_breaker: &'a CircuitBreaker,
     limiter: &'a ErrorLimiter,
-    locks: &'a ShardedLockCache,
-    poison: &'a mut PoisonCabinet, // Add to context
-    // ADDED: Hydration Sender to trigger targeted repair from within processing path
-    hydration_tx: &'a mpsc::Sender<PathBuf>,
+    poison: &'a mut PoisonCabinet,
     cur_cap_avail: u64,
     cur_cap_total: u64,
 }
 
+/// Runs the worker loop for a single target.
 pub async fn run_worker(
-    source: Arc<SourceInfo>, 
-    target_cfg: TargetConfig, 
-    mut rx_high: mpsc::Receiver<Arc<Event>>, 
-    mut rx_low: mpsc::Receiver<Arc<Event>>, 
-    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>, 
-    hydration_tx: mpsc::Sender<PathBuf>, 
+    source: Arc<SourceInfo>,
+    target_cfg: TargetConfig,
+    mut rx_high: mpsc::Receiver<Arc<Event>>,
+    mut rx_low: mpsc::Receiver<Arc<Event>>,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+    hydration_tx: mpsc::Sender<PathBuf>,
     config: SharedConfig,
     governor: Arc<Governor>,
     tuner_board: TunerBoard
 ) -> Result<()> {
     let mut order = crate::ordering::OrderBuf::new();
-    let locks = Arc::new(ShardedLockCache::new()); 
-    let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new(); 
-    let mut flush_interval = interval(Duration::from_millis(100));
+    let locks = Arc::new(ShardedLockCache::new());
     
-    // ... (Ring setup code) ...
+    // Tier 2 WAL State: In-Memory Map of Pending Transactions
+    let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
+    
+    let mut flush_interval = interval(Duration::from_millis(100));
     let mut ring = match IoUring::new(target_cfg.batch_size as u32) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
@@ -490,22 +538,25 @@ pub async fn run_worker(
     let capacity_breaker = CircuitBreaker::new(config_reader.breaker_interval_secs);
     let force_flush_base_secs = config_reader.force_flush_interval_secs;
     drop(config_reader);
-    let hibernation_threshold_secs = 300; 
+    
+    let hibernation_threshold_secs = 300;
     let mut failure_state = FailureState::new(hibernation_threshold_secs);
-    let mut poison_cabinet = PoisonCabinet::new(); // Init Poison Cabinet
-
+    let mut poison_cabinet = PoisonCabinet::new();
+    
     let iov = libc::iovec { iov_base: unsafe { buf.capacity_slice_mut() }.as_mut_ptr() as _, iov_len: buf.capacity() };
     if unsafe { ring.submitter().register_buffers(&[iov]) }.is_err() { error!("Failed to register io_uring buffers. Falling back to standard I/O (slower)."); }
     
     let mut tuner = BbrTuner::new(&target_cfg);
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
-
-    // ... (rest of init) ...
+    
     let mut is_hibernating = false;
     let mut last_dropped_check = 0u64;
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     let mut last_hydration_request = Instant::now().sub(Duration::from_secs(30));
+    let hydration_tx_clone = hydration_tx.clone();
+    
+    let ingestion_panic_threshold: usize = (order.max_count as f64 * 0.8) as usize;
 
     loop {
         if !is_hibernating && !failure_state.can_execute_io() {
@@ -513,30 +564,35 @@ pub async fn run_worker(
              continue;
         }
 
-        let force_flush_age = Duration::from_secs(force_flush_base_secs) * tuner.flush_multiplier;
-        
         let event_poll_result = tokio::select! {
             biased;
-            
             _ = shutdown_rx.recv() => break Ok(()),
-            Some(e) = rx_high.recv() => { if is_hibernating { order.push_and_check(e); continue; } Some(e) },
-            
-            Some(e) = async {
-                let current_state = tuner_board.get(&target_cfg.path).map(|r| *r).unwrap_or(TunerState::Startup);
-                if matches!(current_state, TunerState::Drain | TunerState::Muted | TunerState::SpacePressure) {
-                    sleep(Duration::from_millis(50)).await;
-                }
-                rx_low.recv().await
-            } => { 
-                if is_hibernating { 
-                    order.push_and_check(e.clone());
-                    continue; 
-                } 
+            Some(e) = rx_high.recv() => {
+                metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::Relaxed);
+                if is_hibernating { order.push_and_check(e); continue; }
                 Some(e)
             },
-            
+            Some(e) = async {
+                let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
+                let delay = match current_state {
+                    TunerState::CriticalDrain => Duration::from_millis(100),
+                    TunerState::Drain | TunerState::Muted | TunerState::SpacePressure => Duration::from_millis(10),
+                    _ => Duration::ZERO,
+                };
+                if delay > Duration::ZERO {
+                    sleep(delay).await;
+                }
+                rx_low.recv().await
+            } => {
+                metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::Relaxed);
+                if is_hibernating {
+                    order.push_and_check(e.clone());
+                    continue;
+                }
+                Some(e)
+            },
             _ = flush_interval.tick() => {
-                let path_clone = target_cfg.path.clone(); 
+                let path_clone = target_cfg.path.clone();
                 if flush_interval.period().as_millis() == 100 && (Instant::now().elapsed().as_millis() % 1000 < 150) {
                      if let Ok(s) = statvfs(&path_clone) {
                         cur_cap_total = s.blocks() * s.block_size();
@@ -548,34 +604,61 @@ pub async fn run_worker(
                         metrics::TARGET_CAPACITY_INODES_AVAILABLE.with_label_values(&[&label]).set(s.files_available() as f64);
                     }
                 }
-                
+
                 let time_since_last_req = last_hydration_request.elapsed();
                 let should_request_hydration = time_since_last_req >= tuner.hydration_debounce;
+
+                let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
+                let effective_flush_multiplier = match current_state {
+                    TunerState::Drain | TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => 1,
+                    _ => tuner.flush_multiplier,
+                };
+                let dynamic_force_flush_age = Duration::from_secs(force_flush_base_secs) * effective_flush_multiplier;
 
                 if !is_hibernating {
                     let current_dropped = metrics::EVENTS_DROPPED.get();
                     if current_dropped > last_dropped_check {
                         warn!("Detect event drops ({} -> {}). Triggering partial hydration.", last_dropped_check, current_dropped);
                         if should_request_hydration {
-                            let _ = hydration_tx.send(source.path.clone()).await; 
+                            let _ = hydration_tx_clone.send(source.path.clone()).await;
                             last_hydration_request = Instant::now();
                         }
                         last_dropped_check = current_dropped;
                     }
-                    
+
+                    let order_len = order.len();
+                    if order_len > ingestion_panic_threshold {
+                        warn!("WAL buffer near capacity ({}/{}). FORCING CriticalDrain.", order_len, order.max_count);
+                        if current_state != TunerState::CriticalDrain {
+                            tuner_board.insert(target_cfg.path.clone(), TunerState::CriticalDrain);
+                            tuner.state = TunerState::CriticalDrain;
+                        }
+                    } else if order.should_throttle_bpf() {
+                        warn!("CoDel: Buffer latency exceeded target. Signaling BPF to throttle.");
+                        if current_state != TunerState::CriticalDrain {
+                            tuner_board.insert(target_cfg.path.clone(), TunerState::CriticalDrain);
+                            tuner.state = TunerState::CriticalDrain;
+                        }
+                    } else if current_state == TunerState::CriticalDrain && order_len < 100 {
+                         tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
+                         tuner.state = TunerState::Drain;
+                    }
+
                     if order.check_timeouts() {
                         warn!("Gap detected by OrderBuf (Timeout). Triggering partial hydration.");
                         if should_request_hydration {
-                            let _ = hydration_tx.send(source.path.clone()).await;
+                            let _ = hydration_tx_clone.send(source.path.clone()).await;
                             last_hydration_request = Instant::now();
                         }
                     }
 
                     let now = Instant::now();
                     let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
+                    
                     dirty_stats.retain(|&ino, entry| {
-                        if now.duration_since(entry.first_dirty) > force_flush_age { flushing_stats.insert(ino, entry.clone()); false } else { true }
+                        if now.duration_since(entry.first_dirty) > dynamic_force_flush_age { flushing_stats.insert(ino, entry.clone()); false } else { true }
                     });
+
                     let _committed_inos = spawn_blocking(move || {
                         let mut committed = Vec::new();
                         for (ino, entry) in flushing_stats.into_iter() {
@@ -590,16 +673,11 @@ pub async fn run_worker(
 
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
-        
-        if metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed) > metrics::GLOBAL_BUFFER_LIMIT.get() as u64 {
-             warn!("Worker detected global buffer overflow. Initiating immediate hibernation for {:?}", target_cfg.path);
-             failure_state.record_failure();
-        }
 
         if failure_state.check_hibernation_needed() {
             if !is_hibernating {
                 warn!("Target {:?} failed for {}s. Switching to Hibernation mode.", target_cfg.path, failure_state.hibernation_threshold.as_secs());
-                let _ = hydration_tx.send(source.path.clone()).await; 
+                let _ = hydration_tx_clone.send(source.path.clone()).await;
                 is_hibernating = true;
             }
         }
@@ -615,43 +693,42 @@ pub async fn run_worker(
         }
         
         if is_hibernating { continue; }
-        
         let current_debounce = tuner.hydration_debounce;
 
         if event_ptr.event_type == EventType::SequenceGap {
-            tracing::warn!("Sequence Gap detected on dev {}. Triggering re-sync.", event_ptr.dev_id);
+            tracing::warn!("Sequence Gap detected on dev {}. Triggering Tier 2 (WAL Sweep) recovery.", event_ptr.dev_id);
+            order.next_seq = event_ptr.seq_num;
             if last_hydration_request.elapsed() >= current_debounce {
-                let _ = hydration_tx.send(source.path.clone()).await; 
+                for entry in dirty_stats.values() {
+                    let _ = hydration_tx_clone.send(entry.path.clone()).await;
+                }
                 last_hydration_request = Instant::now();
             }
-            order.next_seq = 0; 
             continue;
         }
-        if order.next_seq > 0 && event_ptr.seq_num < order.next_seq && event_ptr.seq_num != 0 { crate::metrics::LATE_EVENTS.inc(); continue; }
 
+        if order.next_seq > 0 && event_ptr.seq_num < order.next_seq && event_ptr.seq_num != 0 { crate::metrics::LATE_EVENTS.inc(); continue; }
+        
         let current_coalesce_limit = tuner.current_coalesce_bytes;
         let mut batch_bytes_processed = 0u64;
         let mut current_copy_stats: Option<crate::operations::CopyStats> = None;
         let max_pending = order.max_count;
         let pending_len = order.len();
 
-        let events_to_process = if event_ptr.seq_num == 0 {
-            // FIX: Purge pending events for this inode to prevent Time Travel overwrites
+        let events_to_process_raw = if event_ptr.seq_num == 0 {
             order.purge_inode(event_ptr.inode);
-            vec![event_ptr]
+            vec![(event_ptr, false)]
         } else {
             if !order.push_and_check(event_ptr.clone()) {
-                 // ... (drop logic) ...
                  warn!("Ordering buffer full. Rejecting event seq {}. Triggering Gap.", event_ptr.seq_num);
                  metrics::EVENTS_DROPPED.inc();
                  order.next_seq = 0;
                  if last_hydration_request.elapsed() >= current_debounce {
-                     let _ = hydration_tx.send(source.path.clone()).await;
+                     let _ = hydration_tx_clone.send(source.path.clone()).await;
                      last_hydration_request = Instant::now();
                  }
                  continue;
             }
-            
             let mut batch = Vec::new();
             while let Some(e) = order.pop_batch(current_coalesce_limit) {
                 batch.push(e);
@@ -659,14 +736,11 @@ pub async fn run_worker(
             batch
         };
 
-        for e in events_to_process {
-            // POISON CHECK
+        for (e, _is_coalesced) in events_to_process_raw {
             if !poison_cabinet.check_allowed(e.inode) {
-                // If it's a sequence gap or barrier, we might let it through, 
-                // but for file ops, skip to prevent log spam/looping
                 continue;
             }
-
+            
             let mut ctx = WorkerContext {
                 ring: &mut ring,
                 buf: &mut buf,
@@ -675,58 +749,74 @@ pub async fn run_worker(
                 failure_state: &mut failure_state,
                 capacity_breaker: &capacity_breaker,
                 limiter: &limiter,
-                locks: &locks,
-                poison: &mut poison_cabinet, // Pass it down
-                hydration_tx: &hydration_tx, // Pass tx down
+                poison: &mut poison_cabinet,
                 cur_cap_avail,
                 cur_cap_total,
             };
 
-            let res = process_single_event(&mut ctx, e.clone(), &source, &target_cfg, &tuner, capacity_threshold_mb).await;
+            let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+            let src = if is_synthetic {
+                source.mount.join(e.name.trim_start_matches('/'))
+            } else {
+                match dst.strip_prefix(&target_cfg.path) {
+                    Ok(rel) => source.mount.join(rel),
+                    Err(e) => {
+                        error!("CRITICAL PATH ERROR: Target path {:?} is not prefixed by target root {:?}. Failing event: {}", dst, target_cfg.path, e);
+                        return Err(FoxingError::Security("Cannot determine source path from target path.".into()));
+                    }
+                }
+            };
 
+            let lock = locks.get_by_path(&e.name);
+            let _g = lock.lock().await;
+
+            let res = process_single_event_inner(&mut ctx, e.clone(), &source, &target_cfg, &tuner, capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src).await;
+            
             match res {
                 Ok(Some(stats)) => {
                     batch_bytes_processed += stats.bytes_processed;
                     current_copy_stats = Some(stats);
-                    // Success is recorded inside process_single_event via ctx
+                    ctx.poison.record_success(e.inode);
                 },
-                Ok(None) => {}, 
+                Ok(None) => {},
                 Err(err) => {
-                    // Centralized Error Handling for Poisoning
                     ctx.poison.record_failure(e.inode);
-
+                    order.purge_inode_bulk(e.inode);
                     if let FoxingError::Io(ref io_err) = err {
                         if io_err.kind() == io::ErrorKind::NotFound {
-                            // Loop Breaker: If we get a NotFound from a WRITE event (seq=0 implies hydration), 
-                            // it means the file is truly gone. Don't retry hydration.
                             if e.seq_num == 0 {
                                 debug!("Worker: Hydration write failed (NotFound) for inode {}. Aborting recursion.", e.inode);
-                            } else if last_hydration_request.elapsed() >= tuner.hydration_debounce {
-                                let repair_path = source.mount.join(&e.name);
-                                let repair_path_clone = repair_path.clone();
-                                let exists = spawn_blocking(move || repair_path_clone.exists()).await.unwrap_or(false);
-
-                                if exists {
-                                    warn!("Consistency Error (NotFound) for inode {}. Triggering TARGETED repair for {:?}.", e.inode, repair_path);
-                                    source.inode_map.lock().pop(&e.inode);
-                                    let _ = hydration_tx.send(repair_path).await;
+                            } else if is_synthetic {
+                                warn!("Synthetic file {:?} data operation failed. Triggering targeted repair.", dst);
+                                if last_hydration_request.elapsed() >= Duration::from_millis(REPAIR_DEBOUNCE_MS) {
+                                    let _ = hydration_tx_clone.send(source.path.clone()).await;
                                     last_hydration_request = Instant::now();
-                                    tuner.state = TunerState::Drain;
-                                    tuner.hydration_debounce = Duration::from_secs(30); 
-                                    tuner_board.insert(target_cfg.path.clone(), TunerState::Drain);
-                                } else {
-                                     debug!("Skipping hydration for inode {} - source file also missing", e.inode);
+                                }
+                            } else {
+                                warn!("File {:?} disappeared from source mid-operation. Triggering targeted repair.", src.join(&e.name));
+                                if last_hydration_request.elapsed() >= Duration::from_millis(REPAIR_DEBOUNCE_MS) {
+                                    let _ = hydration_tx_clone.send(src.join(&e.name)).await;
+                                    last_hydration_request = Instant::now();
                                 }
                             }
                         } else if io_err.to_string().contains("Target Full") {
-                             // ... (Space logic) ...
                              warn!("Capacity Pressure: Slowing down ingestion for {:?}", target_cfg.path);
                              tuner.state = TunerState::SpacePressure;
                              tuner_board.insert(target_cfg.path.clone(), TunerState::SpacePressure);
                              failure_state.record_failure();
                         }
+                    } else if let FoxingError::Versioning(ref v_err) = err {
+                         if v_err.contains("WAL Coherence Broken") {
+                            error!("WAL T2 Inconsistency detected for Inode {}. Triggering targeted WAL sweep.", e.inode);
+                            metrics::WAL_COHERENCE_FAILURES.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc();
+                            if last_hydration_request.elapsed() >= Duration::from_millis(REPAIR_DEBOUNCE_MS) {
+                                let _ = hydration_tx_clone.send(src.join(&e.name)).await;
+                                last_hydration_request = Instant::now();
+                            }
+                         }
+                         failure_state.record_failure();
                     }
-                    if let FoxingError::Io(ref io_err) = err {
+                    else if let FoxingError::Io(ref io_err) = err {
                          if io_err.kind() != io::ErrorKind::NotFound {
                               failure_state.record_failure();
                          }
@@ -739,7 +829,7 @@ pub async fn run_worker(
         
         if batch_bytes_processed > 0 {
             if let Some(stats) = current_copy_stats {
-                let elapsed_rtt = stats.io_duration.as_secs_f64(); 
+                let elapsed_rtt = stats.io_duration.as_secs_f64();
                 let is_stressed = governor.is_system_stressed();
                 tuner.tune(elapsed_rtt, batch_bytes_processed, is_stressed, pending_len, max_pending, &tuner_board, &target_cfg.path.to_string_lossy());
                 metrics::REPLICATION_LATENCY.with_label_values(&[&target_cfg.path.to_string_lossy()]).observe(elapsed_rtt);
@@ -748,113 +838,184 @@ pub async fn run_worker(
     }
 }
 
-async fn process_single_event(
+async fn process_single_event_inner(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
     source: &Arc<SourceInfo>,
     target_cfg: &TargetConfig,
     tuner: &BbrTuner,
-    capacity_threshold_mb: u64
+    capacity_threshold_mb: u64,
+    dst: &PathBuf,
+    is_synthetic: bool,
+    needs_creation: bool,
+    src: &PathBuf,
 ) -> Result<Option<crate::operations::CopyStats>> {
     let target_cfg_cap = target_cfg.clone();
     let target_cfg_allow = target_cfg.clone();
+
+    // 1. Capacity Check
     let capacity_breaker_clone = ctx.capacity_breaker.clone();
     let check_capacity_result = spawn_blocking(move || { capacity_breaker_clone.can_proceed(&target_cfg_cap.path, capacity_threshold_mb) }).await.unwrap_or(false);
-
     if !check_capacity_result {
         if ctx.limiter.check("capacity") { error!("Target full: {:?}", target_cfg.path); }
         ctx.capacity_breaker.trip();
         ctx.failure_state.record_failure();
         return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Target Full")));
     }
-    
+
+    // 2. Filter Check
     let e_clone = e.clone();
     let allow_result = spawn_blocking(move || { target_cfg_allow.allow(std::path::Path::new(&e_clone.name)) }).await.unwrap_or(false);
     if !allow_result { metrics::EVENTS_FILTERED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc(); return Ok(None); }
-    
-    if e.name.contains(".tmp.") {
-        return Ok(None);
-    }
 
-    let lock = ctx.locks.get_by_path(&e.name);
-    let _g = lock.lock().await;
-    
-    let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+    if e.name.contains(".tmp.") { return Ok(None); }
 
-    // FIX: Derive src from dst relative path to handle deep hierarchy correctly.
-    // BPF only gives us the filename in e.name, so blindly joining e.name to source.mount fails for nested files.
-    // Since resolve_target() uses the InodeMap (populated by Hydration/Parent-tracking) to get the true path,
-    // we should trust the relative path derived from dst.
-    let src = if is_synthetic {
-        // If synthetic, we don't have a mapped path. Fallback to name.
-        source.mount.join(e.name.trim_start_matches('/'))
-    } else {
-        match dst.strip_prefix(&target_cfg.path) {
-            Ok(rel) => source.mount.join(rel),
-            Err(_) => source.mount.join(e.name.trim_start_matches('/')),
-        }
-    };
+    // 3. Locking (Path lock already acquired in run_worker)
 
-    // FIX #2: Parent Directory Pre-Creation Guard
-    // Ensure the parent directory for the destination file exists before we try to 
-    // create the destination file itself (via open/mknod/rename).
+    // 4. Target Directory Setup
     if !is_synthetic {
         let target_dir = dst.parent().map(|p| p.to_path_buf());
         if let Some(target_dir) = target_dir {
-            // Only spawn creation if the path is not the root of the mirror
             if target_dir != target_cfg.path {
-                let _ = spawn_blocking(move || std::fs::create_dir_all(&target_dir)).await;
+                let check_res: Result<()> = match spawn_blocking({
+                    let target_dir_clone = target_dir.clone();
+                    move || {
+                        if target_dir_clone.exists() && !target_dir_clone.is_dir() {
+                            error!("Path collision: Target parent {:?} exists but is not a directory.", target_dir_clone);
+                            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Path component is a file, not a directory"));
+                        }
+                        std::fs::create_dir_all(&target_dir_clone)
+                    }
+                }).await {
+                    Ok(inner_res) => inner_res.map_err(FoxingError::Io),
+                    Err(e) => {
+                        warn!("Parent directory check task failed with JoinError: {}", e);
+                        Err(FoxingError::Join(e))
+                    }
+                };
+                if check_res.is_err() {
+                    warn!("Failed to prepare target directory {:?}: {:?}", target_dir, check_res.err());
+                }
             }
         }
     }
 
+    // 5. Synthetic File Creation (for metadata/control files)
     if needs_creation {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
         let e_inode = e.inode;
         let e_generation = e.generation;
         let e_name = PathBuf::from(&e.name);
+        
         let res = spawn_blocking(move || {
             let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
-            let f_result = std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone);
-            if let Ok(ref f) = f_result {
-                let fd = f.as_raw_fd();
-                if target_cfg_clone.btrfs_compression || target_cfg_clone.f2fs_compression { let _ = security::enable_compression(fd); }
-                if target_cfg_clone.f2fs_pinning { let _ = security::enable_f2fs_pinning(fd); }
-                metrics::SIDECAR_FILES_CREATED.inc();
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
+                Ok(f) => return Ok(f),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    debug!("Synthetic file creation raced. Re-opening existing file.");
+                    std::fs::OpenOptions::new().write(true).open(&dst_clone)
+                },
+                Err(e) => return Err(e),
             }
-            f_result
         }).await;
-        if res.is_ok() {
+
+        let final_res = match res {
+            Ok(inner_res) => inner_res.map_err(FoxingError::Io),
+            Err(e) => Err(FoxingError::Join(e)),
+        };
+
+        if let Ok(f) = final_res {
+            let fd = f.as_raw_fd();
+            if target_cfg.btrfs_compression || target_cfg.f2fs_compression { let _ = security::enable_compression(fd); }
+            if target_cfg.f2fs_pinning { let _ = security::enable_f2fs_pinning(fd); }
+            metrics::SIDECAR_FILES_CREATED.inc();
+            // NOTE: Even if name is empty, we update the map to reflect its synthetic state
             identity::update_map(&source.inode_map, e_inode, e_name, e_generation, true);
             metrics::SYNTHETIC_IDENTITY_FILES.inc();
-        } else { 
-            error!("Failed to create synthetic file: {:?}. This might indicate a missing target directory or IO issue.", res.err()); 
+        } else {
+            let mapped_err: Option<FoxingError> = final_res.err();
+            error!("Failed to create synthetic file: {:?}. This might indicate a missing target directory or IO issue.", mapped_err);
             ctx.failure_state.record_failure();
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Synthetic Creation Failed")));
+            let final_err = mapped_err.unwrap_or_else(|| FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Unknown Synthetic Creation Error")));
+            if let FoxingError::Io(ref io_err) = final_err {
+                if io_err.raw_os_error() == Some(libc::ENOSPC) {
+                    ctx.capacity_breaker.trip();
+                    error!("Capacity Breaker tripped during synthetic file creation.");
+                }
+            }
+            return Err(final_err);
         }
     }
 
-    if e.event_type == EventType::Write || e.event_type == EventType::WriteRange {
-        if !ctx.dirty_stats.contains_key(&e.inode) {
-            let dst_clone = dst.clone();
-            spawn_blocking(move || sidecar::set_dirty_flag(&dst_clone, true));
-            ctx.dirty_stats.insert(e.inode, DirtyEntry { first_dirty: Instant::now(), path: dst.clone(), seq: e.seq_num, projid: e.projid });
-        } else { if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.seq = e.seq_num; } }
+    // 6. Dirty Flag and WAL State Management
+    if matches!(e.event_type,
+        EventType::Write | EventType::Create | EventType::WriteRange |
+        EventType::Truncate | EventType::Fsync | EventType::Rename |
+        EventType::Barrier)
+    {
+        // Get or create DirtyEntry (Per-File WAL State)
+        let entry = ctx.dirty_stats.entry(e.inode).or_insert_with(|| DirtyEntry {
+            first_dirty: Instant::now(),
+            path: dst.clone(),
+            seq: e.seq_num,
+            projid: e.projid,
+            expected_state: ExpectedState::FsyncCommit, // Default safe expectation
+        });
+
+        // --- WAL STATE MACHINE ADVANCEMENT (XFS Consistency Model) ---
+        match e.event_type {
+            EventType::Create => {
+                // Creation of a new file (atomic write starts)
+                // If it's a .tmp file, we expect bulk writes followed by Rename/Commit
+                if e.name.starts_with(".tmp.") {
+                    entry.expected_state = ExpectedState::WriteBulk;
+                } else {
+                    entry.expected_state = ExpectedState::FsyncCommit;
+                }
+            },
+            EventType::Truncate => {
+                entry.expected_state = ExpectedState::WriteBulk; // Truncate must be followed by a Write or Fsync/Commit
+            },
+            EventType::Write | EventType::WriteRange => {
+                // Bulk write occurred, transaction is now open, expect Fsync commit next.
+                if entry.expected_state == ExpectedState::WriteBulk || entry.expected_state == ExpectedState::None {
+                    entry.expected_state = ExpectedState::FsyncCommit;
+                }
+            },
+            EventType::Rename => {
+                // Atomic Commit: This transitions state from FsyncCommit -> None (Done)
+                // But we handle the removal later. Here we just update metadata.
+                // IMPORTANT: If we see a Rename for a file we thought was WriteBulk, it's an Atomic Commit.
+                if entry.expected_state == ExpectedState::WriteBulk {
+                    entry.expected_state = ExpectedState::FsyncCommit;
+                }
+            }
+            // Fsync, Barrier handled later when checking for commit.
+            _ => {}
+        }
+
+        // Update sequence and projid (latest transaction ID)
+        entry.seq = e.seq_num;
+        entry.projid = e.projid;
+        
+        let dst_clone = dst.clone();
+        spawn_blocking(move || sidecar::set_dirty_flag(&dst_clone, true));
     }
 
+    // 7. Event Processing Dispatch
     let res = match e.event_type {
         EventType::Write | EventType::Create | EventType::WriteRange => {
-            let src_clone = src.clone();
             let target_cfg_clone = target_cfg.clone();
-            let dst_clone = dst.clone(); 
-            let e_offset = e.offset; 
-            let e_len = e.length;    
-            
-            let metadata_result = spawn_blocking(move || { 
+            let dst_clone = dst.clone();
+            let e_offset = e.offset;
+            let e_len = e.length;
+            let src_clone_for_metadata = src.clone();
+
+            let metadata_result = spawn_blocking(move || {
                 for attempt in 0..3 {
-                    match std::fs::metadata(&src_clone) {
+                    match std::fs::metadata(&src_clone_for_metadata) {
                         Ok(m) => return Ok(m),
                         Err(e) if e.kind() == io::ErrorKind::NotFound && attempt < 2 => {
                             std::thread::sleep(Duration::from_millis(10));
@@ -862,7 +1023,7 @@ async fn process_single_event(
                         }
                         Err(e) => {
                             if attempt == 2 {
-                                warn!("Worker: Failed to stat {:?}: {}", src_clone, e);
+                                warn!("Worker: Failed to stat {:?}: {}", src_clone_for_metadata, e);
                             }
                             return Err(e)
                         },
@@ -873,8 +1034,41 @@ async fn process_single_event(
 
             if let Ok(m) = metadata_result {
                 if m.is_file() {
-                    // NOTE: Parent directory creation is handled above.
-                     
+                    let current_src_size = m.len();
+                    let initial_is_full_replace = e_offset == 0 && e_len == current_src_size;
+                    let file_size_match = initial_is_full_replace || (e_offset + e_len <= current_src_size);
+                    
+                    if !file_size_match {
+                        warn!("Data integrity warning: Incoming event length ({}) exceeds current source size ({}). Clamping/Aborting.", e_len, current_src_size);
+                        return Ok(None);
+                    }
+
+                    // --- CONSISTENCY CHECK & HEALING (FIX FOR DELTA CHECK FAIL) ---
+                    let mut should_force_full_replace = initial_is_full_replace;
+                    let mut copy_offset = e_offset;
+                    let mut copy_length = e_len;
+
+                    if !should_force_full_replace {
+                        // If it's a delta update, check target size consistency.
+                        let dst_meta_res = spawn_blocking({
+                            let dst_clone_for_meta = dst_clone.clone();
+                            move || std::fs::metadata(&dst_clone_for_meta)
+                        }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+                        if let Ok(dst_meta) = dst_meta_res {
+                            if dst_meta.len() != current_src_size {
+                                warn!("Worker: Target file size mismatch detected (Source: {}, Target: {}). Forcing FULL ATOMIC COPY to heal inconsistency for {:?}",
+                                    current_src_size, dst_meta.len(), dst_clone);
+                                should_force_full_replace = true;
+                            }
+                        }
+                    }
+
+                    if should_force_full_replace {
+                        copy_offset = 0;
+                        copy_length = current_src_size;
+                    }
+                    
                      if e.event_type == EventType::Create && (target_cfg.btrfs_compression || target_cfg.f2fs_compression || target_cfg.f2fs_pinning) {
                           let dst_clone_for_opt = dst_clone.clone();
                           let res = spawn_blocking(move || {
@@ -888,236 +1082,248 @@ async fn process_single_event(
                           }).await;
                           if res.is_err() { warn!("Failed compression/pinning setup: {:?}", res.err()); }
                      }
-                    
-                    let sync_xattrs_src = src.clone();
-                    let sync_xattrs_dst = dst_clone.clone(); 
-                    
-                    let total_size = m.len() as usize;
-                    if total_size > 0 {
-                        let chunks: Vec<usize> = (0..total_size).step_by(1024*1024).collect();
-                        futures::stream::iter(chunks).then(|_sz| {
-                            let sx = sync_xattrs_src.clone();
-                            let dx = sync_xattrs_dst.clone();
-                            async move {
-                                let _ = spawn_blocking(move || { security::sync_xattrs(&sx, &dx); }).await;
-                            }
-                        }).collect::<Vec<_>>().await;
-                    }
 
                     let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
 
                     let copy_res = SmartCopier::copy(
-                        &src, 
-                        &dst_clone, 
-                        ctx.ring, 
-                        ctx.buf, 
-                        &target_cfg.supports_reflink, 
-                        dynamic_vdo_opt, 
-                        e_offset, 
-                        e_len,
-                        target_cfg.direct_io_ok.load(Ordering::Relaxed)
+                        &src,
+                        &dst_clone,
+                        ctx.ring,
+                        ctx.buf,
+                        &target_cfg.supports_reflink,
+                        dynamic_vdo_opt,
+                        copy_offset,
+                        copy_length,
+                        target_cfg.direct_io_ok.load(Ordering::Relaxed),
+                        current_src_size,
                     ).await;
-                    
+
                     match copy_res {
                         Ok(stats) => {
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
                             
-                            // FIX: Force Metadata Apply after Write success to prevent "naked file" issue in Hydration
                             let apply_dst = dst_clone.clone();
                             let apply_src = src.clone();
-                            let _ = spawn_blocking(move || security::apply_metadata(&apply_src, &apply_dst)).await;
-
-                            Ok(Ok(Some(stats)))
+                            let _ = spawn_blocking(move || {
+                                security::sync_xattrs(&apply_src, &apply_dst);
+                                security::apply_metadata(&apply_src, &apply_dst)
+                            }).await;
+                            
+                            return Ok(Some(stats));
                         },
                         Err(e) => Err(e)
                     }
-                } else { Ok(Ok(None)) } 
-            } else if is_synthetic { 
-                if ctx.limiter.check("unlinked_read") { warn!("Unlinked write detected for inode {}. Event ignored.", e.inode); } 
-                Ok(Ok(None)) 
-            } else { 
-                // --- CRITICAL FIX: Aggressive Cache Refresh on Source Not Found ---
-                if let Err(e) = &metadata_result {
-                    if e.kind() == io::ErrorKind::NotFound {
-                        warn!("Worker: Source file for inode {} (mapped path {:?}) not found. Assuming stale map entry and forcing targeted repair.", e.inode, src_clone);
-                        
-                        // 1. Force cache purge locally
-                        source.inode_map.lock().pop(&e.inode);
-                        
-                        // 2. Trigger FAST PATH RESOLUTION (synchronous blocking call)
-                        let fast_resolve_res = spawn_blocking({
-                            let source_map = source.inode_map.clone();
-                            let source_root = source.mount.clone();
-                            move || identity::resolve_and_update_path(&source_map, &source_root, e.inode)
-                        }).await;
+                } else { return Ok(None); }
+            } else if is_synthetic {
+                if ctx.limiter.check("synthetic_data_op") { warn!("Synthetic file data operation attempted without path resolution. Triggering repair path."); }
+                return Err(FoxingError::Io(io::Error::new(io::ErrorKind::NotFound, "Synthetic data operation failed; need path resolution.")));
+            }
+            else if let Err(io_err) = &metadata_result {
+                if io_err.kind() == io::ErrorKind::NotFound {
+                    warn!("Worker: Source file for inode {} (mapped path {:?}) not found. Assuming stale map entry and forcing fast resolution.", e.inode, src.to_path_buf());
+                    source.inode_map.lock().pop(&e.inode);
+                    let fast_resolve_res = spawn_blocking({
+                        let source_map = source.inode_map.clone();
+                        let source_root = source.mount.clone();
+                        let inode = e.inode;
+                        move || identity::resolve_and_update_path(&source_map, &source_root, inode)
+                    }).await;
 
-                        match fast_resolve_res {
-                            Ok(Ok(new_path)) => {
-                                // Success! Map is updated. Abort this event and let the next retry succeed.
-                                debug!("Fast resolve succeeded, new path: {:?}", new_path);
-                                return Ok(Ok(None)); 
-                            },
-                            _ => {
-                                // Fast resolve failed (file still missing, maybe being deleted).
-                                // Trigger the slow hydration sweep only if debounce allows.
-                                if ctx.hydration_tx.is_closed() { return Ok(Ok(None)); }
-
-                                if let Some(parent) = src_clone.parent() {
-                                    let _ = ctx.hydration_tx.send(parent.to_path_buf()).await;
-                                }
-                                return Err(FoxingError::Io(io::Error::new(io::ErrorKind::NotFound, "Fast Path resolution failed, triggering full repair.")));
-                            }
+                    match fast_resolve_res {
+                        Ok(Ok(new_path)) => {
+                            debug!("Fast refresh successful: Inode {} resolved to {:?}", e.inode, new_path);
+                            return Ok(None);
+                        },
+                        _ => {
+                            warn!("Worker: Fast Path resolution failed for inode {}. Triggering targeted repair.", e.inode);
+                            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::NotFound, "Fast Path resolution failed, triggering targeted repair.")));
                         }
-                    } else {
-                        warn!("Worker: Skipping Write for {:?} - Source access failed: {}", dst_clone, e);
                     }
+                } else {
+                    warn!("Worker: Skipping Write for {:?} - Source access failed: {}", dst_clone, io_err);
                 }
-                Ok(Ok(None)) 
+                return Ok(None);
+            } else {
+                return Ok(None);
             }
         },
         EventType::Symlink => {
             let dst_clone = dst.clone();
             let src_clone = src.clone();
-            Ok(spawn_blocking(move || {
+            let inner_res = spawn_blocking(move || {
                 if let Ok(link_target) = std::fs::read_link(&src_clone) {
                     security::create_symlink(&link_target.to_string_lossy(), &dst_clone)
                 } else {
                     Ok(())
                 }
-            }).await.unwrap_or(Ok(())).map(|_| None).map_err(|e| e.into()))
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
+            return inner_res.map(|_| None);
         },
         EventType::Link => {
             warn!("Hardlink event received. Treating as standard create/copy for now to ensure data persistence.");
-            Ok(Ok(None))
+            return Ok(None);
         },
         EventType::Mknod => {
             let dst_clone = dst.clone();
             let mode = e.mode;
             let src_clone = src.clone();
-            Ok(spawn_blocking(move || {
+            let inner_res = spawn_blocking(move || {
                 if let Ok(m) = std::fs::metadata(&src_clone) {
-                    let rdev = m.rdev(); 
+                    let rdev = m.rdev();
                     security::create_mknod(&dst_clone, mode, rdev)
                 } else {
                     Ok(())
                 }
-            }).await.unwrap_or(Ok(())).map(|_| None).map_err(|e| e.into()))
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
+            return inner_res.map(|_| None);
         },
         EventType::Unlink => {
             ctx.dirty_stats.remove(&e.inode);
-            
-            // FIX: Eagerly remove from map to prevent stale lookups on inode reuse
             source.inode_map.lock().pop(&e.inode);
-            
             let dst_clone = dst.clone();
-            // Prefix e_clone with underscore to silence unused variable warning
             let _e_clone = e.clone();
             let res = spawn_blocking(move || {
                 if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
-                
-                if is_synthetic { 
+                if is_synthetic {
                     debug!("Worker: Unlinking synthetic file {:?}", dst_clone);
-                    metrics::SYNTHETIC_IDENTITY_FILES.dec(); 
+                    metrics::SYNTHETIC_IDENTITY_FILES.dec();
                 }
                 let r = std::fs::remove_file(&dst_clone);
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
                 }
                 r
-            }).await.unwrap_or(Ok(())).map_err(|err| err.into());
-            if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
-            Ok(res.map(|_| None))
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+            if res.is_ok() {
+                let dst_clone = dst.clone();
+                let _ = spawn_blocking(move || { if let Some(parent) = dst_clone.parent() { security::write_dir_integrity_hash(parent, 0); } }).await;
+            }
+            return res.map(|_| None);
         },
         EventType::Rename => {
             if let Some(new_name) = &e.new_name {
+                let current_dirty_entry = ctx.dirty_stats.get(&e.inode).cloned();
+                
+                let new_dst_temp = if let Some(parent) = dst.parent() { parent.join(new_name) } else { target_cfg.path.join(new_name) };
+                
+                // --- ATOMIC COMMIT DETECTION (Tier 3) ---
+                // If we see a Rename of a .tmp file, this is the Atomic Commit step of the 3-Tier WAL.
+                if e.name.starts_with(".tmp.") && current_dirty_entry.is_some() {
+                    let entry = current_dirty_entry.as_ref().unwrap();
+                    if entry.expected_state == ExpectedState::FsyncCommit {
+                        info!("Worker: Detected Atomic Write Commit via RENAME ({:?}). Forcing epoch commit.", e.name);
+                        let res = spawn_blocking({
+                            let path = new_dst_temp.clone();
+                            let seq = entry.seq;
+                            let projid = entry.projid;
+                            move || security::commit_epoch(&path, seq, projid)
+                        }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
+
+                        if res.is_ok() {
+                            ctx.dirty_stats.remove(&e.inode);
+                        } else {
+                            warn!("Worker: Failed to commit epoch during Rename detection: {:?}", res.err());
+                        }
+                    } else {
+                         warn!("WAL T2 Failure: RENAME on .tmp file occurred, but state was {:?}. Ignoring rename sequence inconsistency.", entry.expected_state);
+                    }
+                }
+
                 metrics::RENAME_EVENTS.inc();
-                
-                let new_dst = if let Some(parent) = dst.parent() {
-                    parent.join(new_name)
-                } else {
-                    target_cfg.path.join(new_name)
-                };
-                
+                let new_dst = new_dst_temp;
                 let new_rel = new_dst.strip_prefix(&target_cfg.path)
-                    .unwrap_or_else(|_| Path::new(new_name)) 
+                    .unwrap_or_else(|_| Path::new(new_name))
                     .to_path_buf();
 
+                if new_name.contains("..") || new_name.starts_with('/') || !new_dst.starts_with(&target_cfg.path) {
+                    return Err(FoxingError::Security(format!("Invalid rename path traversal detected: {}", new_name)));
+                }
+
                 if target_cfg.allow(&new_rel) {
-                    let dst_clone = dst.clone(); 
-                    let new_dst_clone = new_dst.clone(); 
+                    let dst_clone = dst.clone();
+                    let new_dst_clone = new_dst.clone();
                     let source_clone = source.clone();
                     let e_inode = e.inode;
                     let e_generation = e.generation;
                     let is_synthetic_state = is_synthetic;
-                    
+
                     let res = spawn_blocking(move || {
-                        // NOTE: Parent directory creation is handled above.
-                        
                         info!("Worker: Attempting rename from {:?} to {:?}", dst_clone, new_dst_clone);
                         let rename_res = std::fs::rename(&dst_clone, &new_dst_clone);
                         
                         if rename_res.is_ok() {
-                            let new_rel_clone = new_rel.clone(); 
+                            let new_rel_clone = new_rel.clone();
                             identity::update_map_after_rename(&source_clone.inode_map, e_inode, new_rel_clone, e_generation);
-                            
-                            if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) { 
-                                if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) { 
-                                    if old_sp.exists() { 
-                                        let _ = std::fs::rename(old_sp, new_sp); 
-                                    } 
-                                } 
+                            if let Some(old_sp) = sidecar::get_sidecar_path(&dst_clone) {
+                                if let Some(new_sp) = sidecar::get_sidecar_path(&new_dst_clone) {
+                                    if old_sp.exists() {
+                                        let _ = std::fs::rename(old_sp, new_sp);
+                                    }
+                                }
                             }
-
                             if is_synthetic_state {
                                 metrics::SYNTHETIC_IDENTITY_FILES.dec();
                                 identity::update_map(&source_clone.inode_map, e_inode, new_rel.clone(), e_generation, false);
                             }
                         }
                         rename_res
-                    }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::Other, "Rename task failed"))).map_err(|e| e.into());
-                    
+                    }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
                     if res.is_ok() {
                         if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
-                        let _ = spawn_blocking(move || { 
-                            let dst_path_clone = dst.clone(); 
-                            let new_dst_path_clone = new_dst.clone(); 
-                            if let Some(parent) = dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
-                            if let Some(parent) = new_dst_path_clone.parent() { security::write_dir_integrity_hash(parent, 0); } 
+                        let dst_clone = dst.clone();
+                        let new_dst_clone = new_dst.clone();
+                        let _ = spawn_blocking(move || {
+                            if let Some(parent) = dst_clone.parent() { security::write_dir_integrity_hash(parent, 0); }
+                            if let Some(parent) = new_dst_clone.parent() { security::write_dir_integrity_hash(parent, 0); }
                         }).await;
                     }
-                    Ok(res.map(|_| None))
-                } else { 
+                    return res.map(|_| None);
+                } else {
                     info!("Rename filtered: {:?}", new_rel);
-                    Ok(Ok(None)) 
+                    return Ok(None);
                 }
-            } else { Ok(Ok(None)) }
+            } else { return Ok(None); }
         },
         EventType::Mkdir => {
             let dst_clone = dst.clone();
-            // Parent creation is handled outside, just attempt directory creation here.
-            let res = spawn_blocking(move || { 
+            let res = spawn_blocking(move || {
                 let res = std::fs::create_dir_all(&dst_clone);
                 if res.is_err() && res.as_ref().unwrap_err().kind() == io::ErrorKind::AlreadyExists {
                     Ok(())
                 } else { res }
-            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
-            
-            if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
-            Ok(res.map(|_| None))
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+            if res.is_ok() {
+                let dst_clone = dst.clone();
+                let _ = spawn_blocking(move || { if let Some(parent) = dst_clone.parent() { security::write_dir_integrity_hash(parent, 0); } }).await;
+            }
+            return res.map(|_| None);
         },
         EventType::Rmdir => {
+            ctx.dirty_stats.remove(&e.inode);
+            source.inode_map.lock().pop(&e.inode);
             let dst_clone = dst.clone();
-            let res = spawn_blocking(move || { 
+            let res = spawn_blocking(move || {
+                if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
+                if is_synthetic {
+                    debug!("Worker: Unlinking synthetic file {:?}", dst_clone);
+                    metrics::SYNTHETIC_IDENTITY_FILES.dec();
+                }
                 let r = std::fs::remove_dir(&dst_clone);
                 if let Err(ref e) = r {
                     if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
-                    if e.kind() == io::ErrorKind::NotADirectory { return Ok(()); } 
                 }
                 r
-            }).await.unwrap_or(Ok(())).map_err(|e| e.into());
-            if res.is_ok() { let _ = spawn_blocking(move || { if let Some(parent) = dst.parent() { security::write_dir_integrity_hash(parent, 0); } }).await; }
-            Ok(res.map(|_| None))
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+            if res.is_ok() {
+                let dst_clone = dst.clone();
+                let _ = spawn_blocking(move || { if let Some(parent) = dst_clone.parent() { security::write_dir_integrity_hash(parent, 0); } }).await;
+            }
+            return res.map(|_| None);
         },
         EventType::Barrier | EventType::Fsync => {
             let dst_clone = dst.clone();
@@ -1128,12 +1334,22 @@ async fn process_single_event(
             let enable_versioning = target_cfg.enable_versioning;
             let is_forced = target_cfg.is_forced_version(&dst_clone);
             let defer_maintenance = tuner.should_defer_maintenance();
-            
+
+            if let Some(entry) = ctx.dirty_stats.get(&e.inode) {
+                 if entry.expected_state != ExpectedState::FsyncCommit {
+                      error!("WAL T2 Failure: Fsync/Barrier received, but expected state was {:?} (Inode {}). Triggering targeted WAL sweep.",
+                          entry.expected_state, inode);
+                      return Err(FoxingError::Versioning(format!("WAL Coherence Broken: Inode {} needs repair.", inode)));
+                 }
+            } else {
+                // Warning: Fsync received for inode we don't track. Likely restart or cache eviction.
+            }
+
             let (dyn_max_versions, dyn_max_mb) = if is_forced {
                  let forced_count = target_cfg.force_retention_count.unwrap_or(target_cfg.max_versions);
                  if defer_maintenance { warn!("Forcing version retention for inode {} despite high system system load.", inode); }
                  metrics::TARGET_FORCED_VERSIONING_ACTIVE.with_label_values(&[&target_cfg.path.to_string_lossy()]).set(1);
-                 (forced_count, u64::MAX) 
+                 (forced_count, u64::MAX)
             } else {
                  metrics::TARGET_FORCED_VERSIONING_ACTIVE.with_label_values(&[&target_cfg.path.to_string_lossy()]).set(0);
                  tuner.calculate_version_limits(&target_cfg, ctx.cur_cap_avail, ctx.cur_cap_total)
@@ -1145,66 +1361,54 @@ async fn process_single_event(
                 let dst_for_version = dst_clone.clone();
                  let result = spawn_blocking(move || {
                     let _ = security::create_version_snapshot(&dst_for_version, seq_num, &target_root_clone, inode);
-                    
                     if should_cleanup {
                         let _ = versioning::cleanup_versions(&dst_for_version, &target_root_clone, dyn_max_versions, dyn_max_mb);
                     }
                     Ok::<(), FoxingError>(())
-                }).await;
+                }).await.map_err(FoxingError::Join);
                  if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
             }
             
-            let dst_for_commit = dst_clone.clone(); 
+            let dst_for_commit = dst_clone.clone();
             let r = spawn_blocking(move || {
-                let r = security::commit_epoch(&dst_for_commit, seq_num, projid); 
-                if r.is_ok() { 
-                    if let Some(parent) = dst_for_commit.parent() { 
-                        if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); } 
-                    } 
+                let r = security::commit_epoch(&dst_for_commit, seq_num, projid);
+                if r.is_ok() {
+                    if let Some(parent) = dst_for_commit.parent() {
+                        if let Ok(hash) = security::calc_dir_integrity_hash_target(parent) { security::write_dir_integrity_hash(parent, hash); }
+                    }
                 }
                 r
-            }).await.unwrap_or(Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Commit task failed"))));
+            }).await.map_err(FoxingError::Join)?;
             
-            if let Err(FoxingError::Io(ref io_err)) = r {
-                if io_err.kind() == io::ErrorKind::NotFound {
-                    return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "Fsync target missing")));
-                } else {
-                    Ok(r.map(|_| None))
-                }
-            } else {
-                if r.is_ok() { ctx.dirty_stats.remove(&e.inode); }
-                Ok(r.map(|_| None))
+            if r.is_ok() {
+                ctx.dirty_stats.remove(&e.inode);
             }
+            return r.map(|_| None);
         },
         EventType::SetXattr | EventType::RemoveXattr => {
             let src_clone = src.clone();
             let dst_clone = dst.clone();
             let _ = spawn_blocking(move || { security::sync_xattrs(&src_clone, &dst_clone); }).await;
-            Ok(Ok(None))
+            return Ok(None);
         },
         EventType::Chmod | EventType::Chown | EventType::Utimes => {
             let src_clone = src.clone();
             let dst_clone = dst.clone();
-            
             let dst_for_closure = dst_clone.clone();
-            let res = spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_for_closure) }).await;
-            
+            let res = spawn_blocking(move || { security::apply_metadata(&src_clone, &dst_for_closure) }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
             match res {
-                Ok(inner_res) => {
-                    if let Err(e) = inner_res {
-                        warn!("Worker: Metadata apply failed for {:?}: {}", dst_clone, e);
-                    }
-                },
+                Ok(()) => Ok(None),
                 Err(e) => {
-                    warn!("Worker: Metadata task panicked for {:?}: {}", dst_clone, e);
+                    warn!("Worker: Metadata apply failed for {:?}: {}", dst_clone, e);
+                    Err(e)
                 }
             }
-            Ok(Ok(None))
         },
         EventType::Truncate => {
             let dst_clone = dst.clone();
-            let length = e.length; 
-            Ok(spawn_blocking(move || { security::truncate_file(&dst_clone, length) }).await.unwrap_or(Ok(())).map(|_| None))
+            let length = e.length;
+            let res = spawn_blocking(move || { security::truncate_file(&dst_clone, length) }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
+            return res.map(|_| None);
         },
         EventType::Fallocate => {
             let dst_clone = dst.clone();
@@ -1212,43 +1416,37 @@ async fn process_single_event(
             let length = e.length;
             let mode = e.flags as i32;
             debug!("Worker: Handling Fallocate on {:?} with offset={}, len={}, mode={:#x}", dst_clone, offset, length, mode);
-            Ok(spawn_blocking(move || { security::do_fallocate(&dst_clone, offset, length, mode) }).await.unwrap_or(Ok(())).map(|_| None))
+            let res = spawn_blocking(move || { security::do_fallocate(&dst_clone, offset, length, mode) }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(|e| e.into()));
+            return res.map(|_| None);
         },
         _ => {
             debug!("Worker: Unhandled event type {:?} for {:?}", e.event_type, dst);
-            Ok(Ok(None))
+            return Ok(None);
         }
     };
 
     match res {
-        Ok(inner) => {
-            if let Err(err) = inner {
-                if let FoxingError::Io(io_err) = &err {
-                    if let Some(28) = io_err.raw_os_error() {
-                        error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
-                        ctx.capacity_breaker.trip();
-                        ctx.failure_state.record_failure();
-                        let target_cfg_clone = target_cfg.clone();
-                        let _ = spawn_blocking(move || { 
-                            let target_root = target_cfg_clone.path.parent().unwrap_or(&target_cfg_clone.path);
-                            versioning::prune_global_history(target_root, 512 * 1024 * 1024) 
-                        }).await;
-                    }
-                }
-                
-                error!("IO Worker Error during processing {:?} (Inode {}): {:?}", e.event_type, e.inode, err);
-                if ctx.limiter.check("io") { error!("IO Error: {:?}", err); }
-                ctx.failure_state.record_failure();
-                // NOTE: We don't record poison here because we do it in the loop
-                Err(err)
-            } else {
-                ctx.failure_state.record_success();
-                ctx.poison.record_success(e.inode); // Clear poison on success
-                inner
+        Ok(stats_opt) => {
+            if stats_opt.is_some() {
             }
+            Ok(stats_opt)
         },
         Err(err) => {
-            ctx.failure_state.record_failure();
+            if let FoxingError::Io(io_err) = &err {
+                if let Some(28) = io_err.raw_os_error() {
+                    error!("TARGET FULL (ENOSPC) on {:?}. Tripping circuit breaker immediately.", target_cfg.path);
+                    ctx.capacity_breaker.trip();
+                    ctx.failure_state.record_failure();
+                    
+                    let target_cfg_clone = target_cfg.clone();
+                    let target_root_path = target_cfg_clone.path.parent().unwrap_or(&target_cfg_clone.path).to_path_buf();
+                    let _ = spawn_blocking(move || {
+                        versioning::prune_global_history(&target_root_path, 512 * 1024 * 1024)
+                    }).await;
+                }
+            }
+            error!("IO Worker Error during processing {:?} (Inode {}): {:?}. Backoff initiated.", e.event_type, e.inode, err);
+            if ctx.limiter.check("io") { error!("IO Error: {:?}", err); }
             Err(err)
         }
     }

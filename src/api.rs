@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::worker::TunerState;
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SystemStatus {
     pub load_avg_1m: f64,
@@ -11,7 +10,6 @@ pub struct SystemStatus {
     pub targets: HashMap<String, TargetStatus>,
     pub debug: DebugStatus,
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TargetStatus {
     pub tuner_state: TunerState,
@@ -22,31 +20,25 @@ pub struct TargetStatus {
     pub ops_offload: u64,
     pub ops_standard: u64,
     pub pending_events: u64,
+    pub wal_coherence_failures: u64, // NEW: Expose WAL failure metric
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct DebugStatus {
     pub bpf_sequence_gaps: u64,
     pub bpf_events_malformed: u64,
     pub bpf_events_unwatched: u64,
-    
-    // Key: Hex String "0x00000801"
     pub bpf_device_stats: HashMap<String, BpfDeviceStat>,
-
     pub worker_shutdown_timeouts: u64,
     pub sidecars_created: u64,
     pub generation_mismatches: u64,
-    
     pub memory_usage_mb: u64,
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BpfDeviceStat {
     pub dev_id_raw: u32,
     pub last_sequence: u64,
     pub total_events: u64,
 }
-
 impl Default for SystemStatus {
     fn default() -> Self {
         Self {

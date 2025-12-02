@@ -81,11 +81,14 @@ pub fn resolve_and_update_path(map: &InodeMap, source_mount_root: &std::path::Pa
 
     if let Some(path) = found_path {
         // We found the path. Now, update the map with the correct metadata.
-        if let Ok(metadata) = fs::metadata(source_mount_root.join(&path)) {
+        if let Ok(_metadata) = fs::metadata(source_mount_root.join(&path)) {
             debug!("Fast refresh successful: Inode {} resolved to {:?}", inode, path);
             let rel_path = path.clone();
             // Update the map aggressively with the new, correct relative path
-            map.lock().put(inode, (rel_path, metadata.generation()));
+            // We use 0 for the generation here as getting the correct generation value 
+            // requires accessing the i_generation field in struct inode, which is not directly exposed
+            // by MetadataExt, but is handled by the BPF event stream itself.
+            map.lock().put(inode, (rel_path, 0)); 
             return Ok(path);
         }
     }

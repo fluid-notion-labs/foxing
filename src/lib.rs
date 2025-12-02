@@ -14,8 +14,8 @@ pub mod versioning;
 pub mod governor;
 pub mod operations;
 pub mod hydration;
-pub mod api; 
+pub mod api;
+pub mod hydration_worker; // NEW: Dedicated worker for bulk hydration jobs
 pub mod tui;
-
 pub use mirror::SharedConfig;
 pub use error::Result;
