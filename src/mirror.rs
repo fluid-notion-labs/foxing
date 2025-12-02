@@ -1,5 +1,5 @@
 use std::{sync::{Arc}, collections::HashMap, path::PathBuf, fs};
-use crate::{config::{Config, TargetConfig}, event::{EventQueue}, worker::{self, TunerBoard, TunerState}, identity, Result, governor::Governor};
+use crate::{config::{Config, TargetConfig}, event::{EventQueue, Event}, worker::{self}, identity, Result, governor::Governor};
 use crate::hydration::{Hydrator};
 use crate::hydration_worker::{HydrationQueue};
 use parking_lot::Mutex;
@@ -7,33 +7,65 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use tokio::sync::{RwLock, mpsc};
 use std::os::unix::fs::{MetadataExt};
-use tracing::{info, error, debug, warn};
-use dashmap::DashMap;
+use tracing::{info, error, warn};
+use dashmap::{DashMap, DashSet};
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 use std::ops::Sub;
 use crate::error::FoxingError;
+use crate::tuner::{TunerBoard, TunerState};
+
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
 
-pub const REPAIR_DEBOUNCE_MS: u64 = 5000;
-const MIN_FULL_SCAN_DEBOUNCE_SECS: u64 = 1;
+struct RepairGuard {
+    path: PathBuf,
+    set: Arc<DashSet<PathBuf>>,
+}
 
-fn calculate_full_scan_debounce(tuner_board: &TunerBoard) -> Duration {
-    let mut max_delay = Duration::from_secs(MIN_FULL_SCAN_DEBOUNCE_SECS);
-    for r in tuner_board.iter() {
-        let current_state = *r.value();
-        let delay = match current_state {
-            TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => Duration::from_secs(45),
-            TunerState::Drain => Duration::from_secs(15),
-            _ => Duration::from_secs(MIN_FULL_SCAN_DEBOUNCE_SECS),
-        };
-        if delay > max_delay {
-            max_delay = delay;
-        }
+impl Drop for RepairGuard {
+    fn drop(&mut self) {
+        self.set.remove(&self.path);
     }
-    max_delay
+}
+
+fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration) {
+    let mut max_stress_level = 0;
+    for r in tuner_board.iter() {
+        let level = match *r.value() {
+            TunerState::Startup | TunerState::IdleReset => 0,
+            TunerState::ProbeBW => 1,
+            TunerState::Drain => 2,
+            TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => 3,
+        };
+        if level > max_stress_level { max_stress_level = level; }
+    }
+    match max_stress_level {
+        0 => (Duration::from_millis(50), Duration::from_millis(500)),
+        1 => (Duration::from_millis(200), Duration::from_secs(2)),
+        2 => (Duration::from_millis(1000), Duration::from_secs(5)),
+        _ => (Duration::from_secs(2), Duration::from_secs(10)),
+    }
+}
+
+fn calculate_adaptive_registry_limit(tuner_board: &TunerBoard) -> usize {
+    let mut max_stress_level = 0;
+    for r in tuner_board.iter() {
+        let level = match *r.value() {
+            TunerState::Startup | TunerState::IdleReset => 0,
+            TunerState::ProbeBW => 1,
+            TunerState::Drain => 2,
+            TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => 3,
+        };
+        if level > max_stress_level { max_stress_level = level; }
+    }
+    match max_stress_level {
+        0 => 256,
+        1 => 512,
+        2 => 1024,
+        _ => 128,
+    }
 }
 
 #[derive(Debug)]
@@ -46,8 +78,8 @@ pub struct SourceInfo {
     pub inode_map: identity::InodeMap,
     pub lru_size: usize,
     pub bulk_job_queue: Mutex<Option<HydrationQueue>>,
-    // Updated to RwLock for interior mutability during initialization
     pub queues: RwLock<HashMap<u32, Vec<Arc<EventQueue>>>>,
+    pub active_repairs: Arc<DashSet<PathBuf>>,
 }
 
 pub struct Manager {
@@ -71,35 +103,35 @@ impl Manager {
             config_reader.hydration_delay_ms
         ));
         
-        let mut target_ids_to_exclude = Vec::new();
+        let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
+        let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
+
+        let mut sources: HashMap<u32, Arc<SourceInfo>> = HashMap::new();
+        let mut target_ids_to_exclude = Vec::new(); 
+        
         for sc in &config_reader.sources {
             for tc in &sc.targets {
-                match resolve_all_device_ids(&tc.path) {
-                    Ok((_, ids)) => target_ids_to_exclude.extend(ids),
-                    Err(e) => warn!("Failed to resolve target device ID for exclusion {:?}: {}", tc.path, e),
+                if let Ok(meta) = fs::metadata(&tc.path) {
+                    let rdev = meta.dev();
+                    let maj = ((rdev >> 8) & 0xfff) as u32;
+                    let min = ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32;
+                    let stat_id = (maj << 20) | min;
+                    target_ids_to_exclude.push(stat_id);
                 }
             }
         }
 
-        let mut sources: HashMap<u32, Arc<SourceInfo>> = HashMap::new();
-        let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
-        let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
-
         for sc in &config_reader.sources {
             match resolve_all_device_ids(&sc.path) {
                 Ok((mount_path, mut dev_ids)) => {
-                    if dev_ids.is_empty() { continue; }
-                    
                     dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
                     
-                    if dev_ids.is_empty() {
+                    if dev_ids.is_empty() { 
                         error!("Source {:?} has NO device IDs left after excluding Targets!", sc.path);
-                        continue;
+                        continue; 
                     }
-                    
                     let primary_dev = dev_ids[0];
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
-                    
                     sources.insert(primary_dev, Arc::new(SourceInfo {
                         path: sc.path.clone(),
                         mount: mount_path,
@@ -110,12 +142,13 @@ impl Manager {
                         lru_size: cache_size.get(),
                         bulk_job_queue: Mutex::new(None),
                         queues: RwLock::new(HashMap::new()),
+                        active_repairs: Arc::new(DashSet::new()),
                     }));
                 },
                 Err(e) => error!("Failed to resolve device IDs for {:?}: {}", sc.path, e),
             }
         }
-        
+
         drop(config_reader);
 
         Self {
@@ -145,26 +178,32 @@ impl Manager {
             let mut queues_for_source = HashMap::new();
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets: Vec<TargetConfig> = Vec::new();
-                
+                let mut hydration_repair_txs: Vec<mpsc::Sender<Arc<Event>>> = Vec::new();
+
                 for tgt_cfg in &source_cfg.targets {
-                    let target_workers = tgt_cfg.worker_count;
-                    let (high_tx_raw, high_rx_raw) = crate::event::create_fanout(global_queue_max, target_workers);
-                    let high_queue_arc = Arc::new(high_tx_raw);
+                    let target_workers = tgt_cfg.worker_count.max(2);
                     
-                    let (low_tx_raw, low_rx_raw) = crate::event::create_fanout(global_queue_max, target_workers);
-                    let low_queue_arc = Arc::new(low_tx_raw);
+                    let (fanout_tx, fanout_rxs_vec) = crate::event::create_fanout(global_queue_max, target_workers);
+                    let fanout_queue_arc = Arc::new(fanout_tx);
+                    
+                    let (repair_tx_raw, repair_rx_raw) = crate::event::create_fanout(1000, 1); 
+                    if let Some(tx) = repair_tx_raw.senders.first() {
+                        hydration_repair_txs.push(tx.clone());
+                    }
+                    
+                    let primary_repair_rx = repair_rx_raw.into_iter().next();
+                    let mut repair_rx_option = Some(primary_repair_rx.unwrap());
 
                     for alt_dev_id in &src.dev_ids {
-                        queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(high_queue_arc.clone());
-                        queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(low_queue_arc.clone());
+                        queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
                     }
                     
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
 
-                    let mut high_rxs = high_rx_raw.into_iter();
-                    let mut low_rxs = low_rx_raw.into_iter();
-                    
-                    while let (Some(rx_h), Some(rx_l)) = (high_rxs.next(), low_rxs.next()) {
+                    let num_workers = fanout_rxs_vec.len();
+                    let mut fanout_rxs_iter = fanout_rxs_vec.into_iter(); 
+                    for worker_id in 0..num_workers {
+                        let rx = fanout_rxs_iter.next().unwrap();
                         let s = src.clone();
                         let t = tgt_cfg.clone();
                         let c = self.config.clone();
@@ -172,9 +211,18 @@ impl Manager {
                         let (sd_tx, sd_rx) = tokio::sync::mpsc::channel(1);
                         shutdowns.push(sd_tx);
                         
+                        let repair_channel = if worker_id == 0 {
+                            repair_rx_option.take()
+                        } else {
+                            None
+                        };
+
                         handles.push(tokio::spawn(worker::run_worker(
-                            s, t, rx_h, rx_l, sd_rx, h_tx, c, 
-                            self.governor.clone(), self.tuner_board.clone()
+                            s, t, rx, 
+                            sd_rx, h_tx, c, 
+                            self.governor.clone(), self.tuner_board.clone(),
+                            worker_id, 
+                            repair_channel
                         )));
                     }
                     
@@ -183,7 +231,6 @@ impl Manager {
                     }
                 }
                 
-                // Write the queues into the SourceInfo Arc via RwLock
                 {
                     let mut q_write = src.queues.write().await;
                     *q_write = queues_for_source;
@@ -192,10 +239,10 @@ impl Manager {
                 let bulk_worker_count = config_reader.worker_count.min(4);
                 let (queue, bulk_handles) = HydrationQueue::new(
                     src.clone(), 
-                    self.config.clone(),
-                    self.governor.clone(),
-                    self.tuner_board.clone(),
-                    bulk_worker_count,
+                    self.config.clone(), 
+                    self.governor.clone(), 
+                    self.tuner_board.clone(), 
+                    bulk_worker_count, 
                 );
                 
                 *src.bulk_job_queue.lock() = Some(queue);
@@ -203,10 +250,11 @@ impl Manager {
 
                 if !hydration_targets.is_empty() {
                     let hydrator = Arc::new(Hydrator::new(
-                        src.clone(),
-                        hydration_targets,
-                        self.governor.clone(),
-                        self.tuner_board.clone()
+                        src.clone(), 
+                        hydration_targets, 
+                        self.governor.clone(), 
+                        self.tuner_board.clone(),
+                        hydration_repair_txs, 
                     ));
                     
                     if let Ok(watcher) = hydrator.clone().start_watcher() {
@@ -218,17 +266,11 @@ impl Manager {
                     let h_clone = hydrator.clone();
                     let thread_handle = std::thread::spawn(move || {
                         h_clone.full_scan();
-                        Ok(())
+                        Ok::<(), FoxingError>(())
                     });
                     self.hydration_handles.lock().push(thread_handle);
                 }
             }
-        }
-
-        // Collect all queues for BPF initialization (Read Lock needed temporarily)
-        for (dev_id, src) in self.sources.iter() {
-            let q_read = src.queues.read().await;
-            all_queues_map.insert(*dev_id, q_read.get(dev_id).cloned().unwrap_or_default());
         }
 
         let hydrators_arc = Arc::new(self.hydrators.clone());
@@ -236,70 +278,62 @@ impl Manager {
         let repair_tracker_clone = self.repair_tracker.clone();
 
         let debounce_handle = tokio::spawn(async move {
-            let mut last_full_scan = Instant::now().sub(Duration::from_secs(MIN_FULL_SCAN_DEBOUNCE_SECS));
+            let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
             
             while let Some(path) = hydration_rx.recv().await {
-                let required_debounce = calculate_full_scan_debounce(&tuner_board_clone);
+                let (repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
                 
                 if path.parent().is_none() || path.ends_with(path.file_name().unwrap_or_default()) {
                     let now = Instant::now();
-                    if now.duration_since(last_full_scan) > required_debounce {
-                        warn!("Hydration MANAGER: Triggering FULL scan. Required debounce: {:?}. Elapsed: {:?}.", 
-                              required_debounce, now.duration_since(last_full_scan));
+                    if now.duration_since(last_full_scan) > full_scan_debounce {
+                        warn!("Hydration MANAGER: Triggering FULL scan. Required debounce: {:?}. Elapsed: {:?}.", full_scan_debounce, now.duration_since(last_full_scan));
                         last_full_scan = now;
                         
                         if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                             let h_clone = hydrator.clone();
                             let thread_handle = std::thread::spawn(move || {
                                 h_clone.full_scan();
-                                Ok(())
+                                Ok::<(), FoxingError>(())
                             });
                             match thread_handle.join() {
                                 Ok(Ok(())) => {},
-                                Ok(Err(e)) => {
-                                    error!("Hydration scan thread returned error: {:?}", e);
-                                    return Err(e);
-                                }
-                                Err(e) => {
-                                    error!("Hydration scan thread panic: {:?}", e);
-                                    return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Hydration thread panic")));
-                                }
+                                Ok(Err(_e)) => error!("Hydration scan thread returned error"),
+                                Err(_e) => error!("Hydration scan thread panic"),
                             }
                         }
-                    } else {
-                        debug!("Hydration MANAGER: Full scan debounced. Next attempt in {}ms.", 
-                                (required_debounce - now.duration_since(last_full_scan)).as_millis());
                     }
                 } else {
-                    let now = Instant::now();
-                    let repaired_path = path.clone();
-                    
-                    repair_tracker_clone.retain(|_, time| now.duration_since(*time) < Duration::from_millis(REPAIR_DEBOUNCE_MS));
-                    
-                    if repair_tracker_clone.get(&repaired_path).is_some() {
-                        debug!("Hydration MANAGER: Skipping redundant repair request for {:?}", repaired_path);
-                        continue;
-                    }
-                    
-                    repair_tracker_clone.insert(repaired_path.clone(), now);
-                    
-                    if let Some(hydrator) = hydrators_arc.iter().find(|h| repaired_path.starts_with(&h.source.path)) {
+                    if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
+                        if hydrator.source.active_repairs.contains(&path) { continue; }
+                        let registry_limit = calculate_adaptive_registry_limit(&tuner_board_clone);
+                        if hydrator.source.active_repairs.len() >= registry_limit { continue; }
+
+                        let now = Instant::now();
+                        let repaired_path = path.clone();
+                        
+                        repair_tracker_clone.retain(|_, time| now.duration_since(*time) < repair_debounce);
+                        
+                        if repair_tracker_clone.get(&repaired_path).is_some() { continue; }
+                        repair_tracker_clone.insert(repaired_path.clone(), now);
+                        
+                        hydrator.source.active_repairs.insert(repaired_path.clone());
+                        
+                        let set_clone = hydrator.source.active_repairs.clone();
+                        let path_for_guard = repaired_path.clone();
+                        let path_for_repair = repaired_path.clone();
+
                         let h_clone = hydrator.clone();
                         let thread_handle = std::thread::spawn(move || {
-                            h_clone.repair_path(repaired_path);
-                            Ok(())
+                            let _guard = RepairGuard { path: path_for_guard, set: set_clone };
+                            h_clone.repair_path(path_for_repair);
+                            Ok::<(), FoxingError>(())
                         });
+                        
                         match thread_handle.join() {
                             Ok(Ok(())) => {},
-                            Ok(Err(e)) => {
-                                error!("Hydration repair thread returned error: {:?}", e);
-                                return Err(e);
-                            }
-                            Err(e) => {
-                                error!("Hydration repair thread panic: {:?}", e);
-                                return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Hydration thread panic")));
-                            }
+                            Ok(Err(e)) => error!("Hydration repair error: {:?}", e),
+                            Err(_e) => error!("Hydration repair panic"),
                         }
                     }
                 }
@@ -311,51 +345,12 @@ impl Manager {
         (all_queues_map, handles, shutdowns, hydration_rx_dummy)
     }
 
-    pub fn trigger_hydration(&self, target_path: PathBuf) {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-        if nanos % 25 == 0 {
-             let now = Instant::now();
-             self.repair_tracker.retain(|_, time| now.duration_since(*time) < Duration::from_millis(REPAIR_DEBOUNCE_MS));
-        }
-        
-        for h in &self.hydrators {
-            if target_path.starts_with(&h.source.path) {
-                let h_clone = h.clone();
-                if target_path == h.source.path {
-                    let thread_handle = std::thread::spawn(move || {
-                        h_clone.full_scan();
-                        Ok(())
-                    });
-                    self.hydration_handles.lock().push(thread_handle);
-                } else {
-                    let now = Instant::now();
-                    if let Some(last_repair) = self.repair_tracker.get(&target_path) {
-                         if now.duration_since(*last_repair) < Duration::from_millis(REPAIR_DEBOUNCE_MS) {
-                             debug!("Skipping redundant repair request for {:?}", target_path);
-                             return;
-                         }
-                    }
-                    self.repair_tracker.insert(target_path.clone(), now);
-                    let repair_path = target_path.clone();
-                    let thread_handle = std::thread::spawn(move || {
-                        h_clone.repair_path(repair_path);
-                        Ok(())
-                    });
-                    self.hydration_handles.lock().push(thread_handle);
-                }
-            }
-        }
-    }
-
     pub fn wait_hydration(&mut self) {
         let mut handles = self.hydration_handles.lock();
         for h in handles.drain(..) {
             let _ = h.join();
         }
-        
-        // Use drain(..) to consume handles since JoinHandle is not Clone
         for h in self.bulk_hydration_handles.drain(..) {
-            // Abort background tasks immediately on shutdown
             h.abort(); 
         }
     }
@@ -364,10 +359,6 @@ impl Manager {
 fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     let canonical = path.canonicalize().map_err(|e| crate::error::FoxingError::Io(e))?;
     let mut ids = Vec::new();
-    let mut mount_point = canonical.clone();
-    
-    debug!("Resolving device IDs for path: {:?}", canonical);
-    
     if let Ok(meta) = fs::metadata(&canonical) {
         let rdev = meta.dev();
         let maj = ((rdev >> 8) & 0xfff) as u32;
@@ -375,31 +366,12 @@ fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
         let stat_id = (maj << 20) | min;
         ids.push(stat_id);
     }
-
-    if let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") {
-        let mut best_len = 0;
-        for line in mountinfo.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 { continue; }
-            let mount_root = parts[4];
-            
-            if canonical.to_string_lossy().starts_with(mount_root) {
-                 if mount_root.len() >= best_len {
-                     best_len = mount_root.len();
-                     mount_point = PathBuf::from(mount_root);
-                     
-                     let maj_min = parts[2];
-                     let dev_parts: Vec<&str> = maj_min.split(':').collect();
-                     if dev_parts.len() == 2 {
-                         let major: u32 = dev_parts[0].parse().unwrap_or(0);
-                         let minor: u32 = dev_parts[1].parse().unwrap_or(0);
-                         let kernel_id = (major << 20) | minor;
-                         if !ids.contains(&kernel_id) { ids.push(kernel_id); }
-                     }
-                 }
-            }
-        }
-    }
     
+    let mount_point = canonical.clone();
+    
+    if ids.is_empty() {
+        return Err(crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "Could not determine device ID for path.")));
+    }
+
     Ok((mount_point, ids))
 }

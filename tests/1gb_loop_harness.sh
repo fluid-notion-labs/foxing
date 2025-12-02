@@ -257,8 +257,35 @@ test_2_metadata() {
     wait_for_perm "$target_secret" 700 || return 1
 }
 
-test_3_reflink() {
-    echo -e "\n${YELLOW}=== Test 3: Large File Reflink & Delta ===${NC}"
+test_3_urandom_write() {
+    echo -e "\n${YELLOW}=== Test 3: Large File (Dense Write & Update) ===${NC}"
+    local dense_img="$SOURCE_MNT/dense_data.bin"
+    local target_dense="$TARGET_MNT/dense_data.bin"
+    
+    echo "   Creating 20MB dense file with /dev/urandom..."
+    dd if=/dev/urandom of="$dense_img" bs=1M count=20 status=none
+    
+    wait_for_file "$target_dense" 20 || return 1 # Increased timeout slightly
+    
+    echo "   Performing delta writes at offset 5MB..."
+    local content="DELTA_UPDATE_MARKER"
+    echo "$content" | dd of="$dense_img" bs=1 count=${#content} seek=$((5 * 1024 * 1024)) conv=notrunc status=none
+    sync
+    
+    # Need to wait for the update to complete
+    sleep 2 
+    
+    # Verify delta content in target
+    if dd if="$target_dense" bs=1 count=${#content} skip=$((5 * 1024 * 1024)) status=none 2>/dev/null | grep -q "$content"; then
+        echo -e "   Delta Content Check: ${GREEN}PASS${NC}"
+    else
+        echo -e "   Delta Content Check: ${RED}FAIL${NC}"
+        return 1
+    fi
+}
+
+test_5_qcow2_sparse() {
+    echo -e "\n${YELLOW}=== Test 5: Sparse File (QCOW2 Reflink/CoW) ===${NC}"
     local vm_img="$SOURCE_MNT/vm_disk.qcow2"
     
     echo "   Creating 50MB sparse file..."
@@ -304,7 +331,8 @@ case "$1" in
     run)
         test_1_torture
         test_2_metadata
-        test_3_reflink
+        test_3_urandom_write
+        test_5_qcow2_sparse
         test_6_rename
         ;;
     all)
@@ -329,7 +357,8 @@ case "$1" in
         
         test_1_torture
         test_2_metadata
-        test_3_reflink
+        test_3_urandom_write
+        test_5_qcow2_sparse
         test_6_rename
         
         echo -e "\n${BLUE}Killing Daemon...${NC}"

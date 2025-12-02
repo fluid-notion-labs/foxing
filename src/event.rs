@@ -1,6 +1,8 @@
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use crate::metrics;
+use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -14,7 +16,7 @@ pub enum EventType {
 impl From<u8> for EventType {
     fn from(v: u8) -> Self {
         match v {
-            1=>Self::Write, 2=>Self::WriteRange, 3=>Self::SetXattr, 4=>Self::RemoveXattr,
+             1=>Self::Write, 2=>Self::WriteRange, 3=>Self::SetXattr, 4=>Self::RemoveXattr,
             5=>Self::Rmdir, 6=>Self::Fsync, 7=>Self::Rename, 8=>Self::Create,
             9=>Self::Unlink, 10=>Self::Mkdir, 11=>Self::Truncate, 12=>Self::Link,
             13=>Self::Chmod, 14=>Self::Chown, 15=>Self::Barrier, 16=>Self::Mknod,
@@ -37,22 +39,54 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
+
+    /// Returns true if this event modifies directory topology and should be handled
+    /// by the dedicated Metadata Plane to prevent starvation.
+    pub fn is_structural_metadata(&self) -> bool {
+        matches!(self, 
+            Self::Mkdir | Self::Rmdir | Self::Rename | 
+            Self::Link | Self::Symlink | Self::Mknod
+        )
+    }
 }
 
 #[derive(Debug)]
 pub struct EventQueue {
-    senders: Vec<mpsc::Sender<Arc<Event>>>
+    pub senders: Vec<mpsc::Sender<Arc<Event>>>
 }
 
 impl EventQueue {
-    pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self { Self { senders } }
+    pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
+        Self { senders }
+    }
     
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         if self.senders.is_empty() { return; }
         
-        let idx = (e.inode as usize) % self.senders.len();
-        if self.senders[idx].try_send(e).is_err() {
+        let target_idx = if self.senders.len() > 1 {
+            if e.event_type.is_structural_metadata() {
+                // CONTROL PLANE: Always route structural changes to Worker 0
+                // This ensures strict ordering of directory creation/deletion
+                // and prevents them from being blocked by bulk I/O.
+                0
+            } else {
+                // DATA PLANE: Route file IO to Workers 1..N based on inode hash.
+                // This provides parallelism for heavy operations.
+                // We hash the inode to ensure all writes for the same file go to the same worker
+                // to preserve write ordering.
+                let mut hasher = DefaultHasher::new();
+                e.inode.hash(&mut hasher);
+                let hash = hasher.finish();
+                
+                // Map to range [1, len-1]
+                1 + (hash as usize % (self.senders.len() - 1))
+            }
+        } else {
+            0 // Fallback for single-worker config
+        };
+        
+        if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
         }
     }
@@ -72,8 +106,11 @@ pub struct Event {
 }
 
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
+    // Ensure at least 2 workers for Control/Data plane separation if requested
+    let actual_workers = workers.max(1);
+    
     let (mut txs, mut rxs) = (Vec::new(), Vec::new());
-    for _ in 0..workers {
+    for _ in 0..actual_workers {
         let (t, r) = mpsc::channel(cap);
         txs.push(t);
         rxs.push(r);
