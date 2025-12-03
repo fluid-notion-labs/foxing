@@ -3,31 +3,25 @@ use std::{path::PathBuf, fs, sync::{Arc, atomic::AtomicBool}, collections::HashS
 use crate::error::{Result, FoxingError as MirrorError};
 use regex::RegexSet;
 use sysinfo::System;
-// --- Exported Constants ---
 pub const MAX_FAILURE_BACKOFF: u64 = 600;
 pub const ERROR_LIMITER_SECS: u64 = 60;
-
-fn d_quiesce() -> bool { false }
-fn d_wc()->usize{2}
-fn d_qm()->usize{100000}
-fn d_mp()->u16{9100}
-fn d_st()->u64{30}
-fn d_cmb()->u64{1048576}
-fn d_ct()->u64{500}
-fn d_bi()->u64{60}
-fn d_fmb()->bool{false}
-fn d_ffi()->u64{5}
-fn d_gbl()->u64{500000}
-fn d_max_versions() -> usize { 5 }
-fn d_max_versions_size_mb() -> u64 { 10240 }
-fn d_max_load() -> f64 { 4.0 }
-fn d_hyd_delay() -> u64 { 10 }
-fn d_tune_lat() -> u64 { 50 } // REINSTATED
-fn d_ioprio() -> String { "Normal".to_string() }
-// DYNAMICALLY TUNED FLOOR: Set to 1MiB as base default.
-fn d_io_buffer_size_mib() -> u64 { 1 }
-
-// --- Exported Enums ---
+const BASE_AUTOTUNE_VDO_THRESHOLD: u32 = 128;
+fn d_bool_false() -> bool { false }
+fn d_bool_true() -> bool { true }
+fn d_zero_usize() -> usize { 0 }
+fn d_zero_u64() -> u64 { 0 }
+fn d_zero_f64() -> f64 { 0.0 }
+fn d_mp() -> u16 { 9100 }
+fn d_st() -> u64 { 30 }
+fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
+fn d_zero_u32() -> u32 { 0 }
+fn default_worker_count(sys: &System) -> usize {
+    sys.cpus().len().max(2)
+}
+fn default_global_buffer_limit_mb(sys: &System) -> u64 {
+    let total_mem = sys.total_memory() / 1024 / 1024;
+    (total_mem as f64 * 0.70) as u64
+}
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub enum TargetProfile {
     Auto,
@@ -38,92 +32,74 @@ pub enum TargetProfile {
     Network,
 }
 fn d_profile() -> TargetProfile { TargetProfile::Auto }
-fn d_max_workers_sys()->usize{4}
-
-// NEW: Function to dynamically calculate the optimal chunk size based on profile and resources
 pub fn autotune_buffer_chunk_size(profile: &TargetProfile, global_limit_mib: u64) -> u64 {
-    // Base chunk size, always at least 1 MiB
-    let mut tuned_mib = d_io_buffer_size_mib();
-
-    // Only consider scaling if the system is generously provisioned (> 8GB global buffer limit).
-    // This prevents overly large chunks on memory-constrained systems.
-    if global_limit_mib >= 8192 { // 8 GB limit heuristic
-        match profile {
-            // FIX: Changed NVme -> NVMe
-            TargetProfile::NVMe => tuned_mib = 4, 
-            // FIX: Changed SSD -> SSD
-            TargetProfile::SSD => tuned_mib = 2,
-            // FIX: Changed Network -> Network, NFS -> NFS
-            TargetProfile::Network | TargetProfile::NFS => tuned_mib = 2,
-            // FIX: Changed HDD -> HDD, Auto -> Auto
-            TargetProfile::HDD | TargetProfile::Auto => {}
-        }
+    let base_mib = if global_limit_mib > 16384 { 8 } else { 2 };
+    match profile {
+        TargetProfile::NVMe => base_mib * 2,
+        TargetProfile::SSD => base_mib,
+        TargetProfile::Network | TargetProfile::NFS => base_mib,
+        TargetProfile::HDD | TargetProfile::Auto => base_mib.max(1),
     }
-    
-    // Safety check: ensure the resulting chunk size isn't so large that it monopolizes
-    // the global budget. We cap it at 1/16th of the global limit, minimum of 1MiB.
-    let max_safe_chunk = (global_limit_mib / 16).max(1);
-    
-    tuned_mib.min(max_safe_chunk)
 }
-
-
-// --- Exported Structs ---
+pub fn autotune_vdo_stall_threshold(profile: &TargetProfile) -> u32 {
+    match profile {
+        TargetProfile::NVMe => 1024,
+        TargetProfile::SSD => 512,
+        TargetProfile::HDD => 128,
+        TargetProfile::Network | TargetProfile::NFS => 256,
+        TargetProfile::Auto => BASE_AUTOTUNE_VDO_THRESHOLD,
+    }
+}
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default="d_wc")] pub worker_count: usize,
-    #[serde(default="d_qm")] pub queue_max: usize,
+    #[serde(default="d_zero_usize")] pub worker_count: usize,
+    #[serde(default="d_zero_usize")] pub queue_max: usize,
     #[serde(default="d_mp")] pub metrics_port: u16,
     #[serde(default="d_st")] pub shutdown_timeout_secs: u64,
-    #[serde(default="d_cmb")] pub coalesce_max_bytes: u64,
-    #[serde(default="d_ct")] pub capacity_threshold_mb: u64,
-    #[serde(default="d_bi")] pub breaker_interval_secs: u64,
-    #[serde(default="d_fmb")] pub fatal_metrics_bind: bool,
-    #[serde(default="d_ffi")] pub force_flush_interval_secs: u64,
-    #[serde(default="d_gbl")] pub global_buffer_limit: u64,
-    #[serde(default="d_quiesce")] pub quiesce_mode: bool,
-    #[serde(default="d_max_load")] pub max_system_load_avg: f64,
-    #[serde(default="d_hyd_delay")] pub hydration_delay_ms: u64,
-    #[serde(default="d_ioprio")] pub io_priority: String,
-    
-    // This value is now determined by the target's profile in TargetConfig::compile
-    // It is kept here as a global default fallback, but targets override it.
-    #[serde(default="d_io_buffer_size_mib")] pub io_buffer_size_mib: u64, 
-    
-    #[serde(default="d_max_workers_sys", skip)] pub max_workers_sys: usize,
+    #[serde(default="d_zero_u64")] pub coalesce_max_bytes: u64,
+    #[serde(default="d_zero_u64")] pub capacity_threshold_mb: u64,
+    #[serde(default="d_zero_u64")] pub breaker_interval_secs: u64,
+    #[serde(default="d_bool_false")] pub fatal_metrics_bind: bool,
+    #[serde(default="d_zero_u64")] pub force_flush_interval_secs: u64,
+    #[serde(default="d_zero_u64")] pub global_buffer_limit: u64,
+    #[serde(default="d_bool_false")] pub quiesce_mode: bool,
+    #[serde(default="d_zero_f64")] pub max_system_load_avg: f64,
+    #[serde(default="d_zero_u64")] pub hydration_delay_ms: u64,
+    #[serde(default="String::new")] pub io_priority: String,
+    #[serde(default="d_zero_u64")] pub io_buffer_size_mib: u64,
+    #[serde(default="d_zero_f64")] pub governor_psi_io_threshold: f64,
+    #[serde(default="d_zero_f64")] pub governor_psi_cpu_threshold: f64,
+    #[serde(default="d_zero_usize", skip)] pub max_workers_sys: usize,
     #[serde(default)] pub sources: Vec<SourceConfig>
 }
-
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub path: PathBuf,
     pub targets: Vec<TargetConfig>,
-    // NEW: Source Read Capability is stored here
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
 }
-
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct TargetConfig {
     pub path: PathBuf,
     #[serde(default="d_profile")] pub profile: TargetProfile,
-    #[serde(default="def_true")] pub initial_sync: bool,
-    #[serde(default="def_false")] pub vdo_optimization: bool,
-    #[serde(default="def_false")] pub btrfs_compression: bool,
-    #[serde(default="def_false")] pub f2fs_compression: bool,
-    #[serde(default="def_false")] pub f2fs_pinning: bool,
-    #[serde(default="def_false")] pub enable_versioning: bool,
-    #[serde(default="d_max_versions")] pub max_versions: usize,
-    #[serde(default="d_max_versions_size_mb")] pub max_versions_size_mb: u64,
+    #[serde(default="d_bool_true")] pub initial_sync: bool,
+    #[serde(default="d_bool_false")] pub vdo_optimization: bool,
+    #[serde(default="d_bool_false")] pub btrfs_compression: bool,
+    #[serde(default="d_bool_false")] pub f2fs_compression: bool,
+    #[serde(default="d_bool_false")] pub f2fs_pinning: bool,
+    #[serde(default="d_bool_false")] pub enable_versioning: bool,
+    #[serde(default="d_zero_usize")] pub max_versions: usize,
+    #[serde(default="d_zero_u64")] pub max_versions_size_mb: u64,
     #[serde(default)] pub version_excludes: Vec<String>,
     #[serde(default)] pub version_includes: Vec<String>,
-    #[serde(default="def_false")] pub force_versioning: bool,
+    #[serde(default="d_bool_false")] pub force_versioning: bool,
     #[serde(default)] pub force_version_includes: Vec<String>,
     pub force_retention_count: Option<usize>,
-    #[serde(default="d_wc")] pub worker_count: usize,
-    #[serde(default="d_wc")] pub queue_max: usize,
-    #[serde(default="d_wc")] pub batch_size: usize,
-    #[serde(default="d_io_buffer_size_mib")] pub io_buffer_size_mib: u64, // Now profile-tuned
-    #[serde(default="d_tune_lat")] pub autotune_target_latency_ms: u64,
+    #[serde(default="d_zero_usize")] pub worker_count: usize,
+    #[serde(default="d_zero_usize")] pub queue_max: usize,
+    #[serde(default="d_zero_usize")] pub batch_size: usize,
+    #[serde(default="d_zero_u64")] pub io_buffer_size_mib: u64,
+    #[serde(default="d_zero_u64")] pub autotune_target_latency_ms: u64,
     #[serde(default)] pub excludes: Vec<String>,
     #[serde(default)] pub includes: Vec<String>,
     #[serde(skip)] regex_ex: Option<RegexSet>,
@@ -133,22 +109,28 @@ pub struct TargetConfig {
     #[serde(skip)] regex_force_vin: Option<RegexSet>,
     #[serde(skip, default="def_abool")] pub supports_reflink: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub direct_io_ok: Arc<AtomicBool>,
-    // Target Write Capability
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
+    #[serde(default = "d_zero_u32")] pub vdo_stall_threshold: u32,
+    #[serde(default="d_zero_u64")] pub ordering_max_pending_bytes: u64,
+    #[serde(default="d_zero_usize")] pub ordering_scan_depth: usize,
+    #[serde(default="d_zero_u64")] pub worker_hibernation_secs: u64,
+    #[serde(default="d_zero_u64")] pub worker_flush_interval_ms: u64,
+    #[serde(default="d_zero_u64")] pub worker_gap_recovery_secs: u64,
+    #[serde(default="d_zero_usize")] pub worker_critical_drain_threshold: usize,
+    #[serde(default="d_zero_u64")] pub worker_capacity_check_interval_ms: u64,
+    #[serde(default="d_zero_u64")] pub worker_gap_recovery_batch: u64,
+    #[serde(default="d_zero_u64")] pub worker_gap_recovery_max_backoff: u64,
+    #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_startup_mb: u64,
+    #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_drain_mb: u64,
 }
-fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
-fn def_true() -> bool { true }
-fn def_false() -> bool { false }
-
-// --- Exported Helper Functions ---
-pub fn get_default_coalesce_max_bytes(profile: &TargetProfile) -> u64 {
+pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
     match profile {
-        TargetProfile::NVMe => 4 * 1024 * 1024,
-        TargetProfile::SSD => 2 * 1024 * 1024,
-        TargetProfile::HDD => 512 * 1024,
-        TargetProfile::NFS => 1 * 1024 * 1024,
-        TargetProfile::Network => 1 * 1024 * 1024,
-        TargetProfile::Auto => 1 * 1024 * 1024,
+        TargetProfile::NVMe => (1, 4),
+        TargetProfile::SSD => (2, 8),
+        TargetProfile::HDD => (4, 32),
+        TargetProfile::NFS => (2, 16),
+        TargetProfile::Network => (2, 16),
+        TargetProfile::Auto => (2, 8),
     }
 }
 pub fn get_default_target_workers(profile: &TargetProfile) -> usize {
@@ -171,37 +153,64 @@ pub fn get_default_batch_size(profile: &TargetProfile) -> usize {
         TargetProfile::Auto => 4,
     }
 }
-pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
-    match profile {
-        TargetProfile::NVMe => (1, 4),
-        TargetProfile::SSD => (2, 8),
-        TargetProfile::HDD => (4, 32),
-        TargetProfile::NFS => (2, 16),
-        TargetProfile::Network => (2, 16),
-        TargetProfile::Auto => (2, 8),
-    }
-}
-// --- Implementation Block ---
 impl TargetConfig {
-    pub fn compile(&mut self, max_workers_sys: usize) -> Result<()> {
-        if self.worker_count == d_wc() {
-            let profile_workers = get_default_target_workers(&self.profile);
-            self.worker_count = profile_workers.min(max_workers_sys);
+    pub fn compile(&mut self, max_workers_sys: usize, global_mem_limit_mb: u64) -> Result<()> {
+        if self.worker_count == 0 {
+            self.worker_count = (max_workers_sys / 2).max(2);
         }
-        if self.batch_size == d_wc() {
-            self.batch_size = get_default_batch_size(&self.profile);
+        if self.batch_size == 0 {
+            self.batch_size = match self.profile {
+                TargetProfile::NVMe => 256,
+                TargetProfile::SSD => 128,
+                TargetProfile::Network => 64,
+                _ => 32,
+            };
         }
-        
-        // NEW: Autotune the buffer chunk size if the config uses the default value (1 MiB).
-        // If the user explicitly set a value > 1 MiB, we honor it.
-        if self.io_buffer_size_mib == d_io_buffer_size_mib() {
-            // Note: We need the global_buffer_limit for tuning. Since config.load hasn't finished, 
-            // we use the default (500MiB) as a proxy, which is conservative.
-            // The ultimate logic should run *after* global_buffer_limit is finalized.
-            // For now, we will assume a decent default or rely on the final tuning later.
-            // A safer approach is implemented in Config::load after global_buffer_limit is ready.
+        if self.queue_max == 0 {
+            self.queue_max = match self.profile {
+                TargetProfile::NVMe => 1_000_000,
+                _ => 200_000,
+            };
         }
-
+        if self.autotune_target_latency_ms == 0 {
+            self.autotune_target_latency_ms = match self.profile {
+                TargetProfile::NVMe => 10,
+                TargetProfile::SSD => 50,
+                _ => 200,
+            };
+        }
+        if self.ordering_max_pending_bytes == 0 {
+            let share = (global_mem_limit_mb * 1024 * 1024) / 5;
+            self.ordering_max_pending_bytes = share.max(128 * 1024 * 1024).min(2 * 1024 * 1024 * 1024);
+        }
+        if self.ordering_scan_depth == 0 {
+            self.ordering_scan_depth = 5000;
+        }
+        if self.worker_flush_interval_ms == 0 {
+            self.worker_flush_interval_ms = 10;
+        }
+        if self.worker_hibernation_secs == 0 {
+            self.worker_hibernation_secs = 300;
+        }
+        if self.worker_gap_recovery_secs == 0 { self.worker_gap_recovery_secs = 5; }
+        if self.worker_gap_recovery_batch == 0 { self.worker_gap_recovery_batch = 100; }
+        if self.worker_gap_recovery_max_backoff == 0 { self.worker_gap_recovery_max_backoff = 30; }
+        if self.worker_critical_drain_threshold == 0 { self.worker_critical_drain_threshold = 100; }
+        if self.worker_capacity_check_interval_ms == 0 { self.worker_capacity_check_interval_ms = 1000; }
+        if self.vdo_stall_threshold == 0 {
+            self.vdo_stall_threshold = autotune_vdo_stall_threshold(&self.profile);
+        }
+        if self.hydration_large_file_threshold_startup_mb == 0 {
+            self.hydration_large_file_threshold_startup_mb = match self.profile {
+                TargetProfile::HDD => 16,
+                _ => 128,
+            };
+        }
+        if self.hydration_large_file_threshold_drain_mb == 0 {
+            self.hydration_large_file_threshold_drain_mb = 5;
+        }
+        if self.max_versions == 0 { self.max_versions = 5; }
+        if self.max_versions_size_mb == 0 { self.max_versions_size_mb = 10240; }
         if !self.excludes.is_empty() {
             self.regex_ex = Some(RegexSet::new(&self.excludes).map_err(|e| MirrorError::Config(format!("Invalid exclude regex: {}", e)))?);
         }
@@ -245,16 +254,39 @@ impl TargetConfig {
 impl Config {
     pub fn calculate_defaults(mut self) -> Self {
         let sys = System::new_all();
-        let total_ram_mib = (sys.total_memory() / 1024 / 1024) as u64;
-        let total_cpus = sys.cpus().len().max(1);
-        if self.worker_count == d_wc() {
-             self.worker_count = total_cpus.max(2) / 2;
-        }
-        if self.global_buffer_limit == d_gbl() {
-            // Heuristic: Max 5GB global buffer memory, or 10% of total RAM, whichever is smaller.
-            self.global_buffer_limit = (total_ram_mib / 10).min(5000);
+        // 1. Worker Count
+        if self.worker_count == 0 {
+            self.worker_count = default_worker_count(&sys);
+            tracing::info!("Auto-Config: Worker Count set to {} (All Cores)", self.worker_count);
         }
         self.max_workers_sys = self.worker_count;
+        // 2. Global Buffer Memory
+        if self.global_buffer_limit == 0 {
+            self.global_buffer_limit = default_global_buffer_limit_mb(&sys);
+            tracing::info!("Auto-Config: Global Buffer Limit set to {} MB (70% RAM)", self.global_buffer_limit);
+        }
+        // 3. Queue Depth
+        if self.queue_max == 0 {
+            self.queue_max = 500_000; // Aggressive default
+        }
+        // 4. Load Average
+        if self.max_system_load_avg == 0.0 {
+            let cores = sys.cpus().len() as f64;
+            self.max_system_load_avg = cores * 4.0; // Allow load avg up to 4x core count
+        }
+        // 5. Governor PSI Thresholds
+        if self.governor_psi_io_threshold == 0.0 {
+            self.governor_psi_io_threshold = 60.0; // Very high tolerance for IO stall
+        }
+        if self.governor_psi_cpu_threshold == 0.0 {
+            self.governor_psi_cpu_threshold = 80.0;
+        }
+        // 6. Misc
+        if self.capacity_threshold_mb == 0 { self.capacity_threshold_mb = 500; }
+        if self.breaker_interval_secs == 0 { self.breaker_interval_secs = 60; }
+        if self.force_flush_interval_secs == 0 { self.force_flush_interval_secs = 5; }
+        if self.hydration_delay_ms == 0 { self.hydration_delay_ms = 1; } // Almost zero delay
+        if self.io_priority.is_empty() { self.io_priority = "Realtime".to_string(); }
         self
     }
     pub fn load(p: &str) -> Result<Self> {
@@ -262,42 +294,23 @@ impl Config {
         let mut c: Config = toml::from_str(&s).map_err(|e| MirrorError::Config(e.to_string()))?;
         c = c.calculate_defaults();
         if c.shutdown_timeout_secs == 0 { return Err(MirrorError::Config("shutdown_timeout_secs must be > 0".into())); }
-        
-        let global_limit_mib = c.global_buffer_limit; // Now finalized by calculate_defaults
+        let global_limit_mib = c.global_buffer_limit;
         let system_max_workers = c.max_workers_sys;
         let mut target_paths = HashSet::new();
-        
         for s in &mut c.sources {
-            // Probe Source Capability (Read Operations)
             let src_uncached_ok = crate::security::probe_rwf_uncached(&s.path);
             s.rwf_uncached_ok.store(src_uncached_ok, std::sync::atomic::Ordering::Relaxed);
-            if !src_uncached_ok { tracing::warn!("Source {:?}: Uncached Reads (RWF_UNCACHED) not supported.", s.path); }
-
             for t in &mut s.targets {
-                t.compile(system_max_workers)?;
-                
-                // --- NEW AUTOTUNING STEP ---
-                // If io_buffer_size_mib is at the default floor (1 MiB), scale it up based on profile
-                if t.io_buffer_size_mib == d_io_buffer_size_mib() {
+                t.compile(system_max_workers, global_limit_mib)?;
+                if t.io_buffer_size_mib == 0 {
                     let tuned_mib = autotune_buffer_chunk_size(&t.profile, global_limit_mib);
-                    if tuned_mib > t.io_buffer_size_mib {
-                        tracing::info!("Target {:?}: Autotuning buffer chunk size from {} MiB to {} MiB (Profile: {:?}).", 
-                                        t.path, t.io_buffer_size_mib, tuned_mib, t.profile);
-                        t.io_buffer_size_mib = tuned_mib;
-                    }
+                    t.io_buffer_size_mib = tuned_mib;
+                    tracing::info!("Target {:?}: Autotuning buffer chunk size to {} MiB", t.path, tuned_mib);
                 }
-                // ---------------------------
-
-                // Probe Target Capabilities (Write Operations)
                 let dio_ok = crate::security::probe_direct_io(&t.path);
                 t.direct_io_ok.store(dio_ok, std::sync::atomic::Ordering::Relaxed);
-                
                 let tgt_uncached_ok = crate::security::probe_rwf_uncached(&t.path);
                 t.rwf_uncached_ok.store(tgt_uncached_ok, std::sync::atomic::Ordering::Relaxed);
-
-                if !dio_ok { tracing::warn!("Target {:?}: Direct IO (O_DIRECT) not supported.", t.path); }
-                if !tgt_uncached_ok { tracing::warn!("Target {:?}: Uncached Writes/Reads (RWF_UNCACHED) not supported.", t.path); }
-
                 let abs = t.path.canonicalize().map_err(|e| MirrorError::Config(format!("Invalid path {:?}: {}", t.path, e)))?;
                 if !target_paths.insert(abs.clone()) {
                     return Err(MirrorError::Config(format!("Duplicate target path detected: {:?}.", abs)));

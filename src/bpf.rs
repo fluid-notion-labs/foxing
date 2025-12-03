@@ -42,7 +42,8 @@ struct RawEvent {
     comm: [u8;16]
 }
 
-pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
+// Removed 'async' - this function blocks on ring.poll()
+pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
     let skel_builder = MirrorSkelBuilder::default();
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
@@ -58,9 +59,10 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
         let key = dev.to_ne_bytes();
         let val = 1u8;
         info!("BPF: Watching device 0x{:08x} ({})", dev, dev);
+        
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
-        
+            
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
     }
@@ -68,6 +70,8 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
     let progs = &skel.progs;
+    
+    // Explicitly attaching widely supported probes first
     let probes = [
         ("trace_xfs_write", &progs.trace_xfs_write),
         ("trace_btrfs_write", &progs.trace_btrfs_write),
@@ -110,14 +114,15 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
     if attached_count == 0 {
         return Err(FoxingError::Bpf("Failed to attach ANY BPF probes.".into()));
     }
+    
     info!("BPF: Successfully attached {} probes", attached_count);
 
     let maps = skel.maps;
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
-    
+
     builder.add(events_map, move |data| {
-        let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);
+        let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst); // FIX: Race Condition #1
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
 
         if data.len() != std::mem::size_of::<RawEvent>() {
@@ -127,15 +132,17 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
 
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
 
+        // Backpressure check
         if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
-            // Send Gap event on backpressure
+            
+            // Send gap signal to all workers for this device
             if let Some(qs) = queues.get(&raw.dev) {
                 let gap_evt = Arc::new(Event {
                     event_type: EventType::SequenceGap,
                     dev_id: raw.dev,
                     inode: 0, parent_inode: 0, new_parent_inode: 0, seq_num: 0, offset: 0, length: 0,
-                    name: "".into(), new_name: None, generation: 0, projid: 0, 
+                    name: "".into(), new_name: None, generation: 0, projid: 0,
                     mode: 0, flags: 0, process_name: "backpressure".into(), interactive: false,
                     created_at: std::time::Instant::now()
                 });
@@ -163,10 +170,11 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             return 0;
         }
 
+        // Sequence tracking
         let tracker = SEQUENCE_TRACKER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let prev = tracker.fetch_max(raw.seq, Ordering::Relaxed);
         
-        // Simple heuristic to detect wrapping or gaps
+        // Gap detection (allow wraparound)
         let is_wraparound = prev > (u64::MAX - 1000000) && raw.seq < 1000000;
         if !is_wraparound && raw.seq > prev + 1 {
             warn!("BPF: Sequence gap detected on device 0x{:08x}: {} -> {} (gap of {})", 
@@ -180,12 +188,13 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
                 mode: 0, flags: 0, process_name: "kernel".into(), interactive: false,
                 created_at: std::time::Instant::now()
             });
+            
             if let Some(qs) = queues.get(&raw.dev) {
                 for q in qs { q.push(gap.clone()); }
             }
         }
 
-        let new_name = if raw.type_ == 7 {
+        let new_name = if raw.type_ == 7 { // EVENT_RENAME
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
                 Some(String::from_utf8_lossy(&raw.nname[..nname_len]).to_string())
         } else { None };
@@ -201,17 +210,19 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             created_at: std::time::Instant::now()
         });
 
-        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
+        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst); // FIX: Race Condition #1
+        
         if let Some(qs) = queues.get(&raw.dev) {
             for q in qs { q.push(evt.clone()); }
         }
-
+        
         0
     }).map_err(|e| FoxingError::Bpf(e.to_string()))?;
 
     let ring = builder.build().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     
     info!("BPF: Event processing started");
+    
     let mut last_report = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -232,7 +243,7 @@ pub async fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<Atomi
             }
         }
     }
-
+    
     info!("BPF: Shutting down");
     Ok(())
 }

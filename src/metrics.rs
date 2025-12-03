@@ -1,70 +1,193 @@
-use prometheus::{
-    Registry, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, HistogramVec, GaugeVec, Histogram,
-    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
-    register_histogram_vec_with_registry, register_int_counter_with_registry,
-    register_gauge_vec_with_registry, register_histogram_with_registry
-};
 use lazy_static::lazy_static;
-use std::sync::atomic::{AtomicU64, AtomicBool};
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Registry,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
-    pub static ref EVENTS_TOTAL: IntCounterVec = register_int_counter_vec_with_registry!("foxing_events_total", "Total events received by type", &["device", "type"], REGISTRY).unwrap();
-    pub static ref EVENTS_DROPPED: IntCounter = prometheus::register_int_counter_with_registry!("foxing_events_dropped", "Events dropped due to queue/buffer overflow", REGISTRY).unwrap();
-    pub static ref EVENTS_MALFORMED: IntCounter = prometheus::register_int_counter_with_registry!("foxing_events_malformed", "Malformed BPF events", REGISTRY).unwrap();
-    pub static ref EVENTS_FILTERED: IntCounterVec = register_int_counter_vec_with_registry!("foxing_events_filtered", "Events filtered by target include/exclude rules", &["target"], REGISTRY).unwrap();
-    pub static ref RENAME_EVENTS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_rename_events_total", "Successful rename events processed", REGISTRY).unwrap();
-    pub static ref COALESCED_WRITES: IntCounter = prometheus::register_int_counter_with_registry!("foxing_coalesced_writes_total", "Write events consumed by coalescing", REGISTRY).unwrap();
-    pub static ref LATE_EVENTS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_late_events_total", "Late events (out of order, ignored)", REGISTRY).unwrap();
-    pub static ref SEQUENCE_GAPS: IntCounterVec = register_int_counter_vec_with_registry!("foxing_bpf_sequence_gaps_total", "Sequence gaps detected in BPF stream", &["device"], REGISTRY).unwrap();
-    pub static ref EVENTS_UNWATCHED: IntCounter = prometheus::register_int_counter_with_registry!("foxing_bpf_events_unwatched_device", "Events from devices not being watched", REGISTRY).unwrap();
-    pub static ref ORDERING_BUF_SIZE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_ordering_buffer_size", "Ordering buffer pending count", &["target"], REGISTRY).unwrap();
-    pub static ref BYTES_REPLICATED: IntCounterVec = register_int_counter_vec_with_registry!("foxing_bytes_replicated_total", "Bytes successfully written to target", &["target"], REGISTRY).unwrap();
-    pub static ref REPLICATION_LATENCY: HistogramVec = register_histogram_vec_with_registry!("foxing_replication_latency_seconds", "End-to-end replication latency (event to disk sync)", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_LAG: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_lag_seconds", "Time difference between source event and worker processing", &["target"], REGISTRY).unwrap();
-    pub static ref REFLINK_OPS: IntCounterVec = register_int_counter_vec_with_registry!("foxing_reflink_operations_total", "Reflink attempts by result", &["target", "result"], REGISTRY).unwrap();
-    pub static ref TARGET_CAPACITY_BYTES_TOTAL: GaugeVec = register_gauge_vec_with_registry!("foxing_target_capacity_bytes_total", "Total capacity of target filesystem", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_CAPACITY_BYTES_AVAILABLE: GaugeVec = register_gauge_vec_with_registry!("foxing_target_capacity_bytes_available", "Available capacity of target filesystem", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_CAPACITY_INODES_TOTAL: GaugeVec = register_gauge_vec_with_registry!("foxing_target_capacity_inodes_total", "Total inodes of target filesystem", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_CAPACITY_INODES_AVAILABLE: GaugeVec = register_gauge_vec_with_registry!("foxing_target_capacity_inodes_available", "Available inodes of target filesystem", &["target"], REGISTRY).unwrap();
-    pub static ref HYDRATION_ACTIVE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_hydration_active", "1 if hydration thread is active", &["device"], REGISTRY).unwrap();
-    pub static ref HYDRATION_SCANNED: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_hydration_scanned_total", "Files scanned during hydration", &["device"], REGISTRY).unwrap();
-    pub static ref HYDRATION_SYNCED: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_hydration_synced_total", "Files synced during hydration", &["device"], REGISTRY).unwrap();
-    pub static ref HYDRATION_HASH_SKIPPED: IntCounter = register_int_counter_with_registry!("foxing_hydration_hash_skipped", "Directories skipped via integrity hash check", REGISTRY).unwrap();
-    pub static ref SYNTHETIC_IDENTITY_FILES: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_synthetic_identity_files", "Active synthetic files (unlinked/generation mismatched)", REGISTRY).unwrap();
-    pub static ref GENERATION_MISMATCHES: IntCounter = register_int_counter_with_registry!("foxing_generation_mismatches_total", "Generation mismatches detected", REGISTRY).unwrap();
-    pub static ref WORKER_SHUTDOWN_TIMEOUTS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_worker_shutdown_timeouts_total", "Worker shutdown failures", REGISTRY).unwrap();
-    pub static ref SIDECAR_FILES_CREATED: IntCounter = prometheus::register_int_counter_with_registry!("foxing_sidecar_files_created_total", "Sidecar files created/updated", REGISTRY).unwrap();
-    pub static ref GOVERNOR_LOAD_AVERAGE: GaugeVec = register_gauge_vec_with_registry!("foxing_governor_load_average", "System load average (1m, 5m, 15m)", &["period"], REGISTRY).unwrap();
-    pub static ref GOVERNOR_STRESSED: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_governor_stressed", "Current system stress state (1=stressed, 0=normal)", REGISTRY).unwrap();
-    pub static ref GOVERNOR_THROTTLED_EVENTS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_governor_throttled_events_total", "Total times operations were throttled by the governor", REGISTRY).unwrap();
-    pub static ref GOVERNOR_PACING_DURATION_MS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_governor_pacing_duration_milliseconds_total", "Total time spent sleeping due to governor pacing", REGISTRY).unwrap();
-    pub static ref TARGET_BATCH_SIZE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_tuning_batch_size", "Current adaptive io_uring batch size", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_COALESCE_BYTES: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_tuning_coalesce_bytes", "Current adaptive coalesce window size", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_FLUSH_MULTIPLIER: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_tuning_flush_multiplier", "Current adaptive flush interval multiplier", &["target"], REGISTRY).unwrap();
-    pub static ref TUNER_STATE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_tuner_state", "Current state of the auto-tuner logic (enum)", &["target"], REGISTRY).unwrap();
-    pub static ref WORKER_BUFFER_UTILIZATION: GaugeVec = register_gauge_vec_with_registry!("foxing_worker_buffer_utilization", "Ratio of ordering buffer usage (0.0 - 1.0)", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_VERSION_COUNT: GaugeVec = register_gauge_vec_with_registry!("foxing_target_version_count", "Number of archived file versions", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_VERSION_BYTES: GaugeVec = register_gauge_vec_with_registry!("foxing_target_version_bytes", "Total size of archived file versions", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_DYNAMIC_VERSION_LIMIT_COUNT: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_dynamic_version_limit_count", "Current adaptive limit for version count", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_DYNAMIC_VERSION_LIMIT_BYTES: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_dynamic_version_limit_bytes", "Current adaptive limit for version size (MB)", &["target"], REGISTRY).unwrap();
-    pub static ref TARGET_FORCED_VERSIONING_ACTIVE: IntGaugeVec = register_int_gauge_vec_with_registry!("foxing_target_forced_versioning_active", "1 if Forced Versioning is overriding safety checks", &["target"], REGISTRY).unwrap();
-    pub static ref COPY_METHOD_REFLINK: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_reflink_total", "Writes handled via local Reflink/CoW", REGISTRY).unwrap();
-    pub static ref COPY_METHOD_OFFLOAD: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_offload_total", "Writes handled via NFS/Server-Side Copy", REGISTRY).unwrap();
-    pub static ref COPY_METHOD_STANDARD: IntCounter = prometheus::register_int_counter_with_registry!("foxing_copy_method_standard_total", "Writes handled via standard read/write", REGISTRY).unwrap();
-    pub static ref TOTAL_ITEMS_DISCOVERED: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_total_items_discovered", "Total items found during pre-scan for TUI", REGISTRY).unwrap();
-    pub static ref LIVE_ADDITIONS: IntCounter = prometheus::register_int_counter_with_registry!("foxing_live_additions_total", "New files detected by BPF/Inotify during run", REGISTRY).unwrap();
-    pub static ref DISCOVERY_COMPLETE: AtomicBool = AtomicBool::new(false);
+    pub static ref EVENTS_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_events_total",
+        "Total events received by type",
+        &["device", "type"]
+    ).unwrap();
+    pub static ref EVENTS_DROPPED: Counter = register_counter!(
+        "foxing_events_dropped",
+        "Events dropped due to queue/buffer overflow"
+    ).unwrap();
+    pub static ref EVENTS_FILTERED: CounterVec = register_counter_vec!(
+        "foxing_events_filtered_total",
+        "Events filtered by configuration rules",
+        &["path"]
+    ).unwrap();
+    pub static ref EVENTS_MALFORMED: Counter = register_counter!(
+        "foxing_events_malformed",
+        "Events received from BPF that could not be parsed"
+    ).unwrap();
+    pub static ref EVENTS_UNWATCHED: Counter = register_counter!(
+        "foxing_events_unwatched",
+        "Events received for devices not currently watched"
+    ).unwrap();
+    pub static ref SEQUENCE_GAPS: CounterVec = register_counter_vec!(
+        "foxing_sequence_gaps_total",
+        "Number of detected sequence gaps in BPF stream",
+        &["device"]
+    ).unwrap();
+    pub static ref REPLICATION_LATENCY: HistogramVec = register_histogram_vec!(
+        "foxing_replication_latency_seconds",
+        "End-to-end latency from source event to target write",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_BATCH_SIZE: GaugeVec = register_gauge_vec!(
+        "foxing_target_batch_size",
+        "Current dynamic batch size calculated by BBR tuner",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_COALESCE_BYTES: GaugeVec = register_gauge_vec!(
+        "foxing_target_coalesce_bytes",
+        "Current dynamic coalesce window size in bytes",
+        &["target"]
+    ).unwrap();
+    pub static ref TUNER_STATE: GaugeVec = register_gauge_vec!(
+        "foxing_tuner_state",
+        "Current state of the adaptive tuner (0=Startup, 1=Steady, 2=HighLoad, 3=Muted, 4=Drain, 5=Critical)",
+        &["target"]
+    ).unwrap();
+    pub static ref WORKER_BUFFER_UTILIZATION: GaugeVec = register_gauge_vec!(
+        "foxing_worker_buffer_utilization",
+        "Ratio of pending events to max queue depth (0.0 - 1.0)",
+        &["target"]
+    ).unwrap();
+    pub static ref BYTES_REPLICATED: CounterVec = register_counter_vec!(
+        "foxing_bytes_replicated_total",
+        "Bytes successfully written to target",
+        &["target"]
+    ).unwrap();
+    pub static ref RENAME_EVENTS: Counter = register_counter!(
+        "foxing_rename_events_total",
+        "Total rename operations processed"
+    ).unwrap();
+    pub static ref COALESCED_WRITES: Counter = register_counter!(
+        "foxing_coalesced_writes_total",
+        "Number of write events merged into larger chunks"
+    ).unwrap();
+    pub static ref COPY_METHOD_REFLINK: Counter = register_counter!(
+        "foxing_copy_method_reflink_total",
+        "Writes handled via CoW Reflink"
+    ).unwrap();
+    pub static ref COPY_METHOD_OFFLOAD: Counter = register_counter!(
+        "foxing_copy_method_offload_total",
+        "Writes handled via hardware/network offload"
+    ).unwrap();
+    pub static ref COPY_METHOD_STANDARD: Counter = register_counter!(
+        "foxing_copy_method_standard_total",
+        "Writes handled via standard read/write"
+    ).unwrap();
+    pub static ref JOURNAL_RECOVERIES: Counter = register_counter!(
+        "foxing_journal_recoveries_total",
+        "Number of atomic rename operations recovered from intent journal"
+    ).unwrap();
+    pub static ref POISON_CABINET_ACTIVE: Gauge = register_gauge!(
+        "foxing_poison_cabinet_active_inodes",
+        "Number of inodes currently in backoff state due to repeated failures"
+    ).unwrap();
+    pub static ref SIDECAR_FILES_CREATED: Counter = register_counter!(
+        "foxing_sidecar_files_created_total",
+        "Number of .foxing_meta files created (fallback metadata)"
+    ).unwrap();
+    pub static ref WAL_COHERENCE_FAILURES: CounterVec = register_counter_vec!(
+        "foxing_wal_coherence_failures_total",
+        "Detected mismatches between WAL state and file state",
+        &["target"]
+    ).unwrap();
+    pub static ref GOVERNOR_STRESSED: Gauge = register_gauge!(
+        "foxing_governor_stressed",
+        "Current system stress state (1=stressed, 0=normal)"
+    ).unwrap();
+    pub static ref GOVERNOR_THROTTLED_EVENTS: Counter = register_counter!(
+        "foxing_governor_throttled_events_total",
+        "Events delayed due to governor pressure"
+    ).unwrap();
+    pub static ref GOVERNOR_LOAD_AVERAGE: GaugeVec = register_gauge_vec!(
+        "foxing_governor_load_average",
+        "System load average (1m, 5m, 15m)",
+        &["period"]
+    ).unwrap();
+    pub static ref GOVERNOR_PACING_DURATION_MS: Counter = register_counter!(
+        "foxing_governor_pacing_duration_milliseconds_total",
+        "Total time spent sleeping due to governor pacing"
+    ).unwrap();
+    pub static ref LIVE_ADDITIONS: Counter = register_counter!(
+        "foxing_live_additions_total",
+        "New files detected by BPF/Inotify during run"
+    ).unwrap();
+    pub static ref TOTAL_ITEMS_DISCOVERED: Gauge = register_gauge!(
+        "foxing_total_items_discovered",
+        "Total items found during initial scan"
+    ).unwrap();
+    pub static ref HYDRATION_ACTIVE: GaugeVec = register_gauge_vec!(
+        "foxing_hydration_active",
+        "1 if hydration thread is active",
+        &["device"]
+    ).unwrap();
+    pub static ref HYDRATION_HASH_SKIPPED: Counter = register_counter!(
+        "foxing_hydration_hash_skipped",
+        "Files skipped during hydration because size/mtime matched"
+    ).unwrap();
+    pub static ref TARGET_DYNAMIC_VERSION_LIMIT_COUNT: GaugeVec = register_gauge_vec!(
+        "foxing_target_dynamic_version_limit_count",
+        "Current adaptive limit for version count",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_DYNAMIC_VERSION_LIMIT_BYTES: GaugeVec = register_gauge_vec!(
+        "foxing_target_dynamic_version_limit_bytes",
+        "Current adaptive limit for version storage (MB)",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_FORCED_VERSIONING_ACTIVE: GaugeVec = register_gauge_vec!(
+        "foxing_target_forced_versioning_active",
+        "1 if force retention policies are currently active",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_CAPACITY_BYTES_TOTAL: GaugeVec = register_gauge_vec!(
+        "foxing_target_capacity_bytes_total",
+        "Total capacity of target filesystem",
+        &["target"]
+    ).unwrap();
+    pub static ref TARGET_CAPACITY_BYTES_AVAILABLE: GaugeVec = register_gauge_vec!(
+        "foxing_target_capacity_bytes_available",
+        "Available capacity of target filesystem",
+        &["target"]
+    ).unwrap();
+    pub static ref ORDERING_BUF_SIZE: GaugeVec = register_gauge_vec!(
+        "foxing_ordering_buffer_size",
+        "Ordering buffer pending count",
+        &["target"]
+    ).unwrap();
+    pub static ref LATE_EVENTS: Counter = register_counter!(
+        "foxing_late_events_total",
+        "Events that arrived after their window passed"
+    ).unwrap();
+    pub static ref WORKER_SHUTDOWN_TIMEOUTS: Counter = register_counter!(
+        "foxing_worker_shutdown_timeouts",
+        "Workers that failed to drain gracefully"
+    ).unwrap();
+    pub static ref GENERATION_MISMATCHES: Counter = register_counter!(
+        "foxing_generation_mismatches",
+        "Inode generation mismatches detected"
+    ).unwrap();
+    pub static ref SYNTHETIC_IDENTITY_FILES: Counter = register_counter!(
+        "foxing_synthetic_identity_files",
+        "Identity files created for tracking"
+    ).unwrap();
+    pub static ref GLOBAL_BUFFER_LIMIT: Gauge = register_gauge!(
+        "foxing_global_buffer_limit",
+        "Maximum buffered events across all workers"
+    ).unwrap();
     pub static ref GLOBAL_BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
-    pub static ref GLOBAL_BUFFER_LIMIT: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_global_buffer_limit", "Maximum buffered events across all workers", REGISTRY).unwrap();
-    pub static ref METRICS_ENABLED: IntGauge = prometheus::register_int_gauge_with_registry!("foxing_metrics_enabled", "Status of metrics subsystem (1=enabled)", REGISTRY).unwrap();
-    pub static ref QOS_PRIORITY_JUMPS: IntCounter = register_int_counter_with_registry!("foxing_qos_priority_jumps_total", "Times a Critical/Metadata event bypassed the FIFO queue", REGISTRY).unwrap();
-    pub static ref QOS_SCAN_DEPTH: Histogram = register_histogram_with_registry!("foxing_qos_scan_depth", "Depth scanned in the ordering buffer to find the next event", vec![1.0, 10.0, 50.0, 100.0, 200.0, 500.0], REGISTRY).unwrap();
-    pub static ref QOS_EVENT_CLASS: IntCounterVec = register_int_counter_vec_with_registry!("foxing_qos_event_class_total", "Events processed by QoS Class", &["class"], REGISTRY).unwrap();
-    
-    // NEW: WAL T2 Coherence Failure Counter
-    pub static ref WAL_COHERENCE_FAILURES: IntCounterVec = register_int_counter_vec_with_registry!("foxing_wal_coherence_failures_total", "Events that broke transactional WAL state", &["target"], REGISTRY).unwrap();
-
 }
+pub static DISCOVERY_COMPLETE: AtomicBool = AtomicBool::new(false);
 pub fn initialize_metrics(global_limit: u64) {
-    GLOBAL_BUFFER_LIMIT.set(global_limit as i64);
+    GLOBAL_BUFFER_LIMIT.set((global_limit as i64) as f64);
 }

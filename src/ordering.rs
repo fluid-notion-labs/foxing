@@ -1,215 +1,158 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use crate::event::{Event, EventType};
 use crate::metrics;
+use tracing::warn;
 use std::time::{Instant, Duration};
 
-const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_FLOWS: usize = 2048;
-// Removed unused EVENT_TIMEOUT
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum QoSClass {
-    Bulk = 0,
-    Metadata = 1,
-    Critical = 2,
-}
-
-struct FlowQueue {
-    queue: BTreeMap<u64, Arc<Event>>,
-    last_dequeue: Instant,
-    total_bytes: u64,
-    oldest_entry: Instant,
-}
-
-impl FlowQueue {
-    fn new(event: Arc<Event>) -> Self {
-        let mut queue = BTreeMap::new();
-        let size = event.length;
-        let created = event.created_at;
-        queue.insert(event.seq_num, event);
-        
-        Self {
-            queue,
-            last_dequeue: Instant::now(),
-            total_bytes: size,
-            oldest_entry: created,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-struct FlowKey {
-    qos: QoSClass,
-    inode: u64,
-}
-
 pub struct OrderBuf {
-    flow_queues: HashMap<FlowKey, FlowQueue>,
-    seq_to_flow: BTreeMap<u64, FlowKey>,
-    inode_heads: HashMap<u64, u64>,
+    buffer: BTreeMap<u64, Arc<Event>>,
     pub next_seq: u64,
-    pub max_count: usize,
-    pub current_bytes: u64,
-    pub delay_exceeded_count: u32,
-    target_latency: Duration,
+    max_pending_bytes: u64,
+    current_pending_bytes: u64,
+    scan_depth: usize,
+    _target_latency_ms: u64,
+    stalled_since: Option<Instant>,
+    stall_timeout: Duration,
 }
 
 impl OrderBuf {
-    pub fn new(target_latency_ms: u64) -> Self {
-        Self {
-            flow_queues: HashMap::with_capacity(MAX_FLOWS),
-            seq_to_flow: BTreeMap::new(),
-            inode_heads: HashMap::new(),
-            next_seq: 0,
-            max_count: 100_000,
-            current_bytes: 0,
-            delay_exceeded_count: 0,
-            target_latency: Duration::from_millis(target_latency_ms),
-        }
-    }
-
-    fn classify(etype: EventType) -> QoSClass {
-        match etype {
-            EventType::Rename | EventType::Unlink | EventType::Rmdir | EventType::Mkdir |
-            EventType::Link | EventType::Symlink | EventType::Mknod | EventType::Create => QoSClass::Critical,
-            
-            EventType::Chmod | EventType::Chown | EventType::SetXattr | EventType::RemoveXattr |
-            EventType::Utimes | EventType::Barrier | EventType::Fsync | EventType::Truncate => QoSClass::Metadata,
-            
-            _ => QoSClass::Bulk,
-        }
-    }
-
-    fn class_name(class: QoSClass) -> &'static str {
-        match class {
-            QoSClass::Critical => "critical",
-            QoSClass::Metadata => "metadata",
-            QoSClass::Bulk => "bulk",
-        }
-    }
-
-    pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
-        if self.next_seq == 0 { self.next_seq = e.seq_num; }
+    pub fn new(target_latency_ms: u64, max_pending_bytes: u64, scan_depth: usize) -> Self {
+        // FIX: Ordering Buffer Stall Timeout Insufficient #3
+        // Adaptive timeout: 4x expected latency, minimum 250ms
+        let timeout_ms = (target_latency_ms * 4).max(250);
         
-        if self.current_bytes >= MAX_PENDING_BYTES {
-            metrics::EVENTS_DROPPED.inc();
+        Self {
+            buffer: BTreeMap::new(),
+            next_seq: 0,
+            max_pending_bytes,
+            current_pending_bytes: 0,
+            scan_depth,
+            _target_latency_ms: target_latency_ms,
+            stalled_since: None,
+            stall_timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn peek_min_seq(&self) -> Option<u64> {
+        self.buffer.keys().next().copied()
+    }
+
+    pub fn push_and_check(&mut self, event: Arc<Event>) -> bool {
+        let event_size = 256 + event.name.len() as u64;
+        
+        if self.current_pending_bytes + event_size > self.max_pending_bytes {
             return false;
         }
 
-        let flow_key = FlowKey { qos: Self::classify(e.event_type), inode: e.inode };
-        let size = e.length;
-        let seq = e.seq_num;
-        let inode = e.inode;
-
-        // Update Inode Heads
-        self.inode_heads.entry(inode).and_modify(|head| *head = (*head).min(seq)).or_insert(seq);
-
-        if let Some(flow) = self.flow_queues.get_mut(&flow_key) {
-            flow.queue.insert(seq, e.clone());
-            flow.total_bytes += size;
-            if e.created_at < flow.oldest_entry { flow.oldest_entry = e.created_at; }
-        } else {
-            if self.flow_queues.len() < MAX_FLOWS {
-                self.flow_queues.insert(flow_key.clone(), FlowQueue::new(e.clone()));
-            } else {
-                metrics::EVENTS_DROPPED.inc();
-                return false;
-            }
+        if self.next_seq == 0 && self.buffer.is_empty() {
+            self.next_seq = event.seq_num;
         }
 
-        self.seq_to_flow.insert(seq, flow_key);
-        self.current_bytes += size;
+        if !self.buffer.contains_key(&event.seq_num) {
+            self.current_pending_bytes += event_size;
+            self.buffer.insert(event.seq_num, event);
+        }
+        
+        metrics::ORDERING_BUF_SIZE.with_label_values(&["default"]).set((self.buffer.len() as i64) as f64);
         true
     }
 
-    pub fn check_timeouts(&mut self) -> bool {
-        false 
-    }
+    pub fn pop_batch(&mut self, coalesce_bytes_limit: u64) -> Option<Arc<Event>> {
+        let (&seq, _) = self.buffer.iter().next()?;
 
-    pub fn pop_batch(&mut self, _coalesce_limit: u64) -> Option<(Arc<Event>, bool)> {
-        if self.seq_to_flow.is_empty() { return None; }
-
-        let earliest_global_seq = *self.seq_to_flow.keys().next().unwrap();
-        let earliest_flow_key = self.seq_to_flow.get(&earliest_global_seq).unwrap().clone();
-        
-        let mut seq_to_process = earliest_global_seq;
-        let mut flow_key_to_process = earliest_flow_key.clone();
-
-        // CORE LOGIC: QoS Jump
-        if earliest_flow_key.qos == QoSClass::Bulk {
-            let mut best_qos = QoSClass::Bulk;
-            let mut best_seq = earliest_global_seq;
-            
-            let scan_depth = 1000;
-            let mut scanned = 0;
-
-            for (seq, flow_key) in self.seq_to_flow.iter() {
-                scanned += 1;
-                if scanned > scan_depth { break; }
-
-                if flow_key.qos > best_qos {
-                    if let Some(head_seq) = self.inode_heads.get(&flow_key.inode) {
-                        if *head_seq == *seq {
-                            best_qos = flow_key.qos;
-                            best_seq = *seq;
-                            if best_qos == QoSClass::Critical { break; }
-                        }
-                    }
+        if seq > self.next_seq {
+            if let Some(time) = self.stalled_since {
+                if time.elapsed() > self.stall_timeout {
+                    warn!("ORDERBUF STALL: Jumping gap {} -> {} (after {:?}) to resume processing.", 
+                          self.next_seq, seq, self.stall_timeout);
+                    self.next_seq = seq;
+                    self.stalled_since = None;
+                    return self.pop_batch(coalesce_bytes_limit);
                 }
+            } else {
+                self.stalled_since = Some(Instant::now());
+            }
+            return None;
+        } else {
+            self.stalled_since = None;
+        }
+
+        if seq < self.next_seq {
+            let evt = self.buffer.remove(&seq).unwrap();
+            self.current_pending_bytes -= 256 + evt.name.len() as u64;
+            
+            if matches!(evt.event_type, EventType::Rename | EventType::Mkdir) {
+                 warn!("ORDERBUF LATE-EXEC: forcing execution of late metadata event seq={} type={:?}", seq, evt.event_type);
+                 return Some(evt);
             }
             
-            if best_qos > QoSClass::Bulk {
-                seq_to_process = best_seq;
-                flow_key_to_process = self.seq_to_flow.get(&seq_to_process).unwrap().clone();
+            metrics::LATE_EVENTS.inc();
+            return self.pop_batch(coalesce_bytes_limit);
+        }
+
+        let mut head_event = self.buffer.remove(&seq).unwrap();
+        self.current_pending_bytes -= 256 + head_event.name.len() as u64;
+        self.next_seq += 1;
+
+        if coalesce_bytes_limit > 0 &&
+           (head_event.event_type == EventType::Write || head_event.event_type == EventType::WriteRange)
+        {
+            head_event = self.try_coalesce(head_event, coalesce_bytes_limit);
+        }
+
+        Some(head_event)
+    }
+
+    fn try_coalesce(&mut self, head: Arc<Event>, limit: u64) -> Arc<Event> {
+        let mut merged_len = head.length;
+        let mut lookahead_seq = self.next_seq;
+        let mut coalesced_count = 0;
+        let inode = head.inode;
+        let name = &head.name;
+        let mut current_end_offset = head.offset + head.length;
+
+        while merged_len < limit && coalesced_count < self.scan_depth {
+            if let Some(next_evt) = self.buffer.get(&lookahead_seq) {
+                let is_compatible =
+                    (next_evt.event_type == EventType::Write || next_evt.event_type == EventType::WriteRange) &&
+                    next_evt.inode == inode &&
+                    next_evt.name == *name &&
+                    next_evt.offset == current_end_offset;
+
+                if is_compatible {
+                    merged_len += next_evt.length;
+                    current_end_offset += next_evt.length;
+                    
+                    let removed = self.buffer.remove(&lookahead_seq).unwrap();
+                    self.current_pending_bytes -= 256 + removed.name.len() as u64;
+                    
+                    self.next_seq += 1;
+                    lookahead_seq += 1;
+                    coalesced_count += 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
             }
         }
 
-        if seq_to_process > earliest_global_seq {
-            metrics::QOS_PRIORITY_JUMPS.inc();
+        if coalesced_count > 0 {
+            metrics::COALESCED_WRITES.inc_by((coalesced_count as u64) as f64);
+            let mut new_event = (*head).clone();
+            new_event.length = merged_len;
+            return Arc::new(new_event);
         }
 
-        let flow = self.flow_queues.get_mut(&flow_key_to_process).unwrap();
-        let initial_event = flow.queue.remove(&seq_to_process).unwrap();
-        let initial_size = initial_event.length;
-        
-        flow.last_dequeue = Instant::now();
-        flow.total_bytes -= initial_size;
-        self.seq_to_flow.remove(&seq_to_process);
-        self.current_bytes = self.current_bytes.saturating_sub(initial_size);
-        
-        metrics::QOS_EVENT_CLASS.with_label_values(&[Self::class_name(flow_key_to_process.qos)]).inc();
-
-        if flow.queue.is_empty() {
-            self.flow_queues.remove(&flow_key_to_process);
-        } else {
-            if let Some((_, e)) = flow.queue.iter().next() {
-                flow.oldest_entry = e.created_at;
-            }
-        }
-
-        Some((initial_event, false))
+        head
     }
-
-    pub fn should_throttle_bpf(&mut self) -> bool {
-         if self.seq_to_flow.is_empty() { return false; }
-         let now = Instant::now();
-         
-         let earliest_seq = *self.seq_to_flow.keys().next().unwrap();
-         if let Some(flow_key) = self.seq_to_flow.get(&earliest_seq) {
-             if let Some(flow) = self.flow_queues.get(flow_key) {
-                 if now.duration_since(flow.oldest_entry) > self.target_latency {
-                     self.delay_exceeded_count += 1;
-                     if self.delay_exceeded_count > 100 {
-                         return true;
-                     }
-                 } else {
-                     self.delay_exceeded_count = 0;
-                 }
-             }
-         }
-         false
-    }
-    
-    pub fn len(&self) -> usize { self.seq_to_flow.len() }
 }

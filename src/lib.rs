@@ -20,5 +20,6 @@ pub mod tui;
 pub mod wal;
 pub mod resilience;
 pub mod tuner;
+pub mod consistency;
 pub use mirror::SharedConfig;
 pub use error::Result;

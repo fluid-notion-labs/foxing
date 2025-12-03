@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::tuner::TunerState;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SystemStatus {
     pub load_avg_1m: f64,
     pub governor_stressed: bool,
@@ -12,36 +12,37 @@ pub struct SystemStatus {
     pub debug: DebugStatus,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TargetStatus {
-    pub tuner_state: TunerState,
-    pub throughput_mb: f64,
     pub latency_ms: f64,
+    pub pending_events: usize,
+    pub tuner_state: TunerState,
+    
+    // New BBR Metrics
+    pub batch_size: usize,
+    pub coalesce_window_kb: u64,
+    
     pub buffer_utilization: f64,
     pub ops_reflink: u64,
     pub ops_offload: u64,
     pub ops_standard: u64,
-    pub pending_events: u64,
-    pub wal_coherence_failures: u64,
+    pub wal_failures: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DebugStatus {
-    pub bpf_sequence_gaps: u64,
     pub bpf_events_malformed: u64,
     pub bpf_events_unwatched: u64,
-    pub bpf_device_stats: HashMap<String, BpfDeviceStat>,
     pub worker_shutdown_timeouts: u64,
     pub sidecars_created: u64,
     pub generation_mismatches: u64,
-    pub memory_usage_mb: u64,
+    pub bpf_device_stats: HashMap<String, BpfDeviceStat>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BpfDeviceStat {
-    pub dev_id_raw: u32,
-    pub last_sequence: u64,
-    pub total_events: u64,
+    pub sequence: u64,
+    pub event_count: u64,
 }
 
 impl Default for SystemStatus {
@@ -52,7 +53,14 @@ impl Default for SystemStatus {
             global_events_dropped: 0,
             live_additions: 0,
             targets: HashMap::new(),
-            debug: DebugStatus::default(),
+            debug: DebugStatus {
+                bpf_events_malformed: 0,
+                bpf_events_unwatched: 0,
+                worker_shutdown_timeouts: 0,
+                sidecars_created: 0,
+                generation_mismatches: 0,
+                bpf_device_stats: HashMap::new(),
+            }
         }
     }
 }

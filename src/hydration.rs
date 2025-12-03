@@ -6,8 +6,7 @@ use std::os::unix::fs::{MetadataExt, FileTypeExt};
 use walkdir::WalkDir;
 use tracing::{info, warn, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
-// FIX: Corrected import paths
-use crate::config::{TargetConfig, TargetProfile};
+use crate::config::{TargetConfig};
 use crate::event::{Event, EventType};
 use crate::mirror::SourceInfo;
 use crate::governor::Governor;
@@ -84,7 +83,7 @@ impl Hydrator {
             return;
         }
         let dev_str = self.source.dev.to_string();
-        metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(1);
+        metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(1.0);
         warn!("Hydration: STARTED full background scan of {:?}", self.source.path);
         let walk = WalkDir::new(&self.source.path).sort_by_file_name().into_iter();
         let mut count = 0;
@@ -133,7 +132,7 @@ impl Hydrator {
         }
         warn!("Hydration: FINISHED full scan for {:?}. Scanned {} items.", self.source.path, count);
         self.source.hydration.active.store(false, Ordering::SeqCst);
-        metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0);
+        metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0.0);
     }
     pub fn start_watcher(self: Arc<Self>) -> Result<RecommendedWatcher> {
         let s = self.clone();
@@ -193,13 +192,9 @@ impl Hydrator {
         let queue_sender = bulk_job_queue.as_ref().expect("Bulk hydration queue must be initialized.");
         for target_cfg in &self.targets {
             let current_state = self.tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
-            let low_limit = match target_cfg.profile {
-                 TargetProfile::HDD => 1 * 1024 * 1024,
-                 _                  => 5 * 1024 * 1024,
-            };
             let large_file_threshold = match current_state {
-                TunerState::Startup | TunerState::ProbeBW | TunerState::IdleReset => 64 * 1024 * 1024,
-                TunerState::Drain | TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => low_limit,
+                TunerState::Startup | TunerState::ProbeBW | TunerState::IdleReset | TunerState::Steady | TunerState::HighLoad => target_cfg.hydration_large_file_threshold_startup_mb,
+                TunerState::Drain | TunerState::Muted | TunerState::SpacePressure | TunerState::CriticalDrain => target_cfg.hydration_large_file_threshold_drain_mb,
             };
             let is_dir_meta = m.is_dir() || m.is_symlink();
             let _is_large_file = m.is_file() && m.len() > large_file_threshold;
@@ -215,6 +210,7 @@ impl Hydrator {
                 if m.is_symlink() {
                     self.sync_symlink(path, rel.as_path(), &m, ino, target_cfg)?;
                 } else if m.is_dir() {
+                    self.priority_mkdir(rel.as_path(), ino);
                     self.sync_dir_hash(rel.as_path(), target_cfg)?;
                 } else {
                     let ft = m.file_type();
@@ -225,6 +221,22 @@ impl Hydrator {
             }
         }
         Ok(())
+    }
+    fn priority_mkdir(&self, rel: &Path, ino: u64) {
+        if self.repair_txs.is_empty() { return; }
+        let evt = Event {
+            event_type: EventType::Mkdir,
+            dev_id: self.source.dev,
+            inode: ino, parent_inode: 0, new_parent_inode: 0,
+            seq_num: 0, offset: 0, length: 0,
+            name: rel.to_string_lossy().to_string(), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0,
+            process_name: "hydration_prio".into(), interactive: false,
+            created_at: Instant::now(),
+        };
+        let idx = (rel.as_os_str().len()) % self.repair_txs.len();
+        if let Err(_) = self.repair_txs[idx].try_send(Arc::new(evt)) {
+            warn!("Hydration: Priority Lane FULL. Directory structure {:?} delayed.", rel);
+        }
     }
     fn sync_symlink(&self, src_path: &Path, rel: &Path, _m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<()> {
         let dst_path = target_cfg.path.join(rel);

@@ -65,6 +65,9 @@ class TestEnvironment:
         self.daemon_process: Optional[subprocess.Popen] = None
         self.setup_successful = False
         self.bench_results = {}
+        self.stdout_file = None
+        self.stderr_file = None
+        self.final_metrics_snapshot = "Metrics not captured (Daemon crashed or not started)"
 
     def __enter__(self):
         self.setup()
@@ -225,13 +228,14 @@ path = "{MNT_SOURCE.absolute()}"
 
         config_path = self.create_config()
         
-        # Redirect outputs to files
-        self.stdout_file = open(RUN_DIR / "daemon_stdout.log", "w")
-        self.stderr_file = open(RUN_DIR / "daemon_stderr.log", "w")
+        # Redirect outputs to files with line buffering to ensure capture even on crash
+        self.stdout_file = open(RUN_DIR / "daemon_stdout.log", "w", buffering=1)
+        self.stderr_file = open(RUN_DIR / "daemon_stderr.log", "w", buffering=1)
 
         env = os.environ.copy()
-        # Enable debug logging for deeper insights
-        env["RUST_LOG"] = "info,foxing=debug" 
+        # Enable FULL TRACE logging
+        env["RUST_LOG"] = "trace" 
+        env["RUST_BACKTRACE"] = "full"
 
         self.daemon_process = subprocess.Popen(
             [str(BINARY_PATH), "daemon", "--config", str(config_path)],
@@ -306,6 +310,24 @@ path = "{MNT_SOURCE.absolute()}"
         except Exception:
             return {}
 
+    def wait_for_file(self, path: Path, timeout=10) -> bool:
+        """Polls for file existence up to timeout seconds."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if path.exists():
+                return True
+            time.sleep(0.2)
+        return False
+
+    def wait_for_file_gone(self, path: Path, timeout=10) -> bool:
+        """Polls for file removal up to timeout seconds."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if not path.exists():
+                return True
+            time.sleep(0.2)
+        return False
+
     def run_basic_verification(self):
         logger.info(">>> STEP 4: Basic Verification")
         failures = []
@@ -346,14 +368,38 @@ path = "{MNT_SOURCE.absolute()}"
         # Check 3: Live Update
         try:
             logger.info("Test: Live Append")
+            live_file = MNT_TARGET / "live_test.txt"
             (MNT_SOURCE / "live_test.txt").write_text("Hello World")
-            time.sleep(2) # Give it a moment to replicate
-            if not (MNT_TARGET / "live_test.txt").exists():
-                failures.append("Live file creation failed")
+            
+            if not self.wait_for_file(live_file, timeout=10):
+                failures.append("Live file creation failed (Timed out)")
+            else:
+                logger.info("Live Update: Detected.")
         except Exception as e:
             failures.append(f"Live Update Error: {e}")
         
-        # Check 4: Cross-Directory Rename (CRITICAL: Metadata Integrity Test)
+        # Check 4a: Same-Directory Rename (DIAGNOSTIC)
+        try:
+            logger.info("Test: Same-Directory Rename (Diagnostic)")
+            src_sd = MNT_SOURCE / "rename_local_src.txt"
+            tgt_sd_src = MNT_TARGET / "rename_local_src.txt"
+            tgt_sd_dst = MNT_TARGET / "rename_local_dst.txt"
+            
+            src_sd.write_text("Local Rename")
+            if not self.wait_for_file(tgt_sd_src, timeout=10):
+                 failures.append("Same-Dir Rename Setup Failed (Source file didn't replicate)")
+            else:
+                os.rename(src_sd, MNT_SOURCE / "rename_local_dst.txt")
+                if not self.wait_for_file(tgt_sd_dst, timeout=10):
+                    failures.append("Same-Dir Rename Failed (Dest missing)")
+                elif not self.wait_for_file_gone(tgt_sd_src, timeout=10):
+                    failures.append("Same-Dir Rename Atomicity Failed (Source still present)")
+                else:
+                    logger.info("Same-Directory Rename: PASSED")
+        except Exception as e:
+            failures.append(f"Same-Dir Rename Error: {e}")
+
+        # Check 4b: Cross-Directory Rename (CRITICAL: Metadata Integrity Test)
         try:
             logger.info("Test: Cross-Directory Rename")
             
@@ -363,18 +409,19 @@ path = "{MNT_SOURCE.absolute()}"
 
             # 4.1 Setup: Create file and ensure sync
             source_file.write_text("Moving")
-            time.sleep(2) 
+            if not self.wait_for_file(target_old, timeout=10):
+                failures.append("Setup failed: move_me.txt didn't appear on target")
             
             # 4.2 Action: Rename on Source
             nest_dir = MNT_SOURCE / "nest" / "level_0"
             os.rename(MNT_SOURCE / "move_me.txt", nest_dir / "moved_me.txt")
-            time.sleep(2)
             
-            # 4.3 Verification
-            if not target_new.exists():
-                failures.append("Cross-directory rename failed (New file missing)")
+            # 4.3 Verification - Wait for new file
+            if not self.wait_for_file(target_new, timeout=10):
+                failures.append("Cross-directory rename failed (New file missing after 10s)")
             
-            if target_old.exists():
+            # 4.4 Verification - Wait for old file to disappear (Atomicity)
+            if not self.wait_for_file_gone(target_old, timeout=10):
                 failures.append("Old file still exists after rename (Atomicity failure)")
                 
         except Exception as e:
@@ -538,8 +585,23 @@ path = "{MNT_SOURCE.absolute()}"
             except Exception:
                 pass
 
+    def capture_metrics_snapshot(self):
+        """Captures a snapshot of the metrics endpoint."""
+        try:
+            logger.info("Capturing final metrics snapshot...")
+            response = urllib.request.urlopen(f"http://127.0.0.1:{METRICS_PORT}/metrics", timeout=2)
+            self.final_metrics_snapshot = response.read().decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Could not capture final metrics: {e}")
+            self.final_metrics_snapshot = f"Metrics capture failed: {e}"
+
     def teardown(self, silent=False):
         if not silent: logger.info(">>> Teardown & Cleanup")
+        
+        # Capture metrics BEFORE killing the daemon
+        if self.daemon_process and self.daemon_process.poll() is None:
+            self.capture_metrics_snapshot()
+
         if self.daemon_process:
             if self.daemon_process.poll() is None:
                 if not silent: logger.info("Stopping daemon...")
@@ -550,8 +612,9 @@ path = "{MNT_SOURCE.absolute()}"
                     if not silent: logger.warning("Daemon hung, killing...")
                     self.daemon_process.kill()
             
-            if hasattr(self, 'stdout_file'): self.stdout_file.close()
-            if hasattr(self, 'stderr_file'): self.stderr_file.close()
+            # Close file handles to flush buffers
+            if self.stdout_file: self.stdout_file.close()
+            if self.stderr_file: self.stderr_file.close()
 
         self.safe_unmount(MNT_SOURCE)
         self.safe_unmount(MNT_TARGET)
@@ -563,32 +626,37 @@ path = "{MNT_SOURCE.absolute()}"
         logger.info("Generating AI Context Report...")
         report_path = RUN_DIR / "ai_context_summary.md"
         
-        daemon_stdout_log = ""
-        if (RUN_DIR / "daemon_stdout.log").exists():
-            with open(RUN_DIR / "daemon_stdout.log") as f:
-                logs = f.readlines()
-                daemon_stdout_log = "".join(logs[-30:]) 
-
-        daemon_err = ""
-        if (RUN_DIR / "daemon_stderr.log").exists():
-            with open(RUN_DIR / "daemon_stderr.log") as f:
-                logs = f.readlines()
-                filtered = [l for l in logs if "ERROR" in l or "panic" in l.lower() or "WARN" in l]
-                daemon_err = "".join(filtered[-30:]) if filtered else "No critical errors found."
-
-        metrics_snap = "N/A"
+        relevant_logs = []
+        
+        # Read FULL logs safely after teardown
         try:
-            # Try to grab metrics even if we failed, daemon might still be up if not killed yet
-            status_metrics = self._fetch_metrics()
-            # Format critical metrics explicitly
-            
-            # Fallback to fetching raw content if needed
-            response = urllib.request.urlopen(f"http://127.0.0.1:{METRICS_PORT}/metrics", timeout=2)
-            raw_content = response.read().decode('utf-8')
-            metrics_snap = raw_content[:2000] + "..."
-            
+            log_files = [RUN_DIR / "daemon_stderr.log", RUN_DIR / "daemon_stdout.log"]
+            for lf in log_files:
+                if lf.exists():
+                    prefix = "[STDERR] " if "stderr" in lf.name else "[STDOUT] "
+                    with open(lf, 'r', errors='ignore') as f:
+                        for line in f:
+                            # NO FILTER - CAPTURE EVERYTHING
+                            # This ensures we see DEBUG/INFO logs that don't match strict keywords
+                            relevant_logs.append(prefix + line.strip())
         except Exception as e:
-            metrics_snap = f"Failed to fetch metrics: {e}"
+            relevant_logs.append(f"Error reading logs: {e}")
+
+        # Add file size info for debugging
+        try:
+            sizes = [f"{lf.name}: {lf.stat().st_size} bytes" for lf in log_files if lf.exists()]
+            relevant_logs.insert(0, f"Log Sizes: {', '.join(sizes)}")
+        except: pass
+
+        # Limit report size if massive trace logs
+        if len(relevant_logs) > 500:
+             relevant_logs = relevant_logs[-500:]
+             relevant_logs.insert(0, "... (Truncated, showing last 500 events) ...")
+        
+        log_content = "\n".join(relevant_logs) if relevant_logs else "No log content found (Files are empty)."
+
+        # Use the captured snapshot instead of live fetch
+        metrics_snap = self.final_metrics_snapshot[:2000] + "..." if len(self.final_metrics_snapshot) > 2000 else self.final_metrics_snapshot
 
         bench_table = "| Tool | Time (s) | vs Foxing |\n|---|---|---|\n"
         if self.bench_results:
@@ -611,15 +679,10 @@ path = "{MNT_SOURCE.absolute()}"
 - **Source**: XFS (Reflink) Loopback
 - **Target**: XFS (Reflink) Loopback
 
-## Daemon Health
-### Critical Errors/Warnings (Last 30 lines Stderr)
+## Daemon Diagnostics
+### Full Log Tail (Last 500 Lines, Unfiltered)
 ```text
-{daemon_err}
-```
-
-### Startup Log (Last 30 lines Stdout)
-```text
-{daemon_stdout_log}
+{log_content}
 ```
 
 ### Metrics Snapshot (Partial Raw Content)
@@ -638,21 +701,19 @@ def main():
             env.generate_data()
             env.start_daemon()
             
-            # Generate Report immediately after run attempts to capture metrics before teardown kills daemon
-            try:
-                if env.run_basic_verification():
-                    if env.run_torture_tests():
-                        if env.run_adversarial_tests():
-                            if env.run_benchmarks():
-                                success = True
-            finally:
-                env.generate_ai_report(success)
-                        
+            # Check basic verification first
+            if env.run_basic_verification():
+                 if env.run_torture_tests():
+                     if env.run_adversarial_tests():
+                         if env.run_benchmarks():
+                             success = True
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
     except Exception as e:
         logger.exception("Test Suite Crashed")
     finally:
+        # Move report generation AFTER teardown to ensure logs are flushed
+        env.generate_ai_report(success)
         if not success:
             sys.exit(1)
 
