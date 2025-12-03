@@ -17,14 +17,18 @@ pub struct ReorderBuffer {
 }
 
 impl ReorderBuffer {
-    pub fn new(stall_timeout_ms: u64, max_pending_bytes: u64) -> Self {
+    pub fn new(target_latency_ms: u64, max_pending_bytes: u64) -> Self {
+        // FIX: Ordering Buffer Stall Timeout Adaptive #3
+        // Adaptive timeout: Max(4 * target_latency_ms, 250ms)
+        let timeout_ms = (target_latency_ms * 4).max(250);
+        
         Self {
             buffer: BTreeMap::new(),
             next_seq: 0,
             max_pending_bytes,
             current_pending_bytes: 0,
             stalled_since: None,
-            stall_timeout: Duration::from_millis(stall_timeout_ms),
+            stall_timeout: Duration::from_millis(timeout_ms),
         }
     }
 
