@@ -31,7 +31,7 @@ impl Default for HydrationState {
 }
 pub struct Hydrator {
     pub source: Arc<SourceInfo>,
-    targets: Vec<TargetConfig>,
+    pub targets: Vec<TargetConfig>,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
     repair_txs: Vec<mpsc::Sender<Arc<Event>>>,
@@ -235,7 +235,7 @@ impl Hydrator {
         };
         let idx = (rel.as_os_str().len()) % self.repair_txs.len();
         if let Err(_) = self.repair_txs[idx].try_send(Arc::new(evt)) {
-            warn!("Hydration: Priority Lane FULL. Directory structure {:?} delayed.", rel);
+            warn!("Hydration: PRIORITY LANE FULL for deletion of {:?}. This implies extreme overload.", rel);
         }
     }
     fn sync_symlink(&self, src_path: &Path, rel: &Path, _m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<()> {

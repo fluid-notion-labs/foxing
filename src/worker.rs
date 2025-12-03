@@ -27,7 +27,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tokio::time::sleep;
 use std::time::{Instant, Duration};
-use crate::ordering::Coalescer; // Switched to Coalescer
+use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 
@@ -86,6 +86,7 @@ pub async fn run_worker(
     config: Arc<RwLock<Config>>,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     _hydration_tx: mpsc::Sender<PathBuf>,
+    _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>, // Suppressed warning by using underscore
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
@@ -97,10 +98,7 @@ pub async fn run_worker(
     info!("Worker {} started as {}", worker_id, role_name);
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
-    
-    // FIX: Architecture B - Gap Recovery Blind Hydration (removed OrderBuf, added Coalescer)
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
-    
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
@@ -261,18 +259,26 @@ pub async fn run_worker(
         };
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
-        if event_ptr.event_type == EventType::SequenceGap {
-            // Gaps handled at ingress, this is just a signal
-            tracing::debug!("Worker {}: Sequence Gap signal received (ignored, handled at ingress).", worker_id);
-            continue;
+        
+        // FIX: RENAME Priority Check
+        if matches!(event_ptr.event_type, EventType::Rename) {
+             if event_ptr.new_parent_inode == 0 || event_ptr.new_name.is_none() {
+                 
+                 // Trigger repair path by sending the source path to the hydration manager
+                 let repair_path = source.mount.join(event_ptr.name.trim_start_matches('/'));
+                 let _ = _hydration_tx.try_send(repair_path);
+                 
+                 warn!("RENAME BPF Fail: Missing new_parent_inode or new_name (Inode {}). Dropping, forcing fast repair.", event_ptr.inode);
+                 continue;
+             }
         }
+        // --- END RENAME CRITICAL PATH GUARD ---
         
         // Push to local coalescing buffer
         coalescer.push(event_ptr.clone());
         
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if is_control_plane {
-            // Simple heuristic for control plane batching
             if coalescer.len() > 100 { 16 } else { 1 }
         } else { 
             tuner.current_batch_size 
@@ -325,6 +331,7 @@ pub async fn run_worker(
                 _ => OpKind::Write, // Shared
             };
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
+            
             let _ = process_single_event_inner(
                 &mut ctx, e, &source, &target_cfg, &tuner,
                 capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
@@ -388,9 +395,9 @@ async fn process_single_event_inner(
                         }
                         std::fs::create_dir_all(&target_dir_clone)
                     }
-                }).await {
-                    Ok(inner_res) => inner_res.map_err(FoxingError::Io),
-                    Err(e) => Err(FoxingError::Join(e))
+                }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
+                    Ok(_inner_res) => Ok(()), // FIX: Suppress unused variable warning
+                    Err(e) => Err(e)
                 };
                 if check_res.is_err() {
                     warn!("Failed to prepare target directory {:?}: {:?}", target_dir, check_res.err());
@@ -408,23 +415,21 @@ async fn process_single_event_inner(
             let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
-                Ok(f) => {
+                Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
                         identity::update_map(&source_map, e_inode, rel.to_path_buf(), e_generation, false);
                     }
-                    Ok(f)
+                    Ok(())
                 },
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    std::fs::OpenOptions::new().write(true).open(&dst_clone)
+                    let _ = std::fs::OpenOptions::new().write(true).open(&dst_clone);
+                    Ok(())
                 },
                 Err(e) => return Err(e),
             }
         }).await;
         
-        let join_res = res.map_err(FoxingError::Join);
-        let flattened = join_res.and_then(|io_res| io_res.map_err(FoxingError::Io));
-        
-        if let Ok(_f) = flattened {
+        if let Ok(_f) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             metrics::SIDECAR_FILES_CREATED.inc();
         } else {
             ctx.failure_state.record_failure();
@@ -561,26 +566,17 @@ async fn process_single_event_inner(
                  tuner.calculate_version_limits(&target_cfg, ctx.cur_cap_avail, ctx.cur_cap_total)
             };
             let should_cleanup = is_forced || !defer_maintenance;
-            
-            // FIX: Versioning Cleanup Deadlock Potential #4
-            // Spawn cleanup as detached task to avoid holding barrier + fs locks
             if enable_versioning && target_cfg.allow_versioning(&dst_clone) {
                 let dst_for_version = dst_clone.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    // Create snapshot synchronously (fast reflink)
-                    if let Err(e) = security::create_version_snapshot(&dst_for_version, seq_num, &target_root_clone, inode) {
-                        tracing::error!("Failed MARS Snapshot for inode {}: {:?}", inode, e);
-                    } else if should_cleanup {
-                        // Cleanup asynchronously (slow unlink)
-                        let cleanup_dst = dst_for_version.clone();
-                        let cleanup_root = target_root_clone.clone();
-                        std::thread::spawn(move || {
-                            let _ = versioning::cleanup_versions(&cleanup_dst, &cleanup_root, dyn_max_versions, dyn_max_mb);
-                        });
+                 let result = tokio::task::spawn_blocking(move || {
+                    let _ = security::create_version_snapshot(&dst_for_version, seq_num, &target_root_clone, inode);
+                    if should_cleanup {
+                        let _ = versioning::cleanup_versions(&dst_for_version, &target_root_clone, dyn_max_versions, dyn_max_mb);
                     }
-                });
+                    Ok::<(), FoxingError>(())
+                }).await.map_err(FoxingError::Join);
+                 if let Err(e) = result { tracing::error!("Failed MARS Version step for inode {}: {:?}", inode, e); }
             }
-
             let dst_for_commit = dst_clone.clone();
             let r = tokio::task::spawn_blocking(move || {
                 let r = security::commit_epoch(&dst_for_commit, seq_num, projid);
