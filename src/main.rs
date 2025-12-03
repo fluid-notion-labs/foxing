@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::Ordering, atomic::AtomicBool};
-use foxing::{config::Config, mirror::Manager, bpf, metrics, tuner::{TunerBoard, TunerState}};
-use foxing::error::Result;
+// Removed TunerState unused import
+use foxing::{config::Config, mirror::Manager, bpf, metrics, tuner::TunerBoard};
+// Removed unused foxing::error::Result
 use tokio::signal::unix::{signal, SignalKind};
 use axum::{routing::get, Json, extract::State, Router};
 use serde_json::json;
@@ -15,10 +16,9 @@ use walkdir::WalkDir;
 use std::fs;
 use nix::sched::{sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
-use foxing::tui; 
-use foxing::versioning; 
-use prometheus::{self, Encoder, TextEncoder}; 
-use foxing::versioning::{cleanup_cli, force_version_cli}; 
+use foxing::tui;
+use foxing::versioning;
+use prometheus::{self, Encoder, TextEncoder};
 
 fn get_available_cores() -> Vec<usize> {
     let system = System::new_all();
@@ -131,15 +131,12 @@ fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus 
     use foxing::api::TargetStatus;
     
     let mut status = foxing::api::SystemStatus::default();
-    
     status.load_avg_1m = metrics::GOVERNOR_LOAD_AVERAGE.with_label_values(&["1m"]).get();
     status.governor_stressed = metrics::GOVERNOR_STRESSED.get() == 1;
-    
     status.global_events_dropped = metrics::EVENTS_DROPPED.get();
     status.live_additions = metrics::LIVE_ADDITIONS.get();
-
-    status.debug.bpf_sequence_gaps = 0; 
     
+    status.debug.bpf_sequence_gaps = 0;
     status.debug.bpf_events_malformed = metrics::EVENTS_MALFORMED.get();
     status.debug.bpf_events_unwatched = metrics::EVENTS_UNWATCHED.get();
     status.debug.worker_shutdown_timeouts = metrics::WORKER_SHUTDOWN_TIMEOUTS.get();
@@ -159,10 +156,10 @@ fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus 
     for r in tuner_board.iter() {
         let path_str = r.key().to_string_lossy().to_string();
         let tuner_state = *r.value();
+        
         let lat = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_sum();
         let count = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_count();
         let avg_lat = if count > 0 { (lat / count as f64) * 1000.0 } else { 0.0 };
-        
         let wal_failures = metrics::WAL_COHERENCE_FAILURES.with_label_values(&[&path_str]).get();
 
         let t_status = TargetStatus {
@@ -178,13 +175,17 @@ fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus 
         };
         status.targets.insert(path_str, t_status);
     }
+    
     status
 }
+
 fn handle_status(_port: u16) {
+    // Client impl placeholder
 }
 
 fn handle_metrics_command(_port: u16, _json_mode: bool, _watch_mode: bool) -> anyhow::Result<()> {
-    Ok(()) 
+    // Metrics fetch placeholder
+    Ok(())
 }
 
 async fn handle_version_commands(sub: VersionCommands) -> anyhow::Result<()> {
@@ -202,22 +203,23 @@ async fn handle_version_commands(sub: VersionCommands) -> anyhow::Result<()> {
 }
 
 fn handle_reload() {
+    // SIGHUP logic placeholder
 }
 
 fn set_process_priority(_policy_str: &str) {
+    // Nice value placeholder
 }
 
 async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Result<()> {
-    
     let cfg = match Config::load(&config_path) {
         Ok(c) => Arc::new(RwLock::new(c)),
         Err(e) => { error!("Failed to load config: {}", e); return Ok(()); }
     };
-    
+
     if start_tui {
-        cfg.write().await.max_system_load_avg = 100.0;
+        cfg.write().await.max_system_load_avg = 100.0; // Disable governor for TUI demo
     }
-    
+
     metrics::initialize_metrics(cfg.read().await.global_buffer_limit);
     
     let prio = cfg.read().await.io_priority.clone();
@@ -231,9 +233,8 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
-
     let shutdown_bpf = shutdown.clone();
-    
+
     let bpf_thread_handle = std::thread::Builder::new()
         .name("foxing-bpf-collector".into())
         .spawn(move || {
@@ -250,7 +251,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
                     }
                 })
         }).unwrap();
-        
+
     handles.push(tokio::task::spawn_blocking(move || {
         bpf_thread_handle.join().unwrap();
         Ok(())
@@ -259,19 +260,20 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     let mgr_arc = Arc::new(tokio::sync::Mutex::new(mgr));
     let mgr_for_hydration = mgr_arc.clone();
     let sd_for_hyd = shutdown.clone();
-    
+
     tokio::spawn(async move {
         while let Some(path) = hydration_rx.recv().await {
             if sd_for_hyd.load(Ordering::Relaxed) { break; }
             warn!("Hydration REQUESTED via signal for {:?}", path);
-            let m = mgr_for_hydration.lock().await;
+            let _m = mgr_for_hydration.lock().await; // Fixed unused variable m -> _m
+            // Manager handles hydration internally via channels passed during start()
         }
     });
 
     if start_tui {
         let source_path = cfg.read().await.sources[0].path.clone();
         metrics::DISCOVERY_COMPLETE.store(false, Ordering::Relaxed);
-
+        
         std::thread::spawn(move || {
             let walker = WalkDir::new(source_path).into_iter();
             let mut count = 0;
@@ -284,13 +286,12 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
         });
 
         let board = mgr_arc.lock().await.tuner_board.clone();
-        
         let mut app = tui::TuiApp::new(tui::DataMode::Remote(format!("http://127.0.0.1:{}", cfg.read().await.metrics_port)));
         
         app.run(move || {
             Some(collect_system_status(&board))
         }).unwrap_or_else(|e| eprintln!("TUI Error: {}", e));
-
+        
         sd.store(true, Ordering::Relaxed);
     } else {
         let m_port = cfg.read().await.metrics_port;
@@ -304,7 +305,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
                 .route("/status", get(status_json_handler))
                 .with_state(app_state.clone())
                 .layer(TraceLayer::new_for_http().on_request(trace::DefaultOnRequest::default()).on_response(trace::DefaultOnResponse::default()));
-            
+
             let addr = SocketAddr::from(([0, 0, 0, 0], m_port));
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -324,7 +325,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
 
         let mut sighup = signal(SignalKind::hangup()).unwrap();
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        
+
         loop {
             tokio::select! {
                 _ = sighup.recv() => info!("Received SIGHUP"),
@@ -335,7 +336,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
 
     info!("Draining workers...");
     for tx in shutdown_senders { let _ = tx.send(()).await; }
-
+    
     let timeout_secs = cfg.read().await.shutdown_timeout_secs;
     let timeout = std::time::Duration::from_secs(timeout_secs);
     
@@ -344,14 +345,13 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
     }
     
     mgr_arc.lock().await.wait_hydration();
-
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    
+
     match cli.command {
         Commands::Status { port } => { handle_status(port); return Ok(()); },
         Commands::Metrics { port, json, watch } => {
@@ -370,6 +370,5 @@ async fn main() -> anyhow::Result<()> {
             run_daemon_logic(config, true).await?;
         }
     }
-
     Ok(())
 }

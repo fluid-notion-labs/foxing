@@ -6,10 +6,9 @@ use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use tracing::debug;
 use crate::metrics;
-use crate::config::{TargetConfig, get_flush_multiplier_bounds};
-
+// FIX: Corrected import paths
+use crate::config::{TargetConfig, TargetProfile, get_flush_multiplier_bounds};
 pub type TunerBoard = Arc<DashMap<PathBuf, TunerState>>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunerState {
     Startup = 0,
@@ -20,15 +19,12 @@ pub enum TunerState {
     SpacePressure = 6,
     CriticalDrain = 7,
 }
-
 pub struct WindowedFilter<T> {
     window_duration: Duration,
     samples: VecDeque<(Instant, T)>,
     mode: FilterMode,
 }
-
 pub enum FilterMode { Min, Max }
-
 impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
     pub fn new(window_secs: u64, mode: FilterMode) -> Self {
         Self {
@@ -37,7 +33,6 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
             mode,
         }
     }
-
     pub fn update(&mut self, val: T, now: Instant) -> T {
         while let Some((time, _)) = self.samples.front() {
             if now.duration_since(*time) > self.window_duration {
@@ -56,7 +51,6 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
         }
         best
     }
-
     pub fn get_best(&self) -> Option<T> {
         if self.samples.is_empty() { return None; }
         let mut best = self.samples[0].1;
@@ -68,12 +62,10 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
         }
         Some(best)
     }
-
     pub fn reset(&mut self) {
         self.samples.clear();
     }
 }
-
 pub struct VdoTuner {
     enabled: bool,
     active: bool,
@@ -81,7 +73,6 @@ pub struct VdoTuner {
     last_probe: Instant,
     probe_interval: Duration,
 }
-
 impl VdoTuner {
     pub fn new(cfg_enabled: bool) -> Self {
         Self {
@@ -92,7 +83,6 @@ impl VdoTuner {
             probe_interval: Duration::from_secs(30),
         }
     }
-
     pub fn should_check_zeros(&mut self, file_size: u64) -> bool {
         if !self.enabled { return false; }
         if !self.active && file_size > 100 * 1024 * 1024 {
@@ -106,7 +96,6 @@ impl VdoTuner {
         }
         false
     }
-
     pub fn update(&mut self, total_bytes: u64, zero_bytes: u64) {
         if !self.enabled { return; }
         if total_bytes == 0 { return; }
@@ -130,7 +119,6 @@ impl VdoTuner {
         }
     }
 }
-
 pub struct BbrTuner {
     pub current_batch_size: usize,
     pub current_coalesce_bytes: u64,
@@ -146,23 +134,27 @@ pub struct BbrTuner {
     last_cycle: Instant,
     last_data_seen: Instant,
 }
-
 impl BbrTuner {
     pub fn new(cfg: &TargetConfig) -> Self {
         let (flush_min, _) = get_flush_multiplier_bounds(&cfg.profile);
         let (min_floor, max_burst, batch_min, batch_max) = match cfg.profile {
-            crate::config::TargetProfile::HDD => {
+            TargetProfile::HDD => {
                 (2 * 1024 * 1024, 64 * 1024 * 1024, 4, 32)
             },
-            crate::config::TargetProfile::Network => {
+            TargetProfile::Network => {
                 (1 * 1024 * 1024, 32 * 1024 * 1024, 8, 128)
             },
-            crate::config::TargetProfile::NVMe => {
+            // FIX: Changed TargetProfile::NVme -> TargetProfile::NVMe
+            TargetProfile::NVMe => {
                 (256 * 1024, 16 * 1024 * 1024, 16, 256)
             },
-            crate::config::TargetProfile::SSD | _ => {
+            // FIX: Changed TargetProfile::SSD | _ => { ... } to explicit patterns
+            TargetProfile::SSD | TargetProfile::Auto => { 
                 (128 * 1024, 8 * 1024 * 1024, 8, 64)
             },
+            TargetProfile::NFS => {
+                 (512 * 1024, 16 * 1024 * 1024, 8, 128)
+            }
         };
         Self {
             current_batch_size: cfg.batch_size,
@@ -180,8 +172,7 @@ impl BbrTuner {
             last_data_seen: Instant::now(),
         }
     }
-
-    pub fn tune(&mut self, elapsed_secs: f64, bytes_processed: u64, is_stressed: bool, pending_len: usize, max_pending: usize, board: &TunerBoard, path_label: &str) {
+    pub fn tune(&mut self, elapsed_secs: f64, bytes_processed: u64, is_stressed: bool, pending_len: usize, max_pending: usize, board: &TunerBoard, path_label: &str, chunk_size: u64) -> usize {
         let now = Instant::now();
         let delivery_rate = if elapsed_secs > 0.0005 {
             bytes_processed as f64 / elapsed_secs
@@ -197,7 +188,7 @@ impl BbrTuner {
                     self.rt_prop_filter.reset();
                 }
             }
-            return;
+            return 2;
         } else {
             self.last_data_seen = now;
             if self.state == TunerState::IdleReset {
@@ -245,9 +236,9 @@ impl BbrTuner {
             }
         }
         let effective_state = board.get(Path::new(path_label)).map_or(self.state, |r| *r.value());
-        let (batch_override, coalesce_override) = match effective_state {
+        let (batch_override, coalesce_override, target_inflight_bytes) = match effective_state {
             TunerState::CriticalDrain => {
-                (1, self.min_coalesce_floor)
+                (1, self.min_coalesce_floor, 0)
             },
             _ => {
                 let bdp_bytes = btl_bw * rt_prop;
@@ -266,7 +257,8 @@ impl BbrTuner {
                 let calculated_batch = (target_inflight_bytes / calculated_coalesce.max(1)) as usize;
                 (
                     calculated_batch.max(self.batch_size_min).min(self.batch_size_max),
-                    calculated_coalesce
+                    calculated_coalesce,
+                    target_inflight_bytes
                 )
             }
         };
@@ -282,17 +274,22 @@ impl BbrTuner {
             },
             _ => Duration::from_millis(100),
         };
+        let target_buffer_depth = if chunk_size == 0 || target_inflight_bytes == 0 {
+            4
+        } else {
+            let depth = (target_inflight_bytes / chunk_size).max(2) as usize;
+            depth.min(self.current_batch_size).min(self.batch_size_max)
+        };
         board.insert(PathBuf::from(path_label), self.state);
         metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_label]).set(self.current_batch_size as i64);
         metrics::TARGET_COALESCE_BYTES.with_label_values(&[&path_label]).set(self.current_coalesce_bytes as i64);
         metrics::TUNER_STATE.with_label_values(&[&path_label]).set(self.state as i64);
         metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&path_label]).set(pending_len as f64 / max_pending as f64);
+        target_buffer_depth
     }
-
     pub fn should_defer_maintenance(&self) -> bool {
         matches!(self.state, TunerState::Startup | TunerState::Muted | TunerState::Drain | TunerState::CriticalDrain)
     }
-
     pub fn calculate_version_limits(&self, cfg: &TargetConfig, avail: u64, total: u64) -> (usize, u64) {
         let label = cfg.path.to_string_lossy();
         if total == 0 { return (cfg.max_versions, cfg.max_versions_size_mb); }

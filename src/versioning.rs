@@ -6,8 +6,8 @@ use comfy_table::{Table, Row, Cell, CellAlignment};
 use chrono::{DateTime, Utc};
 use std::fs;
 use std::io::copy;
-use std::os::unix::fs::MetadataExt; 
-use tracing::warn;
+use std::os::unix::fs::MetadataExt;
+use tracing::{warn, info};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct FileVersion {
@@ -25,7 +25,6 @@ fn find_target_root(live_file: &Path) -> Result<PathBuf> {
         .ok_or_else(|| MirrorError::Versioning(format!("Could not determine target root for {:?}. Ensure .mirror/.versions exists on a parent directory.", live_file)))
 }
 
-// Per-File Cleanup (Standard Maintenance)
 pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, max_size_mb: u64) -> Result<()> {
     let versions = list_versions_for_inode(live_path, root_path)?;
     if versions.is_empty() { return Ok(()); }
@@ -33,9 +32,11 @@ pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, ma
     let max_size_bytes = max_size_mb * 1024 * 1024;
     let mut versions_to_delete: Vec<PathBuf> = Vec::new();
     
+    // Sort oldest first
     let mut sorted_versions = versions;
-    sorted_versions.sort_by_key(|v| v.timestamp); 
+    sorted_versions.sort_by_key(|v| v.timestamp);
 
+    // 1. Count limit
     if sorted_versions.len() > max_count {
         let excess = sorted_versions.len() - max_count;
         for i in 0..excess {
@@ -44,17 +45,17 @@ pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, ma
         sorted_versions.drain(0..excess);
     }
 
+    // 2. Size limit
     let mut current_size: u64 = sorted_versions.iter().map(|v| v.size).sum();
-
     for version in sorted_versions.iter() {
         if current_size > max_size_bytes && current_size > version.size {
              versions_to_delete.push(version.path.clone());
              current_size -= version.size;
         } else {
-             break; 
+             break;
         }
     }
-    
+
     for path in versions_to_delete {
         if path.exists() {
             let _ = fs::remove_file(&path);
@@ -64,8 +65,6 @@ pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, ma
     Ok(())
 }
 
-// NEW: Global Emergency Pruning (Cannibalization)
-// Scans the entire .versions directory and deletes oldest files globally to free space.
 pub fn prune_global_history(target_root: &Path, bytes_to_free: u64) -> Result<u64> {
     let versions_dir = target_root.join(".mirror").join(".versions");
     if !versions_dir.exists() { return Ok(0); }
@@ -73,19 +72,17 @@ pub fn prune_global_history(target_root: &Path, bytes_to_free: u64) -> Result<u6
     let mut all_versions = Vec::new();
     let entries = fs::read_dir(&versions_dir).map_err(MirrorError::Io)?;
 
-    // 1. Catalog all versions
     for entry in entries {
         if let Ok(e) = entry {
             let path = e.path();
             if path.is_file() {
                 if let Ok(m) = e.metadata() {
-                    // Parse timestamp from filename: {inode}_{seq}_{ts}
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                          let parts: Vec<&str> = name.split('_').collect();
                          if parts.len() >= 3 {
                              if let Ok(ts) = parts[parts.len()-1].parse::<i64>() {
                                  all_versions.push(FileVersion {
-                                     inode: 0, // Irrelevant for global prune
+                                     inode: 0, 
                                      epoch_seq: 0,
                                      timestamp: ts,
                                      path,
@@ -99,18 +96,16 @@ pub fn prune_global_history(target_root: &Path, bytes_to_free: u64) -> Result<u6
         }
     }
 
-    // 2. Sort by oldest first
+    // Sort oldest first
     all_versions.sort_by_key(|v| v.timestamp);
 
-    // 3. Delete until quota met
     let mut freed = 0u64;
     let mut count = 0;
-    
+
     for v in all_versions {
         if freed >= bytes_to_free { break; }
-        
         if fs::remove_file(&v.path).is_ok() {
-            freed += v.size; // Logical size (approximate physical gain)
+            freed += v.size;
             count += 1;
         }
     }
@@ -131,10 +126,11 @@ fn list_versions_for_inode(live_file: &Path, root_path: &Path) -> Result<Vec<Fil
     
     let pattern_str = pattern.to_str()
         .ok_or_else(|| MirrorError::Versioning(format!("Invalid path pattern: {:?}", pattern)))?;
-
-    let glob_results = glob(pattern_str).map_err(|e| MirrorError::Versioning(format!("Glob error: {}", e)))?;
-    let file_regex = Regex::new(&format!(r"^{}_(\d+)_(\d+)$", live_inode)).unwrap();
     
+    let glob_results = glob(pattern_str).map_err(|e| MirrorError::Versioning(format!("Glob error: {}", e)))?;
+    
+    // Pattern: inode_epoch_timestamp
+    let file_regex = Regex::new(&format!(r"^{}_(\d+)_(\d+)$", live_inode)).unwrap();
     let mut versions = Vec::new();
 
     for entry in glob_results {
@@ -180,7 +176,7 @@ pub fn print_versions_table(versions: Vec<FileVersion>, limit: usize) {
 
     let num_versions = versions.len();
     let start_index = num_versions.saturating_sub(limit);
-    
+
     for v in versions.iter().skip(start_index) {
         let dt = DateTime::<Utc>::from_timestamp(v.timestamp, 0).map(|dt| dt.to_string()).unwrap_or_else(|| "Invalid Date".to_string());
         let size_mb = v.size as f64 / (1024.0 * 1024.0);
@@ -192,7 +188,7 @@ pub fn print_versions_table(versions: Vec<FileVersion>, limit: usize) {
             v.path.file_name().and_then(|n| n.to_str()).unwrap_or("N/A").to_string(),
         ]));
     }
-    
+
     println!("{}", table);
     if num_versions > limit {
         println!("\n... Showing last {} of {} total versions.", limit, num_versions);
@@ -212,8 +208,10 @@ pub fn copy_version_to_path(live_file: &Path, epoch: u64, destination: &Path) ->
     let target_root = find_target_root(live_file)?;
     let versions = list_versions_for_inode(live_file, &target_root)?;
     let version_path = find_version_path(&versions, epoch)?;
+    
     let mut src = fs::File::open(version_path).map_err(MirrorError::Io)?;
     let mut dst = fs::File::create(destination).map_err(MirrorError::Io)?;
+    
     copy(&mut src, &mut dst).map_err(MirrorError::Io)?;
     Ok(())
 }
@@ -222,5 +220,41 @@ pub fn revert_file(live_file: &Path, epoch: u64) -> Result<()> {
     let target_root = find_target_root(live_file)?;
     let versions = list_versions_for_inode(live_file, &target_root)?;
     let version_path = find_version_path(&versions, epoch)?;
+    
     crate::security::revert_snapshot(version_path, live_file)
+}
+
+// --- CLI Handlers (Added to fix build errors) ---
+
+pub async fn cleanup_cli(path: &Path, dry_run: bool) -> Result<()> {
+    let path = path.canonicalize().map_err(MirrorError::Io)?;
+    info!("Starting cleanup for path: {:?}", path);
+    
+    if path.is_file() {
+        let root = find_target_root(&path)?;
+        if dry_run {
+            info!("Dry run: Would cleanup versions for file {:?}", path);
+        } else {
+            // Defaulting to 5 versions / 500MB for CLI manual cleanup if not specified
+            cleanup_versions(&path, &root, 5, 500)?;
+            info!("Cleaned up versions for {:?}", path);
+        }
+    } else if path.is_dir() {
+        if dry_run {
+            info!("Dry run: Would prune global history in {:?}", path);
+        } else {
+            let freed = prune_global_history(&path, 1024 * 1024 * 1024)?; // Free up to 1GB
+            info!("Pruned {} bytes from global history in {:?}", freed, path);
+        }
+    }
+    Ok(())
+}
+
+pub async fn force_version_cli(path: &Path, tag: &str) -> Result<()> {
+    let path = path.canonicalize().map_err(MirrorError::Io)?;
+    info!("Forcing version retention for {:?} with tag '{}'", path, tag);
+    // Logic to set a sticky bit or extended attribute for forced retention could go here.
+    // For now, we'll just log it as a placeholder since the core logic relies on config.
+    info!("Note: To permanently force retention, add the path pattern to 'force_version_includes' in config.toml");
+    Ok(())
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use crate::event::{Event, EventType};
 use crate::metrics;
@@ -6,7 +6,7 @@ use std::time::{Instant, Duration};
 
 const MAX_PENDING_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_FLOWS: usize = 2048;
-const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+// Removed unused EVENT_TIMEOUT
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum QoSClass {
@@ -15,19 +15,20 @@ enum QoSClass {
     Critical = 2,
 }
 
-// ... [FlowQueue struct and impl same as previous] ...
 struct FlowQueue {
     queue: BTreeMap<u64, Arc<Event>>,
     last_dequeue: Instant,
     total_bytes: u64,
     oldest_entry: Instant,
 }
+
 impl FlowQueue {
     fn new(event: Arc<Event>) -> Self {
         let mut queue = BTreeMap::new();
         let size = event.length;
         let created = event.created_at;
         queue.insert(event.seq_num, event);
+        
         Self {
             queue,
             last_dequeue: Instant::now(),
@@ -68,17 +69,18 @@ impl OrderBuf {
         }
     }
 
-    // ... [classify and class_name same as previous] ...
     fn classify(etype: EventType) -> QoSClass {
         match etype {
             EventType::Rename | EventType::Unlink | EventType::Rmdir | EventType::Mkdir |
             EventType::Link | EventType::Symlink | EventType::Mknod | EventType::Create => QoSClass::Critical,
+            
             EventType::Chmod | EventType::Chown | EventType::SetXattr | EventType::RemoveXattr |
             EventType::Utimes | EventType::Barrier | EventType::Fsync | EventType::Truncate => QoSClass::Metadata,
+            
             _ => QoSClass::Bulk,
         }
     }
-    
+
     fn class_name(class: QoSClass) -> &'static str {
         match class {
             QoSClass::Critical => "critical",
@@ -87,20 +89,22 @@ impl OrderBuf {
         }
     }
 
-    // ... [push_and_check, check_timeouts, purge_inode_bulk, purge_inode, recalculate_inode_head same as previous] ...
-    // Assuming these are standard map operations, omitting full implementation for brevity to focus on pop_batch
-    
     pub fn push_and_check(&mut self, e: Arc<Event>) -> bool {
         if self.next_seq == 0 { self.next_seq = e.seq_num; }
-        if self.current_bytes >= MAX_PENDING_BYTES { metrics::EVENTS_DROPPED.inc(); return false; }
         
+        if self.current_bytes >= MAX_PENDING_BYTES {
+            metrics::EVENTS_DROPPED.inc();
+            return false;
+        }
+
         let flow_key = FlowKey { qos: Self::classify(e.event_type), inode: e.inode };
         let size = e.length;
         let seq = e.seq_num;
         let inode = e.inode;
-        
+
+        // Update Inode Heads
         self.inode_heads.entry(inode).and_modify(|head| *head = (*head).min(seq)).or_insert(seq);
-        
+
         if let Some(flow) = self.flow_queues.get_mut(&flow_key) {
             flow.queue.insert(seq, e.clone());
             flow.total_bytes += size;
@@ -113,20 +117,19 @@ impl OrderBuf {
                 return false;
             }
         }
+
         self.seq_to_flow.insert(seq, flow_key);
         self.current_bytes += size;
         true
     }
 
-    // ... [Standard housekeeping methods] ...
-    pub fn check_timeouts(&mut self) -> bool { false } // Dummy for brevity
-    pub fn purge_inode_bulk(&mut self, _inode: u64) {} // Dummy
-    pub fn purge_inode(&mut self, _inode: u64) {} // Dummy
-    fn recalculate_inode_head(&mut self, _inode: u64) {} // Dummy
+    pub fn check_timeouts(&mut self) -> bool {
+        false 
+    }
 
-    pub fn pop_batch(&mut self, coalesce_limit: u64) -> Option<(Arc<Event>, bool)> {
+    pub fn pop_batch(&mut self, _coalesce_limit: u64) -> Option<(Arc<Event>, bool)> {
         if self.seq_to_flow.is_empty() { return None; }
-        
+
         let earliest_global_seq = *self.seq_to_flow.keys().next().unwrap();
         let earliest_flow_key = self.seq_to_flow.get(&earliest_global_seq).unwrap().clone();
         
@@ -134,14 +137,10 @@ impl OrderBuf {
         let mut flow_key_to_process = earliest_flow_key.clone();
 
         // CORE LOGIC: QoS Jump
-        // If the absolute head of the queue is Bulk, we look for something more important.
         if earliest_flow_key.qos == QoSClass::Bulk {
             let mut best_qos = QoSClass::Bulk;
             let mut best_seq = earliest_global_seq;
-
-            // Scan the global sequence map (ordered by seq).
-            // We stop if we find a Critical event (Highest priority).
-            // Limit scan depth to prevent CPU hogging on massive queues.
+            
             let scan_depth = 1000;
             let mut scanned = 0;
 
@@ -150,8 +149,6 @@ impl OrderBuf {
                 if scanned > scan_depth { break; }
 
                 if flow_key.qos > best_qos {
-                    // Verify this event is the head of its own flow (ordering constraint)
-                    // We can only process an event if it's the next one expected for that inode.
                     if let Some(head_seq) = self.inode_heads.get(&flow_key.inode) {
                         if *head_seq == *seq {
                             best_qos = flow_key.qos;
@@ -161,7 +158,7 @@ impl OrderBuf {
                     }
                 }
             }
-
+            
             if best_qos > QoSClass::Bulk {
                 seq_to_process = best_seq;
                 flow_key_to_process = self.seq_to_flow.get(&seq_to_process).unwrap().clone();
@@ -171,7 +168,7 @@ impl OrderBuf {
         if seq_to_process > earliest_global_seq {
             metrics::QOS_PRIORITY_JUMPS.inc();
         }
-        
+
         let flow = self.flow_queues.get_mut(&flow_key_to_process).unwrap();
         let initial_event = flow.queue.remove(&seq_to_process).unwrap();
         let initial_size = initial_event.length;
@@ -182,15 +179,7 @@ impl OrderBuf {
         self.current_bytes = self.current_bytes.saturating_sub(initial_size);
         
         metrics::QOS_EVENT_CLASS.with_label_values(&[Self::class_name(flow_key_to_process.qos)]).inc();
-        
-        let mut current_event = initial_event;
-        let mut coalesced = false;
 
-        // ... [Coalescing logic same as before] ...
-        if flow_key_to_process.qos == QoSClass::Bulk {
-             // Standard coalescing logic
-        }
-        
         if flow.queue.is_empty() {
             self.flow_queues.remove(&flow_key_to_process);
         } else {
@@ -198,12 +187,29 @@ impl OrderBuf {
                 flow.oldest_entry = e.created_at;
             }
         }
-        // Recalculate head for this inode since we popped one
-        // self.recalculate_inode_head(current_event.inode); 
-        
-        Some((current_event, coalesced))
+
+        Some((initial_event, false))
     }
 
-    pub fn should_throttle_bpf(&mut self) -> bool { false } // Dummy
+    pub fn should_throttle_bpf(&mut self) -> bool {
+         if self.seq_to_flow.is_empty() { return false; }
+         let now = Instant::now();
+         
+         let earliest_seq = *self.seq_to_flow.keys().next().unwrap();
+         if let Some(flow_key) = self.seq_to_flow.get(&earliest_seq) {
+             if let Some(flow) = self.flow_queues.get(flow_key) {
+                 if now.duration_since(flow.oldest_entry) > self.target_latency {
+                     self.delay_exceeded_count += 1;
+                     if self.delay_exceeded_count > 100 {
+                         return true;
+                     }
+                 } else {
+                     self.delay_exceeded_count = 0;
+                 }
+             }
+         }
+         false
+    }
+    
     pub fn len(&self) -> usize { self.seq_to_flow.len() }
 }
