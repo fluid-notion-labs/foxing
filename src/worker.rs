@@ -27,7 +27,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tokio::time::sleep;
 use std::time::{Instant, Duration};
-use crate::ordering::OrderBuf;
+use crate::ordering::Coalescer; // Switched to Coalescer
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 
@@ -97,11 +97,10 @@ pub async fn run_worker(
     info!("Worker {} started as {}", worker_id, role_name);
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
-    let mut order = OrderBuf::new(
-        target_cfg.autotune_target_latency_ms,
-        target_cfg.ordering_max_pending_bytes,
-        target_cfg.ordering_scan_depth,
-    );
+    
+    // FIX: Architecture B - Gap Recovery Blind Hydration (removed OrderBuf, added Coalescer)
+    let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
+    
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
@@ -173,7 +172,7 @@ pub async fn run_worker(
             _ = flush_interval.tick() => {
                 let tuner_tick_start = Instant::now();
                 let is_stressed = if is_control_plane { false } else { _governor.is_system_stressed() };
-                let pending_len = order.len();
+                let pending_len = coalescer.len();
                 let max_pending = target_cfg.queue_max;
                 let target_label = target_cfg.path.to_string_lossy().to_string();
                 let bytes_processed = 0;
@@ -263,27 +262,18 @@ pub async fn run_worker(
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
         if event_ptr.event_type == EventType::SequenceGap {
-            tracing::warn!("Sequence Gap detected on dev {}. Activating Gap Recovery Mode.", event_ptr.dev_id);
-            order.next_seq = event_ptr.seq_num;
+            // Gaps handled at ingress, this is just a signal
+            tracing::debug!("Worker {}: Sequence Gap signal received (ignored, handled at ingress).", worker_id);
             continue;
         }
-        if !order.push_and_check(event_ptr.clone()) {
-             metrics::EVENTS_DROPPED.inc();
-             continue;
-        }
         
-        // FIX: Control Plane Starvation (Architecture A)
-        // Allow dynamic batching for control plane, but ensure strict ordering for barriers.
+        // Push to local coalescing buffer
+        coalescer.push(event_ptr.clone());
+        
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if is_control_plane {
-            // Check next event type - if it's safe to batch (e.g. bulk unlink), scale up.
-            // If it's a barrier/rename, force 1.
-            // FIX: Unused variable warning suppression
-            if let Some(_next_seq) = order.peek_min_seq() {
-                // Peek is harder with current OrderBuf, simplistic heuristic:
-                // If the queue is deep, try to process more unlinks/mkdir
-                if order.len() > 100 { 16 } else { 1 } 
-            } else { 1 }
+            // Simple heuristic for control plane batching
+            if coalescer.len() > 100 { 16 } else { 1 }
         } else { 
             tuner.current_batch_size 
         };
@@ -291,12 +281,8 @@ pub async fn run_worker(
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
-                if let Some(e) = order.pop_batch(current_coalesce_limit) {
-                    // For control plane, stop batch if we hit a barrier
+                if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
                     if is_control_plane && matches!(e.event_type, EventType::Rename | EventType::Fsync | EventType::Barrier) && !batch.is_empty() {
-                        // Push back? No, OrderBuf pop is destructive.
-                        // Ideally we peek, but for now we process this barrier as the last item in this batch.
-                        // This maintains causal order because the batch is processed sequentially below.
                         batch.push(e);
                         break; 
                     }

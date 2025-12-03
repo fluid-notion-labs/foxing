@@ -9,6 +9,7 @@ use crate::metrics::{self, GLOBAL_BUFFER_LIMIT};
 use std::mem;
 use libbpf_rs::MapCore;
 use tracing::{info, warn, debug};
+use crate::ordering::ReorderBuffer; // New import
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -42,7 +43,6 @@ struct RawEvent {
     comm: [u8;16]
 }
 
-// Removed 'async' - this function blocks on ring.poll()
 pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>) -> Result<()> {
     let skel_builder = MirrorSkelBuilder::default();
     let mut open_obj = mem::MaybeUninit::uninit();
@@ -55,6 +55,12 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         .map_err(|e| FoxingError::Bpf(format!("Failed to register PID filter: {}", e)))?;
 
     info!("BPF: Registering {} watched device(s)", queues.len());
+    
+    // Initialize Ingress Reorder Buffers per Device
+    // This solves the architecture gap where sharded workers saw sequence gaps.
+    // Now reordering happens globally BEFORE sharding.
+    let mut reorder_buffers: HashMap<u32, ReorderBuffer> = HashMap::new();
+
     for dev in queues.keys() {
         let key = dev.to_ne_bytes();
         let val = 1u8;
@@ -65,13 +71,15 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
+        
+        // 250ms gap jump, 64MB buffer limit for ingress reordering
+        reorder_buffers.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
     }
 
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
     let progs = &skel.progs;
     
-    // Explicitly attaching widely supported probes first
     let probes = [
         ("trace_xfs_write", &progs.trace_xfs_write),
         ("trace_btrfs_write", &progs.trace_btrfs_write),
@@ -122,7 +130,7 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
     let mut builder = RingBufferBuilder::new();
 
     builder.add(events_map, move |data| {
-        let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst); // FIX: Race Condition #1
+        let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
 
         if data.len() != std::mem::size_of::<RawEvent>() {
@@ -132,22 +140,10 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
 
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
 
-        // Backpressure check
         if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
-            
-            // Send gap signal to all workers for this device
-            if let Some(qs) = queues.get(&raw.dev) {
-                let gap_evt = Arc::new(Event {
-                    event_type: EventType::SequenceGap,
-                    dev_id: raw.dev,
-                    inode: 0, parent_inode: 0, new_parent_inode: 0, seq_num: 0, offset: 0, length: 0,
-                    name: "".into(), new_name: None, generation: 0, projid: 0,
-                    mode: 0, flags: 0, process_name: "backpressure".into(), interactive: false,
-                    created_at: std::time::Instant::now()
-                });
-                for q in qs { q.push(gap_evt.clone()); }
-            }
+            // In gap mode, we might want to clear reorder buffers to avoid stale data
+            // but for now we just drop.
             return 0;
         }
 
@@ -160,9 +156,9 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         let comm_len = raw.comm.iter().position(|&c| c == 0).unwrap_or(raw.comm.len());
         let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
 
-        if event_count < 100 {
-            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}, interactive={}", 
-                   event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino, raw.interactive);
+        if event_count < 50 {
+            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}", 
+                   event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino);
         }
 
         if !queues.contains_key(&raw.dev) {
@@ -170,31 +166,21 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             return 0;
         }
 
-        // Sequence tracking
         let tracker = SEQUENCE_TRACKER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let prev = tracker.fetch_max(raw.seq, Ordering::Relaxed);
         
-        // Gap detection (allow wraparound)
         let is_wraparound = prev > (u64::MAX - 1000000) && raw.seq < 1000000;
         if !is_wraparound && raw.seq > prev + 1 {
-            warn!("BPF: Sequence gap detected on device 0x{:08x}: {} -> {} (gap of {})", 
-                  raw.dev, prev, raw.seq, raw.seq - prev - 1);
+            // Logic for actual kernel drops, unrelated to worker sharding
             crate::metrics::SEQUENCE_GAPS.with_label_values(&[&raw.dev.to_string()]).inc();
             
-            let gap = Arc::new(Event {
-                event_type: EventType::SequenceGap, dev_id: raw.dev, inode: 0,
-                parent_inode: 0, new_parent_inode: 0, seq_num: raw.seq, offset: 0, length: 0,
-                name: "".into(), new_name: None, generation: 0, projid: 0,
-                mode: 0, flags: 0, process_name: "kernel".into(), interactive: false,
-                created_at: std::time::Instant::now()
-            });
-            
-            if let Some(qs) = queues.get(&raw.dev) {
-                for q in qs { q.push(gap.clone()); }
+            // Inject gap into buffer if possible, or just reset next_seq in ReorderBuffer
+            if let Some(buf) = reorder_buffers.get_mut(&raw.dev) {
+                buf.next_seq = raw.seq;
             }
         }
 
-        let new_name = if raw.type_ == 7 { // EVENT_RENAME
+        let new_name = if raw.type_ == 7 { 
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
                 Some(String::from_utf8_lossy(&raw.nname[..nname_len]).to_string())
         } else { None };
@@ -210,10 +196,19 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             created_at: std::time::Instant::now()
         });
 
-        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst); // FIX: Race Condition #1
-        
-        if let Some(qs) = queues.get(&raw.dev) {
-            for q in qs { q.push(evt.clone()); }
+        // Push to Reorder Buffer (Global Sequencing)
+        if let Some(buf) = reorder_buffers.get_mut(&raw.dev) {
+            if buf.push(evt) {
+                // Drain ordered events and dispatch
+                while let Some(ordered_evt) = buf.pop() {
+                    metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                    if let Some(qs) = queues.get(&ordered_evt.dev_id) {
+                        for q in qs { q.push(ordered_evt.clone()); }
+                    }
+                }
+            } else {
+                metrics::EVENTS_DROPPED.inc();
+            }
         }
         
         0
@@ -228,6 +223,16 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
+                // Periodically check reorder buffers for stalls
+                for (_, buf) in reorder_buffers.iter_mut() {
+                    while let Some(ordered_evt) = buf.pop() {
+                        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                        if let Some(qs) = queues.get(&ordered_evt.dev_id) {
+                            for q in qs { q.push(ordered_evt.clone()); }
+                        }
+                    }
+                }
+
                 if last_report.elapsed().as_secs() >= 30 {
                     for entry in DEVICE_EVENT_COUNTER.iter() {
                         let dev_id = entry.key();
