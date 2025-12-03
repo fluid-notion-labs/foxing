@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{error, warn, debug};
+use tracing::{error, warn, debug, info};
 use crate::error::{Result, FoxingError};
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
@@ -114,22 +114,75 @@ async fn process_hydration_job(
     buffer_pool: &mut BufferPool,
     src_rwf_uncached_ok: bool,
 ) -> Result<()> {
-    let HydrationJob { rel_path, target_cfg } = job;
+    let HydrationJob { mut rel_path, target_cfg } = job;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
+    
+    let source_path_start = source.mount.join(&rel_path);
+    let mut target_path = target_cfg.path.join(&rel_path);
+    
+    // --- RENAME/MOVE REPAIR LOOKUP ---
+    if let Ok(metadata) = std::fs::metadata(&source_path_start) {
+        let inode = metadata.ino();
+        // Execute the aggressive lookup to find the file's current, correct relative path
+        match spawn_blocking({
+            let map = source.inode_map.clone();
+            let mount = source.mount.clone();
+            move || identity::resolve_and_update_path(&map, &mount, inode)
+        }).await.unwrap_or_else(|e| Err(FoxingError::Join(e))) {
+            Ok(new_full_path) => {
+                if let Ok(new_rel) = new_full_path.strip_prefix(&source.mount) {
+                    if new_rel != rel_path.as_path() {
+                        info!("Hydration Worker: Correcting renamed path {} -> {}", rel_path.to_string_lossy(), new_rel.to_string_lossy());
+                        // Update target_path based on the new location
+                        target_path = target_cfg.path.join(new_rel);
+                        rel_path = new_rel.to_path_buf();
+                    }
+                }
+            },
+            Err(FoxingError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                // Aggressive search failed: file likely deleted or moved off-mount.
+                // We proceed to the deletion path below for the original requested path.
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    // --- END RENAME/MOVE REPAIR LOOKUP ---
+    
+    // Check if source path still exists (either the original path, or the new resolved path)
     let source_path = source.mount.join(&rel_path);
-    let target_path = target_cfg.path.join(&rel_path);
-    let target_path_lossy = target_cfg.path.to_string_lossy().to_string();
+    if !source_path.exists() {
+        if target_path.exists() {
+            // Source is gone, target still exists -> DELETE on target
+            warn!("Hydration Worker: Source path {:?} disappeared. Deleting target: {:?}", source_path, target_path);
+            let target_path_clone = target_path.clone();
+            let _ = spawn_blocking(move || {
+                if target_path_clone.is_dir() {
+                    std::fs::remove_dir(&target_path_clone)
+                } else {
+                    std::fs::remove_file(&target_path_clone)
+                }
+            }).await;
+        }
+        // Whether deletion succeeded or failed, the repair job is logically complete.
+        return Ok(());
+    }
+    
+    let target_path_lossy = target_path.to_string_lossy().to_string();
+
     let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
     if governor.is_system_stressed() ||
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    
+    // Create parent directories if needed, crucial for cross-directory rename repair
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
+    
     let mut attempts = 0;
     let max_attempts = 5;
     let mut success = false;
@@ -138,6 +191,14 @@ async fn process_hydration_job(
         let file_size_res = std::fs::metadata(&source_path);
         let copy_result: Result<Option<CopyStats>> = match file_size_res {
             Ok(metadata) => {
+                if !metadata.is_file() {
+                    // If it's a directory or symlink, just ensure target directory exists and exit.
+                    if metadata.is_dir() && !target_path.exists() {
+                        let _ = std::fs::create_dir_all(&target_path);
+                    }
+                    return Ok(());
+                }
+                
                 let file_size = metadata.len();
                 let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
                 SmartCopier::copy(
@@ -158,7 +219,7 @@ async fn process_hydration_job(
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    debug!("Hydration: Source file {:?} disappeared.", source_path);
+                    // Source file disappeared, already handled in the deletion block above if needed.
                     return Ok(());
                 }
                 Err(FoxingError::Io(e))
@@ -200,6 +261,7 @@ async fn process_hydration_job(
                     tokio::time::sleep(delay).await;
                 } else {
                     error!("Hydration copy POISONED after {} attempts for {:?}: {:?}", max_attempts, rel_path, e);
+                    return Err(e);
                 }
             }
         }

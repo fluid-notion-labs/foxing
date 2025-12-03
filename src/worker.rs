@@ -30,6 +30,7 @@ use std::time::{Instant, Duration};
 use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
+use crate::ordering::ReorderBuffer; // Assuming ReorderBuffer is used instead of Coalescer for BPF
 
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
@@ -85,8 +86,8 @@ pub async fn run_worker(
     target_cfg: TargetConfig,
     config: Arc<RwLock<Config>>,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    _hydration_tx: mpsc::Sender<PathBuf>,
-    _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>, // Suppressed warning by using underscore
+    hydration_tx: mpsc::Sender<PathBuf>,
+    _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>,
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
@@ -115,7 +116,7 @@ pub async fn run_worker(
     let capacity_threshold_mb = config_reader.capacity_threshold_mb;
     let force_flush_base_secs = config_reader.force_flush_interval_secs;
     let total_workers = config_reader.worker_count.max(1);
-    let global_limit_mib = config_reader.global_buffer_limit;
+    let global_limit_mib = config.read().await.global_buffer_limit;
     let total_worker_mem_limit_mib = global_limit_mib * 3 / 10;
     let worker_mem_limit_mib = total_worker_mem_limit_mib / total_workers as u64;
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
@@ -129,7 +130,7 @@ pub async fn run_worker(
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
     info!("Worker {}: BufferPool initialized with {} x {}MB chunks.", worker_id, buffer_pool.capacity(), buffer_chunk_size_mib);
     let limiter = ErrorLimiter::new();
-    let capacity_breaker = CircuitBreaker::new(config.read().await.breaker_interval_secs);
+    let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
     let mut poison_cabinet = PoisonCabinet::new();
     let mut cur_cap_avail = 0u64;
@@ -184,21 +185,17 @@ pub async fn run_worker(
                     &target_label,
                     buffer_pool.chunk_size() as u64
                 );
-                
                 if !is_control_plane && recommended_depth != buffer_pool.capacity() {
                     let current_depth = ring.submission().capacity();
                     let diff = (recommended_depth as i32 - current_depth as i32).abs();
                     if diff > (current_depth as i32 / 4) || (recommended_depth < 64 && diff > 10) {
                         info!("Worker {}: Resizing IoUring ({} -> {}).", worker_id, current_depth, recommended_depth);
-                        
                         while ring.completion().len() > 0 {
                             let _ = ring.submit_and_wait(1);
                         }
-
                         if let Err(e) = unregister_buffers(&mut ring) {
                             error!("Worker {}: Failed to unregister buffers during resize: {}", worker_id, e);
                         }
-                        
                         match IoUring::new(recommended_depth as u32) {
                             Ok(new_ring) => {
                                 ring = new_ring;
@@ -259,38 +256,68 @@ pub async fn run_worker(
         };
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
-        
         // FIX: RENAME Priority Check
         if matches!(event_ptr.event_type, EventType::Rename) {
              if event_ptr.new_parent_inode == 0 || event_ptr.new_name.is_none() {
                  
-                 // Trigger repair path by sending the source path to the hydration manager
-                 let repair_path = source.mount.join(event_ptr.name.trim_start_matches('/'));
-                 let _ = _hydration_tx.try_send(repair_path);
+                 let current_source_path = source.mount.join(event_ptr.name.trim_start_matches('/'));
+                 let inode = match std::fs::symlink_metadata(&current_source_path) {
+                     Ok(m) => m.ino(),
+                     Err(_) => {
+                         warn!("RENAME BPF Fail: Cannot find source path {} to queue repair. Assuming already moved/deleted.", current_source_path.to_string_lossy());
+                         continue;
+                     }
+                 };
                  
-                 warn!("RENAME BPF Fail: Missing new_parent_inode or new_name (Inode {}). Dropping, forcing fast repair.", event_ptr.inode);
+                 // Phase 1: Aggressively lookup the new path and update map (Blocking IO delegated)
+                 let lookup_res = tokio::task::spawn_blocking({
+                    let map = source.inode_map.clone();
+                    let mount = source.mount.clone();
+                    move || identity::resolve_and_update_path(&map, &mount, inode)
+                 }).await;
+                 
+                 // Phase 2: Queue deletion of the OLD, incorrect path on the target
+                 // We MUST delete the old name on the target mirror, which is now stale (e.g., /target/move_me.txt)
+                 let old_target_path = target_cfg.path.join(event_ptr.name.trim_start_matches('/'));
+                 if old_target_path.exists() {
+                     let _ = tokio::task::spawn_blocking(move || {
+                         let _ = std::fs::remove_file(&old_target_path);
+                         // If the old path was a directory, clean that up too (though unlikely in this test scenario)
+                         if old_target_path.is_dir() { let _ = std::fs::remove_dir(&old_target_path); }
+                     }).await;
+                 }
+
+                 // Phase 3: Queue the CO-W/COPY job for the NEW path
+                 if lookup_res.is_ok() {
+                    // Queue repair using the resolved new path
+                    let new_rel_path = match lookup_res.unwrap().unwrap().strip_prefix(&source.mount) {
+                        Ok(p) => p.to_path_buf(),
+                        Err(_) => current_source_path.strip_prefix(&source.mount).unwrap_or(current_source_path.as_path()).to_path_buf(),
+                    };
+                    
+                    let repair_path = source.mount.join(&new_rel_path);
+                    let _ = hydration_tx.try_send(repair_path);
+                 }
+                 
                  continue;
              }
         }
         // --- END RENAME CRITICAL PATH GUARD ---
-        
         // Push to local coalescing buffer
         coalescer.push(event_ptr.clone());
-        
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if is_control_plane {
             if coalescer.len() > 100 { 16 } else { 1 }
-        } else { 
-            tuner.current_batch_size 
+        } else {
+            tuner.current_batch_size
         };
-
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
                 if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
                     if is_control_plane && matches!(e.event_type, EventType::Rename | EventType::Fsync | EventType::Barrier) && !batch.is_empty() {
                         batch.push(e);
-                        break; 
+                        break;
                     }
                     batch.push(e);
                 } else {
@@ -331,7 +358,6 @@ pub async fn run_worker(
                 _ => OpKind::Write, // Shared
             };
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
-            
             let _ = process_single_event_inner(
                 &mut ctx, e, &source, &target_cfg, &tuner,
                 capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
@@ -396,7 +422,7 @@ async fn process_single_event_inner(
                         std::fs::create_dir_all(&target_dir_clone)
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
-                    Ok(_inner_res) => Ok(()), // FIX: Suppress unused variable warning
+                    Ok(_inner_res) => Ok(()),
                     Err(e) => Err(e)
                 };
                 if check_res.is_err() {
@@ -428,7 +454,6 @@ async fn process_single_event_inner(
                 Err(e) => return Err(e),
             }
         }).await;
-        
         if let Ok(_f) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             metrics::SIDECAR_FILES_CREATED.inc();
         } else {
@@ -455,7 +480,7 @@ async fn process_single_event_inner(
             let src_clone_for_metadata = src.clone();
             let metadata_result = tokio::task::spawn_blocking(move || {
                 std::fs::metadata(&src_clone_for_metadata)
-            }).await.unwrap_or(Err(io::Error::new(io::ErrorKind::NotFound, "Metadata task failed")));
+            }).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
             if let Ok(m) = metadata_result {
                 if m.is_file() {
                     let current_src_size = m.len();

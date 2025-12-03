@@ -49,34 +49,37 @@ impl Hydrator {
     pub fn repair_path(&self, path: PathBuf) {
         debug!("Hydration: Targeted repair requested for {:?}", path);
         
-        // 1. If the path is the old source path of a renamed file, we must find its new location.
+        // 1. Check if the file still exists at the old path.
         if let Ok(metadata) = fs::metadata(&path) {
             let inode = metadata.ino();
             if metadata.is_file() {
-                // Perform aggressive lookup to find the file's current, correct relative path
+                // This is a crucial block for RENAME/MOVE fixes:
+                // Find the file's current, correct relative path by searching the entire source tree for its inode.
                 match identity::resolve_and_update_path(&self.source.inode_map, &self.source.mount, inode) {
                     Ok(new_rel_path) => {
-                        // The aggressive lookup found the true location! Dispatch the repair job.
+                        // A new path was found (meaning the file was moved). 
+                        // Submit this new path directly as a job to the fast bulk queue.
                         for target_cfg in &self.targets {
                             if let Some(queue) = self.source.bulk_job_queue.lock().as_ref() {
-                                if let Some(stripped_path) = new_rel_path.strip_prefix(&self.source.mount).ok() {
-                                     // Strip source mount path before converting to string for relative path
+                                if let Ok(stripped_path) = new_rel_path.strip_prefix(&self.source.mount).ok() {
                                      queue.submit_job(stripped_path.to_path_buf(), target_cfg.clone());
-                                     info!("Hydration Fix: Dispatched repair for Inode {} at new path: {:?}", inode, stripped_path);
+                                     info!("Hydration Fix: Dispatched immediate RENAME repair job for Inode {} at new path: {:?}", inode, stripped_path);
+                                     // Success, exit immediately to prevent falling through to generic processing/deletion
                                      return;
                                 }
                             }
                         }
                     },
-                    Err(e) => {
-                         warn!("Hydration: Failed aggressive lookup for Inode {} (File: {:?}): {}", inode, path, e);
-                         // Fall through to original delete/process logic if lookup fails
+                    Err(_) => {
+                         // File no longer found in source tree by inode, it must have been deleted.
+                         // Fall through to deletion logic below.
                     }
                 }
             }
         }
         
-        // Original logic: Deletion or normal file processing if it still exists at that path
+        // 2. Fallback logic: If the aggressive inode lookup failed, or the file exists but 
+        //    is a directory that needs general processing/deletion sweep is needed.
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
@@ -86,7 +89,7 @@ impl Hydrator {
              return;
         }
         
-        // If the aggressive lookup failed or it's a directory/non-file, proceed with normal path process
+        // 3. Generic file/directory processing (less urgent than rename fix)
         if let Err(e) = self.process_path(&path, true, None) {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }

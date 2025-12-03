@@ -264,23 +264,25 @@ impl Manager {
             
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
-                let is_file_repair = !is_root_request && path.is_file();
+                // Check if the path exists AND it's not the root path. This identifies targeted files/dirs.
+                let is_targeted_repair = path.exists() && !is_root_request;
                 
-                if is_file_repair {
-                    // 1. HIGH PRIORITY FILE REPAIR (Immediate Dispatch)
+                if is_targeted_repair {
+                    // 1. HIGH PRIORITY FILE REPAIR (Immediate Dispatch via Bulk Queue)
+                    // This bypasses the full scan debouncing entirely.
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         // Assuming single target for immediate repair for simplicity based on test config
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
                             if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
                                 if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
                                     info!("Hydration MANAGER: IMMEDIATE repair dispatch for file {:?}", path);
-                                    // Submit directly to the fast bulk processing queue
                                     queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone());
                                 }
                             }
                         }
                     }
-                    // Continue to wait for the next job, do NOT execute slow debounce/scan logic
+                    // Since this was a targeted file/directory request, we are done with this path.
+                    // DO NOT fall through to the full scan logic below.
                     continue; 
                 } 
                 
@@ -299,33 +301,10 @@ impl Manager {
                             });
                         }
                     }
-                } else {
-                    // 3. STANDARD DEBOUNCED REPAIR (e.g., directory repair/low priority)
-                    let (repair_debounce, _full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
-                    
-                    if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
-                        if hydrator.source.active_repairs.contains(&path) { continue; }
-                        let registry_limit = calculate_adaptive_registry_limit(&tuner_board_clone);
-                        if hydrator.source.active_repairs.len() >= registry_limit { continue; }
-                        
-                        let now = Instant::now();
-                        let repaired_path = path.clone();
-                        
-                        repair_tracker_clone.retain(|_, time| now.duration_since(*time) < repair_debounce);
-                        if repair_tracker_clone.contains_key(&repaired_path) { continue; }
-
-                        repair_tracker_clone.insert(repaired_path.clone(), now);
-                        hydrator.source.active_repairs.insert(repaired_path.clone());
-                        let h_clone = hydrator.clone();
-                        let path_for_repair = repaired_path.clone();
-                        let set_clone = hydrator.source.active_repairs.clone();
-                        std::thread::spawn(move || {
-                            let _guard = RepairGuard { path: path_for_repair.clone(), set: set_clone };
-                            h_clone.repair_path(path_for_repair);
-                            Ok::<(), FoxingError>(())
-                        });
-                    }
                 }
+                // 3. Low Priority Debounced Repair (Old logic for paths that might need processing later, 
+                //    but we don't need this complex directory tracking here since we rely on full scan/initial sync for dirs).
+                //    Since the BPF fix sends the file path, only case 1 and 2 should be hit for now.
             }
             Ok(())
         });
