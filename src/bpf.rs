@@ -9,7 +9,8 @@ use crate::metrics::{self, GLOBAL_BUFFER_LIMIT};
 use std::mem;
 use libbpf_rs::MapCore;
 use tracing::{info, warn, debug};
-use crate::ordering::ReorderBuffer; // New import
+use crate::ordering::ReorderBuffer; 
+use std::sync::Mutex; // Used for ReorderBuffer access
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -56,12 +57,15 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
 
     info!("BPF: Registering {} watched device(s)", queues.len());
     
-    // Initialize Ingress Reorder Buffers per Device
-    // This solves the architecture gap where sharded workers saw sequence gaps.
-    // Now reordering happens globally BEFORE sharding.
-    let mut reorder_buffers: HashMap<u32, ReorderBuffer> = HashMap::new();
-
-    for dev in queues.keys() {
+    // FIX: Borrow of moved value error E0382 for queues
+    // Clone queues before it is moved into the closure
+    let queues_in_closure = Arc::new(queues);
+    let queues_in_loop = queues_in_closure.clone();
+    
+    // FIX: Borrow of moved value error E0382 for reorder_buffers
+    let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
+    
+    for dev in queues_in_closure.keys() {
         let key = dev.to_ne_bytes();
         let val = 1u8;
         info!("BPF: Watching device 0x{:08x} ({})", dev, dev);
@@ -73,8 +77,11 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
         
         // 250ms gap jump, 64MB buffer limit for ingress reordering
-        reorder_buffers.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
+        reorder_buffers_map.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
     }
+    
+    let reorder_buffers = Arc::new(Mutex::new(reorder_buffers_map));
+    let reorder_buffers_in_closure = reorder_buffers.clone();
 
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
@@ -161,7 +168,7 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
                    event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino);
         }
 
-        if !queues.contains_key(&raw.dev) {
+        if !queues_in_closure.contains_key(&raw.dev) { // Use cloned Arc
             metrics::EVENTS_UNWATCHED.inc();
             return 0;
         }
@@ -175,8 +182,10 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             crate::metrics::SEQUENCE_GAPS.with_label_values(&[&raw.dev.to_string()]).inc();
             
             // Inject gap into buffer if possible, or just reset next_seq in ReorderBuffer
-            if let Some(buf) = reorder_buffers.get_mut(&raw.dev) {
-                buf.next_seq = raw.seq;
+            if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
+                if let Some(buf) = buffers.get_mut(&raw.dev) {
+                    buf.next_seq = raw.seq;
+                }
             }
         }
 
@@ -197,17 +206,19 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         });
 
         // Push to Reorder Buffer (Global Sequencing)
-        if let Some(buf) = reorder_buffers.get_mut(&raw.dev) {
-            if buf.push(evt) {
-                // Drain ordered events and dispatch
-                while let Some(ordered_evt) = buf.pop() {
-                    metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                    if let Some(qs) = queues.get(&ordered_evt.dev_id) {
-                        for q in qs { q.push(ordered_evt.clone()); }
+        if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
+            if let Some(buf) = buffers.get_mut(&raw.dev) {
+                if buf.push(evt) {
+                    // Drain ordered events and dispatch
+                    while let Some(ordered_evt) = buf.pop() {
+                        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                        if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) { // Use cloned Arc
+                            for q in qs { q.push(ordered_evt.clone()); }
+                        }
                     }
+                } else {
+                    metrics::EVENTS_DROPPED.inc();
                 }
-            } else {
-                metrics::EVENTS_DROPPED.inc();
             }
         }
         
@@ -224,11 +235,13 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
                 // Periodically check reorder buffers for stalls
-                for (_, buf) in reorder_buffers.iter_mut() {
-                    while let Some(ordered_evt) = buf.pop() {
-                        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                        if let Some(qs) = queues.get(&ordered_evt.dev_id) {
-                            for q in qs { q.push(ordered_evt.clone()); }
+                if let Ok(mut buffers) = reorder_buffers.lock() { // Use the original Arc
+                    for (_, buf) in buffers.iter_mut() {
+                        while let Some(ordered_evt) = buf.pop() {
+                            metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                            if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) { // Use the clone for the loop
+                                for q in qs { q.push(ordered_evt.clone()); }
+                            }
                         }
                     }
                 }
