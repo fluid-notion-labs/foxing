@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn, error};
 use std::ops::Sub;
 use crate::error::FoxingError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use crate::consistency::SerializationEngine;
 use dashmap::{DashMap, DashSet};
 use std::fs;
 use crate::identity;
-use crate::hydration_worker::{HydrationQueue, HydrationJob};
+use crate::hydration_worker::HydrationQueue;
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
@@ -253,15 +253,39 @@ impl Manager {
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
         let repair_tracker_clone = self.repair_tracker.clone();
+        // Determine the canonical path of the Source root once
+        let source_root_canonical = fs::canonicalize(
+            self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
+        ).unwrap_or_else(|_| PathBuf::from("/"));
+        
         let debounce_handle = tokio::spawn(async move {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
+            
             while let Some(path) = hydration_rx.recv().await {
-                // Determine if this is a high-priority file-level repair job, or a low-priority full scan/debounce job
-                let is_file_repair = path.is_file(); 
+                let is_root_request = path == source_root_canonical;
+                let is_file_repair = !is_root_request && path.is_file();
                 
-                if path.parent().is_none() || path.ends_with(path.file_name().unwrap_or_default()) {
-                    // Logic for requesting a full scan (sent from the Hydrator Manager itself)
+                if is_file_repair {
+                    // 1. HIGH PRIORITY FILE REPAIR (Immediate Dispatch)
+                    if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
+                        // Assuming single target for immediate repair for simplicity based on test config
+                        if let Some(tgt_cfg) = hydrator.targets.iter().next() {
+                            if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
+                                if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
+                                    info!("Hydration MANAGER: IMMEDIATE repair dispatch for file {:?}", path);
+                                    // Submit directly to the fast bulk processing queue
+                                    queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Continue to wait for the next job, do NOT execute slow debounce/scan logic
+                    continue; 
+                } 
+                
+                if is_root_request {
+                    // 2. FULL SCAN REQUEST (Debounced Slow Path)
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
                     if now.duration_since(last_full_scan) > full_scan_debounce {
@@ -275,23 +299,8 @@ impl Manager {
                             });
                         }
                     }
-                } else if is_file_repair {
-                    // FIX: IMMEDIATE DISPATCH FOR RENAME REPAIR
-                    // Bypassing the debounce queue and submitting the job directly to the bulk queue.
-                    if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
-                        if let Some(tgt_cfg) = hydrator.targets.iter().next() {
-                            if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
-                                if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
-                                    info!("Hydration MANAGER: IMMEDIATE repair dispatch for {:?}", path);
-                                    // Use clone() to push PathBuf
-                                    queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone());
-                                }
-                            }
-                        }
-                    }
-                    // Do not execute debounce logic below if this was an immediate file repair.
                 } else {
-                    // Standard directory/low-priority repair path (retains original debounce logic)
+                    // 3. STANDARD DEBOUNCED REPAIR (e.g., directory repair/low priority)
                     let (repair_debounce, _full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
                     
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {

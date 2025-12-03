@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Instant;
 use std::os::unix::fs::{MetadataExt, FileTypeExt};
 use walkdir::WalkDir;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, error, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 use crate::config::{TargetConfig};
 use crate::event::{Event, EventType};
@@ -48,6 +48,35 @@ impl Hydrator {
     }
     pub fn repair_path(&self, path: PathBuf) {
         debug!("Hydration: Targeted repair requested for {:?}", path);
+        
+        // 1. If the path is the old source path of a renamed file, we must find its new location.
+        if let Ok(metadata) = fs::metadata(&path) {
+            let inode = metadata.ino();
+            if metadata.is_file() {
+                // Perform aggressive lookup to find the file's current, correct relative path
+                match identity::resolve_and_update_path(&self.source.inode_map, &self.source.mount, inode) {
+                    Ok(new_rel_path) => {
+                        // The aggressive lookup found the true location! Dispatch the repair job.
+                        for target_cfg in &self.targets {
+                            if let Some(queue) = self.source.bulk_job_queue.lock().as_ref() {
+                                if let Some(stripped_path) = new_rel_path.strip_prefix(&self.source.mount).ok() {
+                                     // Strip source mount path before converting to string for relative path
+                                     queue.submit_job(stripped_path.to_path_buf(), target_cfg.clone());
+                                     info!("Hydration Fix: Dispatched repair for Inode {} at new path: {:?}", inode, stripped_path);
+                                     return;
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                         warn!("Hydration: Failed aggressive lookup for Inode {} (File: {:?}): {}", inode, path, e);
+                         // Fall through to original delete/process logic if lookup fails
+                    }
+                }
+            }
+        }
+        
+        // Original logic: Deletion or normal file processing if it still exists at that path
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
@@ -56,6 +85,8 @@ impl Hydrator {
              }
              return;
         }
+        
+        // If the aggressive lookup failed or it's a directory/non-file, proceed with normal path process
         if let Err(e) = self.process_path(&path, true, None) {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }
@@ -74,7 +105,7 @@ impl Hydrator {
             created_at: Instant::now(),
         };
         if let Err(_) = self.repair_txs[idx].try_send(Arc::new(evt)) {
-            warn!("Hydration: PRIORITY LANE FULL for deletion of {:?}. This implies extreme overload.", rel);
+            warn!("Hydration: Priority Lane FULL for deletion of {:?}. This implies extreme overload.", rel);
         }
     }
     pub fn full_scan(&self) {
@@ -235,7 +266,7 @@ impl Hydrator {
         };
         let idx = (rel.as_os_str().len()) % self.repair_txs.len();
         if let Err(_) = self.repair_txs[idx].try_send(Arc::new(evt)) {
-            warn!("Hydration: PRIORITY LANE FULL for deletion of {:?}. This implies extreme overload.", rel);
+            warn!("Hydration: Priority Lane FULL for deletion of {:?}. This implies extreme overload.", rel);
         }
     }
     fn sync_symlink(&self, src_path: &Path, rel: &Path, _m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<()> {
