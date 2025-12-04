@@ -32,7 +32,6 @@ use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 use crate::mirror::SourceInfo;
 use std::os::unix::fs::MetadataExt;
-
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
 impl Clone for HydrationSender {
@@ -40,7 +39,6 @@ impl Clone for HydrationSender {
         HydrationSender(self.0.clone())
     }
 }
-
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -63,7 +61,6 @@ impl ShardedLockCache {
         self.get(hasher.finish())
     }
 }
-
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
@@ -75,7 +72,6 @@ struct WorkerContext<'a> {
     _cur_cap_total: u64,
     daemon_id: &'a str,
 }
-
 fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_bytes: usize) -> Result<BufferPool> {
     let mut pool = BufferPool::new(num_buffers, chunk_size_bytes);
     let iovs = pool.as_io_vecs();
@@ -85,7 +81,6 @@ fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_byt
     }
     Ok(pool)
 }
-
 fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     if ring.submitter().unregister_buffers().is_err() {
         error!("Failed to unregister io_uring buffers.");
@@ -93,7 +88,6 @@ fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     }
     Ok(())
 }
-
 pub async fn run_worker(
     mut rx_main: mpsc::Receiver<Arc<Event>>,
     source: Arc<SourceInfo>,
@@ -112,69 +106,59 @@ pub async fn run_worker(
     let is_control_plane = worker_id == 0;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
-
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
-            let dev = source.dev; 
+            let dev = source.dev;
             info!("Worker 0: Seeding Root Identity for {:?} -> Inode {} (Dev {})", source.path, inode, dev);
             identity::update_map(
-                &source.inode_map, 
-                &source.dir_map, 
-                dev, 
-                inode, 
-                PathBuf::from(""), 
-                0, 
-                false, 
-                true, 
-                0, 
+                &source.inode_map,
+                &source.dir_map,
+                dev,
+                inode,
+                PathBuf::from(""),
+                0,
+                false,
+                true,
+                0,
                 0
             );
         } else {
             warn!("Worker 0: Failed to stat source root {:?}. Root identity will be missing!", source.path);
         }
     }
-
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
-
     let mut tuner = BbrTuner::new(&target_cfg);
     let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
-
     let mut ring = match IoUring::new(ring_depth) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
     };
-
     let config_reader = config.read().await;
     let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
     let capacity_threshold_mb = config_reader.capacity_threshold_mb;
     let force_flush_base_secs = config_reader.force_flush_interval_secs;
-    
     let total_workers = config_reader.worker_count.max(1);
     let global_limit_mib = config.read().await.global_buffer_limit;
     let total_worker_mem_limit_mib = global_limit_mib * 3 / 10;
     let worker_mem_limit_mib = total_worker_mem_limit_mib / total_workers as u64;
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let initial_num_buffers = current_max_buffers.min(target_cfg.batch_size);
-
     drop(config_reader);
-
     let mut buffer_pool = match initialize_buffer_pool(&mut ring, initial_num_buffers, buffer_chunk_size_bytes) {
         Ok(pool) => pool,
         Err(e) => return Err(e),
     };
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
-
     info!("Worker {}: BufferPool initialized with {} x {}MB chunks.", worker_id, buffer_pool.capacity(), buffer_chunk_size_mib);
-
     let limiter = ErrorLimiter::new();
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
@@ -182,11 +166,9 @@ pub async fn run_worker(
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
-
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
     let _last_dropped_check = 0.0;
-    
     let _result: Result<()> = loop {
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
@@ -194,7 +176,6 @@ pub async fn run_worker(
                  is_hibernating = true;
              }
         }
-        
         if is_hibernating {
              tokio::select! {
                 _ = shutdown_rx.recv() => break Ok(()),
@@ -202,14 +183,12 @@ pub async fn run_worker(
                 Some(_) = rx_main.recv() => { continue; }
              }
         }
-
         if !is_control_plane && !shutdown_requested {
              if let Some(delay) = failure_state.next_retry_delay() {
                  sleep(delay).await;
                  continue;
              }
         }
-
         let event_poll_result = if !shutdown_requested {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -237,7 +216,6 @@ pub async fn run_worker(
                     let max_pending = target_cfg.queue_max;
                     let target_label = target_cfg.path.to_string_lossy().to_string();
                     let bytes_processed = 0;
-                    
                     let recommended_depth = tuner.tune(
                         tuner_tick_start.elapsed().as_secs_f64(),
                         bytes_processed,
@@ -248,11 +226,9 @@ pub async fn run_worker(
                         &target_label,
                         buffer_pool.chunk_size() as u64
                     );
-
                     if !is_control_plane && recommended_depth != buffer_pool.capacity() {
                         // Resizing logic omitted
                     }
-
                     let path_clone = target_cfg.path.clone();
                     let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
                     if last_capacity_check.elapsed() >= cap_check_interval {
@@ -265,7 +241,6 @@ pub async fn run_worker(
                             metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
                         }
                     }
-
                     if !is_hibernating {
                         let now = Instant::now();
                         let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
@@ -293,7 +268,6 @@ pub async fn run_worker(
             let repair_event = if let Some(rx) = &mut rx_repair {
                 rx.try_recv().ok()
             } else { None };
-
             if let Some(e) = repair_event {
                 Some(e)
             } else {
@@ -306,7 +280,6 @@ pub async fn run_worker(
                 }
             }
         };
-
         if let Some(event_ptr) = event_poll_result {
             if matches!(event_ptr.event_type, EventType::Rename) {
                 let src_clone = source.clone();
@@ -370,9 +343,9 @@ pub async fn run_worker(
                     let inode_map_clone = src_clone.inode_map.clone();
                     let lookup_task = tokio::task::spawn_blocking(move || {
                         match identity::resolve_and_update_path(
-                            &inode_map_clone, 
-                            &dir_map_clone, 
-                            &src_clone.mount, 
+                            &inode_map_clone,
+                            &dir_map_clone,
+                            &src_clone.mount,
                             e_inode,
                             e_generation,
                             e_ts,
@@ -414,10 +387,8 @@ pub async fn run_worker(
             if coalescer.is_empty() {
                 break Ok(());
             }
-        } 
-        
+        }
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
-        
         let effective_batch_size = if shutdown_requested {
             256
         } else if is_control_plane {
@@ -425,7 +396,6 @@ pub async fn run_worker(
         } else {
             tuner.current_batch_size
         };
-
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
@@ -444,7 +414,6 @@ pub async fn run_worker(
             }
             batch
         };
-
         for e in events_to_process_raw {
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
@@ -461,7 +430,6 @@ pub async fn run_worker(
                 daemon_id: &daemon_id,
             };
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
-            
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -470,7 +438,6 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
-            
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
             let op_kind = match e.event_type {
@@ -490,11 +457,9 @@ pub async fn run_worker(
             ).await;
         }
     };
-    
     let _ = unregister_buffers(&mut ring);
     Ok(())
 }
-
 async fn process_single_event_inner(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -529,32 +494,8 @@ async fn process_single_event_inner(
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
-                        // Fix #14: Pass is_synthetic correctly to update_map to prevent cache poisoning
-                        // When creating a synthetic placeholder, is_synthetic = true.
-                        // But here we are creating the FILE on the target. 
-                        // The 'dst_clone' passed here is the synthetic path (e.g. .mirror/.by-identity/...)
-                        // But 'rel' is stripped from target_cfg.path, so 'rel' is ".mirror/.by-identity/..."
-                        // If we pass is_synthetic = true to update_map, it will NOT update the map (which is what we want).
-                        // However, the original code passed 'false', effectively saying "This weird path is the real path of the inode".
-                        
-                        // Correction: We ONLY update the map here if we managed to deduce a real path. 
-                        // But if 'dst' is synthetic, 'rel' is also synthetic. 
-                        // So we should pass is_synthetic = true here to PREVENT updating the map with garbage.
-                        
-                        // Wait, why update the map at all if it's synthetic?
-                        // Because if we later rename it, we need to know it exists?
-                        // No, the map tracks the SOURCE path. 
-                        // If we register ".mirror/.by-identity/..." as the source path for inode X,
-                        // then a rename of inode X will try to rename FROM ".mirror/.by-identity/...", which is correct on the TARGET.
-                        
-                        // BUT, the issue is 'resolve_directory' uses the map to find PARENTS.
-                        // If a directory inode gets mapped to ".mirror/.by-identity/...", then children will be resolved to that base.
-                        // Real children are NOT in ".mirror/.by-identity/...", they are in the real tree.
-                        // So a directory must NEVER be mapped to a synthetic path in the DirMap.
-                        
-                        // Identity::update_map has logic: if !is_synthetic { cache.put(...) }
-                        // So by passing 'true' here, we prevent the cache pollution.
-                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, true, false, e_ts, e_seq);
+                        // CORRECTED: Use actual is_synthetic value from resolve_target to avoid cache poisoning
+                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, is_synthetic, false, e_ts, e_seq);
                     }
                     Ok(())
                 },
@@ -654,15 +595,13 @@ async fn process_single_event_inner(
         EventType::Rename => {
             if let Some(new_name_str) = &e.new_name {
                 let mut old_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) };
-                
                 if e.parent_inode != 0 {
                     let mut old_parent_opt = identity::resolve_directory(
-                        &source.dir_map, 
-                        &source.inode_map, 
-                        e.dev_id, 
+                        &source.dir_map,
+                        &source.inode_map,
+                        e.dev_id,
                         e.parent_inode
                     );
-                    
                     if old_parent_opt.is_none() {
                          let src_clone_lookup = source.clone();
                          let parent_ino = e.parent_inode;
@@ -676,30 +615,25 @@ async fn process_single_event_inner(
                                  0, 0, 0
                              );
                          }).await;
-                         
                          old_parent_opt = identity::resolve_directory(
-                             &source.dir_map, 
-                             &source.inode_map, 
-                             e.dev_id, 
+                             &source.dir_map,
+                             &source.inode_map,
+                             e.dev_id,
                              e.parent_inode
                          );
                     }
-
                     if let Some(parent) = old_parent_opt {
                         old_dst_final = target_cfg.path.join(parent).join(&e.name);
                     }
                 }
-                
                 let mut new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
-                
                 if e.new_parent_inode != 0 {
                     let mut new_parent_path_opt = identity::resolve_directory(
-                        &source.dir_map, 
-                        &source.inode_map, 
-                        e.dev_id, 
+                        &source.dir_map,
+                        &source.inode_map,
+                        e.dev_id,
                         e.new_parent_inode
                     );
-                    
                     if new_parent_path_opt.is_none() {
                         let src_clone_lookup = source.clone();
                         let parent_ino = e.new_parent_inode;
@@ -713,15 +647,13 @@ async fn process_single_event_inner(
                                  0, 0, 0
                              );
                         }).await;
-                        
                         new_parent_path_opt = identity::resolve_directory(
-                            &source.dir_map, 
-                            &source.inode_map, 
-                            e.dev_id, 
+                            &source.dir_map,
+                            &source.inode_map,
+                            e.dev_id,
                             e.new_parent_inode
                         );
                     }
-                    
                     if let Some(parent_rel) = new_parent_path_opt {
                         new_dst_final = target_cfg.path.join(parent_rel).join(new_name_str);
                     } else {
@@ -734,12 +666,10 @@ async fn process_single_event_inner(
                         new_dst_final = old_parent.join(new_name_str);
                     }
                 }
-
                 if old_dst_final == new_dst_final {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst_final);
                     return Ok(None);
                 }
-
                 let old_dst_clone = old_dst_final.clone();
                 let target_cfg_path_clone = target_cfg.path.clone();
                 let new_dst_for_rename_clone = new_dst_final.clone();
