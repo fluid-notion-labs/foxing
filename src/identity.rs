@@ -44,13 +44,15 @@ pub fn update_map(map: &InodeMap, dir_map: &DirMap, dev: u32, inode: u64, path: 
     let mut cache = map.lock();
     let key = (dev, inode);
     
-    // Check seq ordering if entry exists
+    // Fix for Hydration vs Live Event race:
+    // If cache has a Hydration Entry (TS=MAX), we MUST allow the Live Event to overwrite it
+    // because the Live Event has the authoritative generation/path for the current point in time.
+    // Otherwise, stale hydration data blocks new 'Create' events, leading to Identity Mismatch later.
     if let Some(entry) = cache.get(&key) {
-        if entry.timestamp_ns > ts {
-            return;
-        }
-        if entry.timestamp_ns == ts && entry.seq_num >= seq {
-            return;
+        let is_hydration = entry.timestamp_ns == u64::MAX;
+        if !is_hydration {
+            if entry.timestamp_ns > ts { return; }
+            if entry.timestamp_ns == ts && entry.seq_num >= seq { return; }
         }
     }
 
@@ -68,13 +70,11 @@ pub fn update_map_after_rename(map: &InodeMap, dir_map: &DirMap, dev: u32, inode
     let mut cache = map.lock();
     let key = (dev, inode);
 
-    // Check seq ordering if entry exists
     if let Some(entry) = cache.get(&key) {
-        if entry.timestamp_ns > ts {
-            return;
-        }
-        if entry.timestamp_ns == ts && entry.seq_num >= seq {
-            return;
+        let is_hydration = entry.timestamp_ns == u64::MAX;
+        if !is_hydration {
+            if entry.timestamp_ns > ts { return; }
+            if entry.timestamp_ns == ts && entry.seq_num >= seq { return; }
         }
     }
 
