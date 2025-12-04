@@ -30,8 +30,7 @@ use std::time::{Instant, Duration};
 use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
-use crate::mirror::SourceInfo; // Canonical SourceInfo is imported
-
+use crate::mirror::SourceInfo;
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -257,7 +256,6 @@ pub async fn run_worker(
         };
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
-
         // START CRITICAL RENAME IDENTITY FIX
         // The worker must update the identity map *before* resolving the target path,
         // as the cached path for the inode might be stale (pointing to the old name).
@@ -267,56 +265,67 @@ pub async fn run_worker(
             let e_generation = event_ptr.generation;
             let new_parent_inode = event_ptr.new_parent_inode;
             let new_name = event_ptr.new_name.clone();
+            
+            // NEW: Validate BPF data completeness BEFORE lookup
+            let has_complete_bpf_data = new_parent_inode != 0 && new_name.is_some();
 
             let lookup_task = tokio::task::spawn_blocking(move || {
-                // Case 1: BPF data is complete (best case)
-                if new_parent_inode != 0 && new_name.is_some() {
+                // Alias the inner success type to avoid repetition
+                type InnerResult = std::result::Result<PathBuf, std::io::Error>;
+
+                if has_complete_bpf_data {
+                    // Case 1: BPF data is complete (best case)
                     let new_name_str = new_name.as_ref().unwrap();
                     let mut cache = src_clone.inode_map.lock();
                     let new_rel_path = if let Some((parent_path, _)) = cache.get(&new_parent_inode) {
                         parent_path.join(new_name_str)
                     } else {
+                        // Fallback to name if parent isn't known, usually indicating a path relative to mount root
                         PathBuf::from(new_name_str)
                     };
                     identity::update_map_after_rename(&src_clone.inode_map, e_inode, new_rel_path.clone(), e_generation);
-                    return Ok(());
+                    // Explicit type annotation added here to resolve E0282
+                    return Ok::<InnerResult, tokio::task::JoinError>(Ok(new_rel_path)); 
                 }
 
-                // Case 2: BPF data incomplete (needs aggressive lookup)
+                // Case 2: BPF data incomplete - DO NOT UPDATE MAP HERE
+                // Just resolve current location for logging/next step
                 match identity::resolve_and_update_path(&src_clone.inode_map, &src_clone.mount, e_inode) {
-                    Ok(new_source_path_rel) => {
-                        // Successfully found the file's new location on the source
-                        identity::update_map_after_rename(&src_clone.inode_map, e_inode, new_source_path_rel, e_generation);
-                        Ok(())
+                    Ok(current_path) => {
+                        // Found it. We update the map with the post-rename location.
+                        // This prevents subsequent logic from using the old, pre-rename name.
+                        identity::update_map_after_rename(&src_clone.inode_map, e_inode, current_path.clone(), e_generation);
+                        warn!("RENAME: BPF data incomplete for inode {}. Aggressive lookup found it at {:?}, updating map.",
+                              e_inode, current_path);
+                        Ok(Ok(current_path)) // Double Ok for success
                     },
-                    Err(_) => {
-                        // File not found (likely deleted or moved outside the source root)
-                        Err(io::Error::new(io::ErrorKind::NotFound, "Inode not found after aggressive search."))
+                    Err(e) => {
+                         warn!("RENAME: BPF data incomplete for inode {}. Aggressive lookup failed: {:?}", e_inode, e);
+                         Ok(Err(e)) // Outer Ok, Inner Err for IO failure
                     }
                 }
             });
-
             match lookup_task.await {
-                Ok(Ok(_)) => {
-                    // Map successfully updated with the NEW path, proceed to process the rename op (which will correctly use the new path)
+                Ok(Ok(_new_path)) => {
+                    // Success: map was updated in the task (either by BPF data or aggressive lookup)
                 }
                 Ok(Err(e)) => {
-                    warn!("Worker {}: RENAME identity lookup failed for Inode {} ({:?}). Assuming eventual cleanup/deletion.", worker_id, e_inode, e);
-                    continue; // Skip processing this RENAME operation if we can't determine the new identity.
+                    // Inner IO error (e: std::io::Error)
+                    warn!("Worker {}: RENAME identity fix failed for Inode {} ({:?}). Skipping event to avoid corruption.",
+                          worker_id, e_inode, e);
+                    continue; // Skip this event entirely
                 }
                 Err(e) => {
-                    error!("Worker {}: Join error during RENAME identity lookup: {:?}", worker_id, e);
+                    // Outer Join error (e: tokio::task::JoinError)
+                    warn!("Worker {}: Join error during RENAME identity lookup for Inode {} ({:?}). Skipping event to avoid corruption.",
+                          worker_id, e_inode, e);
                     continue;
                 }
             }
         }
-        // END CRITICAL RENAME IDENTITY FIX
-
-        // Push to local coalescing buffer
         coalescer.push(event_ptr.clone());
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if is_control_plane {
-            // Control plane is latency-optimized (Batch=1) unless severely backed up.
             if coalescer.len() > 100 { 16 } else { 1 }
         } else {
             tuner.current_batch_size
@@ -325,8 +334,6 @@ pub async fn run_worker(
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
                 if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
-                    // Critical structural metadata events (Rename, Fsync, Barrier) must be processed
-                    // immediately if they follow bulk data, even if the batch size isn't met.
                     if is_control_plane && matches!(e.event_type, EventType::Rename | EventType::Fsync | EventType::Barrier) && !batch.is_empty() {
                         batch.push(e);
                         break;
@@ -352,7 +359,6 @@ pub async fn run_worker(
                 cur_cap_avail,
                 cur_cap_total,
             };
-            // resolve_target now uses the updated path from the map (if it was a RENAME event)
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
@@ -364,11 +370,10 @@ pub async fn run_worker(
             };
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
-            // GLOBAL BARRIER: Strict Consistency
             let op_kind = match e.event_type {
                 EventType::Rename | EventType::Mkdir | EventType::Rmdir |
-                EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename, // Exclusive
-                _ => OpKind::Write, // Shared
+                EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
+                _ => OpKind::Write,
             };
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
             let _ = process_single_event_inner(
@@ -537,42 +542,32 @@ async fn process_single_event_inner(
                 // The correct *destination* path is now `dst` because the map was pre-updated.
                 // Determine the original (old) target path from the event's name field
                 let old_dst = target_cfg.path.join(e.name.trim_start_matches('/'));
-                let new_dst = dst.to_path_buf(); // This is the final new path from resolve_target
-
+                let new_dst = dst.to_path_buf();
+                
+                // This check is the validation that the fix targeted:
                 if old_dst == new_dst {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
                     return Ok(None);
                 }
-
+                
                 if let Some(p) = new_dst.parent() {
                     if !p.exists() {
                         let _ = tokio::task::spawn_blocking({ let p = p.to_path_buf(); move || std::fs::create_dir_all(p) }).await;
                     }
                 }
-
-                // Clone needed because new_dst is used outside the closure (line 567)
                 let new_dst_for_rename = new_dst.clone();
-
-                // If the old path exists and is not the new path, perform the atomic rename.
                 if old_dst.exists() {
                     let res = tokio::task::spawn_blocking(move || {
-                        // old_dst is captured by move here, which is fine since it's not used later.
                         atomic_rename(&old_dst, &new_dst_for_rename).map_err(FoxingError::Io)
                     }).await.map_err(FoxingError::Join).and_then(|r| r);
-
                     metrics::RENAME_EVENTS.inc();
-
                     if res.is_err() {
                         return res.map(|_| None);
                     }
                 } else {
                     debug!("Worker {}: Old target path for RENAME event {:?} does not exist. Skipping atomic rename.", worker_id, old_dst);
                 }
-                
-                // Update dirty stats with the new path
-                // new_dst is available here because new_dst_for_rename (a clone) was moved.
                 if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
-
                 return Ok(None);
             } else { return Ok(None); }
         },
@@ -604,7 +599,6 @@ async fn process_single_event_inner(
             let file_size_res = tokio::task::spawn_blocking(move || std::fs::metadata(&dst_clone_for_metadata).map(|m| m.len())).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
             match file_size_res {
                 Ok(0) => {
-                    // Wal fix for Empty File Corruption Race: skip commit and clear dirty state
                     if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) {
                         entry.expected_state = ExpectedState::None;
                         let dst_clone = dst.clone();
