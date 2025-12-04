@@ -31,6 +31,7 @@ use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 use crate::mirror::SourceInfo;
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
@@ -111,6 +112,32 @@ pub async fn run_worker(
     let is_control_plane = worker_id == 0;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
+
+    // Seed Root Inode Identity (Fixes synthetic path fallback for root operations)
+    if is_control_plane {
+        if let Ok(meta) = std::fs::metadata(&source.path) {
+            let inode = meta.ino();
+            // We assume the primary dev ID for the source path. 
+            // Note: If the source path spans mounts, this might need refinement, 
+            // but for the root, it is always the primary dev.
+            let dev = source.dev; 
+            info!("Worker 0: Seeding Root Identity for {:?} -> Inode {} (Dev {})", source.path, inode, dev);
+            identity::update_map(
+                &source.inode_map, 
+                &source.dir_map, 
+                dev, 
+                inode, 
+                PathBuf::from(""), 
+                0, // Generation 0 for root
+                false, 
+                true, // is_dir
+                0, 
+                0
+            );
+        } else {
+            warn!("Worker 0: Failed to stat source root {:?}. Root identity will be missing!", source.path);
+        }
+    }
 
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
@@ -387,10 +414,7 @@ pub async fn run_worker(
                 break Ok(());
             }
         } 
-        // REMOVED: else { continue; } 
-        // FIX: If event_poll_result is None (due to flush_interval tick), we MUST fall through 
-        // to Process Batch below to allow coalescer to drain based on time/tuner logic.
-
+        
         // Process Batch
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         
@@ -610,6 +634,7 @@ async fn process_single_event_inner(
             if let Some(new_name_str) = &e.new_name {
                 let old_dst = target_cfg.path.join(e.name.trim_start_matches('/'));
                 
+                // Construct new destination path explicitly using BPF data to avoid synthetic fallbacks
                 let new_dst = if e.new_parent_inode != 0 {
                     let new_parent_path_opt = identity::resolve_directory(
                         &source.dir_map, 
@@ -621,6 +646,7 @@ async fn process_single_event_inner(
                     if let Some(parent_rel) = new_parent_path_opt {
                         target_cfg.path.join(parent_rel).join(new_name_str)
                     } else {
+                        // Fallback: assume same directory as old file if parent resolution fails
                         if let Some(old_parent) = old_dst.parent() {
                             old_parent.join(new_name_str)
                         } else {
@@ -628,6 +654,7 @@ async fn process_single_event_inner(
                         }
                     }
                 } else {
+                    // No new parent provided, assume same directory
                     if let Some(old_parent) = old_dst.parent() {
                         old_parent.join(new_name_str)
                     } else {
@@ -635,6 +662,7 @@ async fn process_single_event_inner(
                     }
                 };
 
+                // Check for idempotent / redundant renames
                 if old_dst == new_dst {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
                     return Ok(None);
@@ -690,6 +718,7 @@ async fn process_single_event_inner(
                             Ok(rel) => rel.to_path_buf(),
                             Err(_) => new_dst.to_path_buf(),
                         };
+                        // Update identity map with new path to prevent future lookups failing
                         identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, is_dir, e_ts, e_seq);
                     },
                     Err(FoxingError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {
