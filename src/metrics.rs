@@ -4,7 +4,6 @@ use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Registry,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64};
-
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
     pub static ref EVENTS_TOTAL: CounterVec = register_counter_vec!(
@@ -28,6 +27,10 @@ lazy_static! {
     pub static ref EVENTS_UNWATCHED: Counter = register_counter!(
         "foxing_events_unwatched",
         "Events received for devices not currently watched"
+    ).unwrap();
+    pub static ref BPF_RENAME_INCOMPLETE_DATA: Counter = register_counter!(
+        "foxing_bpf_rename_incomplete_data",
+        "Rename events delivered by BPF lacking new_parent_inode or new_name."
     ).unwrap();
     pub static ref SEQUENCE_GAPS: CounterVec = register_counter_vec!(
         "foxing_sequence_gaps_total",

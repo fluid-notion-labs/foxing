@@ -25,12 +25,14 @@
 #ifndef ATTR_CTIME
 #define ATTR_CTIME  64
 #endif
-
 struct kprojid_t___p { int val; };
 struct inode___p { struct kprojid_t___p i_projid; } __attribute__((preserve_access_index));
 struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
 struct xfs_mount { struct super_block *m_super; } __attribute__((preserve_access_index));
 struct xfs_trans { struct xfs_mount *t_mountp; } __attribute__((preserve_access_index));
+
+// --- Removed manual struct definitions (renamedata) to resolve E0282 redefinition error. ---
+
 enum event_type {
     EVENT_WRITE=1, EVENT_WRITE_RANGE=2, EVENT_SETXATTR=3, EVENT_REMOVEXATTR=4,
     EVENT_RMDIR=5, EVENT_FSYNC=6, EVENT_RENAME=7, EVENT_CREATE=8, EVENT_UNLINK=9,
@@ -56,7 +58,7 @@ struct event {
     char new_name[MAX_FILENAME];
     char comm[16];
 };
-struct stats { __u64 events_submitted; __u64 events_dropped; __u64 write_events; __u64 metadata_events; };
+struct stats { __u64 events_submitted; __u64 events_dropped; __u64 write_events; __u64 metadata_events; __u64 incomplete_rename; };
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64); __type(key, __u32); __type(value, __u64); } device_seq SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64); __type(key, __u32); __type(value, __u8); } watched_devs SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16); __type(key, __u32); __type(value, __u8); } ignored_pids SEC(".maps");
@@ -167,83 +169,83 @@ SEC("kprobe/vfs_fsync") int BPF_KPROBE(trace_vfs_fsync, struct file *file, loff_
     return submit_event(BPF_CORE_READ(file, f_inode), BPF_CORE_READ(file, f_path.dentry), EVENT_FSYNC, 0, 0, 0);
 }
 
-// Fixed Rename Probe: RAW OFFSET READ
-// Bypasses BTF/CO-RE field lookup failures by manually calculating offsets.
+// CO-RE Migration for vfs_rename
+// Function signature uses struct renamedata* rd which relies on BTF
 SEC("kprobe/vfs_rename")
-int BPF_KPROBE(trace_rename, __u64 arg1, __u64 arg2) {
-    // Priority: Try Arg1 first (Modern Kernel 5.12+)
-    // Assume arg1 points to renamedata struct base
-    __u64 rd_ptr = arg1; 
+int BPF_KPROBE(trace_rename, struct renamedata *rd) {
+    // CO-RE Read: Get source dentry (old name/path)
+    struct dentry *old_dentry = BPF_CORE_READ(rd, old_dentry);
+    if (!old_dentry) return 0;
+
+    struct inode *inode = BPF_CORE_READ(old_dentry, d_inode);
+    if (!inode) return 0;
     
-    // Read old_dentry from offset 16 (pointer index 2)
-    // struct layout: [0: old_mnt_idmap][8: old_dir][16: old_dentry]...
-    struct dentry *old = 0;
-    bpf_probe_read_kernel(&old, sizeof(old), (void *)(rd_ptr + 16));
+    if (is_ignored_pid()) return 0;
     
-    struct inode *inode = BPF_CORE_READ(old, d_inode);
-
-    // Fallback: If Arg1 yielded nothing, try Arg2 (Legacy/Distro-Specific)
-    if (!inode) {
-        rd_ptr = arg2;
-        bpf_probe_read_kernel(&old, sizeof(old), (void *)(rd_ptr + 16));
-        inode = BPF_CORE_READ(old, d_inode);
-    }
-
-    if(!inode) return 0;
-
     struct super_block *sb = BPF_CORE_READ(inode, i_sb);
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
+    
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
     
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
+
     __builtin_memset(e, 0, sizeof(*e));
-    
+
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct signal_struct *signal = BPF_CORE_READ(task, signal);
     struct tty_struct *tty = BPF_CORE_READ(signal, tty);
     e->interactive = (tty != NULL) ? 1 : 0;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    
+
     e->type = EVENT_RENAME; e->version = EVENT_VERSION; e->dev_id = dev_id;
     e->seq_num = next_seq(dev_id); e->timestamp_ns = bpf_ktime_get_ns();
     e->inode = BPF_CORE_READ(inode, i_ino); e->generation = BPF_CORE_READ(inode, i_generation);
-    
-    struct dentry *op = BPF_CORE_READ(old, d_parent);
+
+    // 1. Old Parent Inode
+    struct dentry *op = BPF_CORE_READ(old_dentry, d_parent);
     if (op) e->parent_inode = BPF_CORE_READ(op, d_inode, i_ino);
-    
-    const unsigned char *old_name_ptr = BPF_CORE_READ(old, d_name.name);
+
+    // 2. Old Name
+    const unsigned char *old_name_ptr = BPF_CORE_READ(old_dentry, d_name.name);
     bpf_core_read_str(&e->name, sizeof(e->name), (const char *)old_name_ptr);
+
+    // 3. New Dentry (new name/path)
+    struct dentry *new_dentry = BPF_CORE_READ(rd, new_dentry);
     
-    // PRIMARY PATH: Read new_dir directly using offset 32 (pointer index 4)
-    // struct layout: ... [24: new_mnt_idmap][32: new_dir][40: new_dentry]
-    struct inode *new_dir = 0;
-    bpf_probe_read_kernel(&new_dir, sizeof(new_dir), (void *)(rd_ptr + 32));
+    __u64 new_parent_ino = 0;
     
-    if (new_dir) {
-        e->new_parent_inode = BPF_CORE_READ(new_dir, i_ino);
-    } else {
-        // SECONDARY PATH: Read new_dentry (Offset 40) -> d_parent
-        struct dentry *new_d = 0;
-        bpf_probe_read_kernel(&new_d, sizeof(new_d), (void *)(rd_ptr + 40));
-        struct dentry *new_p = BPF_CORE_READ(new_d, d_parent);
+    // --- Removed conditional rd->new_dir access to fix compilation ---
+
+    if (new_dentry) {
+        // New Name
+        const unsigned char *new_name_ptr = BPF_CORE_READ(new_dentry, d_name.name);
+        bpf_core_read_str(&e->new_name, sizeof(e->new_name), (const char *)new_name_ptr);
+        
+        // Populate New Parent Inode via dentry parent (d_parent). This is the safest way.
+        // This relies on the kernel updating new_dentry->d_parent correctly, which is standard behavior
+        // during rename/move, and serves as our primary way to retrieve the new parent directory.
+        struct dentry *new_p = BPF_CORE_READ(new_dentry, d_parent);
         struct inode *new_p_inode = BPF_CORE_READ(new_p, d_inode);
         if (new_p_inode) {
-            e->new_parent_inode = BPF_CORE_READ(new_p_inode, i_ino);
+            new_parent_ino = BPF_CORE_READ(new_p_inode, i_ino);
         }
     }
+
+    e->new_parent_inode = new_parent_ino;
     
-    // Read new_dentry from offset 40
-    struct dentry *new = 0;
-    bpf_probe_read_kernel(&new, sizeof(new), (void *)(rd_ptr + 40));
-    const unsigned char *new_name_ptr = BPF_CORE_READ(new, d_name.name);
-    bpf_core_read_str(&e->new_name, sizeof(e->new_name), (const char *)new_name_ptr);
+    // RENAME INCOMPLETE DATA METRIC
+    // If we could not determine the new parent OR the new name, the event is 'incomplete'.
+    // The worker relies heavily on new_parent_inode for target resolution.
+    if (e->new_parent_inode == 0 || e->new_name[0] == 0) {
+        __u32 z=0; struct stats *s = bpf_map_lookup_elem(&statistics, &z);
+        if (s) __sync_fetch_and_add(&s->incomplete_rename, 1);
+    }
     
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
-
 SEC("kprobe/vfs_create") int BPF_KPROBE(trace_create_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
 SEC("kretprobe/vfs_create") int BPF_KRETPROBE(trace_create_exit, int ret) { return process_stashed_dentry(ret, EVENT_CREATE); }
 SEC("kprobe/vfs_mkdir") int BPF_KPROBE(trace_mkdir_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
