@@ -529,7 +529,32 @@ async fn process_single_event_inner(
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
-                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
+                        // Fix #14: Pass is_synthetic correctly to update_map to prevent cache poisoning
+                        // When creating a synthetic placeholder, is_synthetic = true.
+                        // But here we are creating the FILE on the target. 
+                        // The 'dst_clone' passed here is the synthetic path (e.g. .mirror/.by-identity/...)
+                        // But 'rel' is stripped from target_cfg.path, so 'rel' is ".mirror/.by-identity/..."
+                        // If we pass is_synthetic = true to update_map, it will NOT update the map (which is what we want).
+                        // However, the original code passed 'false', effectively saying "This weird path is the real path of the inode".
+                        
+                        // Correction: We ONLY update the map here if we managed to deduce a real path. 
+                        // But if 'dst' is synthetic, 'rel' is also synthetic. 
+                        // So we should pass is_synthetic = true here to PREVENT updating the map with garbage.
+                        
+                        // Wait, why update the map at all if it's synthetic?
+                        // Because if we later rename it, we need to know it exists?
+                        // No, the map tracks the SOURCE path. 
+                        // If we register ".mirror/.by-identity/..." as the source path for inode X,
+                        // then a rename of inode X will try to rename FROM ".mirror/.by-identity/...", which is correct on the TARGET.
+                        
+                        // BUT, the issue is 'resolve_directory' uses the map to find PARENTS.
+                        // If a directory inode gets mapped to ".mirror/.by-identity/...", then children will be resolved to that base.
+                        // Real children are NOT in ".mirror/.by-identity/...", they are in the real tree.
+                        // So a directory must NEVER be mapped to a synthetic path in the DirMap.
+                        
+                        // Identity::update_map has logic: if !is_synthetic { cache.put(...) }
+                        // So by passing 'true' here, we prevent the cache pollution.
+                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, true, false, e_ts, e_seq);
                     }
                     Ok(())
                 },
