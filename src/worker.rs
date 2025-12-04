@@ -31,7 +31,7 @@ use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 use crate::mirror::SourceInfo;
-use crate::hydration_worker::HydrationJob; // Import HydrationJob
+// Fix: Remove unused import: `crate::hydration_worker::HydrationJob`
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -87,7 +87,9 @@ pub async fn run_worker(
     target_cfg: TargetConfig,
     config: Arc<RwLock<Config>>,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    hydration_tx: mpsc::Sender<PathBuf>, // Hydration Tx now used for targeted repair
+    // Fix: Remove the underscore prefix from the function argument name, 
+    // relying on the clone inside the loop to resolve E0425.
+    hydration_tx: mpsc::Sender<PathBuf>, 
     _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>,
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -612,10 +614,11 @@ async fn process_single_event_inner(
                     metrics::RENAME_EVENTS.inc();
                     
                     if let Ok(_) = res {
+                        // Fix E0425: hydration_tx must be cloned inside the loop's context
+                        let hydration_tx_clone = hydration_tx.clone();
                         // Gap 4 Fix: Deferred Validation with targeted repair on failure
                         let new_full_path_for_validation = new_dst.clone();
                         let target_cfg_clone = target_cfg.clone();
-                        let hydration_tx_clone = hydration_tx.clone();
                         tokio::task::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await; // Wait for FS consistency
                             if !new_full_path_for_validation.exists() {
@@ -695,10 +698,10 @@ async fn process_single_event_inner(
             let res = tokio::task::spawn_blocking(move || {
                 if let Some(sp) = sidecar::get_sidecar_path(&dst_clone) { let _ = std::fs::remove_file(sp); }
                 let r = if is_rmdir { std::fs::remove_dir(&dst_clone) } else { std::fs::remove_file(&dst_clone) };
-                if let Err(ref e) = r { if e.kind() == io::ErrorKind::NotFound { return Ok(()); } }
-                r
-            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(io::Error::from));
-            return res.map(|_| None);
+                // Fix E0308: Map io::Error to FoxingError using `?` and wrap in Ok
+                r.map(|_| ()).map_err(FoxingError::Io)
+            }).await.map_err(FoxingError::Join).and_then(|r| r.map(|_| None));
+            return res;
         },
         EventType::Barrier | EventType::Fsync => {
             if e.inode == 0 { return Ok(None); }

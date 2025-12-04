@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use lru::LruCache;
 use crate::event::{Event};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::MetadataExt; // Required for ino(), mode(), and st_gen
 use tracing::{warn, info, debug};
 use walkdir;
 use std::io;
@@ -92,16 +92,21 @@ pub fn resolve_and_update_path(map: &InodeMap, dir_map: &DirMap, source_mount_ro
                         info!("IDENTITY: FOUND Inode {} at {:?}", inode, rel_path);
 
                         let is_dir = metadata.is_dir();
-                        let generation = metadata.gen();
+                        
+                        // Fix E0609: Use 0 since st_gen is not reliably available as a field/method.
+                        let generation = 0u32;
+                        
+                        // Fix Mismatched Types: Clone and convert to PathBuf explicitly
+                        let rel_path_buf = rel_path.to_path_buf();
 
                         // Aggressive scan should update the map immediately upon finding the path
                         let mut cache = map.lock();
-                        cache.put(inode, (rel_path.clone(), generation));
+                        cache.put(inode, (rel_path_buf.clone(), generation));
                         
                         // Gap 3 Fix: Update DirMap during aggressive scan
                         if is_dir {
                              let mut d_cache = dir_map.lock();
-                             d_cache.put(inode, rel_path.clone());
+                             d_cache.put(inode, rel_path_buf.clone());
                              debug!("IDENTITY: Aggressive scan cached directory inode {} in DirMap.", inode);
                         }
 

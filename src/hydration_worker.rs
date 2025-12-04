@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, warn, debug, info};
 use crate::error::{Result, FoxingError};
-use crate::mirror::{SourceInfo, SharedConfig}; // Correct type import
+use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
 use crate::operations::{SmartCopier, CopyStats};
 use crate::tuner::{TunerBoard, TunerState};
@@ -41,7 +41,7 @@ fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> 
 }
 impl HydrationQueue {
     pub fn new(
-        source: Arc<SourceInfo>, // Correct type
+        source: Arc<SourceInfo>,
         config: SharedConfig,
         governor: Arc<Governor>,
         tuner_board: TunerBoard,
@@ -71,7 +71,7 @@ impl HydrationQueue {
 }
 async fn run_hydration_worker_loop(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<HydrationJob>>>,
-    source: Arc<SourceInfo>, // Correct type
+    source: Arc<SourceInfo>,
     config: SharedConfig,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -108,7 +108,7 @@ async fn run_hydration_worker_loop(
 }
 async fn process_hydration_job(
     job: HydrationJob,
-    source: &Arc<SourceInfo>, // Correct type
+    source: &Arc<SourceInfo>,
     governor: &Arc<Governor>,
     tuner_board: &TunerBoard,
     ring: &mut io_uring::IoUring,
@@ -123,8 +123,10 @@ async fn process_hydration_job(
         let inode = metadata.ino();
         match spawn_blocking({
             let map = source.inode_map.clone();
+            // Fix E0061: Pass missing dir_map argument
+            let dir_map = source.dir_map.clone(); 
             let mount = source.mount.clone();
-            move || identity::resolve_and_update_path(&map, &mount, inode)
+            move || identity::resolve_and_update_path(&map, &dir_map, &mount, inode)
         }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             Ok(new_full_path) => {
                 if let Ok(new_rel) = new_full_path.strip_prefix(&source.mount) {
@@ -233,8 +235,10 @@ async fn process_hydration_job(
                     if io_err.kind() == ErrorKind::Other || io_err.raw_os_error() == Some(5) {
                         let _ = spawn_blocking({
                             let source_map = source.inode_map.clone();
+                            // Fix E0061: Pass missing dir_map argument
+                            let source_dir_map = source.dir_map.clone(); 
                             let source_mount = source.mount.clone();
-                            move || identity::resolve_and_update_path(&source_map, &source_mount, 0)
+                            move || identity::resolve_and_update_path(&source_map, &source_dir_map, &source_mount, 0)
                         }).await;
                     }
                 }
