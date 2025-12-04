@@ -110,29 +110,25 @@ pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Pa
 
         if !match_gen {
             let full_path = target_root.join(&entry.path);
+            let is_synthetic = entry.path.to_string_lossy().contains(".by-identity");
+
+            // FIX: If it's a synthetic path, NEVER invalidate based on generation mismatch.
+            // Synthetic paths are stable anchors. If the file is missing, it will be recreated.
+            // Invalidating here loses the topology information.
+            if is_synthetic {
+                // Return without checking disk. Trust the map for topology.
+                return (full_path, false, false);
+            }
             
-            // CRITICAL FIX: If the file physically exists at the cached path, we MUST use it.
-            // In high-velocity renames (torture tests), the kernel generation ID might bump 
-            // before we process the rename event. Invalidating the cache here causes us to lose 
-            // the location of the file we need to move.
+            // For real paths, check if file exists (Trust-on-Disk)
             if let Ok(_) = std::fs::metadata(&full_path) {
-                let is_synthetic = entry.path.to_string_lossy().contains(".by-identity");
-                
-                // If it's a real file, we can update the generation to match the event.
-                // If it's synthetic, we CANNOT update generation because the filename relies on it.
-                // We just return the path so the worker can rename the old marker to the new real path.
-                if !is_synthetic {
-                    warn!("Identity: Generation lag corrected for real file {:?} ({} -> {}).", 
-                          entry.path, entry.generation, event.generation);
-                    entry.generation = event.generation;
-                } else {
-                    debug!("Identity: Using stale synthetic marker {:?} despite generation mismatch ({} != {}) to preserve topology.", 
-                          entry.path, entry.generation, event.generation);
-                }
-                
+                // Real file exists, update generation to match event (assume valid lag)
+                warn!("Identity: Generation lag corrected for real file {:?} ({} -> {}).", 
+                      entry.path, entry.generation, event.generation);
+                entry.generation = event.generation;
                 return (full_path, false, false);
             } else {
-                warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. File missing at {:?}. Invalidating.",
+                warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. Real file missing at {:?}. Invalidating.",
                       event.inode, entry.generation, event.generation, entry.path);
                 cache.pop(&key);
             }
@@ -160,7 +156,7 @@ pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Pa
 
     let event_path = PathBuf::from(&event.name);
     if !event.name.is_empty() && !event.name.contains('/') {
-        // Likely just a filename, skip direct relative path assumption
+        // Just a filename, no parent context.
     } else if !event.name.is_empty() {
         cache.put(key, IdentityEntry::new(
             event_path.clone(),

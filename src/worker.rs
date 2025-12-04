@@ -143,9 +143,11 @@ pub async fn run_worker(
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
     let mut tuner = BbrTuner::new(&target_cfg);
-    let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     
+    // Increased depth for control plane to handle bursts of small metadata ops
+    let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
+    
     let mut ring = match IoUring::new(ring_depth) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
@@ -156,6 +158,7 @@ pub async fn run_worker(
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
     let capacity_threshold_mb = config_reader.capacity_threshold_mb;
     let force_flush_base_secs = config_reader.force_flush_interval_secs;
+    
     let total_workers = config_reader.worker_count.max(1);
     let global_limit_mib = config.read().await.global_buffer_limit;
     let total_worker_mem_limit_mib = global_limit_mib * 3 / 10;
@@ -177,9 +180,11 @@ pub async fn run_worker(
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
     let mut poison_cabinet = PoisonCabinet::new();
+    
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
+    
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
 
@@ -211,6 +216,7 @@ pub async fn run_worker(
                 _ = shutdown_rx.recv() => {
                     info!("Worker {}: Shutdown requested. Draining queue...", worker_id);
                     shutdown_requested = true;
+                    // Try one last non-blocking read to clear any pending item
                     match rx_main.try_recv() {
                         Ok(e) => {
                             metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
@@ -261,13 +267,15 @@ pub async fn run_worker(
                     if !is_hibernating {
                         let now = Instant::now();
                         let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
+                        // Identify dirty entries that need flush
                         dirty_stats.retain(|&ino, entry| {
                             if now.duration_since(entry.first_dirty) > Duration::from_secs(force_flush_base_secs) {
                                 flushing_stats.insert(ino, entry.clone());
-                                false
+                                false // Remove from main map, we are handling it
                             } else { true }
                         });
 
+                        // Offload flush to blocking thread
                         let _committed_inos = tokio::task::spawn_blocking(move || {
                             let mut committed = Vec::new();
                             for (ino, entry) in flushing_stats.into_iter() {
@@ -283,6 +291,7 @@ pub async fn run_worker(
                 }
             }
         } else {
+            // Shutdown drain mode: try draining
             let repair_event = if let Some(rx) = &mut rx_repair {
                 rx.try_recv().ok()
             } else { None };
@@ -312,6 +321,7 @@ pub async fn run_worker(
         let effective_batch_size = if shutdown_requested {
             256
         } else if is_control_plane {
+            // Less aggressive batching for Control Plane to prevent event backup
             if coalescer.len() > 50 { 4 } else { 1 }
         } else {
             tuner.current_batch_size
@@ -565,7 +575,6 @@ async fn process_single_event_inner(
                     PathBuf::from(new_name_str)
                 };
                 
-                // Update map IMMEDIATELY
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,
@@ -581,25 +590,24 @@ async fn process_single_event_inner(
 
             if let Some(new_name_str) = &e.new_name {
                 let mut old_dst_final = dst.clone();
+                let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
                 
-                // CRITICAL FIX: If synthetic path is missing but we determined it was synthetic, recreate it.
-                // This handles the race where the file was deleted/moved before we could rename it,
-                // but we need to perform the rename to keep the topology consistent.
-                if is_synthetic && !old_dst_final.exists() {
-                    let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
-                    if potential_real.exists() {
-                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
-                        old_dst_final = potential_real;
-                    } else {
-                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
-                        // Ensure parent directory exists for nested synthetic paths
-                        if let Some(parent) = old_dst_final.parent() {
-                            if !parent.exists() {
-                                let _ = std::fs::create_dir_all(parent);
+                if is_effective_synthetic {
+                    if !old_dst_final.exists() {
+                        let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
+                        if potential_real.exists() {
+                            warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
+                            old_dst_final = potential_real;
+                        } else {
+                            warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
+                            if let Some(parent) = old_dst_final.parent() {
+                                if !parent.exists() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
                             }
-                        }
-                        if let Err(e) = std::fs::File::create(&old_dst_final) {
-                            error!("Failed to recreate synthetic marker: {}", e);
+                            if let Err(e) = std::fs::File::create(&old_dst_final) {
+                                error!("Failed to recreate synthetic marker: {}", e);
+                            }
                         }
                     }
                 }
@@ -688,6 +696,47 @@ async fn process_single_event_inner(
                     return Ok(None);
                 }
 
+                // FIX: Fallback lookup for non-synthetic missing files
+                if !old_dst_final.exists() && !is_effective_synthetic {
+                    let src_inode = e.inode;
+                    let e_generation = e.generation;
+                    let e_ts = e.timestamp_ns;
+                    let e_seq = e.seq_num;
+                    
+                    let lookup_result = tokio::task::spawn_blocking({
+                        let src_map = source.inode_map.clone();
+                        let src_dir_map = source.dir_map.clone();
+                        let src_mount = source.mount.clone();
+                        move || identity::resolve_and_update_path(&src_map, &src_dir_map, &src_mount, src_inode, e_generation, e_ts, e_seq)
+                    }).await;
+
+                    if let Ok(Ok(resolved_path)) = lookup_result {
+                        let potential_source = target_cfg.path.join(&resolved_path);
+                        if potential_source.exists() {
+                            warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, old_dst_final);
+                            old_dst_final = potential_source;
+                        } else {
+                            // File not found on Source or Target. It's truly gone.
+                            // Check if Destination already exists (idempotency)
+                            if new_dst_final.exists() {
+                                return Ok(None);
+                            }
+                            // Otherwise, assume it was deleted and we don't need to rename it.
+                            warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion.", src_inode);
+                            // Ensure map points to new location (ghost) so subsequent events fail gracefully
+                            // identity::update_map_after_rename(...) was already called above.
+                            return Ok(None);
+                        }
+                    } else {
+                         // Lookup failed on source (file deleted?)
+                         if new_dst_final.exists() {
+                             return Ok(None);
+                         }
+                         warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion.", e.inode);
+                         return Ok(None);
+                    }
+                }
+
                 let old_dst_clone = old_dst_final.clone();
                 let target_cfg_path_clone = target_cfg.path.clone();
                 let new_dst_for_rename_clone = new_dst_final.clone();
@@ -734,6 +783,41 @@ async fn process_single_event_inner(
                         });
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
+                        let mut recovered = false;
+                        let is_identity_path = is_effective_synthetic;
+                        
+                        if is_identity_path {
+                            warn!("Rename Source Missing for Identity File: {:?}. Regenerating and retrying.", old_dst_final);
+                            let retry_src = old_dst_final.clone();
+                            let retry_dst = new_dst_final.clone();
+                            let retry_res = tokio::task::spawn_blocking(move || {
+                                if let Some(parent) = retry_src.parent() {
+                                    if !parent.exists() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                }
+                                if let Err(e) = std::fs::File::create(&retry_src) {
+                                    warn!("Failed to recreate marker during retry: {}", e);
+                                    return Err(FoxingError::Io(e));
+                                }
+                                atomic_rename(&retry_src, &retry_dst).map_err(FoxingError::Io)
+                            }).await.map_err(FoxingError::Join).and_then(|r| r);
+
+                            if retry_res.is_ok() {
+                                info!("Worker {}: Recovered Atomic Rename: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
+                                metrics::RENAME_EVENTS.inc();
+                                metrics::JOURNAL_RECOVERIES.inc();
+                                recovered = true;
+                            } else {
+                                error!("Worker {}: Recovery Rename FAILED: {:?}", worker_id, retry_res);
+                            }
+                        }
+                        
+                        if recovered {
+                            if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst_final.clone(); }
+                            return Ok(None);
+                        }
+
                         warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst_final);
                         let dest_exists = tokio::task::spawn_blocking({
                             let path = new_dst_final.clone();
