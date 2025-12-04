@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, warn, debug, info};
 use crate::error::{Result, FoxingError};
-// FIX: SourceInfo and SharedConfig are defined in mirror.rs
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
 use crate::operations::{SmartCopier, CopyStats};
@@ -17,6 +16,9 @@ use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
 use std::os::unix::fs::MetadataExt;
+use crate::versioning;
+use crate::sidecar;
+
 #[derive(Debug)]
 pub struct HydrationJob {
     pub rel_path: PathBuf,
@@ -186,6 +188,50 @@ async fn process_hydration_job(
                     return Ok(());
                 }
                 let file_size = metadata.len();
+                let src_mtime = metadata.mtime();
+                
+                // --- OPTIMIZATION START: Check for Version Match ---
+                let target_path_clone_ver = target_path.clone();
+                let target_cfg_clone_ver = target_cfg.clone();
+                let source_path_clone_meta = source_path.clone();
+                
+                let version_match_found = spawn_blocking(move || {
+                    if target_cfg_clone_ver.enable_versioning {
+                        // FIX #5: Compute partial hash of SOURCE to enable strict comparison
+                        let mut source_hash = None;
+                        if target_cfg_clone_ver.paranoid_deduplication {
+                            source_hash = security::calculate_partial_hash(&source_path_clone_meta).ok();
+                        }
+
+                        if let Some(version_path) = versioning::find_matching_version(&target_path_clone_ver, &target_cfg_clone_ver, file_size, src_mtime, source_hash) {
+                            debug!("Hydration: FAST DEDUPE. Restoring {:?} from version {:?}", target_path_clone_ver, version_path);
+                            // 1. Reflink version -> target (Instant)
+                            if security::revert_snapshot(&version_path, &target_path_clone_ver).is_ok() {
+                                // 2. Verify Checksum (Head/Tail) to detect bitrot/collisions
+                                if let Ok(valid) = versioning::verify_content_match(&source_path_clone_meta, &target_path_clone_ver) {
+                                    if valid {
+                                        // 3. Apply Metadata
+                                        security::sync_xattrs(&source_path_clone_meta, &target_path_clone_ver);
+                                        let _ = security::apply_metadata(&source_path_clone_meta, &target_path_clone_ver);
+                                        sidecar::clear_wal_state(&target_path_clone_ver);
+                                        return true;
+                                    } else {
+                                        warn!("Hydration: Version {:?} content mismatch! Falling back to full copy.", version_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                }).await.unwrap_or(false);
+
+                if version_match_found {
+                    metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(0.0);
+                    metrics::COPY_METHOD_REFLINK.inc();
+                    return Ok(None);
+                }
+                // --- OPTIMIZATION END ---
+
                 let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
                 SmartCopier::copy(
                     &source_path,
@@ -217,10 +263,11 @@ async fn process_hydration_job(
                 let dst_path_clone = target_path.clone();
                 let apply_res = spawn_blocking(move || {
                     security::sync_xattrs(&src_path_clone, &dst_path_clone);
-                    security::apply_metadata(&src_path_clone, &dst_path_clone)
+                    security::apply_metadata(&src_path_clone, &dst_path_clone);
+                    sidecar::clear_wal_state(&dst_path_clone);
                 }).await;
-                if apply_res.is_err() || apply_res.unwrap().is_err() {
-                    warn!("Hydration: Failed to apply metadata to {:?}. Retrying.", target_path);
+                if apply_res.is_err() {
+                    warn!("Hydration: Failed to apply metadata/clear state for {:?}. Retrying.", target_path);
                 } else {
                     success = true;
                     source.hydration.synced.fetch_add(1, Ordering::Relaxed);

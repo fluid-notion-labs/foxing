@@ -9,8 +9,8 @@ use crate::metrics::{self, GLOBAL_BUFFER_LIMIT};
 use std::mem;
 use libbpf_rs::MapCore;
 use tracing::{info, warn, debug};
-use crate::ordering::ReorderBuffer; 
-use std::sync::Mutex; // Used for ReorderBuffer access
+use crate::ordering::ReorderBuffer;
+use std::sync::Mutex;
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -49,40 +49,29 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
     let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
-
     let self_pid = std::process::id();
     let pid_val: u8 = 1;
     skel.maps.ignored_pids.update(&self_pid.to_ne_bytes(), &pid_val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .map_err(|e| FoxingError::Bpf(format!("Failed to register PID filter: {}", e)))?;
-
-    info!("BPF: Registering {} watched device(s)", queues.len());
     
-    // FIX: Borrow of moved value error E0382 for queues
-    // Clone queues before it is moved into the closure
+    info!("BPF: Registering {} watched device(s)", queues.len());
     let queues_in_closure = Arc::new(queues);
     let queues_in_loop = queues_in_closure.clone();
-    
-    // FIX: Borrow of moved value error E0382 for reorder_buffers
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
     
     for dev in queues_in_closure.keys() {
         let key = dev.to_ne_bytes();
         let val = 1u8;
         info!("BPF: Watching device 0x{:08x} ({})", dev, dev);
-        
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
-            
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
-        
-        // 250ms gap jump, 64MB buffer limit for ingress reordering
         reorder_buffers_map.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
     }
     
     let reorder_buffers = Arc::new(Mutex::new(reorder_buffers_map));
     let reorder_buffers_in_closure = reorder_buffers.clone();
-
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
     let progs = &skel.progs;
@@ -112,7 +101,7 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
         ("trace_fallocate", &progs.trace_fallocate),
         ("trace_xfs_commit", &progs.trace_xfs_commit),
     ];
-
+    
     for (name, prog) in probes.iter() {
         match prog.attach() {
             Ok(link) => {
@@ -125,94 +114,88 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             }
         }
     }
-
+    
     if attached_count == 0 {
         return Err(FoxingError::Bpf("Failed to attach ANY BPF probes.".into()));
     }
-    
     info!("BPF: Successfully attached {} probes", attached_count);
-
+    
     let maps = skel.maps;
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
-
+    
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
-
+        
         if data.len() != std::mem::size_of::<RawEvent>() {
             crate::metrics::EVENTS_MALFORMED.inc();
             return 0;
         }
-
+        
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
-
         if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
-            // In gap mode, we might want to clear reorder buffers to avoid stale data
-            // but for now we just drop.
             return 0;
         }
-
+        
         let counter = DEVICE_EVENT_COUNTER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let event_count = counter.fetch_add(1, Ordering::Relaxed);
-
         let name_len = raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len());
         let name = String::from_utf8_lossy(&raw.name[..name_len]).to_string();
-        
         let comm_len = raw.comm.iter().position(|&c| c == 0).unwrap_or(raw.comm.len());
         let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
-
+        
         if event_count < 50 {
-            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}", 
+            debug!("BPF Event #{} (Seq {}) from {} ({}): type={}, inode={}",
                    event_count, raw.seq, comm, raw.dev, raw.type_, raw.ino);
         }
-
-        if !queues_in_closure.contains_key(&raw.dev) { // Use cloned Arc
+        
+        if !queues_in_closure.contains_key(&raw.dev) {
             metrics::EVENTS_UNWATCHED.inc();
             return 0;
         }
-
-        let tracker = SEQUENCE_TRACKER.entry(raw.dev).or_insert(AtomicU64::new(0));
-        let prev = tracker.fetch_max(raw.seq, Ordering::Relaxed);
         
-        let is_wraparound = prev > (u64::MAX - 1000000) && raw.seq < 1000000;
-        if !is_wraparound && raw.seq > prev + 1 {
-            // Logic for actual kernel drops, unrelated to worker sharding
-            crate::metrics::SEQUENCE_GAPS.with_label_values(&[&raw.dev.to_string()]).inc();
-            
-            // Inject gap into buffer if possible, or just reset next_seq in ReorderBuffer
-            if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
-                if let Some(buf) = buffers.get_mut(&raw.dev) {
-                    buf.next_seq = raw.seq;
-                }
-            }
-        }
-
-        let new_name = if raw.type_ == 7 { 
+        // Sequence tracker mainly for stats now, ordering handled by ReorderBuffer/IdentityMap
+        let tracker = SEQUENCE_TRACKER.entry(raw.dev).or_insert(AtomicU64::new(0));
+        let _ = tracker.fetch_max(raw.seq, Ordering::Relaxed);
+        
+        // Gap detection logic (simplified for per-cpu seq)
+        // If we strictly want to detect gaps, we'd need per-cpu tracking logic here.
+        // For now, we trust the ReorderBuffer to handle jitter.
+        
+        let new_name = if raw.type_ == 7 {
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
                 Some(String::from_utf8_lossy(&raw.nname[..nname_len]).to_string())
         } else { None };
-
+        
         let evt = Arc::new(Event {
-            event_type: EventType::from(raw.type_), dev_id: raw.dev, inode: raw.ino,
-            parent_inode: raw.p_ino, new_parent_inode: raw.np_ino, seq_num: raw.seq, offset: raw.off, length: raw.len,
-            name, new_name, generation: raw.r#gen, projid: raw.projid,
+            event_type: EventType::from(raw.type_), 
+            dev_id: raw.dev, 
+            inode: raw.ino,
+            parent_inode: raw.p_ino, 
+            new_parent_inode: raw.np_ino, 
+            seq_num: raw.seq,
+            timestamp_ns: raw.ts, // FIX #1: Propagate monotonic timestamp
+            offset: raw.off, 
+            length: raw.len,
+            name, 
+            new_name, 
+            generation: raw.r#gen, 
+            projid: raw.projid,
             mode: raw.mode,
             flags: raw.flags,
             process_name: comm,
             interactive: raw.interactive == 1,
             created_at: std::time::Instant::now()
         });
-
-        // Push to Reorder Buffer (Global Sequencing)
+        
         if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
             if let Some(buf) = buffers.get_mut(&raw.dev) {
                 if buf.push(evt) {
-                    // Drain ordered events and dispatch
                     while let Some(ordered_evt) = buf.pop() {
                         metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                        if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) { // Use cloned Arc
+                        if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) {
                             for q in qs { q.push(ordered_evt.clone()); }
                         }
                     }
@@ -221,36 +204,31 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
                 }
             }
         }
-        
         0
     }).map_err(|e| FoxingError::Bpf(e.to_string()))?;
-
+    
     let ring = builder.build().map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    
     info!("BPF: Event processing started");
-    
     let mut last_report = std::time::Instant::now();
-
+    
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
-                // Periodically check reorder buffers for stalls
-                if let Ok(mut buffers) = reorder_buffers.lock() { // Use the original Arc
+                if let Ok(mut buffers) = reorder_buffers.lock() {
                     for (_, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                             metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                            if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) { // Use the clone for the loop
+                            if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) {
                                 for q in qs { q.push(ordered_evt.clone()); }
                             }
                         }
                     }
                 }
-
                 if last_report.elapsed().as_secs() >= 30 {
                     for entry in DEVICE_EVENT_COUNTER.iter() {
                         let dev_id = entry.key();
                         let count = entry.value().load(Ordering::Relaxed);
-                        info!("BPF Stats: Device 0x{:08x} ({}) - {} events processed", 
+                        info!("BPF Stats: Device 0x{:08x} ({}) - {} events processed",
                               dev_id, dev_id, count);
                     }
                     last_report = std::time::Instant::now();
@@ -261,7 +239,6 @@ pub fn run(queues: HashMap<u32, Vec<Arc<EventQueue>>>, shutdown: Arc<AtomicBool>
             }
         }
     }
-    
     info!("BPF: Shutting down");
     Ok(())
 }

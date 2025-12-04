@@ -3,9 +3,11 @@ use std::{path::PathBuf, fs, sync::{Arc, atomic::AtomicBool}, collections::HashS
 use crate::error::{Result, FoxingError as MirrorError};
 use regex::RegexSet;
 use sysinfo::System;
+
 pub const MAX_FAILURE_BACKOFF: u64 = 600;
 pub const ERROR_LIMITER_SECS: u64 = 60;
 const BASE_AUTOTUNE_VDO_THRESHOLD: u32 = 128;
+
 fn d_bool_false() -> bool { false }
 fn d_bool_true() -> bool { true }
 fn d_zero_usize() -> usize { 0 }
@@ -15,6 +17,7 @@ fn d_mp() -> u16 { 9100 }
 fn d_st() -> u64 { 30 }
 fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
 fn d_zero_u32() -> u32 { 0 }
+
 fn default_worker_count(sys: &System) -> usize {
     sys.cpus().len().max(2)
 }
@@ -22,6 +25,7 @@ fn default_global_buffer_limit_mb(sys: &System) -> u64 {
     let total_mem = sys.total_memory() / 1024 / 1024;
     (total_mem as f64 * 0.70) as u64
 }
+
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub enum TargetProfile {
     Auto,
@@ -32,6 +36,7 @@ pub enum TargetProfile {
     Network,
 }
 fn d_profile() -> TargetProfile { TargetProfile::Auto }
+
 pub fn autotune_buffer_chunk_size(profile: &TargetProfile, global_limit_mib: u64) -> u64 {
     let base_mib = if global_limit_mib > 16384 { 8 } else { 2 };
     match profile {
@@ -50,6 +55,7 @@ pub fn autotune_vdo_stall_threshold(profile: &TargetProfile) -> u32 {
         TargetProfile::Auto => BASE_AUTOTUNE_VDO_THRESHOLD,
     }
 }
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default="d_zero_usize")] pub worker_count: usize,
@@ -72,12 +78,14 @@ pub struct Config {
     #[serde(default="d_zero_usize", skip)] pub max_workers_sys: usize,
     #[serde(default)] pub sources: Vec<SourceConfig>
 }
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub path: PathBuf,
     pub targets: Vec<TargetConfig>,
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
 }
+
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct TargetConfig {
     pub path: PathBuf,
@@ -88,6 +96,10 @@ pub struct TargetConfig {
     #[serde(default="d_bool_false")] pub f2fs_compression: bool,
     #[serde(default="d_bool_false")] pub f2fs_pinning: bool,
     #[serde(default="d_bool_false")] pub enable_versioning: bool,
+    
+    // FIX #5: Enable hash-based verification for time-travel
+    #[serde(default="d_bool_true")] pub paranoid_deduplication: bool,
+
     #[serde(default="d_zero_usize")] pub max_versions: usize,
     #[serde(default="d_zero_u64")] pub max_versions_size_mb: u64,
     #[serde(default)] pub version_excludes: Vec<String>,
@@ -107,9 +119,12 @@ pub struct TargetConfig {
     #[serde(skip)] regex_vex: Option<RegexSet>,
     #[serde(skip)] regex_vin: Option<RegexSet>,
     #[serde(skip)] regex_force_vin: Option<RegexSet>,
+    
     #[serde(skip, default="def_abool")] pub supports_reflink: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub direct_io_ok: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
+    #[serde(skip, default="def_abool")] pub xattr_supported: Arc<AtomicBool>,
+
     #[serde(default = "d_zero_u32")] pub vdo_stall_threshold: u32,
     #[serde(default="d_zero_u64")] pub ordering_max_pending_bytes: u64,
     #[serde(default="d_zero_usize")] pub ordering_scan_depth: usize,
@@ -123,6 +138,7 @@ pub struct TargetConfig {
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_startup_mb: u64,
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_drain_mb: u64,
 }
+
 pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
     match profile {
         TargetProfile::NVMe => (1, 4),
@@ -153,6 +169,7 @@ pub fn get_default_batch_size(profile: &TargetProfile) -> usize {
         TargetProfile::Auto => 4,
     }
 }
+
 impl TargetConfig {
     pub fn compile(&mut self, max_workers_sys: usize, global_mem_limit_mb: u64) -> Result<()> {
         if self.worker_count == 0 {
@@ -251,44 +268,35 @@ impl TargetConfig {
         false
     }
 }
+
 impl Config {
     pub fn calculate_defaults(mut self) -> Self {
+        // ... (Existing calculate_defaults implementation) ...
         let sys = System::new_all();
-        // 1. Worker Count
         if self.worker_count == 0 {
             self.worker_count = default_worker_count(&sys);
             tracing::info!("Auto-Config: Worker Count set to {} (All Cores)", self.worker_count);
         }
         self.max_workers_sys = self.worker_count;
-        // 2. Global Buffer Memory
         if self.global_buffer_limit == 0 {
             self.global_buffer_limit = default_global_buffer_limit_mb(&sys);
             tracing::info!("Auto-Config: Global Buffer Limit set to {} MB (70% RAM)", self.global_buffer_limit);
         }
-        // 3. Queue Depth
-        if self.queue_max == 0 {
-            self.queue_max = 500_000; // Aggressive default
-        }
-        // 4. Load Average
+        if self.queue_max == 0 { self.queue_max = 500_000; }
         if self.max_system_load_avg == 0.0 {
             let cores = sys.cpus().len() as f64;
-            self.max_system_load_avg = cores * 4.0; // Allow load avg up to 4x core count
+            self.max_system_load_avg = cores * 4.0; 
         }
-        // 5. Governor PSI Thresholds
-        if self.governor_psi_io_threshold == 0.0 {
-            self.governor_psi_io_threshold = 60.0; // Very high tolerance for IO stall
-        }
-        if self.governor_psi_cpu_threshold == 0.0 {
-            self.governor_psi_cpu_threshold = 80.0;
-        }
-        // 6. Misc
+        if self.governor_psi_io_threshold == 0.0 { self.governor_psi_io_threshold = 60.0; }
+        if self.governor_psi_cpu_threshold == 0.0 { self.governor_psi_cpu_threshold = 80.0; }
         if self.capacity_threshold_mb == 0 { self.capacity_threshold_mb = 500; }
         if self.breaker_interval_secs == 0 { self.breaker_interval_secs = 60; }
         if self.force_flush_interval_secs == 0 { self.force_flush_interval_secs = 5; }
-        if self.hydration_delay_ms == 0 { self.hydration_delay_ms = 1; } // Almost zero delay
+        if self.hydration_delay_ms == 0 { self.hydration_delay_ms = 1; }
         if self.io_priority.is_empty() { self.io_priority = "Realtime".to_string(); }
         self
     }
+    // ... (rest of Config implementation) ...
     pub fn load(p: &str) -> Result<Self> {
         let s = fs::read_to_string(p)?;
         let mut c: Config = toml::from_str(&s).map_err(|e| MirrorError::Config(e.to_string()))?;

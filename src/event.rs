@@ -39,7 +39,6 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir | Self::Rename |
@@ -57,11 +56,9 @@ impl EventQueue {
     pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
         Self { senders }
     }
-
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         if self.senders.is_empty() { return; }
-
         let target_idx = if self.senders.len() > 1 {
             if e.event_type.is_structural_metadata() {
                 0
@@ -74,7 +71,6 @@ impl EventQueue {
         } else {
             0
         };
-
         if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
         }
@@ -83,15 +79,17 @@ impl EventQueue {
 
 #[derive(Clone, Debug)]
 pub struct Event {
-    pub event_type: EventType, 
-    pub dev_id: u32, 
-    pub inode: u64, 
+    pub event_type: EventType,
+    pub dev_id: u32,
+    pub inode: u64,
     pub parent_inode: u64,
-    pub new_parent_inode: u64, // Added field
-    pub seq_num: u64, 
-    pub offset: u64, 
-    pub length: u64, 
-    pub name: String, 
+    pub new_parent_inode: u64,
+    pub seq_num: u64,
+    // FIX #1: Added timestamp for monotonic ordering
+    pub timestamp_ns: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub name: String,
     pub new_name: Option<String>,
     pub generation: u32,
     pub projid: u32,
