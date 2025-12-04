@@ -31,6 +31,7 @@ use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 use crate::mirror::SourceInfo;
+
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
 impl Clone for HydrationSender {
@@ -38,6 +39,7 @@ impl Clone for HydrationSender {
         HydrationSender(self.0.clone())
     }
 }
+
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -60,6 +62,7 @@ impl ShardedLockCache {
         self.get(hasher.finish())
     }
 }
+
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
@@ -71,6 +74,7 @@ struct WorkerContext<'a> {
     _cur_cap_total: u64,
     daemon_id: &'a str,
 }
+
 fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_bytes: usize) -> Result<BufferPool> {
     let mut pool = BufferPool::new(num_buffers, chunk_size_bytes);
     let iovs = pool.as_io_vecs();
@@ -80,6 +84,7 @@ fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_byt
     }
     Ok(pool)
 }
+
 fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     if ring.submitter().unregister_buffers().is_err() {
         error!("Failed to unregister io_uring buffers.");
@@ -87,6 +92,7 @@ fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     }
     Ok(())
 }
+
 pub async fn run_worker(
     mut rx_main: mpsc::Receiver<Arc<Event>>,
     source: Arc<SourceInfo>,
@@ -105,38 +111,47 @@ pub async fn run_worker(
     let is_control_plane = worker_id == 0;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
+
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
+
     let mut tuner = BbrTuner::new(&target_cfg);
     let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
+
     let mut ring = match IoUring::new(ring_depth) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
     };
+
     let config_reader = config.read().await;
     let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
     let capacity_threshold_mb = config_reader.capacity_threshold_mb;
     let force_flush_base_secs = config_reader.force_flush_interval_secs;
+    
     let total_workers = config_reader.worker_count.max(1);
     let global_limit_mib = config.read().await.global_buffer_limit;
     let total_worker_mem_limit_mib = global_limit_mib * 3 / 10;
     let worker_mem_limit_mib = total_worker_mem_limit_mib / total_workers as u64;
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let initial_num_buffers = current_max_buffers.min(target_cfg.batch_size);
+
     drop(config_reader);
+
     let mut buffer_pool = match initialize_buffer_pool(&mut ring, initial_num_buffers, buffer_chunk_size_bytes) {
         Ok(pool) => pool,
         Err(e) => return Err(e),
     };
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
+
     info!("Worker {}: BufferPool initialized with {} x {}MB chunks.", worker_id, buffer_pool.capacity(), buffer_chunk_size_mib);
+
     let limiter = ErrorLimiter::new();
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
@@ -144,8 +159,11 @@ pub async fn run_worker(
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
+
     let mut is_hibernating = false;
+    let mut shutdown_requested = false;
     let _last_dropped_check = 0.0;
+    
     let _result: Result<()> = loop {
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
@@ -153,6 +171,7 @@ pub async fn run_worker(
                  is_hibernating = true;
              }
         }
+        
         if is_hibernating {
              tokio::select! {
                 _ = shutdown_rx.recv() => break Ok(()),
@@ -160,184 +179,240 @@ pub async fn run_worker(
                 Some(_) = rx_main.recv() => { continue; }
              }
         }
-        if !is_control_plane {
+
+        if !is_control_plane && !shutdown_requested {
              if let Some(delay) = failure_state.next_retry_delay() {
                  sleep(delay).await;
                  continue;
              }
         }
-        let event_poll_result = tokio::select! {
-            _ = shutdown_rx.recv() => break Ok(()),
-            Some(e) = async {
-                if let Some(rx) = &mut rx_repair { rx.recv().await } else { std::future::pending().await }
-            } => { Some(e) },
-            Some(e) = rx_main.recv() => {
-                metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
-                Some(e)
-            },
-            _ = flush_interval.tick() => {
-                let tuner_tick_start = Instant::now();
-                let is_stressed = if is_control_plane { false } else { _governor.is_system_stressed() };
-                let pending_len = coalescer.len();
-                let max_pending = target_cfg.queue_max;
-                let target_label = target_cfg.path.to_string_lossy().to_string();
-                let bytes_processed = 0;
-                let recommended_depth = tuner.tune(
-                    tuner_tick_start.elapsed().as_secs_f64(),
-                    bytes_processed,
-                    is_stressed,
-                    pending_len,
-                    max_pending,
-                    &tuner_board,
-                    &target_label,
-                    buffer_pool.chunk_size() as u64
-                );
-                if !is_control_plane && recommended_depth != buffer_pool.capacity() {
-                }
-                let path_clone = target_cfg.path.clone();
-                let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
-                if last_capacity_check.elapsed() >= cap_check_interval {
-                     last_capacity_check = Instant::now();
-                     if let Ok(s) = statvfs(&path_clone) {
-                        cur_cap_total = s.blocks() * s.block_size();
-                        cur_cap_avail = s.blocks_available() * s.block_size();
-                        let label = target_cfg.path.to_string_lossy();
-                        metrics::TARGET_CAPACITY_BYTES_TOTAL.with_label_values(&[&label]).set(cur_cap_total as f64);
-                        metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
-                    }
-                }
-                if !is_hibernating {
-                    let now = Instant::now();
-                    let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
-                    dirty_stats.retain(|&ino, entry| {
-                        if now.duration_since(entry.first_dirty) > Duration::from_secs(force_flush_base_secs) {
-                            flushing_stats.insert(ino, entry.clone());
-                            false
-                        } else { true }
-                    });
-                    let _committed_inos = tokio::task::spawn_blocking(move || {
-                        let mut committed = Vec::new();
-                        for (ino, entry) in flushing_stats.into_iter() {
-                            if security::commit_epoch(&entry.path, entry.seq, entry.projid).is_ok() {
-                                sidecar::clear_wal_state(&entry.path);
-                                committed.push(ino);
-                            }
+
+        let event_poll_result = if !shutdown_requested {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Worker {}: Shutdown requested. Draining queue...", worker_id);
+                    shutdown_requested = true;
+                    match rx_main.try_recv() {
+                        Ok(e) => {
+                            metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+                            Some(e)
                         }
-                        committed
-                    }).await.unwrap_or_default();
+                        Err(_) => None
+                    }
+                },
+                Some(e) = async {
+                    if let Some(rx) = &mut rx_repair { rx.recv().await } else { std::future::pending().await }
+                } => { Some(e) },
+                Some(e) = rx_main.recv() => {
+                    metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+                    Some(e)
+                },
+                _ = flush_interval.tick() => {
+                    let tuner_tick_start = Instant::now();
+                    let is_stressed = if is_control_plane { false } else { _governor.is_system_stressed() };
+                    let pending_len = coalescer.len();
+                    let max_pending = target_cfg.queue_max;
+                    let target_label = target_cfg.path.to_string_lossy().to_string();
+                    let bytes_processed = 0;
+                    
+                    let recommended_depth = tuner.tune(
+                        tuner_tick_start.elapsed().as_secs_f64(),
+                        bytes_processed,
+                        is_stressed,
+                        pending_len,
+                        max_pending,
+                        &tuner_board,
+                        &target_label,
+                        buffer_pool.chunk_size() as u64
+                    );
+
+                    if !is_control_plane && recommended_depth != buffer_pool.capacity() {
+                        // Resizing logic omitted
+                    }
+
+                    let path_clone = target_cfg.path.clone();
+                    let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
+                    if last_capacity_check.elapsed() >= cap_check_interval {
+                         last_capacity_check = Instant::now();
+                         if let Ok(s) = statvfs(&path_clone) {
+                            cur_cap_total = s.blocks() * s.block_size();
+                            cur_cap_avail = s.blocks_available() * s.block_size();
+                            let label = target_cfg.path.to_string_lossy();
+                            metrics::TARGET_CAPACITY_BYTES_TOTAL.with_label_values(&[&label]).set(cur_cap_total as f64);
+                            metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
+                        }
+                    }
+
+                    if !is_hibernating {
+                        let now = Instant::now();
+                        let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
+                        dirty_stats.retain(|&ino, entry| {
+                            if now.duration_since(entry.first_dirty) > Duration::from_secs(force_flush_base_secs) {
+                                flushing_stats.insert(ino, entry.clone());
+                                false
+                            } else { true }
+                        });
+                        let _committed_inos = tokio::task::spawn_blocking(move || {
+                            let mut committed = Vec::new();
+                            for (ino, entry) in flushing_stats.into_iter() {
+                                if security::commit_epoch(&entry.path, entry.seq, entry.projid).is_ok() {
+                                    sidecar::clear_wal_state(&entry.path);
+                                    committed.push(ino);
+                                }
+                            }
+                            committed
+                        }).await.unwrap_or_default();
+                    }
+                    None
                 }
-                None
+            }
+        } else {
+            // Shutdown mode: Non-blocking drain of BOTH main and repair channels
+            // This fixes possible loss of high-priority metadata events during drain
+            let repair_event = if let Some(rx) = &mut rx_repair {
+                rx.try_recv().ok()
+            } else { None };
+
+            if let Some(e) = repair_event {
+                Some(e)
+            } else {
+                match rx_main.try_recv() {
+                    Ok(e) => {
+                        metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+                        Some(e)
+                    },
+                    Err(_) => None
+                }
             }
         };
-        if event_poll_result.is_none() { continue; }
-        let event_ptr = event_poll_result.unwrap();
-        if matches!(event_ptr.event_type, EventType::Rename) {
-            let src_clone = source.clone();
-            let e_inode = event_ptr.inode;
-            let e_dev = event_ptr.dev_id;
-            let e_generation = event_ptr.generation;
-            let e_seq = event_ptr.seq_num;
-            let e_ts = event_ptr.timestamp_ns;
-            let e_mode = event_ptr.mode;
-            let is_dir = (e_mode & libc::S_IFMT) == libc::S_IFDIR;
-            let new_parent_inode = event_ptr.new_parent_inode;
-            let new_name_opt = event_ptr.new_name.clone();
-            let mut parent_is_known = false;
-            if new_parent_inode != 0 {
-                let dir_map = src_clone.dir_map.lock();
-                if dir_map.contains(&(e_dev, new_parent_inode)) {
-                    parent_is_known = true;
-                } else {
-                    let inode_map = src_clone.inode_map.lock();
-                    if inode_map.contains(&(e_dev, new_parent_inode)) {
+
+        if let Some(event_ptr) = event_poll_result {
+            if matches!(event_ptr.event_type, EventType::Rename) {
+                let src_clone = source.clone();
+                let e_inode = event_ptr.inode;
+                let e_dev = event_ptr.dev_id;
+                let e_generation = event_ptr.generation;
+                let e_seq = event_ptr.seq_num;
+                let e_ts = event_ptr.timestamp_ns;
+                let e_mode = event_ptr.mode;
+                let is_dir = (e_mode & libc::S_IFMT) == libc::S_IFDIR;
+                let new_parent_inode = event_ptr.new_parent_inode;
+                let new_name_opt = event_ptr.new_name.clone();
+                let mut parent_is_known = false;
+                if new_parent_inode != 0 {
+                    let dir_map = src_clone.dir_map.lock();
+                    if dir_map.contains(&(e_dev, new_parent_inode)) {
                         parent_is_known = true;
-                    }
-                }
-            }
-            let has_complete_bpf_data = new_parent_inode != 0 &&
-                                      parent_is_known &&
-                                      new_name_opt.is_some() &&
-                                      new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
-            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Valid: {}",
-                e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
-            const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
-            let mut fast_path_success = false;
-            if has_complete_bpf_data {
-                let new_name_string = new_name_opt.clone().unwrap();
-                let dir_map_clone = src_clone.dir_map.clone();
-                let inode_map_clone = src_clone.inode_map.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let parent_path_opt = identity::resolve_directory(&dir_map_clone, &inode_map_clone, e_dev, new_parent_inode);
-                    if let Some(parent_path) = parent_path_opt {
-                        let new_rel_path = parent_path.join(&new_name_string);
-                        identity::update_map_after_rename(&inode_map_clone, &dir_map_clone, e_dev, e_inode, new_rel_path, e_generation, is_dir, e_ts, e_seq);
-                        Ok(parent_path)
                     } else {
-                        Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap or InodeMap"))
-                    }
-                }).await.map_err(FoxingError::Join);
-                if result.is_err() || matches!(result, Ok(Err(_))) {
-                    warn!("RENAME Handler: Fast-path (BPF trust) failed or parent not in map. Falling back to slow path.");
-                } else {
-                    debug!("RENAME Handler: Fast-path identity map update successful.");
-                    fast_path_success = true;
-                }
-            }
-            if !fast_path_success {
-                if !has_complete_bpf_data {
-                    warn!("RENAME Handler: BPF data incomplete or parent unknown. Falling back to aggressive FS scan with timeout.");
-                } else {
-                     warn!("RENAME Handler: Parent not in DirMap. Performing aggressive FS scan for identity resolution.");
-                }
-                let dir_map_clone = src_clone.dir_map.clone();
-                let inode_map_clone = src_clone.inode_map.clone();
-                let lookup_task = tokio::task::spawn_blocking(move || {
-                    match identity::resolve_and_update_path(&inode_map_clone, &dir_map_clone, &src_clone.mount, e_inode) {
-                        Ok(current_path) => Ok(current_path),
-                        Err(e) => {
-                            warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
-                            Err(e)
+                        let inode_map = src_clone.inode_map.lock();
+                        if inode_map.contains(&(e_dev, new_parent_inode)) {
+                            parent_is_known = true;
                         }
                     }
-                });
-                match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
-                    Ok(Ok(Ok(_new_path))) => {
+                }
+                let has_complete_bpf_data = new_parent_inode != 0 &&
+                                          parent_is_known &&
+                                          new_name_opt.is_some() &&
+                                          new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
+                debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Valid: {}",
+                    e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
+                const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+                let mut fast_path_success = false;
+                if has_complete_bpf_data {
+                    let new_name_string = new_name_opt.clone().unwrap();
+                    let dir_map_clone = src_clone.dir_map.clone();
+                    let inode_map_clone = src_clone.inode_map.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let parent_path_opt = identity::resolve_directory(&dir_map_clone, &inode_map_clone, e_dev, new_parent_inode);
+                        if let Some(parent_path) = parent_path_opt {
+                            let new_rel_path = parent_path.join(&new_name_string);
+                            identity::update_map_after_rename(&inode_map_clone, &dir_map_clone, e_dev, e_inode, new_rel_path, e_generation, is_dir, e_ts, e_seq);
+                            Ok(parent_path)
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap or InodeMap"))
+                        }
+                    }).await.map_err(FoxingError::Join);
+                    if result.is_err() || matches!(result, Ok(Err(_))) {
+                        warn!("RENAME Handler: Fast-path (BPF trust) failed or parent not in map. Falling back to slow path.");
+                    } else {
+                        debug!("RENAME Handler: Fast-path identity map update successful.");
+                        fast_path_success = true;
                     }
-                    Ok(Ok(Err(e))) => {
-                        warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.",
-                              worker_id, e_inode, e);
-                        coalescer.push(event_ptr.clone());
-                        continue;
+                }
+                if !fast_path_success {
+                    if !has_complete_bpf_data {
+                        warn!("RENAME Handler: BPF data incomplete or parent unknown. Falling back to aggressive FS scan with timeout.");
+                    } else {
+                         warn!("RENAME Handler: Parent not in DirMap. Performing aggressive FS scan for identity resolution.");
                     }
-                    Ok(Err(e)) => {
-                        warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.",
-                              worker_id, e_inode, e);
-                        coalescer.push(event_ptr.clone());
-                        continue;
-                    }
-                    Err(_) => {
-                        warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.",
-                              worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
-                        coalescer.push(event_ptr.clone());
-                        continue;
+                    let dir_map_clone = src_clone.dir_map.clone();
+                    let inode_map_clone = src_clone.inode_map.clone();
+                    let lookup_task = tokio::task::spawn_blocking(move || {
+                        match identity::resolve_and_update_path(&inode_map_clone, &dir_map_clone, &src_clone.mount, e_inode) {
+                            Ok(current_path) => Ok(current_path),
+                            Err(e) => {
+                                warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
+                                Err(e)
+                            }
+                        }
+                    });
+                    match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
+                        Ok(Ok(Ok(_new_path))) => {
+                        }
+                        Ok(Ok(Err(e))) => {
+                            warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.",
+                                  worker_id, e_inode, e);
+                            coalescer.push(event_ptr.clone());
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.",
+                                  worker_id, e_inode, e);
+                            coalescer.push(event_ptr.clone());
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.",
+                                  worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
+                            coalescer.push(event_ptr.clone());
+                            continue;
+                        }
                     }
                 }
             }
-        }
-        coalescer.push(event_ptr.clone());
+            coalescer.push(event_ptr.clone());
+        } else if shutdown_requested {
+            // No new event, check if we are done
+            if coalescer.is_empty() {
+                break Ok(());
+            }
+        } 
+        // REMOVED: else { continue; } 
+        // FIX: If event_poll_result is None (due to flush_interval tick), we MUST fall through 
+        // to Process Batch below to allow coalescer to drain based on time/tuner logic.
+
+        // Process Batch
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
-        let effective_batch_size = if is_control_plane {
+        
+        // Optimize batch size for shutdown to drain quickly
+        let effective_batch_size = if shutdown_requested {
+            256
+        } else if is_control_plane {
             if coalescer.len() > 100 { 16 } else { 1 }
         } else {
             tuner.current_batch_size
         };
+
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
-                if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
+                let limit = if shutdown_requested { 0 } else { current_coalesce_limit };
+                if let Some(e) = coalescer.pop_batch(limit) {
                     if is_control_plane && matches!(e.event_type, EventType::Rename | EventType::Fsync | EventType::Barrier) && !batch.is_empty() {
-                        batch.push(e);
-                        break;
+                        if !shutdown_requested {
+                            batch.push(e);
+                            break;
+                        }
                     }
                     batch.push(e);
                 } else {
@@ -346,6 +421,7 @@ pub async fn run_worker(
             }
             batch
         };
+
         for e in events_to_process_raw {
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
@@ -389,9 +465,11 @@ pub async fn run_worker(
             ).await;
         }
     };
+    
     let _ = unregister_buffers(&mut ring);
     Ok(())
 }
+
 async fn process_single_event_inner(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -411,8 +489,6 @@ async fn process_single_event_inner(
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
     // needs_creation logic: Only create placeholder FILES for file-type events.
-    // Directories (Mkdir) and other types must use their specific handlers to create the correct node type
-    // even if the path is synthetic.
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
@@ -534,7 +610,6 @@ async fn process_single_event_inner(
             if let Some(new_name_str) = &e.new_name {
                 let old_dst = target_cfg.path.join(e.name.trim_start_matches('/'));
                 
-                // Construct new destination path explicitly using BPF data to avoid synthetic fallbacks
                 let new_dst = if e.new_parent_inode != 0 {
                     let new_parent_path_opt = identity::resolve_directory(
                         &source.dir_map, 
@@ -546,7 +621,6 @@ async fn process_single_event_inner(
                     if let Some(parent_rel) = new_parent_path_opt {
                         target_cfg.path.join(parent_rel).join(new_name_str)
                     } else {
-                        // Fallback: assume same directory as old file if parent resolution fails
                         if let Some(old_parent) = old_dst.parent() {
                             old_parent.join(new_name_str)
                         } else {
@@ -554,13 +628,17 @@ async fn process_single_event_inner(
                         }
                     }
                 } else {
-                    // No new parent provided, assume same directory
                     if let Some(old_parent) = old_dst.parent() {
                         old_parent.join(new_name_str)
                     } else {
                         target_cfg.path.join(new_name_str)
                     }
                 };
+
+                if old_dst == new_dst {
+                    warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
+                    return Ok(None);
+                }
 
                 let old_dst_clone = old_dst.clone();
                 let target_cfg_path_clone = target_cfg.path.clone();
@@ -591,16 +669,13 @@ async fn process_single_event_inner(
                     ctx.failure_state.record_failure();
                     return Err(e);
                 }
-                if old_dst == new_dst {
-                    warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
-                    return Ok(None);
-                }
                 let res = tokio::task::spawn_blocking(move || {
                     atomic_rename(&old_dst_clone, &new_dst_for_rename_clone).map_err(FoxingError::Io)
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
+                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst, new_dst);
                         let hydration_tx_for_move = hydration_trigger.clone();
                         let new_full_path_for_validation = new_dst.clone();
                         tokio::task::spawn(async move {
@@ -615,9 +690,7 @@ async fn process_single_event_inner(
                             Ok(rel) => rel.to_path_buf(),
                             Err(_) => new_dst.to_path_buf(),
                         };
-                        if is_dir {
-                            identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, true, e_ts, e_seq);
-                        }
+                        identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, is_dir, e_ts, e_seq);
                     },
                     Err(FoxingError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {
                         warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst);
