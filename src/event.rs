@@ -3,7 +3,6 @@ use tokio::sync::mpsc;
 use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventType {
@@ -12,7 +11,6 @@ pub enum EventType {
     Barrier=15, Mknod=16, Symlink=17, Fallocate=18, Utimes=19,
     SequenceGap=255, Unknown=0
 }
-
 impl From<u8> for EventType {
     fn from(v: u8) -> Self {
         match v {
@@ -26,7 +24,6 @@ impl From<u8> for EventType {
         }
     }
 }
-
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -42,16 +39,15 @@ impl EventType {
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir | Self::Rename |
-            Self::Link | Self::Symlink | Self::Mknod
+            Self::Link | Self::Symlink | Self::Mknod |
+            Self::Create | Self::Unlink
         )
     }
 }
-
 #[derive(Debug)]
 pub struct EventQueue {
     pub senders: Vec<mpsc::Sender<Arc<Event>>>
 }
-
 impl EventQueue {
     pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
         Self { senders }
@@ -76,7 +72,6 @@ impl EventQueue {
         }
     }
 }
-
 #[derive(Clone, Debug)]
 pub struct Event {
     pub event_type: EventType,
@@ -85,7 +80,6 @@ pub struct Event {
     pub parent_inode: u64,
     pub new_parent_inode: u64,
     pub seq_num: u64,
-    // FIX #1: Added timestamp for monotonic ordering
     pub timestamp_ns: u64,
     pub offset: u64,
     pub length: u64,
@@ -99,7 +93,6 @@ pub struct Event {
     pub interactive: bool,
     pub created_at: std::time::Instant
 }
-
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
     let actual_workers = workers.max(1);
     let (mut txs, mut rxs) = (Vec::new(), Vec::new());
