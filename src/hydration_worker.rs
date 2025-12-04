@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, warn, debug, info};
 use crate::error::{Result, FoxingError};
+// FIX: SourceInfo and SharedConfig are defined in mirror.rs
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
 use crate::operations::{SmartCopier, CopyStats};
@@ -123,8 +124,7 @@ async fn process_hydration_job(
         let inode = metadata.ino();
         match spawn_blocking({
             let map = source.inode_map.clone();
-            // Fix E0061: Pass missing dir_map argument
-            let dir_map = source.dir_map.clone(); 
+            let dir_map = source.dir_map.clone();
             let mount = source.mount.clone();
             move || identity::resolve_and_update_path(&map, &dir_map, &mount, inode)
         }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
@@ -235,8 +235,7 @@ async fn process_hydration_job(
                     if io_err.kind() == ErrorKind::Other || io_err.raw_os_error() == Some(5) {
                         let _ = spawn_blocking({
                             let source_map = source.inode_map.clone();
-                            // Fix E0061: Pass missing dir_map argument
-                            let source_dir_map = source.dir_map.clone(); 
+                            let source_dir_map = source.dir_map.clone();
                             let source_mount = source.mount.clone();
                             move || identity::resolve_and_update_path(&source_map, &source_dir_map, &source_mount, 0)
                         }).await;
