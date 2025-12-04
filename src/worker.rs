@@ -522,7 +522,8 @@ async fn process_single_event_inner(
                     if old_parent_opt.is_none() {
                          let src_clone_lookup = source.clone();
                          let parent_ino = e.parent_inode;
-                         let dev_id = e.dev_id;
+                         // Unused dev_id removed or prefixed
+                         let _dev_id = e.dev_id;
                          let _ = tokio::task::spawn_blocking(move || {
                              let _ = identity::resolve_and_update_path(
                                  &src_clone_lookup.inode_map,
@@ -563,7 +564,8 @@ async fn process_single_event_inner(
                     if new_parent_path_opt.is_none() {
                         let src_clone_lookup = source.clone();
                         let parent_ino = e.new_parent_inode;
-                        let dev_id = e.dev_id;
+                        // Unused dev_id removed or prefixed
+                        let _dev_id = e.dev_id;
                         let _ = tokio::task::spawn_blocking(move || {
                              let _ = identity::resolve_and_update_path(
                                  &src_clone_lookup.inode_map,

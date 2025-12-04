@@ -5,42 +5,38 @@ use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
 
-/// Strict Reordering Buffer for Global Ingress
-/// Ensures monotonic sequence numbers before sharding.
 pub struct ReorderBuffer {
     buffer: BTreeMap<u64, Arc<Event>>,
     pub next_seq: u64,
     max_pending_bytes: u64,
     current_pending_bytes: u64,
     stalled_since: Option<Instant>,
-    stall_timeout: Duration,
+    base_stall_timeout: Duration,
 }
 
 impl ReorderBuffer {
     pub fn new(target_latency_ms: u64, max_pending_bytes: u64) -> Self {
-        // FIX: Ordering Buffer Stall Timeout Adaptive #3
-        // Adaptive timeout: Max(4 * target_latency_ms, 250ms)
-        let timeout_ms = (target_latency_ms * 4).max(250);
-        
+        // Ensure we have a sensible floor and ceiling for the base timeout
+        let timeout_ms = (target_latency_ms * 4).max(100).min(2000);
         Self {
             buffer: BTreeMap::new(),
             next_seq: 0,
             max_pending_bytes,
             current_pending_bytes: 0,
             stalled_since: None,
-            stall_timeout: Duration::from_millis(timeout_ms),
+            base_stall_timeout: Duration::from_millis(timeout_ms),
         }
     }
 
     pub fn push(&mut self, event: Arc<Event>) -> bool {
+        // Approximate memory usage: struct overhead + path string
         let event_size = 256 + event.name.len() as u64;
         
-        // Safety valve: if buffer is huge, we must drop or force-progress
         if self.current_pending_bytes + event_size > self.max_pending_bytes {
-            return false;
+            return false; // Buffer Full - Signal to drop
         }
 
-        // Initialize sequence on first event
+        // If this is the very first event, synchronize sequence
         if self.next_seq == 0 && self.buffer.is_empty() {
             self.next_seq = event.seq_num;
         }
@@ -57,45 +53,73 @@ impl ReorderBuffer {
     pub fn pop(&mut self) -> Option<Arc<Event>> {
         let (&seq, _) = self.buffer.iter().next()?;
 
-        // Case 1: Gap detected
         if seq > self.next_seq {
+            // [Adaptive Logic]
+            // Calculate buffer pressure. If we are filling up, we must reduce the timeout
+            // to "fail fast" on gaps. Holding a gap while the buffer is 90% full guarantees
+            // tail-drop of subsequent valid events.
+            let utilization = self.current_pending_bytes as f64 / self.max_pending_bytes as f64;
+            
+            let effective_timeout = if utilization > 0.8 {
+                // CRITICAL: Buffer nearly full. Drop gap immediately (10ms) to resume flow.
+                Duration::from_millis(10)
+            } else if utilization > 0.5 {
+                // HIGH: Buffer filling. Halve the timeout.
+                self.base_stall_timeout / 2
+            } else {
+                // NORMAL: Use configured latency tolerance.
+                self.base_stall_timeout
+            };
+
             if let Some(time) = self.stalled_since {
-                if time.elapsed() > self.stall_timeout {
-                    warn!("INGRESS STALL: Jumping gap {} -> {} (after {:?}).", 
-                          self.next_seq, seq, self.stall_timeout);
+                if time.elapsed() > effective_timeout {
+                    warn!("INGRESS STALL: Jumping gap {} -> {} (utilization: {:.1}%, timeout: {:?}).",
+                          self.next_seq, seq, utilization * 100.0, effective_timeout);
+                    
+                    // Detect sequence gap and potentially inject a GAP event here if architecture allowed,
+                    // but for now we simply advance the sequence counter to unblock the queue.
+                    // This effectively "drops" the missing packet (which is likely already lost by kernel).
+                    metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
                     self.next_seq = seq;
                     self.stalled_since = None;
+                    
+                    // Recursive call to pop the now-ready event
                     return self.pop();
                 }
             } else {
                 self.stalled_since = Some(Instant::now());
+                // If we are already critical, don't wait for next poll, check logic immediately?
+                // No, pop() is polled, so we return None and wait for next poll cycle.
             }
             return None;
-        } 
-        
-        // Case 2: In-order or Late event
+        }
+
+        // Event is ready (seq == next_seq) OR late (seq < next_seq)
         self.stalled_since = None;
 
         if seq < self.next_seq {
-            // Late event (already jumped over)
+            // Late arrival (duplicate or out of order after jump)
             let evt = self.buffer.remove(&seq).unwrap();
             self.current_pending_bytes -= 256 + evt.name.len() as u64;
             metrics::LATE_EVENTS.inc();
-            // Just emit it, don't update next_seq
+            // We can return it, but the consumer might be confused by old seq.
+            // Generally safer to return it and let worker idempotency handle it, 
+            // provided the worker doesn't enforce strict increasing seq.
             return Some(evt);
         }
 
-        // Case 3: Correct sequence
+        // Exact match
         let evt = self.buffer.remove(&seq).unwrap();
         self.current_pending_bytes -= 256 + evt.name.len() as u64;
         self.next_seq += 1;
+        
+        // Reset metric on successful flow
+        metrics::ORDERING_BUF_SIZE.with_label_values(&["ingress"]).set((self.buffer.len() as i64) as f64);
         
         Some(evt)
     }
 }
 
-/// Relaxed Coalescer for Workers
-/// Batches compatible writes, ignores sequence gaps.
 pub struct Coalescer {
     buffer: Vec<Arc<Event>>,
     scan_depth: usize,
@@ -108,29 +132,22 @@ impl Coalescer {
             scan_depth,
         }
     }
-
     pub fn push(&mut self, event: Arc<Event>) {
         self.buffer.push(event);
         metrics::ORDERING_BUF_SIZE.with_label_values(&["worker"]).set((self.buffer.len() as i64) as f64);
     }
-
     pub fn len(&self) -> usize { self.buffer.len() }
     pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
-
     pub fn pop_batch(&mut self, coalesce_bytes_limit: u64) -> Option<Arc<Event>> {
         if self.buffer.is_empty() { return None; }
-        
         let head = self.buffer.remove(0);
-        
-        if coalesce_bytes_limit > 0 && 
-           (head.event_type == EventType::Write || head.event_type == EventType::WriteRange) 
+        if coalesce_bytes_limit > 0 &&
+           (head.event_type == EventType::Write || head.event_type == EventType::WriteRange)
         {
             return Some(self.try_coalesce(head, coalesce_bytes_limit));
         }
-        
         Some(head)
     }
-
     fn try_coalesce(&mut self, head: Arc<Event>, limit: u64) -> Arc<Event> {
         let mut merged_len = head.length;
         let mut merged_count = 0;
@@ -138,40 +155,31 @@ impl Coalescer {
         let inode = head.inode;
         let name = &head.name;
         let mut current_end_offset = head.offset + head.length;
-
-        // Scan ahead for contiguous writes
         for (i, evt) in self.buffer.iter().enumerate().take(self.scan_depth) {
             if merged_len >= limit { break; }
-
-            let is_compatible = 
+            let is_compatible =
                 (evt.event_type == EventType::Write || evt.event_type == EventType::WriteRange) &&
                 evt.inode == inode &&
                 evt.name == *name &&
                 evt.offset == current_end_offset;
-
             if is_compatible {
                 merged_len += evt.length;
                 current_end_offset += evt.length;
                 indices_to_remove.push(i);
                 merged_count += 1;
             } else {
-                // Break on non-contiguous event for same inode (consistency)
                 if evt.inode == inode { break; }
             }
         }
-
         if merged_count > 0 {
-            // Remove coalesced events (reverse order to keep indices valid)
             for &i in indices_to_remove.iter().rev() {
                 self.buffer.remove(i);
             }
-            
             metrics::COALESCED_WRITES.inc_by((merged_count as u64) as f64);
             let mut new_event = (*head).clone();
             new_event.length = merged_len;
             return Arc::new(new_event);
         }
-
         head
     }
 }
