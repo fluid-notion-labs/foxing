@@ -628,57 +628,96 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             if let Some(new_name_str) = &e.new_name {
-                // Fix #11: Explicitly resolve old_dst from parent_inode to bypass stale cache
-                let old_dst = if e.parent_inode != 0 {
-                    let old_parent_opt = identity::resolve_directory(
+                let mut old_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) };
+                
+                if e.parent_inode != 0 {
+                    let mut old_parent_opt = identity::resolve_directory(
                         &source.dir_map, 
                         &source.inode_map, 
                         e.dev_id, 
                         e.parent_inode
                     );
-                    if let Some(parent) = old_parent_opt {
-                        target_cfg.path.join(parent).join(&e.name)
-                    } else {
-                        // Fallback to existing logic if parent resolution fails
-                        if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) }
+                    
+                    if old_parent_opt.is_none() {
+                         let src_clone_lookup = source.clone();
+                         let parent_ino = e.parent_inode;
+                         let dev_id = e.dev_id;
+                         let _ = tokio::task::spawn_blocking(move || {
+                             let _ = identity::resolve_and_update_path(
+                                 &src_clone_lookup.inode_map,
+                                 &src_clone_lookup.dir_map,
+                                 &src_clone_lookup.mount,
+                                 parent_ino,
+                                 0, 0, 0
+                             );
+                         }).await;
+                         
+                         old_parent_opt = identity::resolve_directory(
+                             &source.dir_map, 
+                             &source.inode_map, 
+                             e.dev_id, 
+                             e.parent_inode
+                         );
                     }
-                } else {
-                     if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) }
-                };
+
+                    if let Some(parent) = old_parent_opt {
+                        old_dst_final = target_cfg.path.join(parent).join(&e.name);
+                    }
+                }
                 
-                let new_dst = if e.new_parent_inode != 0 {
-                    let new_parent_path_opt = identity::resolve_directory(
+                let mut new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
+                
+                if e.new_parent_inode != 0 {
+                    let mut new_parent_path_opt = identity::resolve_directory(
                         &source.dir_map, 
                         &source.inode_map, 
                         e.dev_id, 
                         e.new_parent_inode
                     );
                     
+                    if new_parent_path_opt.is_none() {
+                        let src_clone_lookup = source.clone();
+                        let parent_ino = e.new_parent_inode;
+                        let dev_id = e.dev_id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                             let _ = identity::resolve_and_update_path(
+                                 &src_clone_lookup.inode_map,
+                                 &src_clone_lookup.dir_map,
+                                 &src_clone_lookup.mount,
+                                 parent_ino,
+                                 0, 0, 0
+                             );
+                        }).await;
+                        
+                        new_parent_path_opt = identity::resolve_directory(
+                            &source.dir_map, 
+                            &source.inode_map, 
+                            e.dev_id, 
+                            e.new_parent_inode
+                        );
+                    }
+                    
                     if let Some(parent_rel) = new_parent_path_opt {
-                        target_cfg.path.join(parent_rel).join(new_name_str)
+                        new_dst_final = target_cfg.path.join(parent_rel).join(new_name_str);
                     } else {
-                        if let Some(old_parent) = old_dst.parent() {
-                            old_parent.join(new_name_str)
-                        } else {
-                            target_cfg.path.join(new_name_str)
+                        if let Some(old_parent) = old_dst_final.parent() {
+                            new_dst_final = old_parent.join(new_name_str);
                         }
                     }
                 } else {
-                    if let Some(old_parent) = old_dst.parent() {
-                        old_parent.join(new_name_str)
-                    } else {
-                        target_cfg.path.join(new_name_str)
+                    if let Some(old_parent) = old_dst_final.parent() {
+                        new_dst_final = old_parent.join(new_name_str);
                     }
-                };
+                }
 
-                if old_dst == new_dst {
-                    warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
+                if old_dst_final == new_dst_final {
+                    warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst_final);
                     return Ok(None);
                 }
 
-                let old_dst_clone = old_dst.clone();
+                let old_dst_clone = old_dst_final.clone();
                 let target_cfg_path_clone = target_cfg.path.clone();
-                let new_dst_for_rename_clone = new_dst.clone();
+                let new_dst_for_rename_clone = new_dst_final.clone();
                 let src_map_clone = source.inode_map.clone();
                 let src_dir_map_clone = source.dir_map.clone();
                 let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
@@ -687,7 +726,7 @@ async fn process_single_event_inner(
                 let e_generation = e.generation;
                 let e_seq = e.seq_num;
                 let e_ts = e.timestamp_ns;
-                let parent_dir = new_dst.parent().map(|p| p.to_path_buf());
+                let parent_dir = new_dst_final.parent().map(|p| p.to_path_buf());
                 let parent_dir_clone = parent_dir.clone();
                 let parent_check_res = tokio::task::spawn_blocking(move || {
                     if let Some(parent) = parent_dir_clone {
@@ -711,9 +750,9 @@ async fn process_single_event_inner(
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
-                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst, new_dst);
+                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
                         let hydration_tx_for_move = hydration_trigger.clone();
-                        let new_full_path_for_validation = new_dst.clone();
+                        let new_full_path_for_validation = new_dst_final.clone();
                         tokio::task::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             if !new_full_path_for_validation.exists() {
@@ -722,16 +761,16 @@ async fn process_single_event_inner(
                                 let _ = hydration_tx_for_move.0.send(new_full_path_for_validation.clone()).await;
                             }
                         });
-                        let new_rel_path_to_store = match new_dst.strip_prefix(&target_cfg.path) {
+                        let new_rel_path_to_store = match new_dst_final.strip_prefix(&target_cfg.path) {
                             Ok(rel) => rel.to_path_buf(),
-                            Err(_) => new_dst.to_path_buf(),
+                            Err(_) => new_dst_final.to_path_buf(),
                         };
                         identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, is_dir, e_ts, e_seq);
                     },
                     Err(FoxingError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {
-                        warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst);
+                        warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst_final);
                         let dest_exists = tokio::task::spawn_blocking({
-                            let path = new_dst.clone();
+                            let path = new_dst_final.clone();
                             move || {
                                 if path.exists() {
                                     if let Ok(_meta) = std::fs::metadata(&path) {
@@ -742,22 +781,22 @@ async fn process_single_event_inner(
                             }
                         }).await.unwrap_or(false);
                         if dest_exists {
-                            debug!("Idempotency check passed: File already at destination {:?}.", new_dst);
+                            debug!("Idempotency check passed: File already at destination {:?}.", new_dst_final);
                             return Ok(None);
                         }
                         error!("Rename failed and file lost. Triggering resync of parent.");
-                        if let Some(parent) = new_dst.parent() {
+                        if let Some(parent) = new_dst_final.parent() {
                             let _ = hydration_trigger.0.send(parent.to_path_buf()).await;
                         }
                         return Ok(None);
                     },
                     Err(e) => {
-                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst, new_dst, e);
+                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst_final, new_dst_final, e);
                         ctx.failure_state.record_failure();
                         return Err(e);
                     }
                 }
-                if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
+                if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst_final.clone(); }
                 return Ok(None);
             } else { return Ok(None); }
         },
