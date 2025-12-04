@@ -267,59 +267,79 @@ pub async fn run_worker(
             let new_name = event_ptr.new_name.clone();
             
             // NEW: Validate BPF data completeness BEFORE lookup
-            let has_complete_bpf_data = new_parent_inode != 0 && new_name.is_some();
-
-            let lookup_task = tokio::task::spawn_blocking(move || {
-                // Alias the inner success type to avoid repetition
-                type InnerResult = std::result::Result<PathBuf, std::io::Error>;
-
-                if has_complete_bpf_data {
-                    // Case 1: BPF data is complete (best case)
-                    let new_name_str = new_name.as_ref().unwrap();
-                    let mut cache = src_clone.inode_map.lock();
-                    let new_rel_path = if let Some((parent_path, _)) = cache.get(&new_parent_inode) {
-                        parent_path.join(new_name_str)
-                    } else {
-                        // Fallback to name if parent isn't known, usually indicating a path relative to mount root
-                        PathBuf::from(new_name_str)
-                    };
-                    identity::update_map_after_rename(&src_clone.inode_map, e_inode, new_rel_path.clone(), e_generation);
-                    // Explicit type annotation added here to resolve E0282
-                    return Ok::<InnerResult, tokio::task::JoinError>(Ok(new_rel_path)); 
-                }
-
-                // Case 2: BPF data incomplete - DO NOT UPDATE MAP HERE
-                // Just resolve current location for logging/next step
-                match identity::resolve_and_update_path(&src_clone.inode_map, &src_clone.mount, e_inode) {
-                    Ok(current_path) => {
-                        // Found it. We update the map with the post-rename location.
-                        // This prevents subsequent logic from using the old, pre-rename name.
-                        identity::update_map_after_rename(&src_clone.inode_map, e_inode, current_path.clone(), e_generation);
-                        warn!("RENAME: BPF data incomplete for inode {}. Aggressive lookup found it at {:?}, updating map.",
-                              e_inode, current_path);
-                        Ok(Ok(current_path)) // Double Ok for success
-                    },
-                    Err(e) => {
-                         warn!("RENAME: BPF data incomplete for inode {}. Aggressive lookup failed: {:?}", e_inode, e);
-                         Ok(Err(e)) // Outer Ok, Inner Err for IO failure
+            let has_complete_bpf_data = new_parent_inode != 0 && new_name.is_some() && new_name.as_ref().map_or(false, |n| !n.is_empty());
+            
+            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Complete: {}", 
+                e_inode, event_ptr.name, new_parent_inode, new_name, has_complete_bpf_data);
+            
+            // 500ms timeout for aggressive lookup
+            const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+            
+            if has_complete_bpf_data {
+                // *** FAST PATH: BPF data is sufficient, perform map update directly (quick metadata op) ***
+                let new_name_str = new_name.as_ref().unwrap();
+                let map_update_success = tokio::task::spawn_blocking({
+                    let src_clone = src_clone.clone();
+                    move || {
+                        let mut cache = src_clone.inode_map.lock();
+                        let new_rel_path = if let Some((parent_path, _)) = cache.get(&new_parent_inode) {
+                            parent_path.join(new_name_str)
+                        } else {
+                            PathBuf::from(new_name_str)
+                        };
+                        identity::update_map_after_rename(&src_clone.inode_map, e_inode, new_rel_path.clone(), e_generation);
+                        debug!("RENAME Handler: Case 1 - Map updated with BPF data path: {:?}", new_rel_path);
+                        Ok::<(), FoxingError>(())
                     }
-                }
-            });
-            match lookup_task.await {
-                Ok(Ok(_new_path)) => {
-                    // Success: map was updated in the task (either by BPF data or aggressive lookup)
-                }
-                Ok(Err(e)) => {
-                    // Inner IO error (e: std::io::Error)
-                    warn!("Worker {}: RENAME identity fix failed for Inode {} ({:?}). Skipping event to avoid corruption.",
-                          worker_id, e_inode, e);
-                    continue; // Skip this event entirely
-                }
-                Err(e) => {
-                    // Outer Join error (e: tokio::task::JoinError)
-                    warn!("Worker {}: Join error during RENAME identity lookup for Inode {} ({:?}). Skipping event to avoid corruption.",
-                          worker_id, e_inode, e);
+                }).await;
+
+                if map_update_success.is_err() || map_update_success.unwrap().is_err() {
+                    warn!("Worker {}: RENAME identity update failed (Mutex/Join Error) for Inode {}. Skipping event.",
+                        worker_id, e_inode);
                     continue;
+                }
+            } else {
+                // *** SLOW PATH: BPF data is incomplete, must run aggressive filesystem scan with timeout ***
+                warn!("RENAME Handler: Case 2 - BPF data incomplete or zeroed. Falling back to aggressive FS scan with timeout.");
+                
+                let lookup_task = tokio::task::spawn_blocking(move || {
+                    // This internal blocking task performs the slow FS scan and map update
+                    match identity::resolve_and_update_path(&src_clone.inode_map, &src_clone.mount, e_inode) {
+                        Ok(current_path) => {
+                            // Since resolve_and_update_path no longer updates the map, we do it here
+                            identity::update_map_after_rename(&src_clone.inode_map, e_inode, current_path.clone(), e_generation);
+                            warn!("RENAME Handler: Aggressive lookup found new path {:?}. Map updated.", current_path);
+                            Ok(current_path) // Inner Success
+                        },
+                        Err(e) => {
+                            warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
+                            Err(e) // Inner IO failure
+                        }
+                    }
+                });
+
+                match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
+                    Ok(Ok(Ok(_new_path))) => {
+                        // Success: map was updated in the task
+                    }
+                    Ok(Ok(Err(e))) => {
+                        // Inner IO error (std::io::Error)
+                        warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.",
+                              worker_id, e_inode, e);
+                        continue; // Skip this event entirely
+                    }
+                    Ok(Err(e)) => {
+                        // Outer Join error (tokio::task::JoinError)
+                        warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.",
+                              worker_id, e_inode, e);
+                        continue;
+                    }
+                    Err(_) => {
+                        // Timeout error
+                        warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.",
+                              worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
+                        continue;
+                    }
                 }
             }
         }

@@ -31,7 +31,7 @@ struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
 struct xfs_mount { struct super_block *m_super; } __attribute__((preserve_access_index));
 struct xfs_trans { struct xfs_mount *t_mountp; } __attribute__((preserve_access_index));
 
-// --- Removed manual struct definitions (renamedata) to resolve E0282 redefinition error. ---
+// --- Removed manual struct definitions to resolve redefinition error. ---
 
 enum event_type {
     EVENT_WRITE=1, EVENT_WRITE_RANGE=2, EVENT_SETXATTR=3, EVENT_REMOVEXATTR=4,
@@ -215,17 +215,13 @@ int BPF_KPROBE(trace_rename, struct renamedata *rd) {
     struct dentry *new_dentry = BPF_CORE_READ(rd, new_dentry);
     
     __u64 new_parent_ino = 0;
-    
-    // --- Removed conditional rd->new_dir access to fix compilation ---
 
     if (new_dentry) {
         // New Name
         const unsigned char *new_name_ptr = BPF_CORE_READ(new_dentry, d_name.name);
         bpf_core_read_str(&e->new_name, sizeof(e->new_name), (const char *)new_name_ptr);
         
-        // Populate New Parent Inode via dentry parent (d_parent). This is the safest way.
-        // This relies on the kernel updating new_dentry->d_parent correctly, which is standard behavior
-        // during rename/move, and serves as our primary way to retrieve the new parent directory.
+        // New Parent Inode via dentry parent (d_parent). This is the safest way.
         struct dentry *new_p = BPF_CORE_READ(new_dentry, d_parent);
         struct inode *new_p_inode = BPF_CORE_READ(new_p, d_inode);
         if (new_p_inode) {
@@ -237,7 +233,6 @@ int BPF_KPROBE(trace_rename, struct renamedata *rd) {
     
     // RENAME INCOMPLETE DATA METRIC
     // If we could not determine the new parent OR the new name, the event is 'incomplete'.
-    // The worker relies heavily on new_parent_inode for target resolution.
     if (e->new_parent_inode == 0 || e->new_name[0] == 0) {
         __u32 z=0; struct stats *s = bpf_map_lookup_elem(&statistics, &z);
         if (s) __sync_fetch_and_add(&s->incomplete_rename, 1);
