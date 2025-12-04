@@ -99,6 +99,7 @@ async fn run_hydration_worker_loop(
             return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Failed to register io_uring buffers")));
         }
     }
+
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
 
     loop {
@@ -106,6 +107,7 @@ async fn run_hydration_worker_loop(
             let mut lock = rx.lock().await;
             lock.recv().await
         };
+
         match job {
             Some(job) => {
                 process_hydration_job(job, &source, &governor, &tuner_board, &mut ring, &mut buffer_pool, src_rwf_uncached_ok).await?;
@@ -128,16 +130,21 @@ async fn process_hydration_job(
 ) -> Result<()> {
     let HydrationJob { mut rel_path, target_cfg } = job;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
+
     let source_path_start = source.mount.join(&rel_path);
     let mut target_path = target_cfg.path.join(&rel_path);
 
+    // Resolve symlinks and real paths on source
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
         match spawn_blocking({
             let map = source.inode_map.clone();
             let dir_map = source.dir_map.clone();
             let mount = source.mount.clone();
-            move || identity::resolve_and_update_path(&map, &dir_map, &mount, inode)
+            // Aggressive lookup updates the map. 
+            // Hydration implies "now", so we pass 0/MAX wildcards to be accepted by the map logic.
+            // We use 0 for generation (wildcard) and 0 for timestamp (weakest, so BPF updates win).
+            move || identity::resolve_and_update_path(&map, &dir_map, &mount, inode, 0, 0, 0)
         }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             Ok(new_full_path) => {
                 if let Ok(new_rel) = new_full_path.strip_prefix(&source.mount) {
@@ -146,6 +153,7 @@ async fn process_hydration_job(
                         target_path = target_cfg.path.join(new_rel);
                         rel_path = new_rel.to_path_buf();
                     } else {
+                        // Path matches
                     }
                 }
             },
@@ -181,6 +189,7 @@ async fn process_hydration_job(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // Ensure directory structure
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
@@ -205,7 +214,8 @@ async fn process_hydration_job(
                 }
                 let file_size = metadata.len();
                 let _src_mtime = metadata.mtime();
-
+                
+                // Versioning Check (Deduplication)
                 let target_path_clone_ver = target_path.clone();
                 let target_cfg_clone_ver = target_cfg.clone();
                 let source_path_clone_meta = source_path.clone();
@@ -283,6 +293,7 @@ async fn process_hydration_job(
                 metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(stats.bytes_processed as f64);
                 let src_path_clone = source_path.clone();
                 let dst_path_clone = target_path.clone();
+                
                 let apply_res = spawn_blocking(move || {
                     security::sync_xattrs(&src_path_clone, &dst_path_clone);
                     let _ = security::apply_metadata(&src_path_clone, &dst_path_clone);
@@ -297,20 +308,23 @@ async fn process_hydration_job(
                 }
             },
             Ok(None) => {
-                success = true;
+                success = true; // Reflink / Dedupe success
             }
             Err(e) => {
                 let delay = Duration::from_millis(100 * (attempts as u64).min(5));
                 if let FoxingError::Io(io_err) = &e {
+                    // Recover from stale file handles or IO errors by forcing a re-lookup
                     if io_err.kind() == ErrorKind::Other || io_err.raw_os_error() == Some(5) {
                         let _ = spawn_blocking({
                             let source_map = source.inode_map.clone();
                             let source_dir_map = source.dir_map.clone();
                             let source_mount = source.mount.clone();
-                            move || identity::resolve_and_update_path(&source_map, &source_dir_map, &source_mount, 0)
+                            // Re-resolve path for root inode 0 (special case) or generic
+                            move || identity::resolve_and_update_path(&source_map, &source_dir_map, &source_mount, 0, 0, 0, 0)
                         }).await;
                     }
                 }
+
                 if attempts < max_attempts {
                     warn!("Hydration copy FAILED for {:?} (Attempt {}/{}) due to {:?}. Delaying {:?}.",
                           rel_path, attempts, max_attempts, e, delay);
@@ -326,5 +340,6 @@ async fn process_hydration_job(
     if !success {
         return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hydration job failed repeated attempts")));
     }
+
     Ok(())
 }

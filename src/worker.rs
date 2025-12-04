@@ -113,13 +113,9 @@ pub async fn run_worker(
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
 
-    // Seed Root Inode Identity (Fixes synthetic path fallback for root operations)
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
-            // We assume the primary dev ID for the source path. 
-            // Note: If the source path spans mounts, this might need refinement, 
-            // but for the root, it is always the primary dev.
             let dev = source.dev; 
             info!("Worker 0: Seeding Root Identity for {:?} -> Inode {} (Dev {})", source.path, inode, dev);
             identity::update_map(
@@ -128,9 +124,9 @@ pub async fn run_worker(
                 dev, 
                 inode, 
                 PathBuf::from(""), 
-                0, // Generation 0 for root
+                0, 
                 false, 
-                true, // is_dir
+                true, 
                 0, 
                 0
             );
@@ -294,8 +290,6 @@ pub async fn run_worker(
                 }
             }
         } else {
-            // Shutdown mode: Non-blocking drain of BOTH main and repair channels
-            // This fixes possible loss of high-priority metadata events during drain
             let repair_event = if let Some(rx) = &mut rx_repair {
                 rx.try_recv().ok()
             } else { None };
@@ -375,7 +369,15 @@ pub async fn run_worker(
                     let dir_map_clone = src_clone.dir_map.clone();
                     let inode_map_clone = src_clone.inode_map.clone();
                     let lookup_task = tokio::task::spawn_blocking(move || {
-                        match identity::resolve_and_update_path(&inode_map_clone, &dir_map_clone, &src_clone.mount, e_inode) {
+                        match identity::resolve_and_update_path(
+                            &inode_map_clone, 
+                            &dir_map_clone, 
+                            &src_clone.mount, 
+                            e_inode,
+                            e_generation,
+                            e_ts,
+                            e_seq
+                        ) {
                             Ok(current_path) => Ok(current_path),
                             Err(e) => {
                                 warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
@@ -409,16 +411,13 @@ pub async fn run_worker(
             }
             coalescer.push(event_ptr.clone());
         } else if shutdown_requested {
-            // No new event, check if we are done
             if coalescer.is_empty() {
                 break Ok(());
             }
         } 
         
-        // Process Batch
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         
-        // Optimize batch size for shutdown to drain quickly
         let effective_batch_size = if shutdown_requested {
             256
         } else if is_control_plane {
@@ -462,6 +461,7 @@ pub async fn run_worker(
                 daemon_id: &daemon_id,
             };
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+            
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -470,6 +470,7 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
+            
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
             let op_kind = match e.event_type {
@@ -502,7 +503,7 @@ async fn process_single_event_inner(
     _tuner: &BbrTuner,
     _capacity_threshold_mb: u64,
     dst: &PathBuf,
-    _is_synthetic: bool,
+    is_synthetic: bool,
     needs_creation: bool,
     src: &PathBuf,
     buffer_pool: &mut BufferPool,
@@ -512,7 +513,6 @@ async fn process_single_event_inner(
     worker_id: usize,
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
-    // needs_creation logic: Only create placeholder FILES for file-type events.
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
@@ -547,14 +547,12 @@ async fn process_single_event_inner(
             return Err(FoxingError::Io(io::ErrorKind::Other.into()));
         }
     }
-    // FIX #3: 3-Phase WAL Transition
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::Rename | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
             let daemon_id = ctx.daemon_id.to_string();
             let seq = e.seq_num;
-            // PHASE 1: IntentPending (Ghost)
             let wal_res = tokio::task::spawn_blocking(move || {
                 sidecar::update_wal(&dst_for_wal, WalState::IntentPending, seq, &daemon_id);
             }).await;
@@ -580,7 +578,6 @@ async fn process_single_event_inner(
             let src_clone_for_metadata = src.clone();
             let daemon_id = ctx.daemon_id.to_string();
             let e_seq = e.seq_num;
-            // PHASE 2: InProgress (Committing to IO)
             let dst_for_phase2 = dst_clone.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 sidecar::update_wal(&dst_for_phase2, WalState::InProgress, e_seq, &daemon_id);
@@ -609,7 +606,6 @@ async fn process_single_event_inner(
                     ).await;
                     match copy_res {
                         Ok(stats) => {
-                            // PHASE 3: CommitPending (IO Done)
                             let dst_for_phase3 = dst_clone.clone();
                             let daemon_id_p3 = ctx.daemon_id.to_string();
                             let _ = tokio::task::spawn_blocking(move || {
@@ -632,9 +628,24 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             if let Some(new_name_str) = &e.new_name {
-                let old_dst = target_cfg.path.join(e.name.trim_start_matches('/'));
+                // Fix #11: Explicitly resolve old_dst from parent_inode to bypass stale cache
+                let old_dst = if e.parent_inode != 0 {
+                    let old_parent_opt = identity::resolve_directory(
+                        &source.dir_map, 
+                        &source.inode_map, 
+                        e.dev_id, 
+                        e.parent_inode
+                    );
+                    if let Some(parent) = old_parent_opt {
+                        target_cfg.path.join(parent).join(&e.name)
+                    } else {
+                        // Fallback to existing logic if parent resolution fails
+                        if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) }
+                    }
+                } else {
+                     if !is_synthetic { dst.clone() } else { target_cfg.path.join(e.name.trim_start_matches('/')) }
+                };
                 
-                // Construct new destination path explicitly using BPF data to avoid synthetic fallbacks
                 let new_dst = if e.new_parent_inode != 0 {
                     let new_parent_path_opt = identity::resolve_directory(
                         &source.dir_map, 
@@ -646,7 +657,6 @@ async fn process_single_event_inner(
                     if let Some(parent_rel) = new_parent_path_opt {
                         target_cfg.path.join(parent_rel).join(new_name_str)
                     } else {
-                        // Fallback: assume same directory as old file if parent resolution fails
                         if let Some(old_parent) = old_dst.parent() {
                             old_parent.join(new_name_str)
                         } else {
@@ -654,7 +664,6 @@ async fn process_single_event_inner(
                         }
                     }
                 } else {
-                    // No new parent provided, assume same directory
                     if let Some(old_parent) = old_dst.parent() {
                         old_parent.join(new_name_str)
                     } else {
@@ -662,7 +671,6 @@ async fn process_single_event_inner(
                     }
                 };
 
-                // Check for idempotent / redundant renames
                 if old_dst == new_dst {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
                     return Ok(None);
@@ -718,7 +726,6 @@ async fn process_single_event_inner(
                             Ok(rel) => rel.to_path_buf(),
                             Err(_) => new_dst.to_path_buf(),
                         };
-                        // Update identity map with new path to prevent future lookups failing
                         identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, is_dir, e_ts, e_seq);
                     },
                     Err(FoxingError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {

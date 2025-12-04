@@ -18,11 +18,20 @@ pub struct IdentityEntry {
 }
 
 impl IdentityEntry {
+    pub fn new(path: PathBuf, generation: u32, timestamp_ns: u64, seq_num: u64) -> Self {
+        Self {
+            path,
+            generation,
+            timestamp_ns,
+            seq_num,
+        }
+    }
+    
     pub fn from_stat(path: PathBuf, generation: u32) -> Self {
         Self {
             path,
             generation,
-            timestamp_ns: u64::MAX,
+            timestamp_ns: u64::MAX, // Stat lookups have no timestamp ordering context
             seq_num: u64::MAX,
         }
     }
@@ -43,12 +52,7 @@ pub fn update_map(map: &InodeMap, dir_map: &DirMap, dev: u32, inode: u64, path: 
         }
     }
     if !is_synthetic {
-        cache.put(key, IdentityEntry {
-            path: path.clone(),
-            generation,
-            timestamp_ns: ts,
-            seq_num: seq,
-        });
+        cache.put(key, IdentityEntry::new(path.clone(), generation, ts, seq));
     }
     if is_dir {
         let mut d_cache = dir_map.lock();
@@ -67,12 +71,7 @@ pub fn update_map_after_rename(map: &InodeMap, dir_map: &DirMap, dev: u32, inode
             return;
         }
     }
-    cache.put(key, IdentityEntry {
-        path: new_path.clone(),
-        generation,
-        timestamp_ns: ts,
-        seq_num: seq,
-    });
+    cache.put(key, IdentityEntry::new(new_path.clone(), generation, ts, seq));
     if is_dir {
         let mut d_cache = dir_map.lock();
         d_cache.put(key, new_path);
@@ -82,39 +81,54 @@ pub fn update_map_after_rename(map: &InodeMap, dir_map: &DirMap, dev: u32, inode
 pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Path) -> (PathBuf, bool, bool) {
     let mut cache = map.lock();
     let key = (event.dev_id, event.inode);
-    if let Some(entry) = cache.get(&key) {
-        if entry.generation != event.generation && entry.generation != std::u32::MAX {
+    
+    // Fix E0594: Use get_mut to allow modifying the entry for self-healing
+    if let Some(entry) = cache.get_mut(&key) {
+        // Allow 0 as a wildcard generation in cache (from legacy/aggressive lookups)
+        let match_gen = entry.generation == event.generation 
+                        || entry.generation == 0 
+                        || entry.generation == std::u32::MAX;
+
+        if !match_gen {
              warn!("Identity Mismatch: Device {} Inode {} cached gen {} != event gen {}. Invalidating cache.",
                    event.dev_id, event.inode, entry.generation, event.generation);
              cache.pop(&key);
         } else {
+             // If generation was 0, self-heal it with the event's generation
+             if entry.generation == 0 && event.generation != 0 {
+                 entry.generation = event.generation;
+             }
              return (target_root.join(&entry.path), false, false);
         }
     }
+
     if event.parent_inode != 0 {
         let parent_key = (event.dev_id, event.parent_inode);
         if let Some(parent_entry) = cache.get(&parent_key) {
             let full_path = parent_entry.path.join(&event.name);
-            cache.put(key, IdentityEntry {
-                path: full_path.clone(),
-                generation: event.generation,
-                timestamp_ns: event.timestamp_ns,
-                seq_num: event.seq_num,
-            });
+            cache.put(key, IdentityEntry::new(
+                full_path.clone(),
+                event.generation,
+                event.timestamp_ns,
+                event.seq_num,
+            ));
             return (target_root.join(full_path), false, false);
         }
     }
+
     let event_path = PathBuf::from(&event.name);
     if !event.name.is_empty() && !event.name.contains('/') {
+        // Simple filename, can't resolve without parent
     } else if !event.name.is_empty() {
-        cache.put(key, IdentityEntry {
-            path: event_path.clone(),
-            generation: event.generation,
-            timestamp_ns: event.timestamp_ns,
-            seq_num: event.seq_num,
-        });
+        cache.put(key, IdentityEntry::new(
+            event_path.clone(),
+            event.generation,
+            event.timestamp_ns,
+            event.seq_num,
+        ));
         return (target_root.join(event_path), false, false);
     }
+
     let identity_dir = target_root.join(".mirror").join(".by-identity");
     let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
     let synthetic_path = identity_dir.join(filename);
@@ -129,6 +143,7 @@ pub fn resolve_directory(dir_map: &DirMap, inode_map: &InodeMap, dev: u32, inode
             return Some(p.clone());
         }
     }
+    
     let mut i_cache = inode_map.lock();
     if let Some(entry) = i_cache.get(&key) {
         let p_clone = entry.path.clone();
@@ -137,28 +152,41 @@ pub fn resolve_directory(dir_map: &DirMap, inode_map: &InodeMap, dev: u32, inode
         d_cache.put(key, p_clone.clone());
         return Some(p_clone);
     }
+    
     None
 }
 
-pub fn resolve_and_update_path(map: &InodeMap, dir_map: &DirMap, source_mount_root: &std::path::Path, inode: u64) -> Result<PathBuf, io::Error> {
+pub fn resolve_and_update_path(
+    map: &InodeMap, 
+    dir_map: &DirMap, 
+    source_mount_root: &std::path::Path, 
+    inode: u64,
+    generation_hint: u32,
+    ts_hint: u64,
+    seq_hint: u64
+) -> Result<PathBuf, io::Error> {
     info!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source_mount_root);
     let mut found_path = None;
-    let mut _found_dev = 0;
+    
     for entry in walkdir::WalkDir::new(source_mount_root).min_depth(1) {
         if let Ok(entry) = entry {
             if entry.depth() > 20 { continue; }
+            
             if let Ok(metadata) = entry.metadata() {
                 if metadata.ino() == inode {
                     if let Ok(rel_path) = entry.path().strip_prefix(source_mount_root) {
                         found_path = Some(rel_path.to_path_buf());
                         let found_dev = metadata.dev() as u32;
                         info!("IDENTITY: FOUND Inode {} (Dev {}) at {:?}", inode, found_dev, rel_path);
+                        
                         let is_dir = metadata.is_dir();
-                        let generation = 0u32;
                         let rel_path_buf = rel_path.to_path_buf();
                         let key = (found_dev, inode);
+                        
+                        // Update maps with provided hints or defaults if generic lookup
                         let mut cache = map.lock();
-                        cache.put(key, IdentityEntry::from_stat(rel_path_buf.clone(), generation));
+                        cache.put(key, IdentityEntry::new(rel_path_buf.clone(), generation_hint, ts_hint, seq_hint));
+                        
                         if is_dir {
                              let mut d_cache = dir_map.lock();
                              d_cache.put(key, rel_path_buf.clone());
@@ -172,11 +200,13 @@ pub fn resolve_and_update_path(map: &InodeMap, dir_map: &DirMap, source_mount_ro
             warn!("Error during aggressive path resolution walk: {}", e);
         }
     }
+    
     if let Some(path) = found_path {
         if fs::metadata(source_mount_root.join(&path)).is_ok() {
             return Ok(path);
         }
     }
+    
     warn!("IDENTITY: Failed to resolve Inode {} after full walk.", inode);
     Err(io::Error::new(io::ErrorKind::NotFound, "Inode not found after aggressive search."))
 }
