@@ -263,19 +263,41 @@ pub async fn run_worker(
             let e_generation = event_ptr.generation;
             let new_parent_inode = event_ptr.new_parent_inode;
             let new_name_opt = event_ptr.new_name.clone(); // Clone Option<String> outside closure
+            
             // NEW: Validate BPF data completeness BEFORE lookup
             let has_complete_bpf_data = new_parent_inode != 0 && new_name_opt.is_some() && new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
-            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Complete: {}",
+            
+            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Complete: {}", 
                 e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
+            
             // 500ms timeout for aggressive lookup
             const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+            
             if has_complete_bpf_data {
                 // *** FAST PATH: BPF data is sufficient, bypass slow file scan and aggressive timeout. ***
-                // We rely on the blocking task below to perform the actual update post-rename success.
-                // The quick fix has been removed from this block to prevent the race.
+                let new_name_str = new_name_opt.as_ref().unwrap().clone();
+                
+                let map_update_success = tokio::task::spawn_blocking(move || {
+                    let mut cache = src_clone.inode_map.lock();
+                    let new_rel_path = if let Some((parent_path, _)) = cache.get(&new_parent_inode) {
+                        parent_path.join(&new_name_str) // Use cloned string reference
+                    } else {
+                        PathBuf::from(new_name_str)
+                    };
+                    identity::update_map_after_rename(&src_clone.inode_map, e_inode, new_rel_path.clone(), e_generation);
+                    debug!("RENAME Handler: Case 1 - Map updated with BPF data path: {:?}", new_rel_path);
+                    Ok::<(), FoxingError>(())
+                }).await;
+
+                if map_update_success.is_err() || map_update_success.unwrap().is_err() {
+                    warn!("Worker {}: RENAME identity update failed (Mutex/Join Error) for Inode {}. Skipping event.",
+                        worker_id, e_inode);
+                    continue;
+                }
             } else {
                 // *** SLOW PATH: BPF data is incomplete, must run aggressive filesystem scan with timeout ***
                 warn!("RENAME Handler: Case 2 - BPF data incomplete or zeroed. Falling back to aggressive FS scan with timeout.");
+                
                 let lookup_task = tokio::task::spawn_blocking(move || {
                     // This internal blocking task performs the slow FS scan and map update
                     match identity::resolve_and_update_path(&src_clone.inode_map, &src_clone.mount, e_inode) {
@@ -291,6 +313,7 @@ pub async fn run_worker(
                         }
                     }
                 });
+
                 match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
                     Ok(Ok(Ok(_new_path))) => {
                         // Success: map was updated in the task
@@ -532,30 +555,24 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             if let Some(_new_name) = &e.new_name {
+                // The correct *destination* path is now `dst` because the map was pre-updated.
+                // Determine the original (old) target path from the event's name field
                 let old_dst = target_cfg.path.join(e.name.trim_start_matches('/'));
                 let new_dst = dst.to_path_buf();
-                let old_dst_clone = old_dst.clone();
-                let target_cfg_path_clone = target_cfg.path.clone();
-                let new_dst_for_rename_clone = new_dst.clone();
                 
-                // --- IDENTITY MAP RACE FIX: Prepare new path and generation data ---
-                // The aggressive lookup logic in `run_worker` might have already updated the map 
-                // in the slow path, but we still need the data for the fast path and for cleanup.
-                let src_map_clone = source.inode_map.clone();
-                let e_inode = e.inode;
-                let e_generation = e.generation;
-                let new_rel_path_to_store = match new_dst.strip_prefix(&target_cfg.path) {
-                    Ok(rel) => rel.to_path_buf(),
-                    Err(_) => new_dst.to_path_buf(),
-                };
-                // --- End fix prep ---
+                // --- Clone required values for blocking tasks ---
+                let old_dst_clone = old_dst.clone(); // Fix E0382 for error logging
+                let target_cfg_path_clone = target_cfg.path.clone(); // Fix E0521
 
+                // 1. Ensure new parent directory exists (critical for cross-directory moves)
                 let parent_dir = new_dst.parent().map(|p| p.to_path_buf());
                 let parent_dir_clone = parent_dir.clone();
+                let new_dst_for_rename_clone = new_dst.clone(); // Clone for atomic_rename task
                 
                 let parent_check_res = tokio::task::spawn_blocking(move || {
                     if let Some(parent) = parent_dir_clone {
-                        if parent != target_cfg_path_clone && !parent.exists() {
+                        // Use cloned target_cfg path
+                        if parent != target_cfg_path_clone && !parent.exists() { 
                             std::fs::create_dir_all(&parent)
                         } else {
                             Ok(())
@@ -564,50 +581,37 @@ async fn process_single_event_inner(
                         Ok(())
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
                 if let Err(e) = parent_check_res {
                     error!("Worker {}: RENAME failed to create target directory {:?}: {:?}", worker_id, parent_dir, e);
                     ctx.failure_state.record_failure();
                     return Err(e);
                 }
-                
+
+                // 2. Check for "no-op" rename caused by poisoning
                 if old_dst == new_dst {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
                     return Ok(None);
                 }
-
+                
+                // 3. Perform Atomic Rename
+                
                 if old_dst.exists() {
                     let res = tokio::task::spawn_blocking(move || {
-                        // CRITICAL BLOCK START: Perform atomic rename
-                        let res = atomic_rename(&old_dst_clone, &new_dst_for_rename_clone).map_err(FoxingError::Io);
-                        
-                        // FIX: ONLY UPDATE IDENTITY MAP AFTER SUCCESSFUL PHYSICAL RENAME
-                        if res.is_ok() {
-                            identity::update_map_after_rename(&src_map_clone, e_inode, new_rel_path_to_store, e_generation);
-                            debug!("Worker {}: Identity map updated post-rename success.", worker_id);
-                        }
-                        res
-                        // CRITICAL BLOCK END
+                        atomic_rename(&old_dst_clone, &new_dst_for_rename_clone).map_err(FoxingError::Io)
                     }).await.map_err(FoxingError::Join).and_then(|r| r);
                     
                     metrics::RENAME_EVENTS.inc();
+                    
                     if let Err(e) = res {
+                        // Use old_dst_clone for logging (Fix E0382)
                         error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst, new_dst, e);
                         ctx.failure_state.record_failure();
                         return Err(e);
                     }
                 } else {
                     debug!("Worker {}: Old target path for RENAME event {:?} does not exist. Skipping atomic rename.", worker_id, old_dst);
-                    // Even if old_dst doesn't exist, we must update the map if the file was tracked.
-                    // The map should have been updated by the aggressive lookup in run_worker, but re-run for safety.
-                    let res = tokio::task::spawn_blocking(move || {
-                         identity::update_map_after_rename(&src_map_clone, e_inode, new_rel_path_to_store, e_generation);
-                         Ok::<(), FoxingError>(())
-                    }).await;
-                    if res.is_err() {
-                        warn!("Worker {}: Identity update failed for non-existent source file: {:?}", worker_id, res.err());
-                    }
                 }
-                
                 if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst.clone(); }
                 return Ok(None);
             } else { return Ok(None); }
