@@ -25,23 +25,15 @@ use crate::hydration_worker::HydrationQueue;
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
-
-// --- START: RepairGuard Consistency Feature ---
-// This is an RAII guard used to ensure a specific file path is only undergoing
-// a targeted hydration repair job once at a time. It uses the SourceInfo's
-// DashSet for global locking.
 struct RepairGuard {
     path: PathBuf,
     set: Arc<DashSet<PathBuf>>,
 }
 impl Drop for RepairGuard {
     fn drop(&mut self) {
-        // Release the lock on the path when the repair operation finishes.
         self.set.remove(&self.path);
     }
 }
-// --- END: RepairGuard Consistency Feature ---
-
 fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration) {
     let max_stress_level = tuner_board.iter().map(|r| {
         match *r.value() {
@@ -73,6 +65,7 @@ pub struct SourceInfo {
     pub dev_ids: Vec<u32>,
     pub hydration: Arc<crate::hydration::HydrationState>,
     pub inode_map: identity::InodeMap,
+    pub dir_map: identity::DirMap, // NEW: Directory-only inode map
     pub lru_size: usize,
     pub bulk_job_queue: Mutex<Option<HydrationQueue>>,
     pub queues: RwLock<HashMap<u32, Vec<Arc<EventQueue>>>>,
@@ -118,6 +111,7 @@ impl Manager {
         ));
         let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
         let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
+        let dir_cache_size = NonZeroUsize::new(cache_size.get().min(10000)).unwrap_or_else(|| NonZeroUsize::new(1000).unwrap());
         let mut sources: HashMap<u32, Arc<SourceInfo>> = HashMap::new();
         let mut target_ids_to_exclude = Vec::new();
         for sc in &config_reader.sources {
@@ -149,6 +143,7 @@ impl Manager {
                         dev_ids: dev_ids.clone(),
                         hydration: Arc::new(crate::hydration::HydrationState::default()),
                         inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
+                        dir_map: Arc::new(Mutex::new(LruCache::new(dir_cache_size))), // Initialize DirMap
                         lru_size: cache_size.get(),
                         bulk_job_queue: Mutex::new(None),
                         queues: RwLock::new(HashMap::new()),

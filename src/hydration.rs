@@ -8,7 +8,7 @@ use tracing::{info, warn, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 use crate::config::{TargetConfig};
 use crate::event::{Event, EventType};
-use crate::mirror::SourceInfo; // Correct import
+use crate::mirror::SourceInfo;
 use crate::governor::Governor;
 use crate::tuner::{TunerBoard, TunerState};
 use crate::{security, identity, sidecar, metrics, Result};
@@ -30,7 +30,7 @@ impl Default for HydrationState {
     }
 }
 pub struct Hydrator {
-    pub source: Arc<SourceInfo>, // Correct type
+    pub source: Arc<SourceInfo>,
     pub targets: Vec<TargetConfig>,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -38,7 +38,7 @@ pub struct Hydrator {
 }
 impl Hydrator {
     pub fn new(
-        source: Arc<SourceInfo>, // Correct type
+        source: Arc<SourceInfo>,
         targets: Vec<TargetConfig>,
         governor: Arc<Governor>,
         tuner_board: TunerBoard,
@@ -51,7 +51,8 @@ impl Hydrator {
         if let Ok(metadata) = fs::metadata(&path) {
             let inode = metadata.ino();
             if metadata.is_file() {
-                match identity::resolve_and_update_path(&self.source.inode_map, &self.source.mount, inode) {
+                // Since this resolve function is now integrated with dir_map logic, it helps repair parent paths too.
+                match identity::resolve_and_update_path(&self.source.inode_map, &self.source.dir_map, &self.source.mount, inode) {
                     Ok(new_full_path) => {
                         for target_cfg in &self.targets {
                             if let Some(queue) = self.source.bulk_job_queue.lock().as_ref() {
@@ -200,7 +201,11 @@ impl Hydrator {
             Err(_) => return Ok(()),
         };
         let ino = m.ino();
-        identity::update_map(&self.source.inode_map, ino, rel.clone(), std::u32::MAX, false);
+        
+        let is_dir = m.is_dir();
+        // Gap 2 Fix: Update both the general inode map and the directory-specific map during scan
+        identity::update_map(&self.source.inode_map, &self.source.dir_map, ino, rel.clone(), std::u32::MAX, false, is_dir);
+
         if !urgent {
             self.source.hydration.scanned.fetch_add(1, Ordering::Relaxed);
         } else {
