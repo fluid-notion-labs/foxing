@@ -4,7 +4,7 @@ use std::fs;
 use std::time::Instant;
 use std::os::unix::fs::{MetadataExt, FileTypeExt};
 use walkdir::WalkDir;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 use crate::config::{TargetConfig};
 use crate::event::{Event, EventType};
@@ -48,38 +48,27 @@ impl Hydrator {
     }
     pub fn repair_path(&self, path: PathBuf) {
         debug!("Hydration: Targeted repair requested for {:?}", path);
-        
-        // 1. Check if the file still exists at the old path.
         if let Ok(metadata) = fs::metadata(&path) {
             let inode = metadata.ino();
             if metadata.is_file() {
-                // This is a crucial block for RENAME/MOVE fixes:
-                // Find the file's current, correct relative path by searching the entire source tree for its inode.
                 match identity::resolve_and_update_path(&self.source.inode_map, &self.source.mount, inode) {
-                    Ok(new_rel_path) => {
-                        // A new path was found (meaning the file was moved). 
-                        // Submit this new path directly as a job to the fast bulk queue.
+                    Ok(new_full_path) => {
                         for target_cfg in &self.targets {
                             if let Some(queue) = self.source.bulk_job_queue.lock().as_ref() {
-                                if let Ok(stripped_path) = new_rel_path.strip_prefix(&self.source.mount).ok() {
+                                if let Ok(stripped_path) = new_full_path.strip_prefix(&self.source.mount) {
                                      queue.submit_job(stripped_path.to_path_buf(), target_cfg.clone());
                                      info!("Hydration Fix: Dispatched immediate RENAME repair job for Inode {} at new path: {:?}", inode, stripped_path);
-                                     // Success, exit immediately to prevent falling through to generic processing/deletion
                                      return;
                                 }
                             }
                         }
                     },
-                    Err(_) => {
-                         // File no longer found in source tree by inode, it must have been deleted.
-                         // Fall through to deletion logic below.
+                    Err(e) => {
+                         warn!("Hydration: Failed aggressive lookup for Inode {} (File: {:?}): {:?}", inode, path, e);
                     }
                 }
             }
         }
-        
-        // 2. Fallback logic: If the aggressive inode lookup failed, or the file exists but 
-        //    is a directory that needs general processing/deletion sweep is needed.
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
@@ -88,8 +77,6 @@ impl Hydrator {
              }
              return;
         }
-        
-        // 3. Generic file/directory processing (less urgent than rename fix)
         if let Err(e) = self.process_path(&path, true, None) {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }

@@ -51,7 +51,7 @@ fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration
         _ => (Duration::from_secs(2), Duration::from_secs(10)),
     }
 }
-fn calculate_adaptive_registry_limit(tuner_board: &TunerBoard) -> usize {
+fn _calculate_adaptive_registry_limit(tuner_board: &TunerBoard) -> usize {
     for r in tuner_board.iter() {
         if matches!(*r.value(), TunerState::CriticalDrain) { return 10; }
     }
@@ -252,7 +252,7 @@ impl Manager {
         }
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
-        let repair_tracker_clone = self.repair_tracker.clone();
+        let _repair_tracker_clone = self.repair_tracker.clone(); // Suppressed warning
         // Determine the canonical path of the Source root once
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
@@ -264,14 +264,11 @@ impl Manager {
             
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
-                // Check if the path exists AND it's not the root path. This identifies targeted files/dirs.
                 let is_targeted_repair = path.exists() && !is_root_request;
                 
                 if is_targeted_repair {
                     // 1. HIGH PRIORITY FILE REPAIR (Immediate Dispatch via Bulk Queue)
-                    // This bypasses the full scan debouncing entirely.
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
-                        // Assuming single target for immediate repair for simplicity based on test config
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
                             if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
                                 if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
@@ -281,10 +278,8 @@ impl Manager {
                             }
                         }
                     }
-                    // Since this was a targeted file/directory request, we are done with this path.
-                    // DO NOT fall through to the full scan logic below.
-                    continue; 
-                } 
+                    continue;
+                }
                 
                 if is_root_request {
                     // 2. FULL SCAN REQUEST (Debounced Slow Path)
@@ -302,9 +297,6 @@ impl Manager {
                         }
                     }
                 }
-                // 3. Low Priority Debounced Repair (Old logic for paths that might need processing later, 
-                //    but we don't need this complex directory tracking here since we rely on full scan/initial sync for dirs).
-                //    Since the BPF fix sends the file path, only case 1 and 2 should be hit for now.
             }
             Ok(())
         });

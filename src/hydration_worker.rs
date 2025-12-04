@@ -15,6 +15,8 @@ use std::time::Duration;
 use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
+use std::os::unix::fs::MetadataExt; 
+
 #[derive(Debug)]
 pub struct HydrationJob {
     pub rel_path: PathBuf,
@@ -123,36 +125,33 @@ async fn process_hydration_job(
     // --- RENAME/MOVE REPAIR LOOKUP ---
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
-        // Execute the aggressive lookup to find the file's current, correct relative path
         match spawn_blocking({
             let map = source.inode_map.clone();
             let mount = source.mount.clone();
             move || identity::resolve_and_update_path(&map, &mount, inode)
-        }).await.unwrap_or_else(|e| Err(FoxingError::Join(e))) {
+        }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             Ok(new_full_path) => {
                 if let Ok(new_rel) = new_full_path.strip_prefix(&source.mount) {
                     if new_rel != rel_path.as_path() {
                         info!("Hydration Worker: Correcting renamed path {} -> {}", rel_path.to_string_lossy(), new_rel.to_string_lossy());
-                        // Update target_path based on the new location
                         target_path = target_cfg.path.join(new_rel);
                         rel_path = new_rel.to_path_buf();
+                    } else {
+                         
                     }
                 }
             },
             Err(FoxingError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-                // Aggressive search failed: file likely deleted or moved off-mount.
-                // We proceed to the deletion path below for the original requested path.
+                warn!("Hydration Worker: Inode lookup failed for former path {:?}. Assuming deletion.", rel_path);
             },
             Err(e) => return Err(e),
         }
     }
     // --- END RENAME/MOVE REPAIR LOOKUP ---
     
-    // Check if source path still exists (either the original path, or the new resolved path)
     let source_path = source.mount.join(&rel_path);
     if !source_path.exists() {
         if target_path.exists() {
-            // Source is gone, target still exists -> DELETE on target
             warn!("Hydration Worker: Source path {:?} disappeared. Deleting target: {:?}", source_path, target_path);
             let target_path_clone = target_path.clone();
             let _ = spawn_blocking(move || {
@@ -163,7 +162,6 @@ async fn process_hydration_job(
                 }
             }).await;
         }
-        // Whether deletion succeeded or failed, the repair job is logically complete.
         return Ok(());
     }
     
@@ -176,7 +174,6 @@ async fn process_hydration_job(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
-    // Create parent directories if needed, crucial for cross-directory rename repair
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
@@ -192,7 +189,6 @@ async fn process_hydration_job(
         let copy_result: Result<Option<CopyStats>> = match file_size_res {
             Ok(metadata) => {
                 if !metadata.is_file() {
-                    // If it's a directory or symlink, just ensure target directory exists and exit.
                     if metadata.is_dir() && !target_path.exists() {
                         let _ = std::fs::create_dir_all(&target_path);
                     }
@@ -219,7 +215,6 @@ async fn process_hydration_job(
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    // Source file disappeared, already handled in the deletion block above if needed.
                     return Ok(());
                 }
                 Err(FoxingError::Io(e))
