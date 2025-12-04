@@ -23,20 +23,24 @@ use std::fs;
 use std::sync::atomic::AtomicBool;
 use crate::governor::Governor;
 use crate::security;
-use uuid::Uuid; // FIX #4: Needed for Daemon ID generation
+use uuid::Uuid;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
+
+#[allow(dead_code)]
 struct RepairGuard {
     path: PathBuf,
     set: Arc<DashSet<PathBuf>>,
 }
+
 impl Drop for RepairGuard {
     fn drop(&mut self) {
         self.set.remove(&self.path);
     }
 }
+
 fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration) {
     let max_stress_level = tuner_board.iter().map(|r| {
         match *r.value() {
@@ -47,6 +51,7 @@ fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration
             _ => 0,
         }
     }).max().unwrap_or(0);
+
     match max_stress_level {
         0 => (Duration::from_millis(50), Duration::from_millis(500)),
         1 => (Duration::from_millis(200), Duration::from_secs(2)),
@@ -54,12 +59,14 @@ fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration
         _ => (Duration::from_secs(2), Duration::from_secs(10)),
     }
 }
+
 fn _calculate_adaptive_registry_limit(tuner_board: &TunerBoard) -> usize {
     for r in tuner_board.iter() {
         if matches!(*r.value(), TunerState::CriticalDrain) { return 10; }
     }
     1000
 }
+
 #[derive(Debug)]
 pub struct SourceInfo {
     pub path: PathBuf,
@@ -75,6 +82,7 @@ pub struct SourceInfo {
     pub active_repairs: Arc<DashSet<PathBuf>>,
     pub rwf_uncached_ok: Arc<AtomicBool>,
 }
+
 pub struct Manager {
     pub config: SharedConfig,
     pub sources: HashMap<u32, Arc<SourceInfo>>,
@@ -85,9 +93,9 @@ pub struct Manager {
     pub tuner_board: TunerBoard,
     repair_tracker: Arc<DashMap<PathBuf, Instant>>,
     bulk_hydration_handles: Vec<tokio::task::JoinHandle<Result<()>>>,
-    // FIX #4: Store the unique ID for this running instance
     pub daemon_id: String,
 }
+
 fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     let canonical = path.canonicalize().map_err(|e| crate::error::FoxingError::Io(e))?;
     let mut ids = Vec::new();
@@ -105,12 +113,11 @@ fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     }
     Ok((mount_point, ids))
 }
+
 impl Manager {
     pub async fn new(cfg: SharedConfig) -> Self {
-        // FIX #4: Generate unique session ID on startup
         let daemon_id = Uuid::new_v4().to_string();
         info!("Daemon Session ID: {}", daemon_id);
-
         let config_reader = cfg.read().await;
         let governor = Arc::new(crate::governor::Governor::new(
             config_reader.max_system_load_avg,
@@ -183,6 +190,7 @@ impl Manager {
             daemon_id,
         }
     }
+
     pub async fn start(&mut self) -> (HashMap<u32, Vec<Arc<EventQueue>>>, Vec<tokio::task::JoinHandle<Result<()>>>, Vec<tokio::sync::mpsc::Sender<()>>, HydrationRx) {
         let mut all_queues_map: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
         let mut handles = Vec::new();
@@ -191,6 +199,7 @@ impl Manager {
         let hydration_tx = Arc::new(HydrationSender(raw_hydration_tx));
         let (_, hydration_rx_dummy) = mpsc::channel(1);
         let config_reader = self.config.read().await;
+
         for (_primary_dev, src) in self.sources.iter_mut() {
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets = Vec::new();
@@ -201,7 +210,6 @@ impl Manager {
                 for tgt_cfg in &source_cfg.targets {
                     let serialization_engine = SerializationEngine::new();
                     serialization_engines.insert(tgt_cfg.path.clone(), serialization_engine.clone());
-
                     let target_workers = tgt_cfg.worker_count.max(2);
                     let (fanout_tx, fanout_rxs_vec) = crate::event::create_fanout(config_reader.queue_max, target_workers);
                     let fanout_queue_arc = Arc::new(fanout_tx);
@@ -210,18 +218,17 @@ impl Manager {
                         hydration_repair_txs.push(tx.clone());
                     }
                     let mut repair_rx_option = Some(repair_rx_raw.into_iter().next().unwrap());
+
                     for alt_dev_id in &src.dev_ids {
                         queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
                     }
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
+
                     for (i, rx) in fanout_rxs_vec.into_iter().enumerate() {
                         let (sd_tx, sd_rx) = mpsc::channel(1);
                         shutdowns.push(sd_tx);
                         let repair_channel = if i == 0 { repair_rx_option.take() } else { None };
-                        
-                        // FIX #4: Pass daemon_id to worker for WAL tagging
                         let worker_daemon_id = self.daemon_id.clone();
-                        
                         handles.push(tokio::spawn(worker::run_worker(
                             rx,
                             src.clone(),
@@ -248,6 +255,7 @@ impl Manager {
                 for (k, v) in queues_for_source {
                     all_queues_map.entry(k).or_insert_with(Vec::new).extend(v);
                 }
+
                 let bulk_worker_count = config_reader.worker_count.min(4);
                 let (queue, bulk_handles) = HydrationQueue::new(
                     src.clone(),
@@ -258,9 +266,8 @@ impl Manager {
                 );
                 *src.bulk_job_queue.lock() = Some(queue);
                 self.bulk_hydration_handles.extend(bulk_handles);
+
                 if !hydration_targets.is_empty() {
-                    
-                    // FIX #4: Pass daemon_id to Hydrator for crash detection
                     let hydrator = Arc::new(Hydrator::new(
                         src.clone(),
                         hydration_targets,
@@ -270,7 +277,6 @@ impl Manager {
                         serialization_engines,
                         self.daemon_id.clone(),
                     ));
-                    
                     if let Ok(watcher) = hydrator.clone().start_watcher() {
                         self.watchers.push(watcher);
                     }
@@ -284,18 +290,21 @@ impl Manager {
                 }
             }
         }
+
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
         let _repair_tracker_clone = self.repair_tracker.clone();
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
         ).unwrap_or_else(|_| PathBuf::from("/"));
+
         let debounce_handle = tokio::spawn(async move {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
                 let is_targeted_repair = path.exists() && !is_root_request;
+
                 if is_targeted_repair {
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
@@ -309,6 +318,7 @@ impl Manager {
                     }
                     continue;
                 }
+
                 if is_root_request {
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
@@ -328,8 +338,10 @@ impl Manager {
             Ok(())
         });
         handles.push(debounce_handle);
+
         (all_queues_map, handles, shutdowns, hydration_rx_dummy)
     }
+
     pub fn wait_hydration(&mut self) {
         let mut handles = self.hydration_handles.lock();
         for h in handles.drain(..) {

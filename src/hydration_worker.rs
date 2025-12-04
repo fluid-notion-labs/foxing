@@ -24,10 +24,12 @@ pub struct HydrationJob {
     pub rel_path: PathBuf,
     pub target_cfg: TargetConfig,
 }
+
 #[derive(Debug)]
 pub struct HydrationQueue {
     sender: mpsc::Sender<HydrationJob>,
 }
+
 fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> Result<BufferPool> {
     let config_reader = futures::executor::block_on(cfg.read());
     let global_limit_mib = config_reader.global_buffer_limit;
@@ -42,6 +44,7 @@ fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> 
            pool.capacity(), buffer_chunk_size_mib, pool.capacity() as u64 * buffer_chunk_size_mib);
     Ok(pool)
 }
+
 impl HydrationQueue {
     pub fn new(
         source: Arc<SourceInfo>,
@@ -65,6 +68,7 @@ impl HydrationQueue {
         }
         (Self { sender: tx }, handles)
     }
+
     pub fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig) {
         let job = HydrationJob { rel_path, target_cfg };
         if let Err(_) = self.sender.try_send(job) {
@@ -72,6 +76,7 @@ impl HydrationQueue {
         }
     }
 }
+
 async fn run_hydration_worker_loop(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<HydrationJob>>>,
     source: Arc<SourceInfo>,
@@ -85,6 +90,7 @@ async fn run_hydration_worker_loop(
         Ok(r) => r,
         Err(e) => { error!("Failed to create hydration io_uring: {}", e); return Err(e.into()); }
     };
+
     let mut buffer_pool = initialize_hydration_buffer_pool(&config, worker_count)?;
     {
         let iovs = buffer_pool.as_io_vecs();
@@ -94,6 +100,7 @@ async fn run_hydration_worker_loop(
         }
     }
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
+
     loop {
         let job = {
             let mut lock = rx.lock().await;
@@ -109,6 +116,7 @@ async fn run_hydration_worker_loop(
     let _ = ring.submitter().unregister_buffers();
     Ok(())
 }
+
 async fn process_hydration_job(
     job: HydrationJob,
     source: &Arc<SourceInfo>,
@@ -122,6 +130,7 @@ async fn process_hydration_job(
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
     let source_path_start = source.mount.join(&rel_path);
     let mut target_path = target_cfg.path.join(&rel_path);
+
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
         match spawn_blocking({
@@ -146,6 +155,7 @@ async fn process_hydration_job(
             Err(e) => return Err(e),
         }
     }
+
     let source_path = source.mount.join(&rel_path);
     if !source_path.exists() {
         if target_path.exists() {
@@ -161,24 +171,30 @@ async fn process_hydration_job(
         }
         return Ok(());
     }
+
     let target_path_lossy = target_path.to_string_lossy().to_string();
     let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
+
     if governor.is_system_stressed() ||
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
+
     let mut attempts = 0;
     let max_attempts = 5;
     let mut success = false;
+
     while attempts < max_attempts && !success {
         attempts += 1;
         let file_size_res = std::fs::metadata(&source_path);
+
         let copy_result: Result<Option<CopyStats>> = match file_size_res {
             Ok(metadata) => {
                 if !metadata.is_file() {
@@ -189,28 +205,22 @@ async fn process_hydration_job(
                 }
                 let file_size = metadata.len();
                 let src_mtime = metadata.mtime();
-                
-                // --- OPTIMIZATION START: Check for Version Match ---
+
                 let target_path_clone_ver = target_path.clone();
                 let target_cfg_clone_ver = target_cfg.clone();
                 let source_path_clone_meta = source_path.clone();
-                
+
                 let version_match_found = spawn_blocking(move || {
                     if target_cfg_clone_ver.enable_versioning {
-                        // FIX #5: Compute partial hash of SOURCE to enable strict comparison
                         let mut source_hash = None;
                         if target_cfg_clone_ver.paranoid_deduplication {
                             source_hash = security::calculate_partial_hash(&source_path_clone_meta).ok();
                         }
-
                         if let Some(version_path) = versioning::find_matching_version(&target_path_clone_ver, &target_cfg_clone_ver, file_size, src_mtime, source_hash) {
                             debug!("Hydration: FAST DEDUPE. Restoring {:?} from version {:?}", target_path_clone_ver, version_path);
-                            // 1. Reflink version -> target (Instant)
                             if security::revert_snapshot(&version_path, &target_path_clone_ver).is_ok() {
-                                // 2. Verify Checksum (Head/Tail) to detect bitrot/collisions
                                 if let Ok(valid) = versioning::verify_content_match(&source_path_clone_meta, &target_path_clone_ver) {
                                     if valid {
-                                        // 3. Apply Metadata
                                         security::sync_xattrs(&source_path_clone_meta, &target_path_clone_ver);
                                         let _ = security::apply_metadata(&source_path_clone_meta, &target_path_clone_ver);
                                         sidecar::clear_wal_state(&target_path_clone_ver);
@@ -228,26 +238,25 @@ async fn process_hydration_job(
                 if version_match_found {
                     metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(0.0);
                     metrics::COPY_METHOD_REFLINK.inc();
-                    return Ok(None);
+                    Ok(None)
+                } else {
+                    let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
+                    SmartCopier::copy(
+                        &source_path,
+                        &target_path,
+                        ring,
+                        buffer_pool,
+                        &target_cfg.supports_reflink,
+                        target_cfg.vdo_optimization,
+                        0,
+                        file_size,
+                        direct_io_ok,
+                        file_size,
+                        src_rwf_uncached_ok,
+                        target_rwf_uncached_ok,
+                        target_cfg.vdo_stall_threshold,
+                    ).await.map(Some).map_err(FoxingError::from)
                 }
-                // --- OPTIMIZATION END ---
-
-                let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
-                SmartCopier::copy(
-                    &source_path,
-                    &target_path,
-                    ring,
-                    buffer_pool,
-                    &target_cfg.supports_reflink,
-                    target_cfg.vdo_optimization,
-                    0,
-                    file_size,
-                    direct_io_ok,
-                    file_size,
-                    src_rwf_uncached_ok,
-                    target_rwf_uncached_ok,
-                    target_cfg.vdo_stall_threshold,
-                ).await.map(Some).map_err(FoxingError::from)
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
@@ -256,6 +265,7 @@ async fn process_hydration_job(
                 Err(FoxingError::Io(e))
             }
         };
+
         match copy_result {
             Ok(Some(stats)) => {
                 metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(stats.bytes_processed as f64);
@@ -263,9 +273,10 @@ async fn process_hydration_job(
                 let dst_path_clone = target_path.clone();
                 let apply_res = spawn_blocking(move || {
                     security::sync_xattrs(&src_path_clone, &dst_path_clone);
-                    security::apply_metadata(&src_path_clone, &dst_path_clone);
+                    let _ = security::apply_metadata(&src_path_clone, &dst_path_clone);
                     sidecar::clear_wal_state(&dst_path_clone);
                 }).await;
+
                 if apply_res.is_err() {
                     warn!("Hydration: Failed to apply metadata/clear state for {:?}. Retrying.", target_path);
                 } else {
@@ -299,6 +310,7 @@ async fn process_hydration_job(
             }
         }
     }
+
     if !success {
         return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hydration job failed repeated attempts")));
     }

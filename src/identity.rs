@@ -22,13 +22,12 @@ impl IdentityEntry {
         Self {
             path,
             generation,
-            timestamp_ns: u64::MAX, // stat() beats buffered events
+            timestamp_ns: u64::MAX,
             seq_num: u64::MAX,
         }
     }
 }
 
-// FIX #6: Composite key (DeviceID, Inode) to support multi-device sources safely
 pub type InodeMap = Arc<Mutex<LruCache<(u32, u64), IdentityEntry>>>;
 pub type DirMap = Arc<Mutex<LruCache<(u32, u64), PathBuf>>>;
 
@@ -83,7 +82,6 @@ pub fn update_map_after_rename(map: &InodeMap, dir_map: &DirMap, dev: u32, inode
 pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Path) -> (PathBuf, bool, bool) {
     let mut cache = map.lock();
     let key = (event.dev_id, event.inode);
-    
     if let Some(entry) = cache.get(&key) {
         if entry.generation != event.generation && entry.generation != std::u32::MAX {
              warn!("Identity Mismatch: Device {} Inode {} cached gen {} != event gen {}. Invalidating cache.",
@@ -93,7 +91,6 @@ pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Pa
              return (target_root.join(&entry.path), false, false);
         }
     }
-    
     if event.parent_inode != 0 {
         let parent_key = (event.dev_id, event.parent_inode);
         if let Some(parent_entry) = cache.get(&parent_key) {
@@ -107,10 +104,8 @@ pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Pa
             return (target_root.join(full_path), false, false);
         }
     }
-    
     let event_path = PathBuf::from(&event.name);
     if !event.name.is_empty() && !event.name.contains('/') {
-        // Root relative path in name, heuristic fallback
     } else if !event.name.is_empty() {
         cache.put(key, IdentityEntry {
             path: event_path.clone(),
@@ -120,7 +115,6 @@ pub fn resolve_target(map: &InodeMap, event: &Event, target_root: &std::path::Pa
         });
         return (target_root.join(event_path), false, false);
     }
-    
     let identity_dir = target_root.join(".mirror").join(".by-identity");
     let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
     let synthetic_path = identity_dir.join(filename);
@@ -148,11 +142,8 @@ pub fn resolve_directory(dir_map: &DirMap, inode_map: &InodeMap, dev: u32, inode
 
 pub fn resolve_and_update_path(map: &InodeMap, dir_map: &DirMap, source_mount_root: &std::path::Path, inode: u64) -> Result<PathBuf, io::Error> {
     info!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source_mount_root);
-    
-    // Scan logic modified to capture dev_id from filesystem metadata
     let mut found_path = None;
-    let mut found_dev = 0;
-    
+    let mut _found_dev = 0;
     for entry in walkdir::WalkDir::new(source_mount_root).min_depth(1) {
         if let Ok(entry) = entry {
             if entry.depth() > 20 { continue; }
@@ -160,17 +151,14 @@ pub fn resolve_and_update_path(map: &InodeMap, dir_map: &DirMap, source_mount_ro
                 if metadata.ino() == inode {
                     if let Ok(rel_path) = entry.path().strip_prefix(source_mount_root) {
                         found_path = Some(rel_path.to_path_buf());
-                        found_dev = metadata.dev() as u32; 
-                        
+                        let found_dev = metadata.dev() as u32;
                         info!("IDENTITY: FOUND Inode {} (Dev {}) at {:?}", inode, found_dev, rel_path);
                         let is_dir = metadata.is_dir();
                         let generation = 0u32;
                         let rel_path_buf = rel_path.to_path_buf();
                         let key = (found_dev, inode);
-                        
                         let mut cache = map.lock();
                         cache.put(key, IdentityEntry::from_stat(rel_path_buf.clone(), generation));
-                        
                         if is_dir {
                              let mut d_cache = dir_map.lock();
                              d_cache.put(key, rel_path_buf.clone());

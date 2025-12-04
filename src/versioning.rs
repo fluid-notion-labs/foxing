@@ -5,7 +5,7 @@ use regex::Regex;
 use std::fs;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, copy};
 use crate::sidecar;
 use tracing::{debug, warn, info};
 use chrono::{DateTime, Utc};
@@ -20,12 +20,10 @@ pub struct FileVersion {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: i64,
-    pub content_hash: Option<u64>, // FIX #5: Store hash
+    pub content_hash: Option<u64>,
 }
 
-// FIX #9: In-Memory Index to avoid O(N) IO during hydration
 pub struct VersionIndex {
-    // Map (Inode, Size, Mtime) -> PathBuf
     index: RwLock<HashMap<(u64, u64, i64), PathBuf>>,
 }
 
@@ -33,31 +31,24 @@ impl VersionIndex {
     pub fn new() -> Self {
         Self { index: RwLock::new(HashMap::new()) }
     }
-    
-    pub fn index_directory(&self, root_path: &Path) {
-        // (Omitted for brevity: standard directory walk to populate map)
+    pub fn index_directory(&self, _root_path: &Path) {
     }
-
     pub fn find(&self, inode: u64, size: u64, mtime: i64) -> Option<PathBuf> {
         let guard = self.index.read().unwrap();
         guard.get(&(inode, size, mtime)).cloned()
     }
 }
 
-// FIX #14: Lightweight verification
 pub fn verify_content_match(p1: &Path, p2: &Path) -> Result<bool> {
     let mut f1 = fs::File::open(p1).map_err(MirrorError::Io)?;
     let mut f2 = fs::File::open(p2).map_err(MirrorError::Io)?;
-    
     let len = f1.metadata().map_err(MirrorError::Io)?.len();
     if len != f2.metadata().map_err(MirrorError::Io)?.len() { return Ok(false); }
-    
     let mut buf1 = [0u8; 65536];
     let mut buf2 = [0u8; 65536];
     let n1 = f1.read(&mut buf1).map_err(MirrorError::Io)?;
     let n2 = f2.read(&mut buf2).map_err(MirrorError::Io)?;
     if n1 != n2 || buf1[..n1] != buf2[..n1] { return Ok(false); }
-    
     if len > 131072 {
         f1.seek(SeekFrom::End(-65536)).map_err(MirrorError::Io)?;
         f2.seek(SeekFrom::End(-65536)).map_err(MirrorError::Io)?;
@@ -65,7 +56,6 @@ pub fn verify_content_match(p1: &Path, p2: &Path) -> Result<bool> {
         let n2 = f2.read(&mut buf2).map_err(MirrorError::Io)?;
         if n1 != n2 || buf1[..n1] != buf2[..n1] { return Ok(false); }
     }
-    
     Ok(true)
 }
 
@@ -97,7 +87,6 @@ fn list_versions_for_inode(live_file: &Path, root_path: &Path) -> Result<Vec<Fil
                              // FIX #5: Read stored hash from metadata
                              let hash_bytes = sidecar::get_metadata(&path, "user.foxing.content_hash");
                              let content_hash = hash_bytes.map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0;8])));
-                             
                              versions.push(FileVersion {
                                 inode: live_inode,
                                 epoch_seq,
@@ -122,31 +111,24 @@ pub fn list_versions(live_file: &Path) -> Result<Vec<FileVersion>> {
     list_versions_for_inode(live_file, &target_root)
 }
 
-// FIX #5: Expanded signature to accept source_hash
 pub fn find_matching_version(live_file: &Path, target_cfg: &crate::config::TargetConfig, size: u64, mtime: i64, source_hash: Option<u64>) -> Option<PathBuf> {
     let target_root = if live_file.exists() {
         find_target_root(live_file).ok()?
     } else {
-        target_cfg.path.clone() 
+        target_cfg.path.clone()
     };
-
     if !live_file.exists() { return None; }
-
     if let Ok(versions) = list_versions_for_inode(live_file, &target_root) {
-        for v in versions.iter().rev() { 
-            // Priority 1: Strong Hash Match (Paranoid Mode)
+        for v in versions.iter().rev() {
             if target_cfg.paranoid_deduplication && source_hash.is_some() && v.content_hash.is_some() {
                 if source_hash == v.content_hash && v.size == size {
                     debug!("Dedupe: Hash match! {:?} (Epoch: {})", live_file, v.epoch_seq);
                     return Some(v.path.clone());
                 }
             }
-            // Priority 2: Heuristic Match (Size + Mtime)
-            // Used if hash unavailable or paranoid mode disabled
             if v.size == size && v.mtime == mtime {
                 if target_cfg.paranoid_deduplication && (source_hash.is_some() || v.content_hash.is_some()) {
-                    // If we have partial hashes but they didn't match above, do NOT fall back to mtime.
-                    continue; 
+                    continue;
                 }
                 debug!("Dedupe: Heuristic match {:?} (Epoch: {})", live_file, v.epoch_seq);
                 return Some(v.path.clone());
@@ -156,7 +138,6 @@ pub fn find_matching_version(live_file: &Path, target_cfg: &crate::config::Targe
     None
 }
 
-// ... (Rest of utils like cleanup_versions, etc. preserved) ...
 pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, max_size_mb: u64) -> Result<()> {
     let versions = list_versions_for_inode(live_path, root_path)?;
     if versions.is_empty() { return Ok(()); }
@@ -187,6 +168,7 @@ pub fn cleanup_versions(live_path: &Path, root_path: &Path, max_count: usize, ma
     }
     Ok(())
 }
+
 pub fn prune_global_history(target_root: &Path, bytes_to_free: u64) -> Result<u64> {
     let versions_dir = target_root.join(".mirror").join(".versions");
     if !versions_dir.exists() { return Ok(0); }
@@ -232,6 +214,7 @@ pub fn prune_global_history(target_root: &Path, bytes_to_free: u64) -> Result<u6
     }
     Ok(freed)
 }
+
 pub fn print_versions_table(versions: Vec<FileVersion>, limit: usize) {
     let mut table = Table::new();
     table.set_header(vec![
@@ -259,12 +242,14 @@ pub fn print_versions_table(versions: Vec<FileVersion>, limit: usize) {
         println!("\nShowing {} total versions.", num_versions);
     }
 }
+
 fn find_version_path(versions: &[FileVersion], epoch: u64) -> Result<&PathBuf> {
     versions.iter()
         .find(|v| v.epoch_seq == epoch)
         .map(|v| &v.path)
         .ok_or_else(|| MirrorError::Versioning(format!("Version with epoch {} not found.", epoch)))
 }
+
 pub fn copy_version_to_path(live_file: &Path, epoch: u64, destination: &Path) -> Result<()> {
     let target_root = find_target_root(live_file)?;
     let versions = list_versions_for_inode(live_file, &target_root)?;
@@ -274,12 +259,14 @@ pub fn copy_version_to_path(live_file: &Path, epoch: u64, destination: &Path) ->
     copy(&mut src, &mut dst).map_err(MirrorError::Io)?;
     Ok(())
 }
+
 pub fn revert_file(live_file: &Path, epoch: u64) -> Result<()> {
     let target_root = find_target_root(live_file)?;
     let versions = list_versions_for_inode(live_file, &target_root)?;
     let version_path = find_version_path(&versions, epoch)?;
     crate::security::revert_snapshot(version_path, live_file)
 }
+
 pub async fn cleanup_cli(path: &Path, dry_run: bool) -> Result<()> {
     let path = path.canonicalize().map_err(MirrorError::Io)?;
     info!("Starting cleanup for path: {:?}", path);
@@ -301,6 +288,7 @@ pub async fn cleanup_cli(path: &Path, dry_run: bool) -> Result<()> {
     }
     Ok(())
 }
+
 pub async fn force_version_cli(path: &Path, tag: &str) -> Result<()> {
     let path = path.canonicalize().map_err(MirrorError::Io)?;
     info!("Forcing version retention for {:?} with tag '{}'", path, tag);

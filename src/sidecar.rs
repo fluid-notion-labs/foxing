@@ -13,10 +13,9 @@ use std::collections::hash_map::DefaultHasher;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub enum WalState {
-    IntentPending, // Flag set, no bytes written yet (Ghost)
-    InProgress,    // Buffers submitted to kernel
-    CommitPending, // Data written, waiting for fsync/metadata
-    // Legacy states
+    IntentPending,
+    InProgress,
+    CommitPending,
     WriteBulk,
     FsyncCommit,
     PendingRename,
@@ -28,8 +27,8 @@ pub struct PersistedWalEntry {
     pub seq: u64,
     pub state: WalState,
     pub timestamp: u64,
-    pub daemon_id: String, 
-    pub crc: u64, 
+    pub daemon_id: String,
+    pub crc: u64,
 }
 
 pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
@@ -59,7 +58,6 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()>
     } else {
         return Ok(());
     }
-
     match xattr::set(path, key, value) {
         Ok(_) => {
             if let Some(sp) = get_sidecar_path(path) {
@@ -87,12 +85,10 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()>
             }
         }
     }
-
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine sidecar path")),
     };
-
     let mut file = fs::OpenOptions::new().read(true).write(true).create(true).open(&sp)?;
     lock_file(&file, true)?;
     let mut map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
@@ -109,11 +105,9 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.is_symlink() { return None; }
     } else { return None; }
-
     if let Ok(Some(val)) = xattr::get(path, key) {
         return Some(val);
     }
-
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {
             if let Ok(file) = File::open(&sp) {
@@ -173,7 +167,6 @@ pub fn update_wal(path: &Path, state: WalState, seq: u64, daemon_id: &str) {
     hasher.write_u64(seq);
     hasher.write(daemon_id.as_bytes());
     let crc = hasher.finish();
-
     let entry = PersistedWalEntry {
         seq,
         state,
@@ -214,7 +207,6 @@ pub fn is_dirty(path: &Path) -> bool {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.is_symlink() { return false; }
     } else { return false; }
-
     if get_metadata(path, "user.foxing.wal").is_some() {
         return true;
     }
@@ -222,4 +214,12 @@ pub fn is_dirty(path: &Path) -> bool {
         return val == vec![1];
     }
     false
+}
+
+pub fn set_dirty_flag(path: &Path, active: bool, _reason: &str) {
+    if active {
+        let _ = set_metadata(path, "user.foxing.dirty", &[1]);
+    } else {
+        let _ = remove_metadata(path, "user.foxing.dirty");
+    }
 }

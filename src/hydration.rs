@@ -41,10 +41,7 @@ pub struct Hydrator {
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
     repair_txs: Vec<mpsc::Sender<Arc<Event>>>,
-    // Map of Target Root Path -> SerializationEngine for that target
-    // Used to check if a "Dirty" file is actually being worked on right now.
     serialization_engines: HashMap<PathBuf, Arc<SerializationEngine>>,
-    // ID of the current running daemon instance
     daemon_id: String,
 }
 
@@ -63,7 +60,6 @@ impl Hydrator {
 
     pub fn repair_path(&self, path: PathBuf) {
         debug!("Hydration: Targeted repair requested for {:?}", path);
-        // 1. Update Identity Map if file exists
         if let Ok(metadata) = fs::metadata(&path) {
             let inode = metadata.ino();
             if metadata.is_file() {
@@ -85,8 +81,6 @@ impl Hydrator {
                 }
             }
         }
-
-        // 2. Handle Deletion if file is missing
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
@@ -95,8 +89,6 @@ impl Hydrator {
              }
              return;
         }
-
-        // 3. Standard Sync if still present
         if let Err(e) = self.process_path(&path, true, None) {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }
@@ -111,7 +103,7 @@ impl Hydrator {
             dev_id: self.source.dev,
             inode: 0, parent_inode: 0, new_parent_inode: 0,
             seq_num: 0, offset: 0, length: 0,
-            timestamp_ns: 0, // Hydration events are locally generated, no BPF timestamp
+            timestamp_ns: 0,
             name: path_str.to_string(), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0,
             process_name: "hydration_repair".into(), interactive: false,
             created_at: Instant::now(),
@@ -129,7 +121,7 @@ impl Hydrator {
         let dev_str = self.source.dev.to_string();
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(1.0);
         warn!("Hydration: STARTED full background scan of {:?}", self.source.path);
-        
+
         let walk = WalkDir::new(&self.source.path).sort_by_file_name().into_iter();
         let mut count = 0;
         for entry_result in walk {
@@ -145,8 +137,6 @@ impl Hydrator {
                 Err(e) => warn!("Hydration walk error: {}", e),
             }
         }
-
-        // Deletion Sweep
         if !self.governor.is_system_stressed() {
             warn!("Hydration: Starting DELETION SWEEP.");
             for target_cfg in &self.targets {
@@ -155,19 +145,15 @@ impl Hydrator {
                     if let Ok(entry) = entry_result {
                         let target_path = entry.path();
                         let path_str = target_path.to_string_lossy();
-                        // Skip internal metadata
                         if path_str.contains(".mirror") ||
                            path_str.contains(".foxing_meta") ||
                            path_str.contains(".tmp.") {
                             continue;
                         }
-                        
                         if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
                             if rel.as_os_str().is_empty() { continue; }
                             let source_path = self.source.path.join(rel);
-                            
                             if !source_path.exists() {
-                                // Re-verify parent exists on target before queuing unlink
                                 if let Some(parent_rel) = rel.parent() {
                                     let parent_path = target_cfg.path.join(parent_rel);
                                     if !parent_path.exists() {
@@ -181,7 +167,6 @@ impl Hydrator {
                 }
             }
         }
-        
         warn!("Hydration: FINISHED full scan for {:?}. Scanned {} items.", self.source.path, count);
         self.source.hydration.active.store(false, Ordering::SeqCst);
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0.0);
@@ -191,7 +176,6 @@ impl Hydrator {
         let s = self.clone();
         let path = self.source.path.clone();
         let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, EventKind)>();
-        
         std::thread::Builder::new()
             .name("foxing-hydration-proc".into())
             .spawn(move || {
@@ -219,10 +203,9 @@ impl Hydrator {
                 Err(e) => warn!("Inotify watch error: {:?}", e),
             }
         }).map_err(|e| crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-
         watcher.watch(&path, RecursiveMode::Recursive)
             .map_err(|e| crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-        
+
         info!("Hydration: Inotify watcher started for {:?}", path);
         Ok(watcher)
     }
@@ -232,57 +215,49 @@ impl Hydrator {
             Ok(r) => r.to_path_buf(),
             Err(_) => return Ok(()),
         };
-        
-        // Only process existing files
+
         let m = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(_) => return Ok(()),
         };
-        
+
         let ino = m.ino();
-        let dev = m.dev() as u32; // FIX #6: Capture Device ID
+        let dev = m.dev() as u32;
         let is_dir = m.is_dir();
-        
-        // Update Identity Map: Use u64::MAX for TS/Seq to assert authoritative filesystem reality
-        // This prevents "Time Travel" issues where stale BPF events overwrite fresh scan data.
+
         identity::update_map(
-            &self.source.inode_map, 
-            &self.source.dir_map, 
-            dev, 
-            ino, 
-            rel.clone(), 
-            std::u32::MAX, 
-            false, 
-            is_dir, 
-            u64::MAX, 
+            &self.source.inode_map,
+            &self.source.dir_map,
+            dev,
+            ino,
+            rel.clone(),
+            std::u32::MAX,
+            false,
+            is_dir,
+            u64::MAX,
             u64::MAX
         );
-        
+
         if !urgent {
             self.source.hydration.scanned.fetch_add(1, Ordering::Relaxed);
         } else {
             metrics::LIVE_ADDITIONS.inc();
         }
-        
+
         if let Some(EventKind::Modify(_)) = kind {
             return Ok(());
         }
 
         let bulk_job_queue = self.source.bulk_job_queue.lock();
         let queue_sender = bulk_job_queue.as_ref().expect("Bulk hydration queue must be initialized.");
-        
+
         for target_cfg in &self.targets {
-            let current_state = self.tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
-            
-            // Governor/Tuner Check
             if !urgent {
                 self.check_tuner_pause(target_cfg);
             }
 
             let is_dir_meta = m.is_dir() || m.is_symlink();
-            
             if m.is_file() && (m.len() > 0 || urgent) {
-                // Check if sync is needed
                 if self.sync_file_needed(path, rel.as_path(), &m, ino, target_cfg)? {
                     queue_sender.submit_job(rel.clone(), target_cfg.clone());
                     self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
@@ -294,7 +269,6 @@ impl Hydrator {
                     self.priority_mkdir(rel.as_path(), ino);
                     self.sync_dir_hash(rel.as_path(), target_cfg)?;
                 } else {
-                    // Special files (block/char/fifo)
                     let ft = m.file_type();
                     if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() {
                          self.sync_special(path, rel.as_path(), &m, ino, target_cfg)?;
@@ -330,7 +304,7 @@ impl Hydrator {
                 target != existing
             } else { true }
         } else { false };
-        
+
         if needs_sync {
             if !self.repair_txs.is_empty() {
                 let path_str = rel.to_string_lossy();
@@ -353,42 +327,30 @@ impl Hydrator {
 
     fn sync_file_needed(&self, src_path: &Path, rel: &Path, m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<bool> {
         let dst_path = target_cfg.path.join(rel);
-        
-        // FIX #4: WAL Logic with Daemon ID check
+
         if let Some(wal_entry) = sidecar::get_wal_state(&dst_path) {
-            
-            // Check for Daemon ID Mismatch (Crash detected from previous instance)
             if wal_entry.daemon_id != self.daemon_id {
                 warn!("Hydration: Found WAL from previous daemon instance (ID mismatch). Forcing repair for {:?}.", dst_path);
                 return Ok(true);
             }
-
             let mut is_active_worker = false;
-            // Check if ANY worker is actively processing this inode
             if let Some(engine) = self.serialization_engines.get(&target_cfg.path) {
                 if engine.is_active(ino) {
                     is_active_worker = true;
                 }
             }
-
             if is_active_worker {
                 debug!("Hydration: Skipping {:?} - active write in progress by worker", dst_path);
                 return Ok(false);
             }
-
-            // No active worker, but file is dirty. Check the state.
             match wal_entry.state {
                 WalState::IntentPending => {
-                    // "Ghost" write: Worker set flag but crashed/exited before submitting I/O.
-                    // Action: Clear flag, treat file as clean (check timestamps/size below).
                     info!("Hydration: Clearing stale INTENT_PENDING flag for {:?}", dst_path);
                     sidecar::clear_wal_state(&dst_path);
                 },
                 WalState::InProgress | WalState::CommitPending => {
-                    // "Partial" write: Daemon died while bytes were moving.
-                    // Action: Force repair.
                     warn!("Hydration: Found STALE/CRASHED write ({:?}) for {:?}. Forcing repair.", wal_entry.state, dst_path);
-                    return Ok(true); 
+                    return Ok(true);
                 },
                 _ => {
                     warn!("Hydration: Found Unknown WAL state for {:?}. Forcing repair.", dst_path);
@@ -408,8 +370,7 @@ impl Hydrator {
                         let dst_parent = dst_path.parent().unwrap_or(&dst_path);
                         let integrity_hash = security::get_valid_dir_hash(src_parent);
                         let target_hash = security::calc_dir_integrity_hash_target(dst_parent).unwrap_or(0);
-                        
-                        // Primary Heuristics: Size and Mtime
+
                         if dm.len() != m.len() { true }
                         else if integrity_hash != 0 && integrity_hash == target_hash {
                             metrics::HYDRATION_HASH_SKIPPED.inc();
@@ -419,7 +380,7 @@ impl Hydrator {
                         else { false }
                     }
                 },
-                Err(_) => true // Target missing or unreadable -> Sync
+                Err(_) => true
             }
         };
         Ok(needs_sync)

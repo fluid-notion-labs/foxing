@@ -31,7 +31,6 @@ use crate::ordering::Coalescer;
 use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
 use crate::versioning;
 use crate::mirror::SourceInfo;
-use std::os::unix::fs::MetadataExt;
 
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
@@ -40,6 +39,7 @@ impl Clone for HydrationSender {
         HydrationSender(self.0.clone())
     }
 }
+
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -62,17 +62,19 @@ impl ShardedLockCache {
         self.get(hasher.finish())
     }
 }
+
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
     vdo_tuner: &'a mut VdoTuner,
     failure_state: &'a mut FailureState,
     capacity_breaker: &'a CircuitBreaker,
-    limiter: &'a ErrorLimiter,
-    cur_cap_avail: u64,
-    cur_cap_total: u64,
+    _limiter: &'a ErrorLimiter,
+    _cur_cap_avail: u64,
+    _cur_cap_total: u64,
     daemon_id: &'a str,
 }
+
 fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_bytes: usize) -> Result<BufferPool> {
     let mut pool = BufferPool::new(num_buffers, chunk_size_bytes);
     let iovs = pool.as_io_vecs();
@@ -82,6 +84,7 @@ fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_byt
     }
     Ok(pool)
 }
+
 fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     if ring.submitter().unregister_buffers().is_err() {
         error!("Failed to unregister io_uring buffers.");
@@ -89,13 +92,14 @@ fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     }
     Ok(())
 }
+
 pub async fn run_worker(
     mut rx_main: mpsc::Receiver<Arc<Event>>,
     source: Arc<SourceInfo>,
     target_cfg: TargetConfig,
     config: Arc<RwLock<Config>>,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    hydration_trigger: Arc<HydrationSender>, 
+    hydration_trigger: Arc<HydrationSender>,
     _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>,
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -132,23 +136,30 @@ pub async fn run_worker(
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let initial_num_buffers = current_max_buffers.min(target_cfg.batch_size);
     drop(config_reader);
+
     let mut buffer_pool = match initialize_buffer_pool(&mut ring, initial_num_buffers, buffer_chunk_size_bytes) {
         Ok(pool) => pool,
         Err(e) => return Err(e),
     };
+
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
+
     info!("Worker {}: BufferPool initialized with {} x {}MB chunks.", worker_id, buffer_pool.capacity(), buffer_chunk_size_mib);
+
     let limiter = ErrorLimiter::new();
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
     let mut poison_cabinet = PoisonCabinet::new();
+
     let mut cur_cap_avail = 0u64;
     let mut cur_cap_total = 0u64;
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
+
     let mut is_hibernating = false;
-    let mut last_dropped_check = 0.0;
-    let result: Result<()> = loop {
+    let _last_dropped_check = 0.0;
+
+    let _result: Result<()> = loop {
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
                  warn!("Target {:?} failed. Hibernating.", target_cfg.path);
@@ -195,7 +206,7 @@ pub async fn run_worker(
                     buffer_pool.chunk_size() as u64
                 );
                 if !is_control_plane && recommended_depth != buffer_pool.capacity() {
-                    // (Resizing logic omitted for brevity)
+                    // Resizing logic omitted in original snippet
                 }
                 let path_clone = target_cfg.path.clone();
                 let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
@@ -232,8 +243,10 @@ pub async fn run_worker(
                 None
             }
         };
+
         if event_poll_result.is_none() { continue; }
         let event_ptr = event_poll_result.unwrap();
+
         if matches!(event_ptr.event_type, EventType::Rename) {
             let src_clone = source.clone();
             let e_inode = event_ptr.inode;
@@ -243,9 +256,8 @@ pub async fn run_worker(
             let e_ts = event_ptr.timestamp_ns;
             let new_parent_inode = event_ptr.new_parent_inode;
             let new_name_opt = event_ptr.new_name.clone();
+
             let mut parent_is_known = false;
-            
-            // Check Directory Map with Composite Key (DevID, Inode)
             if new_parent_inode != 0 {
                 let dir_map = src_clone.dir_map.lock();
                 if dir_map.contains(&(e_dev, new_parent_inode)) {
@@ -263,6 +275,7 @@ pub async fn run_worker(
                                       new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
             debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Valid: {}",
                 e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
+
             const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
             let mut fast_path_success = false;
             if has_complete_bpf_data {
@@ -279,6 +292,7 @@ pub async fn run_worker(
                         Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap or InodeMap"))
                     }
                 }).await.map_err(FoxingError::Join);
+
                 if result.is_err() || matches!(result, Ok(Err(_))) {
                     warn!("RENAME Handler: Fast-path (BPF trust) failed or parent not in map. Falling back to slow path.");
                 } else {
@@ -286,6 +300,7 @@ pub async fn run_worker(
                     fast_path_success = true;
                 }
             }
+
             if !fast_path_success {
                 if !has_complete_bpf_data {
                     warn!("RENAME Handler: BPF data incomplete or parent unknown. Falling back to aggressive FS scan with timeout.");
@@ -303,6 +318,7 @@ pub async fn run_worker(
                         }
                     }
                 });
+
                 match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
                     Ok(Ok(Ok(_new_path))) => {
                     }
@@ -327,6 +343,7 @@ pub async fn run_worker(
                 }
             }
         }
+
         coalescer.push(event_ptr.clone());
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if is_control_plane {
@@ -334,6 +351,7 @@ pub async fn run_worker(
         } else {
             tuner.current_batch_size
         };
+
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
@@ -349,6 +367,7 @@ pub async fn run_worker(
             }
             batch
         };
+
         for e in events_to_process_raw {
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
@@ -359,11 +378,12 @@ pub async fn run_worker(
                 vdo_tuner: &mut vdo_tuner,
                 failure_state: &mut failure_state,
                 capacity_breaker: &capacity_breaker,
-                limiter: &limiter,
-                cur_cap_avail,
-                cur_cap_total,
+                _limiter: &limiter,
+                _cur_cap_avail: cur_cap_avail,
+                _cur_cap_total: cur_cap_total,
                 daemon_id: &daemon_id,
             };
+
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
@@ -373,14 +393,17 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
+
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
+
             let op_kind = match e.event_type {
                 EventType::Rename | EventType::Mkdir | EventType::Rmdir |
                 EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
                 _ => OpKind::Write,
             };
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
+
             let _ = process_single_event_inner(
                 &mut ctx, e, &source, &target_cfg, &tuner,
                 capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
@@ -392,32 +415,29 @@ pub async fn run_worker(
             ).await;
         }
     };
+
     let _ = unregister_buffers(&mut ring);
     Ok(())
 }
+
 async fn process_single_event_inner(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
     source: &Arc<SourceInfo>,
     target_cfg: &TargetConfig,
-    tuner: &BbrTuner,
-    capacity_threshold_mb: u64,
+    _tuner: &BbrTuner,
+    _capacity_threshold_mb: u64,
     dst: &PathBuf,
-    is_synthetic: bool,
+    _is_synthetic: bool,
     needs_creation: bool,
     src: &PathBuf,
     buffer_pool: &mut BufferPool,
     src_rwf_uncached_ok: bool,
     dst_rwf_uncached_ok: bool,
-    is_control_plane: bool,
+    _is_control_plane: bool,
     worker_id: usize,
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
-    let target_cfg_cap = target_cfg.clone();
-    let target_cfg_allow = target_cfg.clone();
-    
-    // (Capacity Checks and Filter logic omitted for brevity, identical to baseline)
-
     // needs_creation logic
     if needs_creation {
         let dst_clone = dst.clone();
@@ -446,6 +466,7 @@ async fn process_single_event_inner(
                 Err(e) => return Err(e),
             }
         }).await;
+
         if let Ok(_f) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             metrics::SIDECAR_FILES_CREATED.inc();
         } else {
@@ -461,17 +482,14 @@ async fn process_single_event_inner(
             let dst_for_wal = dst.clone();
             let daemon_id = ctx.daemon_id.to_string();
             let seq = e.seq_num;
-            
             // PHASE 1: IntentPending (Ghost)
             let wal_res = tokio::task::spawn_blocking(move || {
                 sidecar::update_wal(&dst_for_wal, WalState::IntentPending, seq, &daemon_id);
             }).await;
-            
             if let Err(e) = wal_res {
                 warn!("Failed to persist WAL Intent for {:?}: {:?}", dst, e);
             }
         }
-
         let entry = ctx.dirty_stats.entry(e.inode).or_insert_with(|| DirtyEntry {
             first_dirty: Instant::now(),
             path: dst.clone(),
@@ -491,7 +509,6 @@ async fn process_single_event_inner(
             let src_clone_for_metadata = src.clone();
             let daemon_id = ctx.daemon_id.to_string();
             let e_seq = e.seq_num;
-            
             // PHASE 2: InProgress (Committing to IO)
             let dst_for_phase2 = dst_clone.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -501,11 +518,12 @@ async fn process_single_event_inner(
             let metadata_result = tokio::task::spawn_blocking(move || {
                 std::fs::metadata(&src_clone_for_metadata)
             }).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
-            
+
             if let Ok(m) = metadata_result {
                 if m.is_file() {
                     let current_src_size = m.len();
                     let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
+
                     let copy_res = SmartCopier::copy(
                         &src,
                         &dst_clone,
@@ -521,7 +539,7 @@ async fn process_single_event_inner(
                         dst_rwf_uncached_ok,
                         target_cfg.vdo_stall_threshold,
                     ).await;
-                    
+
                     match copy_res {
                         Ok(stats) => {
                             // PHASE 3: CommitPending (IO Done)
@@ -530,7 +548,6 @@ async fn process_single_event_inner(
                             let _ = tokio::task::spawn_blocking(move || {
                                 sidecar::update_wal(&dst_for_phase3, WalState::CommitPending, e_seq, &daemon_id_p3);
                             }).await;
-
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
                             let apply_dst = dst_clone.clone();
@@ -561,8 +578,10 @@ async fn process_single_event_inner(
                 let e_generation = e.generation;
                 let e_seq = e.seq_num;
                 let e_ts = e.timestamp_ns;
+
                 let parent_dir = new_dst.parent().map(|p| p.to_path_buf());
                 let parent_dir_clone = parent_dir.clone();
+
                 let parent_check_res = tokio::task::spawn_blocking(move || {
                     if let Some(parent) = parent_dir_clone {
                         if parent != target_cfg_path_clone && !parent.exists() {
@@ -574,17 +593,18 @@ async fn process_single_event_inner(
                         Ok(())
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
                 if let Err(e) = parent_check_res {
                     error!("Worker {}: RENAME failed to create target directory {:?}: {:?}", worker_id, parent_dir, e);
                     ctx.failure_state.record_failure();
                     return Err(e);
                 }
+
                 if old_dst == new_dst {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst);
                     return Ok(None);
                 }
-                
-                // Attempt rename eagerly, handling the "NotFound" race explicitly
+
                 let res = tokio::task::spawn_blocking(move || {
                     atomic_rename(&old_dst_clone, &new_dst_for_rename_clone).map_err(FoxingError::Io)
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
@@ -602,24 +622,24 @@ async fn process_single_event_inner(
                                 let _ = hydration_tx_for_move.0.send(new_full_path_for_validation.clone()).await;
                             }
                         });
+
                         let new_rel_path_to_store = match new_dst.strip_prefix(&target_cfg.path) {
                             Ok(rel) => rel.to_path_buf(),
                             Err(_) => new_dst.to_path_buf(),
                         };
+
                         if is_dir {
                             identity::update_map_after_rename(&src_map_clone, &src_dir_map_clone, e_dev, e_inode, new_rel_path_to_store, e_generation, true, e_ts, e_seq);
                         }
                     },
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    Err(FoxingError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => {
                         warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst);
-                        
-                        // FALLBACK: Idempotency Check
                         let dest_exists = tokio::task::spawn_blocking({
                             let path = new_dst.clone();
                             move || {
                                 if path.exists() {
-                                    if let Ok(meta) = std::fs::metadata(&path) {
-                                        return true; 
+                                    if let Ok(_meta) = std::fs::metadata(&path) {
+                                        return true;
                                     }
                                 }
                                 false
@@ -631,12 +651,10 @@ async fn process_single_event_inner(
                             return Ok(None);
                         }
 
-                        // FALLBACK: Lost Artifact Recovery
                         error!("Rename failed and file lost. Triggering resync of parent.");
                         if let Some(parent) = new_dst.parent() {
                             let _ = hydration_trigger.0.send(parent.to_path_buf()).await;
                         }
-                        
                         return Ok(None);
                     },
                     Err(e) => {
@@ -670,9 +688,9 @@ async fn process_single_event_inner(
             }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
             return res.map(|_| None);
         },
-        // ... (Other cases same as previous, returning Ok(None))
         _ => { return Ok(None); }
     };
+
     match res {
         Ok(stats_opt) => Ok(stats_opt),
         Err(err) => {

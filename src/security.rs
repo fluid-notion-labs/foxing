@@ -13,12 +13,12 @@ use std::os::unix::fs::MetadataExt;
 use std::fs::{File, OpenOptions};
 use chrono::Utc;
 use crate::sidecar;
-use tracing::{warn, error, info};
+use tracing::{warn};
 use crate::buffer::AlignedBuffer;
 use io_uring::{IoUring, opcode, types};
 use std::collections::hash_map::DefaultHasher;
 use std::io::{Read, Seek, SeekFrom};
-use fxhash::FxHasher; 
+use fxhash::FxHasher;
 
 const FS_IOC_FSSETXATTR: u64 = 0x40205820;
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
@@ -32,31 +32,22 @@ const F2FS_SUPER_MAGIC: i64 = 0xF2F52010;
 #[repr(C)] #[derive(Default)]
 struct FsxAttr { fsx_xflags: u32, fsx_extsize: u32, fsx_nextents: u32, fsx_projid: u32, fsx_cowextsize: u32, fsx_pad: [u8; 8] }
 
-// FIX #5: Partial Content Hash Calculation
 pub fn calculate_partial_hash(path: &Path) -> Result<u64> {
     let mut file = File::open(path).map_err(FoxingError::Io)?;
     let len = file.metadata().map_err(FoxingError::Io)?.len();
-    
     let mut hasher = FxHasher::default();
     hasher.write_u64(len);
-
     let mut buf = [0u8; 65536];
-    
-    // Read head
     let n = file.read(&mut buf).map_err(FoxingError::Io)?;
     hasher.write(&buf[..n]);
-
-    // Read tail if file is large enough
     if len > 131072 {
         file.seek(SeekFrom::End(-65536)).map_err(FoxingError::Io)?;
         let n = file.read(&mut buf).map_err(FoxingError::Io)?;
         hasher.write(&buf[..n]);
     }
-
     Ok(hasher.finish())
 }
 
-// ... (Existing probe and util functions preserved) ...
 pub fn check_capacity(path: &Path, threshold_mb: u64) -> bool {
     if let Ok(s) = statvfs(path) {
         let avail = s.blocks_available() * s.block_size();
@@ -67,10 +58,11 @@ pub fn check_capacity(path: &Path, threshold_mb: u64) -> bool {
     }
     true
 }
+
 pub fn probe_xattr_support(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_xattr");
     if probe_file.exists() { let _ = std::fs::remove_file(&probe_file); }
-    if let Ok(f) = File::create(&probe_file) {
+    if let Ok(_f) = File::create(&probe_file) {
         let key = "user.foxing_probe";
         let val = b"1";
         let res = xattr::set(&probe_file, key, val);
@@ -80,6 +72,7 @@ pub fn probe_xattr_support(target_root: &Path) -> bool {
         false
     }
 }
+
 pub fn probe_direct_io(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_dio");
     let mut buf = AlignedBuffer::new(4096);
@@ -93,6 +86,7 @@ pub fn probe_direct_io(target_root: &Path) -> bool {
     let _ = std::fs::remove_file(probe_file);
     ret == 4096
 }
+
 pub fn probe_rwf_uncached(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_uncached");
     let mut buf = AlignedBuffer::new(4096);
@@ -100,32 +94,28 @@ pub fn probe_rwf_uncached(target_root: &Path) -> bool {
     let file_res = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&probe_file);
     let sfd = match file_res {
         Ok(f) => f.as_raw_fd(),
-        Err(e) => {
-            error!("Probe RWF_UNCACHED: Failed to open temp file: {}", e);
+        Err(_e) => {
             let _ = std::fs::remove_file(probe_file);
             return false;
         }
     };
     let ret = unsafe { libc::write(sfd, buf.as_ptr() as *const _, 4096) };
     if ret != 4096 {
-        error!("Probe RWF_UNCACHED: Failed initial write.");
         let _ = std::fs::remove_file(probe_file);
         return false;
     }
     let mut ring = match IoUring::new(1) {
         Ok(r) => r,
-        Err(e) => { error!("Probe RWF_UNCACHED: Failed to create io_uring: {}", e); return false; }
+        Err(_e) => { return false; }
     };
     let iov = [libc::iovec { iov_base: buf.ptr() as _, iov_len: 4096 }];
     if unsafe { ring.submitter().register_buffers(&iov) }.is_err() {
-        error!("Probe RWF_UNCACHED: Failed to register buffer.");
         let _ = ring.submitter().unregister_buffers();
         let _ = std::fs::remove_file(probe_file);
         return false;
     }
     let r_op = opcode::ReadFixed::new(types::Fd(sfd), buf.ptr(), 4096, 0).offset(0).rw_flags(RWF_UNCACHED).build().user_data(1);
     if unsafe { ring.submission().push(&r_op) }.is_err() {
-        error!("Probe RWF_UNCACHED: Failed to submit read operation.");
         let _ = ring.submitter().unregister_buffers();
         let _ = std::fs::remove_file(probe_file);
         return false;
@@ -139,8 +129,7 @@ pub fn probe_rwf_uncached(target_root: &Path) -> bool {
             }
             cqe_success
         },
-        Err(e) => {
-            error!("Probe RWF_UNCACHED: Failed submit_and_wait: {}", e);
+        Err(_e) => {
             false
         }
     };
@@ -148,24 +137,28 @@ pub fn probe_rwf_uncached(target_root: &Path) -> bool {
     let _ = std::fs::remove_file(probe_file);
     result
 }
+
 pub fn preallocate(fd: i32, size: u64) {
     if size > 0 {
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let _ = fallocate(borrowed_fd.as_raw_fd(), FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as i64);
     }
 }
+
 pub fn enable_compression(fd: i32) -> Result<()> {
     let flags: u32 = FS_COMPR_FL;
     let ret = unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) };
     if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
+
 pub fn enable_f2fs_pinning(fd: i32) -> Result<()> {
     let pin: u32 = 1;
     let ret = unsafe { libc::ioctl(fd, F2FS_IOC_SET_PIN_FILE, &pin) };
     if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
+
 pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     if projid == 0 { return Ok(()); }
     let mut attr: FsxAttr = Default::default();
@@ -179,6 +172,7 @@ pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     }
     Ok(())
 }
+
 pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     let lock = libc::flock { l_type: libc::F_WRLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
     if unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) } < 0 {
@@ -186,6 +180,7 @@ pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     }
     Ok(())
 }
+
 pub fn get_target_epoch(path: &Path) -> u64 {
     if let Some(val) = sidecar::get_metadata(path, "user.foxing_epoch") {
          if val.len() == 8 {
@@ -194,6 +189,7 @@ pub fn get_target_epoch(path: &Path) -> u64 {
     }
     0
 }
+
 pub fn calc_dir_integrity_hash_target(dir_path: &Path) -> Result<u64> {
     if !dir_path.is_dir() { return Ok(0); }
     let mut hasher = DefaultHasher::new();
@@ -218,6 +214,7 @@ pub fn calc_dir_integrity_hash_target(dir_path: &Path) -> Result<u64> {
     }
     Ok(hasher.finish())
 }
+
 pub fn get_dir_integrity_hash(path: &Path) -> u64 {
     if let Some(val) = sidecar::get_metadata(path, "user.foxing_dir_hash") {
          if val.len() == 8 {
@@ -226,6 +223,7 @@ pub fn get_dir_integrity_hash(path: &Path) -> u64 {
     }
     0
 }
+
 pub fn get_valid_dir_hash(path: &Path) -> u64 {
     let hash_bytes = match sidecar::get_metadata(path, "user.foxing_dir_hash") {
         Some(b) if b.len() == 8 => b,
@@ -244,6 +242,7 @@ pub fn get_valid_dir_hash(path: &Path) -> u64 {
     }
     0
 }
+
 pub fn write_dir_integrity_hash(target_dir: &Path, hash: u64) {
     let hash_bytes = hash.to_le_bytes();
     let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_hash", &hash_bytes);
@@ -252,16 +251,14 @@ pub fn write_dir_integrity_hash(target_dir: &Path, hash: u64) {
         let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_guard", &mtime_bytes);
     }
 }
+
 pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, inode: u64) -> Result<()> {
     let version_dir = root_path.join(".mirror").join(".versions");
     std::fs::create_dir_all(&version_dir)?;
     let src_file = std::fs::File::open(path)?;
     let src_fd = src_file.as_raw_fd();
     let size = src_file.metadata()?.len();
-    
-    // FIX #5: Calculate partial hash for snapshot metadata
     let content_hash = calculate_partial_hash(path).unwrap_or(0);
-
     let version_path = version_dir.join(format!("{}_{}_{}", inode, epoch_seq, Utc::now().timestamp()));
     let dst_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&version_path)?;
     let dst_fd = dst_file.as_raw_fd();
@@ -281,17 +278,14 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
              return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Fallback copy failed size mismatch"))));
         }
     }
-    
     let _ = apply_metadata(path, &version_path);
-    
-    // FIX #5: Store hash in metadata
     if content_hash != 0 {
         let _ = sidecar::set_metadata(&version_path, "user.foxing.content_hash", &content_hash.to_le_bytes());
     }
-
     dst_file.sync_all()?;
     Ok(())
 }
+
 pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let src_file = std::fs::File::open(version_path)?;
     let src_fd = src_file.as_raw_fd();
@@ -312,6 +306,7 @@ pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let _ = apply_metadata(version_path, live_path);
     Ok(())
 }
+
 pub fn commit_epoch(path: &Path, seq: u64, projid: u32) -> Result<()> {
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let fd = f.as_raw_fd();
@@ -321,9 +316,10 @@ pub fn commit_epoch(path: &Path, seq: u64, projid: u32) -> Result<()> {
     }
     let _ = sidecar::set_metadata(path, "user.foxing_epoch", &seq.to_le_bytes());
     f.sync_all()?;
-    sidecar::set_dirty_flag(path, false, "COMMIT"); 
+    sidecar::set_dirty_flag(path, false, "COMMIT");
     Ok(())
 }
+
 pub fn sync_xattrs(src: &Path, dst: &Path) {
     if let Ok(list) = xattr::list(src) {
         for name in list.filter(|n| n.to_string_lossy().starts_with("user.")) {
@@ -333,6 +329,7 @@ pub fn sync_xattrs(src: &Path, dst: &Path) {
         }
     }
 }
+
 pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     let m = std::fs::symlink_metadata(src).map_err(FoxingError::Io)?;
     if !m.is_symlink() {
@@ -354,11 +351,13 @@ pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     }
     Ok(())
 }
+
 pub fn truncate_file(dst: &Path, size: u64) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(dst)?;
     f.set_len(size)?;
     Ok(())
 }
+
 pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(dst)?;
     let fd = f.as_raw_fd();
@@ -367,18 +366,21 @@ pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> 
     nix::fcntl::fallocate(borrowed.as_raw_fd(), flags, offset as i64, len as i64)?;
     Ok(())
 }
+
 pub fn create_symlink(link_target: &str, dst: &Path) -> Result<()> {
     if dst.exists() || std::fs::symlink_metadata(dst).is_ok() {
         let _ = std::fs::remove_file(dst);
     }
     std::os::unix::fs::symlink(link_target, dst).map_err(FoxingError::Io)
 }
+
 pub fn create_hard_link(original: &Path, link: &Path) -> Result<()> {
     if link.exists() {
         let _ = std::fs::remove_file(link);
     }
     std::fs::hard_link(original, link).map_err(FoxingError::Io)
 }
+
 pub fn create_mknod(dst: &Path, mode: u32, dev: u64) -> Result<()> {
     if dst.exists() {
         let _ = std::fs::remove_file(dst);
