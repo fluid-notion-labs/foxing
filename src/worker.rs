@@ -175,7 +175,6 @@ pub async fn run_worker(
     let mut last_dropped_check = 0.0;
     
     // Main Event Loop
-    // FIX E0282: Explicitly annotate the result type so break Ok(()) can infer the Error type
     let result: Result<()> = loop {
         // Hibernation Logic
         if !is_hibernating && failure_state.check_hibernation_needed() {
@@ -334,13 +333,34 @@ pub async fn run_worker(
             let new_parent_inode = event_ptr.new_parent_inode;
             let new_name_opt = event_ptr.new_name.clone(); // Clone Option<String> outside closure
             
-            // Validate BPF data completeness
-            let has_complete_bpf_data = new_parent_inode != 0 && new_name_opt.is_some() && new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
+            // Critical Issue 10: Robust BPF Data Check
+            // We must verify not just that we have data, but that the parent inode is KNOWN.
+            // If the parent inode is unknown, a relative path is meaningless.
+            let mut parent_is_known = false;
+            if new_parent_inode != 0 {
+                let dir_map = src_clone.dir_map.lock();
+                if dir_map.contains(&new_parent_inode) {
+                    parent_is_known = true;
+                } else {
+                    // Fallback to inode map
+                    let inode_map = src_clone.inode_map.lock();
+                    if inode_map.contains(&new_parent_inode) {
+                        parent_is_known = true;
+                    }
+                }
+            }
+
+            let has_complete_bpf_data = new_parent_inode != 0 && 
+                                      parent_is_known && 
+                                      new_name_opt.is_some() && 
+                                      new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
             
-            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Complete: {}", 
+            debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Valid: {}", 
                 e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
 
             const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
+            
+            let mut fast_path_success = false;
 
             if has_complete_bpf_data {
                 // *** FAST PATH: Trust BPF and perform pre-rename map update (Change 1 & 2) ***
@@ -349,8 +369,8 @@ pub async fn run_worker(
                 let inode_map_clone = src_clone.inode_map.clone();
                 
                 let result = tokio::task::spawn_blocking(move || {
-                    // Gap 10 Check: If resolve_directory returns None, we need to fall back to the slow path
-                    let parent_path_opt = identity::resolve_directory(&dir_map_clone, new_parent_inode);
+                    // Critical Issue 5: Use improved resolve_directory with fallback
+                    let parent_path_opt = identity::resolve_directory(&dir_map_clone, &inode_map_clone, new_parent_inode);
                     
                     if let Some(parent_path) = parent_path_opt {
                         let new_rel_path = parent_path.join(&new_name_string);
@@ -358,7 +378,7 @@ pub async fn run_worker(
                         identity::update_map_after_rename(&inode_map_clone, &dir_map_clone, e_inode, new_rel_path, e_generation, false);
                         Ok(parent_path)
                     } else {
-                        Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap"))
+                        Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap or InodeMap"))
                     }
                 }).await.map_err(FoxingError::Join);
 
@@ -366,53 +386,54 @@ pub async fn run_worker(
                     warn!("RENAME Handler: Fast-path (BPF trust) failed or parent not in map. Falling back to slow path.");
                 } else {
                     debug!("RENAME Handler: Fast-path identity map update successful.");
-                    coalescer.push(event_ptr.clone());
-                    continue; // Skip the slow path
+                    fast_path_success = true;
                 }
             }
             
-            // SLOW PATH: Aggressive FS scan
-            if !has_complete_bpf_data {
-                warn!("RENAME Handler: BPF data incomplete. Falling back to aggressive FS scan with timeout.");
-            } else {
-                 warn!("RENAME Handler: Parent not in DirMap. Performing aggressive FS scan for identity resolution.");
-            }
-
-            let dir_map_clone = src_clone.dir_map.clone();
-            let inode_map_clone = src_clone.inode_map.clone();
-            
-            let lookup_task = tokio::task::spawn_blocking(move || {
-                match identity::resolve_and_update_path(&inode_map_clone, &dir_map_clone, &src_clone.mount, e_inode) {
-                    Ok(current_path) => Ok(current_path),
-                    Err(e) => {
-                        warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
-                        Err(e)
+            if !fast_path_success {
+                // SLOW PATH: Aggressive FS scan
+                if !has_complete_bpf_data {
+                    warn!("RENAME Handler: BPF data incomplete or parent unknown. Falling back to aggressive FS scan with timeout.");
+                } else {
+                     warn!("RENAME Handler: Parent not in DirMap. Performing aggressive FS scan for identity resolution.");
+                }
+    
+                let dir_map_clone = src_clone.dir_map.clone();
+                let inode_map_clone = src_clone.inode_map.clone();
+                
+                let lookup_task = tokio::task::spawn_blocking(move || {
+                    match identity::resolve_and_update_path(&inode_map_clone, &dir_map_clone, &src_clone.mount, e_inode) {
+                        Ok(current_path) => Ok(current_path),
+                        Err(e) => {
+                            warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
+                            Err(e)
+                        }
                     }
-                }
-            });
-
-            match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
-                Ok(Ok(Ok(_new_path))) => {
-                    // Identity map updated by thread, proceed
-                }
-                Ok(Ok(Err(e))) => {
-                    warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.", 
-                          worker_id, e_inode, e);
-                    // Push anyway to attempt standard processing, though it might fail
-                    coalescer.push(event_ptr.clone());
-                    continue; 
-                }
-                Ok(Err(e)) => {
-                    warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.", 
-                          worker_id, e_inode, e);
-                    coalescer.push(event_ptr.clone());
-                    continue; 
-                }
-                Err(_) => {
-                    warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.", 
-                          worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
-                    coalescer.push(event_ptr.clone());
-                    continue;
+                });
+    
+                match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
+                    Ok(Ok(Ok(_new_path))) => {
+                        // Identity map updated by thread, proceed
+                    }
+                    Ok(Ok(Err(e))) => {
+                        warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.", 
+                              worker_id, e_inode, e);
+                        // Push anyway to attempt standard processing, though it might fail
+                        coalescer.push(event_ptr.clone());
+                        continue; 
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.", 
+                              worker_id, e_inode, e);
+                        coalescer.push(event_ptr.clone());
+                        continue; 
+                    }
+                    Err(_) => {
+                        warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.", 
+                              worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
+                        coalescer.push(event_ptr.clone());
+                        continue;
+                    }
                 }
             }
         }
@@ -738,8 +759,6 @@ async fn process_single_event_inner(
                         let hydration_tx_for_move = hydration_trigger.clone();
                         let new_full_path_for_validation = new_dst.clone();
                         
-                        // UNUSED VARIABLE FIX: Removed unused target_cfg_clone
-                        
                         tokio::task::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             if !new_full_path_for_validation.exists() {
@@ -798,6 +817,8 @@ async fn process_single_event_inner(
                 let r = std::fs::create_dir_all(&dst_clone);
                 if r.is_ok() {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_path_clone) {
+                        // Critical Issue 1: Fix Mkdir Handler
+                        // Explicitly pass is_dir=true to ensure caching in DirMap
                         identity::update_map(&source_map_clone, &source_dir_map_clone, e_inode, rel.to_path_buf(), e_generation, false, true);
                     }
                 }
@@ -810,6 +831,9 @@ async fn process_single_event_inner(
             // Remove from dirty stats and cache
             ctx.dirty_stats.remove(&e.inode);
             source.inode_map.lock().pop(&e.inode);
+            
+            // Critical Issue 3: Fix RMDIR Handler
+            // Ensure directory map is also pruned
             source.dir_map.lock().pop(&e.inode);
 
             let dst_clone = dst.clone();
