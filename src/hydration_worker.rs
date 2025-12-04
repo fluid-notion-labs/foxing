@@ -204,11 +204,12 @@ async fn process_hydration_job(
                     return Ok(());
                 }
                 let file_size = metadata.len();
-                let src_mtime = metadata.mtime();
+                let _src_mtime = metadata.mtime();
 
                 let target_path_clone_ver = target_path.clone();
                 let target_cfg_clone_ver = target_cfg.clone();
                 let source_path_clone_meta = source_path.clone();
+                let version_index_clone = source.version_index.clone();
 
                 let version_match_found = spawn_blocking(move || {
                     if target_cfg_clone_ver.enable_versioning {
@@ -216,8 +217,19 @@ async fn process_hydration_job(
                         if target_cfg_clone_ver.paranoid_deduplication {
                             source_hash = security::calculate_partial_hash(&source_path_clone_meta).ok();
                         }
-                        if let Some(version_path) = versioning::find_matching_version(&target_path_clone_ver, &target_cfg_clone_ver, file_size, src_mtime, source_hash) {
-                            debug!("Hydration: FAST DEDUPE. Restoring {:?} from version {:?}", target_path_clone_ver, version_path);
+                        
+                        let match_path = if let Some(hash) = source_hash {
+                            if let Some(path) = version_index_clone.find_by_hash(hash, file_size) {
+                                debug!("Hydration: FAST DEDUPE by HASH found {:?}", path);
+                                Some(path)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(version_path) = match_path {
                             if security::revert_snapshot(&version_path, &target_path_clone_ver).is_ok() {
                                 if let Ok(valid) = versioning::verify_content_match(&source_path_clone_meta, &target_path_clone_ver) {
                                     if valid {

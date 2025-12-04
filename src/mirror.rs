@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use crate::governor::Governor;
 use crate::security;
 use uuid::Uuid;
+use crate::versioning::VersionIndex;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
@@ -81,6 +82,7 @@ pub struct SourceInfo {
     pub queues: RwLock<HashMap<u32, Vec<Arc<EventQueue>>>>,
     pub active_repairs: Arc<DashSet<PathBuf>>,
     pub rwf_uncached_ok: Arc<AtomicBool>,
+    pub version_index: Arc<VersionIndex>,
 }
 
 pub struct Manager {
@@ -152,6 +154,18 @@ impl Manager {
                     }
                     let primary_dev = dev_ids[0];
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
+                    
+                    // Initialize VersionIndex for this source's PRIMARY target
+                    // Note: This assumes one primary target per source for versioning scope, 
+                    // or that they share a root. In complex multi-target setups, we might need a map.
+                    // For now, we take the path of the first target to root the index.
+                    let version_root = if let Some(first_target) = sc.targets.first() {
+                        first_target.path.clone()
+                    } else {
+                        sc.path.clone() // Fallback, unlikely to have versions
+                    };
+                    let version_index = Arc::new(VersionIndex::new(version_root));
+
                     sources.insert(primary_dev, Arc::new(SourceInfo {
                         path: sc.path.clone(),
                         mount: mount_path,
@@ -165,6 +179,7 @@ impl Manager {
                         queues: RwLock::new(HashMap::new()),
                         active_repairs: Arc::new(DashSet::new()),
                         rwf_uncached_ok: sc.rwf_uncached_ok.clone(),
+                        version_index,
                     }));
                 },
                 Err(e) => error!("Failed to resolve device IDs for {:?}: {}", sc.path, e),
@@ -201,6 +216,12 @@ impl Manager {
         let config_reader = self.config.read().await;
 
         for (_primary_dev, src) in self.sources.iter_mut() {
+            // Kick off Version Indexing in background
+            let v_index = src.version_index.clone();
+            std::thread::spawn(move || {
+                v_index.index_directory();
+            });
+
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets = Vec::new();
                 let mut hydration_repair_txs = Vec::new();
