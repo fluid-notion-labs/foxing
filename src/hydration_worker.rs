@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, warn, debug, info};
 use crate::error::{Result, FoxingError};
-use crate::mirror::{SourceInfo, SharedConfig};
+use crate::mirror::{SourceInfo, SharedConfig}; // Correct type import
 use crate::config::TargetConfig;
 use crate::operations::{SmartCopier, CopyStats};
 use crate::tuner::{TunerBoard, TunerState};
@@ -15,8 +15,7 @@ use std::time::Duration;
 use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
-use std::os::unix::fs::MetadataExt; 
-
+use std::os::unix::fs::MetadataExt;
 #[derive(Debug)]
 pub struct HydrationJob {
     pub rel_path: PathBuf,
@@ -42,7 +41,7 @@ fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> 
 }
 impl HydrationQueue {
     pub fn new(
-        source: Arc<SourceInfo>,
+        source: Arc<SourceInfo>, // Correct type
         config: SharedConfig,
         governor: Arc<Governor>,
         tuner_board: TunerBoard,
@@ -72,7 +71,7 @@ impl HydrationQueue {
 }
 async fn run_hydration_worker_loop(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<HydrationJob>>>,
-    source: Arc<SourceInfo>,
+    source: Arc<SourceInfo>, // Correct type
     config: SharedConfig,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -109,7 +108,7 @@ async fn run_hydration_worker_loop(
 }
 async fn process_hydration_job(
     job: HydrationJob,
-    source: &Arc<SourceInfo>,
+    source: &Arc<SourceInfo>, // Correct type
     governor: &Arc<Governor>,
     tuner_board: &TunerBoard,
     ring: &mut io_uring::IoUring,
@@ -118,11 +117,8 @@ async fn process_hydration_job(
 ) -> Result<()> {
     let HydrationJob { mut rel_path, target_cfg } = job;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
-    
     let source_path_start = source.mount.join(&rel_path);
     let mut target_path = target_cfg.path.join(&rel_path);
-    
-    // --- RENAME/MOVE REPAIR LOOKUP ---
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
         match spawn_blocking({
@@ -137,7 +133,6 @@ async fn process_hydration_job(
                         target_path = target_cfg.path.join(new_rel);
                         rel_path = new_rel.to_path_buf();
                     } else {
-                         
                     }
                 }
             },
@@ -147,8 +142,6 @@ async fn process_hydration_job(
             Err(e) => return Err(e),
         }
     }
-    // --- END RENAME/MOVE REPAIR LOOKUP ---
-    
     let source_path = source.mount.join(&rel_path);
     if !source_path.exists() {
         if target_path.exists() {
@@ -164,22 +157,18 @@ async fn process_hydration_job(
         }
         return Ok(());
     }
-    
     let target_path_lossy = target_path.to_string_lossy().to_string();
-
     let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
     if governor.is_system_stressed() ||
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
-    
     let mut attempts = 0;
     let max_attempts = 5;
     let mut success = false;
@@ -194,7 +183,6 @@ async fn process_hydration_job(
                     }
                     return Ok(());
                 }
-                
                 let file_size = metadata.len();
                 let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
                 SmartCopier::copy(

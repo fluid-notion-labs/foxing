@@ -25,15 +25,23 @@ use crate::hydration_worker::HydrationQueue;
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
 pub type HydrationRx = mpsc::Receiver<PathBuf>;
+
+// --- START: RepairGuard Consistency Feature ---
+// This is an RAII guard used to ensure a specific file path is only undergoing
+// a targeted hydration repair job once at a time. It uses the SourceInfo's
+// DashSet for global locking.
 struct RepairGuard {
     path: PathBuf,
     set: Arc<DashSet<PathBuf>>,
 }
 impl Drop for RepairGuard {
     fn drop(&mut self) {
+        // Release the lock on the path when the repair operation finishes.
         self.set.remove(&self.path);
     }
 }
+// --- END: RepairGuard Consistency Feature ---
+
 fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration) {
     let max_stress_level = tuner_board.iter().map(|r| {
         match *r.value() {
@@ -252,22 +260,17 @@ impl Manager {
         }
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
-        let _repair_tracker_clone = self.repair_tracker.clone(); // Suppressed warning
-        // Determine the canonical path of the Source root once
+        let _repair_tracker_clone = self.repair_tracker.clone();
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
         ).unwrap_or_else(|_| PathBuf::from("/"));
-        
         let debounce_handle = tokio::spawn(async move {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
-            
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
                 let is_targeted_repair = path.exists() && !is_root_request;
-                
                 if is_targeted_repair {
-                    // 1. HIGH PRIORITY FILE REPAIR (Immediate Dispatch via Bulk Queue)
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
                             if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
@@ -280,9 +283,7 @@ impl Manager {
                     }
                     continue;
                 }
-                
                 if is_root_request {
-                    // 2. FULL SCAN REQUEST (Debounced Slow Path)
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
                     if now.duration_since(last_full_scan) > full_scan_debounce {

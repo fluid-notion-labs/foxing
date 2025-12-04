@@ -8,7 +8,7 @@ use tracing::{info, warn, debug};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 use crate::config::{TargetConfig};
 use crate::event::{Event, EventType};
-use crate::mirror::SourceInfo;
+use crate::mirror::SourceInfo; // Correct import
 use crate::governor::Governor;
 use crate::tuner::{TunerBoard, TunerState};
 use crate::{security, identity, sidecar, metrics, Result};
@@ -30,7 +30,7 @@ impl Default for HydrationState {
     }
 }
 pub struct Hydrator {
-    pub source: Arc<SourceInfo>,
+    pub source: Arc<SourceInfo>, // Correct type
     pub targets: Vec<TargetConfig>,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
@@ -38,7 +38,7 @@ pub struct Hydrator {
 }
 impl Hydrator {
     pub fn new(
-        source: Arc<SourceInfo>,
+        source: Arc<SourceInfo>, // Correct type
         targets: Vec<TargetConfig>,
         governor: Arc<Governor>,
         tuner_board: TunerBoard,
@@ -301,7 +301,7 @@ impl Hydrator {
                         let src_parent = src_path.parent().unwrap_or(src_path);
                         let dst_parent = dst_path.parent().unwrap_or(&dst_path);
                         let integrity_hash = security::get_valid_dir_hash(src_parent);
-                        let target_hash = security::get_dir_integrity_hash(dst_parent);
+                        let target_hash = security::calc_dir_integrity_hash_target(dst_parent).unwrap_or(0);
                         if dm.len() != m.len() { true }
                         else if integrity_hash != 0 && integrity_hash == target_hash {
                             metrics::HYDRATION_HASH_SKIPPED.inc();
