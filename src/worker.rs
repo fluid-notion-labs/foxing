@@ -281,7 +281,6 @@ pub async fn run_worker(
             }
         };
         if let Some(event_ptr) = event_poll_result {
-            // FIX: Removed Aggressive Rename Fast-Path that was causing "Time Travel" Identity Poisoning
             coalescer.push(event_ptr.clone());
         } else if shutdown_requested {
             if coalescer.is_empty() {
@@ -329,7 +328,23 @@ pub async fn run_worker(
                 _cur_cap_total: cur_cap_total,
                 daemon_id: &daemon_id,
             };
+            
+            let op_kind = match e.event_type {
+                EventType::Rename | EventType::Mkdir | EventType::Rmdir |
+                EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
+                _ => OpKind::Write,
+            };
+            
+            // CRITICAL CHANGE: Acquire the Serialization Barrier FIRST.
+            // This ensures that if a Create/Write (Worker N) is in progress, the Rename (Worker 0)
+            // will wait here until that operation completes and releases the lock.
+            let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
+
+            // NOW it is safe to resolve the target path.
+            // If we waited for a Create operation, the Identity Map has now been updated,
+            // and resolve_target will see the correct, existing path instead of a missing/synthetic one.
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+            
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -338,14 +353,10 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
+
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
-            let op_kind = match e.event_type {
-                EventType::Rename | EventType::Mkdir | EventType::Rmdir |
-                EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
-                _ => OpKind::Write,
-            };
-            let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
+
             let _ = process_single_event_inner(
                 &mut ctx, e, &source, &target_cfg, &tuner,
                 capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
@@ -505,7 +516,6 @@ async fn process_single_event_inner(
                         }
                     }
                 }
-
                 if e.parent_inode != 0 {
                     let mut old_parent_opt = identity::resolve_directory(
                         &source.dir_map,
@@ -516,7 +526,6 @@ async fn process_single_event_inner(
                     if old_parent_opt.is_none() {
                          let src_clone_lookup = source.clone();
                          let parent_ino = e.parent_inode;
-                         // Unused dev_id removed or prefixed
                          let _dev_id = e.dev_id;
                          let _ = tokio::task::spawn_blocking(move || {
                              let _ = identity::resolve_and_update_path(
@@ -552,7 +561,6 @@ async fn process_single_event_inner(
                     if new_parent_path_opt.is_none() {
                         let src_clone_lookup = source.clone();
                         let parent_ino = e.new_parent_inode;
-                        // Unused dev_id removed or prefixed
                         let _dev_id = e.dev_id;
                         let _ = tokio::task::spawn_blocking(move || {
                              let _ = identity::resolve_and_update_path(

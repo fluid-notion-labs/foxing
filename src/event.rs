@@ -39,8 +39,7 @@ impl EventType {
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir | Self::Rename |
-            Self::Link | Self::Symlink | Self::Mknod |
-            Self::Create | Self::Unlink
+            Self::Link | Self::Symlink | Self::Mknod
         )
     }
 }
