@@ -3,6 +3,11 @@ use tokio::sync::mpsc;
 use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+
+// Constants for file mode checks (from libc)
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventType {
@@ -11,6 +16,7 @@ pub enum EventType {
     Barrier=15, Mknod=16, Symlink=17, Fallocate=18, Utimes=19,
     SequenceGap=255, Unknown=0
 }
+
 impl From<u8> for EventType {
     fn from(v: u8) -> Self {
         match v {
@@ -24,6 +30,7 @@ impl From<u8> for EventType {
         }
     }
 }
+
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -36,28 +43,49 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
+
+    // Only strictly directory-structural events go to Control Plane by default.
+    // Rename is handled conditionally in push().
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
-            Self::Mkdir | Self::Rmdir | Self::Rename |
+            Self::Mkdir | Self::Rmdir |
             Self::Link | Self::Symlink | Self::Mknod
         )
     }
 }
+
 #[derive(Debug)]
 pub struct EventQueue {
     pub senders: Vec<mpsc::Sender<Arc<Event>>>
 }
+
 impl EventQueue {
     pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
         Self { senders }
     }
+
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         if self.senders.is_empty() { return; }
+
         let target_idx = if self.senders.len() > 1 {
-            if e.event_type.is_structural_metadata() {
+            if e.event_type == EventType::Rename {
+                // INTELLIGENT ROUTING:
+                // If it's a Directory Rename, force Control Plane (Worker 0) to maintain tree lock integrity.
+                // If it's a File Rename, hash it to Data Plane (Worker N) to preserve order with Create/Write.
+                if (e.mode & S_IFMT) == S_IFDIR {
+                    0
+                } else {
+                    let mut hasher = DefaultHasher::new();
+                    e.inode.hash(&mut hasher);
+                    let hash = hasher.finish();
+                    1 + (hash as usize % (self.senders.len() - 1))
+                }
+            } else if e.event_type.is_structural_metadata() {
+                // Directories/Links -> Control Plane
                 0
             } else {
+                // Files -> Data Plane
                 let mut hasher = DefaultHasher::new();
                 e.inode.hash(&mut hasher);
                 let hash = hasher.finish();
@@ -66,11 +94,13 @@ impl EventQueue {
         } else {
             0
         };
+
         if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub event_type: EventType,
@@ -92,6 +122,7 @@ pub struct Event {
     pub interactive: bool,
     pub created_at: std::time::Instant
 }
+
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
     let actual_workers = workers.max(1);
     let (mut txs, mut rxs) = (Vec::new(), Vec::new());
