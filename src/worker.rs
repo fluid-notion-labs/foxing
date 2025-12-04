@@ -281,107 +281,7 @@ pub async fn run_worker(
             }
         };
         if let Some(event_ptr) = event_poll_result {
-            if matches!(event_ptr.event_type, EventType::Rename) {
-                let src_clone = source.clone();
-                let e_inode = event_ptr.inode;
-                let e_dev = event_ptr.dev_id;
-                let e_generation = event_ptr.generation;
-                let e_seq = event_ptr.seq_num;
-                let e_ts = event_ptr.timestamp_ns;
-                let e_mode = event_ptr.mode;
-                let is_dir = (e_mode & libc::S_IFMT) == libc::S_IFDIR;
-                let new_parent_inode = event_ptr.new_parent_inode;
-                let new_name_opt = event_ptr.new_name.clone();
-                let mut parent_is_known = false;
-                if new_parent_inode != 0 {
-                    let dir_map = src_clone.dir_map.lock();
-                    if dir_map.contains(&(e_dev, new_parent_inode)) {
-                        parent_is_known = true;
-                    } else {
-                        let inode_map = src_clone.inode_map.lock();
-                        if inode_map.contains(&(e_dev, new_parent_inode)) {
-                            parent_is_known = true;
-                        }
-                    }
-                }
-                let has_complete_bpf_data = new_parent_inode != 0 &&
-                                          parent_is_known &&
-                                          new_name_opt.is_some() &&
-                                          new_name_opt.as_ref().map_or(false, |n| !n.is_empty());
-                debug!("RENAME Handler: Inode {}, Old Name: {:?}, New Parent Inode: {}, New Name: {:?}, BPF Data Valid: {}",
-                    e_inode, event_ptr.name, new_parent_inode, new_name_opt, has_complete_bpf_data);
-                const AGGRESSIVE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(500);
-                let mut fast_path_success = false;
-                if has_complete_bpf_data {
-                    let new_name_string = new_name_opt.clone().unwrap();
-                    let dir_map_clone = src_clone.dir_map.clone();
-                    let inode_map_clone = src_clone.inode_map.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let parent_path_opt = identity::resolve_directory(&dir_map_clone, &inode_map_clone, e_dev, new_parent_inode);
-                        if let Some(parent_path) = parent_path_opt {
-                            let new_rel_path = parent_path.join(&new_name_string);
-                            identity::update_map_after_rename(&inode_map_clone, &dir_map_clone, e_dev, e_inode, new_rel_path, e_generation, is_dir, e_ts, e_seq);
-                            Ok(parent_path)
-                        } else {
-                            Err(io::Error::new(io::ErrorKind::NotFound, "Parent directory not in DirMap or InodeMap"))
-                        }
-                    }).await.map_err(FoxingError::Join);
-                    if result.is_err() || matches!(result, Ok(Err(_))) {
-                        warn!("RENAME Handler: Fast-path (BPF trust) failed or parent not in map. Falling back to slow path.");
-                    } else {
-                        debug!("RENAME Handler: Fast-path identity map update successful.");
-                        fast_path_success = true;
-                    }
-                }
-                if !fast_path_success {
-                    if !has_complete_bpf_data {
-                        warn!("RENAME Handler: BPF data incomplete or parent unknown. Falling back to aggressive FS scan with timeout.");
-                    } else {
-                         warn!("RENAME Handler: Parent not in DirMap. Performing aggressive FS scan for identity resolution.");
-                    }
-                    let dir_map_clone = src_clone.dir_map.clone();
-                    let inode_map_clone = src_clone.inode_map.clone();
-                    let lookup_task = tokio::task::spawn_blocking(move || {
-                        match identity::resolve_and_update_path(
-                            &inode_map_clone,
-                            &dir_map_clone,
-                            &src_clone.mount,
-                            e_inode,
-                            e_generation,
-                            e_ts,
-                            e_seq
-                        ) {
-                            Ok(current_path) => Ok(current_path),
-                            Err(e) => {
-                                warn!("RENAME Handler: Aggressive lookup failed for Inode {}: {:?}", e_inode, e);
-                                Err(e)
-                            }
-                        }
-                    });
-                    match tokio::time::timeout(AGGRESSIVE_LOOKUP_TIMEOUT, lookup_task).await {
-                        Ok(Ok(Ok(_new_path))) => {
-                        }
-                        Ok(Ok(Err(e))) => {
-                            warn!("Worker {}: RENAME identity fix failed (IO Error) for Inode {} ({:?}). Skipping event.",
-                                  worker_id, e_inode, e);
-                            coalescer.push(event_ptr.clone());
-                            continue;
-                        }
-                        Ok(Err(e)) => {
-                            warn!("Worker {}: RENAME identity fix failed (Join Error) for Inode {} ({:?}). Skipping event.",
-                                  worker_id, e_inode, e);
-                            coalescer.push(event_ptr.clone());
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!("Worker {}: RENAME identity lookup TIMED OUT ({}ms) for Inode {}. Skipping event to avoid stall.",
-                                  worker_id, AGGRESSIVE_LOOKUP_TIMEOUT.as_millis(), e_inode);
-                            coalescer.push(event_ptr.clone());
-                            continue;
-                        }
-                    }
-                }
-            }
+            // FIX: Removed Aggressive Rename Fast-Path that was causing "Time Travel" Identity Poisoning
             coalescer.push(event_ptr.clone());
         } else if shutdown_requested {
             if coalescer.is_empty() {
@@ -494,8 +394,9 @@ async fn process_single_event_inner(
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
-                        // CORRECTED: Use actual is_synthetic value from resolve_target to avoid cache poisoning
-                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, is_synthetic, false, e_ts, e_seq);
+                        // FORCE CACHE: We successfully created the file, so it exists.
+                        // Even if the path is synthetic, we must cache it so subsequent events can find it.
+                        identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
                     }
                     Ok(())
                 },
