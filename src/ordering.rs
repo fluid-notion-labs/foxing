@@ -54,18 +54,20 @@ impl ReorderBuffer {
         let (&seq, _) = self.buffer.iter().next()?;
 
         if seq > self.next_seq {
-            // [Adaptive Logic]
+            // [Adaptive Storm Logic]
             // Calculate buffer pressure. If we are filling up, we must reduce the timeout
             // to "fail fast" on gaps. Holding a gap while the buffer is 90% full guarantees
             // tail-drop of subsequent valid events.
+            let pending_count = self.buffer.len();
             let utilization = self.current_pending_bytes as f64 / self.max_pending_bytes as f64;
             
-            let effective_timeout = if utilization > 0.8 {
-                // CRITICAL: Buffer nearly full. Drop gap immediately (10ms) to resume flow.
+            let effective_timeout = if pending_count > 200 || utilization > 0.8 {
+                // CRITICAL STORM: Massive backlog. Jump immediately.
+                // Dropping one packet is better than stalling 200+ operations.
+                Duration::from_millis(0)
+            } else if pending_count > 50 || utilization > 0.5 {
+                // MODERATE STORM: Queue building up. Fail fast (10ms).
                 Duration::from_millis(10)
-            } else if utilization > 0.5 {
-                // HIGH: Buffer filling. Halve the timeout.
-                self.base_stall_timeout / 2
             } else {
                 // NORMAL: Use configured latency tolerance.
                 self.base_stall_timeout
@@ -73,12 +75,13 @@ impl ReorderBuffer {
 
             if let Some(time) = self.stalled_since {
                 if time.elapsed() > effective_timeout {
-                    warn!("INGRESS STALL: Jumping gap {} -> {} (utilization: {:.1}%, timeout: {:?}).",
-                          self.next_seq, seq, utilization * 100.0, effective_timeout);
+                    // Only warn if we are jumping a significant gap or we actually waited
+                    if effective_timeout.as_millis() > 10 {
+                         warn!("INGRESS STALL: Jumping gap {} -> {} (pending: {}, timeout: {:?}).",
+                               self.next_seq, seq, pending_count, effective_timeout);
+                    }
                     
-                    // Detect sequence gap and potentially inject a GAP event here if architecture allowed,
-                    // but for now we simply advance the sequence counter to unblock the queue.
-                    // This effectively "drops" the missing packet (which is likely already lost by kernel).
+                    // Advance sequence, effectively "dropping" the missing packet
                     metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
                     self.next_seq = seq;
                     self.stalled_since = None;
@@ -87,9 +90,13 @@ impl ReorderBuffer {
                     return self.pop();
                 }
             } else {
+                // If timeout is 0, jump immediately without setting stalled_since
+                if effective_timeout.is_zero() {
+                     metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
+                     self.next_seq = seq;
+                     return self.pop();
+                }
                 self.stalled_since = Some(Instant::now());
-                // If we are already critical, don't wait for next poll, check logic immediately?
-                // No, pop() is polled, so we return None and wait for next poll cycle.
             }
             return None;
         }
@@ -102,9 +109,6 @@ impl ReorderBuffer {
             let evt = self.buffer.remove(&seq).unwrap();
             self.current_pending_bytes -= 256 + evt.name.len() as u64;
             metrics::LATE_EVENTS.inc();
-            // We can return it, but the consumer might be confused by old seq.
-            // Generally safer to return it and let worker idempotency handle it, 
-            // provided the worker doesn't enforce strict increasing seq.
             return Some(evt);
         }
 
@@ -132,12 +136,16 @@ impl Coalescer {
             scan_depth,
         }
     }
+    
     pub fn push(&mut self, event: Arc<Event>) {
         self.buffer.push(event);
         metrics::ORDERING_BUF_SIZE.with_label_values(&["worker"]).set((self.buffer.len() as i64) as f64);
     }
+    
     pub fn len(&self) -> usize { self.buffer.len() }
+    
     pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
+    
     pub fn pop_batch(&mut self, coalesce_bytes_limit: u64) -> Option<Arc<Event>> {
         if self.buffer.is_empty() { return None; }
         let head = self.buffer.remove(0);
@@ -148,6 +156,7 @@ impl Coalescer {
         }
         Some(head)
     }
+    
     fn try_coalesce(&mut self, head: Arc<Event>, limit: u64) -> Arc<Event> {
         let mut merged_len = head.length;
         let mut merged_count = 0;
@@ -155,6 +164,7 @@ impl Coalescer {
         let inode = head.inode;
         let name = &head.name;
         let mut current_end_offset = head.offset + head.length;
+        
         for (i, evt) in self.buffer.iter().enumerate().take(self.scan_depth) {
             if merged_len >= limit { break; }
             let is_compatible =
@@ -162,15 +172,18 @@ impl Coalescer {
                 evt.inode == inode &&
                 evt.name == *name &&
                 evt.offset == current_end_offset;
+                
             if is_compatible {
                 merged_len += evt.length;
                 current_end_offset += evt.length;
                 indices_to_remove.push(i);
                 merged_count += 1;
             } else {
+                // Stop scanning at first incompatibility for same inode to preserve strict ordering within file
                 if evt.inode == inode { break; }
             }
         }
+        
         if merged_count > 0 {
             for &i in indices_to_remove.iter().rev() {
                 self.buffer.remove(i);

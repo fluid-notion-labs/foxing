@@ -495,14 +495,8 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             if let Some(new_name_str) = &e.new_name {
-                // FIXED: Trust the `dst` from resolve_target as primary truth, BUT if it is synthetic
-                // and missing (because the CREATE was dropped/stalled), attempt to recover by checking the 'clean' path.
                 let mut old_dst_final = dst.clone();
                 if is_synthetic {
-                    // We are renaming FROM a synthetic path.
-                    // If the file actually exists at the synthetic path (ideal), use it.
-                    // If not, it means we might have lost track or it's an existing file not in cache.
-                    // Try the 'clean' path heuristic as a fallback.
                     if !old_dst_final.exists() {
                         let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
                         if potential_real.exists() {
@@ -541,12 +535,6 @@ async fn process_single_event_inner(
                          );
                     }
                     if let Some(parent) = old_parent_opt {
-                        // If parent path was resolved, we construct the old path from it.
-                        // However, we must ensure we don't blindly overwrite our 'smart' old_dst_final
-                        // unless we are sure.
-                        // Actually, if we have a parent directory from the map, constructing from parent is usually safer
-                        // for directory moves. But for simple renames where we already resolved `dst`...
-                        // Let's stick to using the parent-based construction only if we didn't find the file above.
                         let candidate = target_cfg.path.join(parent).join(&e.name);
                         if !old_dst_final.exists() && candidate.exists() {
                              old_dst_final = candidate;

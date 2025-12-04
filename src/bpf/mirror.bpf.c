@@ -2,9 +2,11 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+
 #define MAX_FILENAME 256
 #define EVENT_VERSION 3
 
+// Attribute flags
 #ifndef ATTR_MODE
 #define ATTR_MODE   1
 #endif
@@ -27,6 +29,7 @@
 #define ATTR_CTIME  64
 #endif
 
+// Kernel structs
 struct kprojid_t___p { int val; };
 struct inode___p { struct kprojid_t___p i_projid; } __attribute__((preserve_access_index));
 struct atomic_t___p { int counter; } __attribute__((preserve_access_index));
@@ -46,9 +49,17 @@ struct event {
     __u8 version;
     __u8 interactive;
     __u8 _pad0[1];
-    __u32 dev_id; __u64 seq_num;
-    __u64 timestamp_ns; __u64 parent_inode; __u64 inode; __u64 new_parent_inode;
-    __u32 generation; __u32 mode; __u64 offset; __u64 length; __u32 uid;
+    __u32 dev_id; 
+    __u64 seq_num;
+    __u64 timestamp_ns; 
+    __u64 parent_inode; 
+    __u64 inode; 
+    __u64 new_parent_inode;
+    __u32 generation; 
+    __u32 mode; 
+    __u64 offset; 
+    __u64 length; 
+    __u32 uid;
     __u32 gid;
     __u32 nlink;
     __u32 flags;
@@ -60,15 +71,21 @@ struct event {
     char comm[16];
 };
 
-struct stats { __u64 events_submitted; __u64 events_dropped; __u64 write_events; __u64 metadata_events; __u64 incomplete_rename; };
+struct stats { 
+    __u64 events_submitted; 
+    __u64 events_dropped; 
+    __u64 write_events; 
+    __u64 metadata_events; 
+    __u64 incomplete_rename; 
+};
 
-// FIX #1 & #10: Per-CPU Array to prevent false sharing / global lock contention.
+// GLOBAL SEQUENCE MAP: ARRAY type ensures shared state across all CPUs.
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u64);
-} local_seq_map SEC(".maps");
+} global_seq_map SEC(".maps");
 
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 64); __type(key, __u32); __type(value, __u8); } watched_devs SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16); __type(key, __u32); __type(value, __u8); } ignored_pids SEC(".maps");
@@ -78,16 +95,12 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 1024); __type(key,
 
 static __always_inline __u64 get_next_seq() {
     __u32 key = 0;
-    __u64 *seq = bpf_map_lookup_elem(&local_seq_map, &key);
+    __u64 *seq = bpf_map_lookup_elem(&global_seq_map, &key);
     if (!seq) return 0;
     
-    // Increment local counter (no atomic needed as it is per-cpu)
-    *seq += 1;
-    
-    // FIX #10: Encode CPU ID into upper 32 bits to ensure global uniqueness
-    // without requiring a global atomic counter.
-    __u32 cpu_id = bpf_get_smp_processor_id();
-    return ((__u64)cpu_id << 32) | (*seq & 0xFFFFFFFF);
+    // CRITICAL: Use atomic fetch_and_add to guarantee global monotonic ordering.
+    // This removes CPU ID from the sequence, preventing "False Gaps" in the reorder buffer.
+    return __sync_fetch_and_add(seq, 1);
 }
 
 static __always_inline int is_ignored_pid() {
@@ -133,22 +146,20 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     
     e->interactive = (tty != NULL) ? 1 : 0;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    
-    e->type = type; 
-    e->version = EVENT_VERSION; 
+    e->type = type;
+    e->version = EVENT_VERSION;
     e->dev_id = dev_id;
-    e->seq_num = get_next_seq(); 
-    e->timestamp_ns = bpf_ktime_get_ns(); // Critical for Fix #1
-    
+    e->seq_num = get_next_seq(); // GLOBAL SEQUENCE
+    e->timestamp_ns = bpf_ktime_get_ns();
     e->inode = BPF_CORE_READ(inode, i_ino);
     e->generation = BPF_CORE_READ(inode, i_generation);
-    e->mode = BPF_CORE_READ(inode, i_mode); 
+    e->mode = BPF_CORE_READ(inode, i_mode);
     e->nlink = BPF_CORE_READ(inode, i_nlink);
-    e->file_size = BPF_CORE_READ(inode, i_size); 
+    e->file_size = BPF_CORE_READ(inode, i_size);
     e->uid = BPF_CORE_READ(inode, i_uid.val);
-    e->gid = BPF_CORE_READ(inode, i_gid.val); 
-    e->offset = offset; 
-    e->length = length; 
+    e->gid = BPF_CORE_READ(inode, i_gid.val);
+    e->offset = offset;
+    e->length = length;
     e->flags = flags;
     
     struct inode___p *ip = (struct inode___p *)inode;
@@ -178,8 +189,6 @@ static __always_inline int submit_event(struct inode *inode, struct dentry *dent
     }
     return 0;
 }
-
-// ... (Kprobe definitions remain largely the same, calling submit_event) ...
 
 static __always_inline int process_stashed_dentry(int ret, enum event_type type) {
     if (ret != 0) return 0;
@@ -217,31 +226,42 @@ int BPF_KPROBE(trace_rename, struct renamedata *rd) {
     struct inode *inode = BPF_CORE_READ(old_dentry, d_inode);
     if (!inode) return 0;
     if (is_ignored_pid()) return 0;
+    
     struct super_block *sb = BPF_CORE_READ(inode, i_sb);
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
+
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
+    
     __builtin_memset(e, 0, sizeof(*e));
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct signal_struct *signal = BPF_CORE_READ(task, signal);
     struct tty_struct *tty = BPF_CORE_READ(signal, tty);
+    
     e->interactive = (tty != NULL) ? 1 : 0;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    e->type = EVENT_RENAME; e->version = EVENT_VERSION; e->dev_id = dev_id;
-    e->seq_num = get_next_seq(); 
+    e->type = EVENT_RENAME; 
+    e->version = EVENT_VERSION; 
+    e->dev_id = dev_id;
+    e->seq_num = get_next_seq();
     e->timestamp_ns = bpf_ktime_get_ns();
-    e->inode = BPF_CORE_READ(inode, i_ino); e->generation = BPF_CORE_READ(inode, i_generation);
+    e->inode = BPF_CORE_READ(inode, i_ino); 
+    e->generation = BPF_CORE_READ(inode, i_generation);
+    
     struct dentry *op = BPF_CORE_READ(old_dentry, d_parent);
     if (op) e->parent_inode = BPF_CORE_READ(op, d_inode, i_ino);
+    
     const unsigned char *old_name_ptr = BPF_CORE_READ(old_dentry, d_name.name);
     bpf_core_read_str(&e->name, sizeof(e->name), (const char *)old_name_ptr);
+    
     struct dentry *new_dentry = BPF_CORE_READ(rd, new_dentry);
     __u64 new_parent_ino = 0;
     if (new_dentry) {
         const unsigned char *new_name_ptr = BPF_CORE_READ(new_dentry, d_name.name);
         bpf_core_read_str(&e->new_name, sizeof(e->new_name), (const char *)new_name_ptr);
+        
         struct dentry *new_p = BPF_CORE_READ(new_dentry, d_parent);
         struct inode *new_p_inode = BPF_CORE_READ(new_p, d_inode);
         if (new_p_inode) {
@@ -249,6 +269,7 @@ int BPF_KPROBE(trace_rename, struct renamedata *rd) {
         }
     }
     e->new_parent_inode = new_parent_ino;
+    
     if (e->new_parent_inode == 0 || e->new_name[0] == 0) {
         __u32 z=0; struct stats *s = bpf_map_lookup_elem(&statistics, &z);
         if (s) __sync_fetch_and_add(&s->incomplete_rename, 1);
@@ -256,6 +277,7 @@ int BPF_KPROBE(trace_rename, struct renamedata *rd) {
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
+
 SEC("kprobe/vfs_create") int BPF_KPROBE(trace_create_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
 SEC("kretprobe/vfs_create") int BPF_KRETPROBE(trace_create_exit, int ret) { return process_stashed_dentry(ret, EVENT_CREATE); }
 SEC("kprobe/vfs_mkdir") int BPF_KPROBE(trace_mkdir_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
@@ -308,7 +330,7 @@ SEC("kprobe/xfs_trans_commit") int BPF_KPROBE(trace_xfs_commit, struct xfs_trans
     if (!e) return 0;
     __builtin_memset(e, 0, sizeof(*e));
     e->type = EVENT_BARRIER; e->version = EVENT_VERSION; e->dev_id = dev_id;
-    e->seq_num = get_next_seq(); 
+    e->seq_num = get_next_seq();
     e->timestamp_ns = bpf_ktime_get_ns();
     bpf_ringbuf_submit(e, 0);
     return 0;
