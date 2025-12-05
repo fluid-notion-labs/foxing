@@ -130,7 +130,8 @@ impl JournalStore {
     pub fn append_batch(&self, events: &[Arc<Event>]) -> io::Result<u64> {
         let mut buffer = Vec::with_capacity(events.len() * 128);
         for evt in events {
-            if let Ok(json) = serde_json::to_string(evt) {
+            // Explicitly dereference Arc for serialization
+            if let Ok(json) = serde_json::to_string(&**evt) {
                 buffer.extend_from_slice(json.as_bytes());
                 buffer.push(b'\n');
             }

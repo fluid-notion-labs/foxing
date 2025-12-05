@@ -42,6 +42,8 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
+    // Only strictly directory-structural events go to Control Plane by default.
+    // Rename is handled conditionally in push().
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir |

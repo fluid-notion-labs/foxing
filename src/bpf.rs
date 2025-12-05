@@ -83,7 +83,7 @@ pub fn run(
     
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
     
-    // Wrap journal buffers in Arc<Mutex> so they can be shared between the ring buffer callback and the outer loop
+    // Shared state for journal buffers across threads/closures
     let journal_buffers: Arc<Mutex<HashMap<u32, Vec<Arc<Event>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let journal_buffers_closure = journal_buffers.clone();
     
@@ -164,9 +164,8 @@ pub fn run(
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
 
-    // Move journal_tuners into the closure since it's not shared with the outer loop
-    // But journal_buffers IS shared via Arc<Mutex>
-    let mut journal_tuners_closure = journal_tuners; 
+    // Move journal tuners into closure (exclusive access within the ringbuf thread)
+    let mut journal_tuners_closure = journal_tuners;
 
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
@@ -222,7 +221,6 @@ pub fn run(
 
         if let Some(src_info) = sources_in_closure.get(&raw.dev) {
             if let Some(journal) = &src_info.journal {
-                // Lock the shared journal buffers map
                 if let Ok(mut buffers_map) = journal_buffers_closure.lock() {
                     if let Some(buffer) = buffers_map.get_mut(&raw.dev) {
                         buffer.push(evt.clone());
@@ -272,7 +270,7 @@ pub fn run(
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
-                // Flush Journal Buffers
+                // Flush Journal Buffers for all devices
                 if let Ok(mut buffers_map) = journal_buffers.lock() {
                     for (dev_id, buffer) in buffers_map.iter_mut() {
                         if !buffer.is_empty() {
@@ -287,7 +285,7 @@ pub fn run(
                 }
 
                 if let Ok(mut buffers) = reorder_buffers.lock() {
-                    for (dev_id, buf) in buffers.iter_mut() {
+                    for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
                                 if let Some(projector) = &src_info.projector {

@@ -311,20 +311,17 @@ impl Manager {
                 *q_write = queues_for_source.clone();
                 drop(q_write);
                 
+                // Iterate by reference to avoid moving queues_for_source
                 for (k, v) in &queues_for_source {
                     all_queues_map.entry(*k).or_insert_with(Vec::new).extend(v.iter().cloned());
                 }
 
-                // [OPTIMIZATION] REPLAY LOGIC
-                // Perform replay to restore identity map and capture the last sequence
                 let queues_copy = queues_for_source.clone();
                 if let Some(journal) = &src.journal {
                     let projector = src.projector.clone();
                     let replay_count = journal.replay(|evt| {
                         let evt_arc = Arc::new(evt);
-                        // 1. Update Identity
                         if let Some(p) = &projector { p.project(&evt_arc); }
-                        // 2. Queue for Workers
                         if let Some(qs) = queues_copy.get(&evt_arc.dev_id) {
                             for q in qs { q.push(evt_arc.clone()); }
                         }
