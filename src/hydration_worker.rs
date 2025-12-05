@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{error, warn, debug, info};
+use tracing::{error, warn, debug};
 use crate::error::{Result, FoxingError};
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
