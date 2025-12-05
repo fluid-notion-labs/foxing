@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use serde::{Serialize, Deserialize};
+use std::time::Instant;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
@@ -41,8 +42,6 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-    // Only strictly directory-structural events go to Control Plane by default.
-    // Rename is handled conditionally in push().
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir |
@@ -107,7 +106,7 @@ pub struct Event {
     pub process_name: String,
     pub interactive: bool,
     #[serde(skip, default="Instant::now")]
-    pub created_at: std::time::Instant
+    pub created_at: Instant
 }
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
     let actual_workers = workers.max(1);

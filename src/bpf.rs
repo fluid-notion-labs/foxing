@@ -82,7 +82,11 @@ pub fn run(
     let sources_in_loop = sources_in_closure.clone();
     
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
-    let mut journal_buffers: HashMap<u32, Vec<Arc<Event>>> = HashMap::new();
+    
+    // Wrap journal buffers in Arc<Mutex> so they can be shared between the ring buffer callback and the outer loop
+    let journal_buffers: Arc<Mutex<HashMap<u32, Vec<Arc<Event>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let journal_buffers_closure = journal_buffers.clone();
+    
     let mut journal_tuners: HashMap<u32, BbrTuner> = HashMap::new();
     let dummy_board = Arc::new(DashMap::new());
 
@@ -96,7 +100,7 @@ pub fn run(
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
         reorder_buffers_map.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
         
-        journal_buffers.insert(*dev, Vec::with_capacity(128));
+        journal_buffers.lock().unwrap().insert(*dev, Vec::with_capacity(128));
         
         let mut journal_cfg = TargetConfig {
             path: PathBuf::from("journal"),
@@ -160,6 +164,10 @@ pub fn run(
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
 
+    // Move journal_tuners into the closure since it's not shared with the outer loop
+    // But journal_buffers IS shared via Arc<Mutex>
+    let mut journal_tuners_closure = journal_tuners; 
+
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
@@ -214,18 +222,21 @@ pub fn run(
 
         if let Some(src_info) = sources_in_closure.get(&raw.dev) {
             if let Some(journal) = &src_info.journal {
-                if let Some(buffer) = journal_buffers.get_mut(&raw.dev) {
-                    buffer.push(evt.clone());
-                    
-                    let tuner = journal_tuners.get_mut(&raw.dev).unwrap();
-                    if buffer.len() >= tuner.current_batch_size {
-                        let start = std::time::Instant::now();
-                        let res = journal.append_batch(buffer);
-                        let duration = start.elapsed().as_secs_f64();
+                // Lock the shared journal buffers map
+                if let Ok(mut buffers_map) = journal_buffers_closure.lock() {
+                    if let Some(buffer) = buffers_map.get_mut(&raw.dev) {
+                        buffer.push(evt.clone());
                         
-                        let bytes = res.unwrap_or(0);
-                        tuner.tune(duration, bytes, false, 0, 10000, &dummy_board, "journal", 0);
-                        buffer.clear();
+                        let tuner = journal_tuners_closure.get_mut(&raw.dev).unwrap();
+                        if buffer.len() >= tuner.current_batch_size {
+                            let start = std::time::Instant::now();
+                            let res = journal.append_batch(buffer);
+                            let duration = start.elapsed().as_secs_f64();
+                            
+                            let bytes = res.unwrap_or(0);
+                            tuner.tune(duration, bytes, false, 0, 10000, &dummy_board, "journal", 0);
+                            buffer.clear();
+                        }
                     }
                 }
             }
@@ -261,19 +272,22 @@ pub fn run(
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
-                if let Ok(mut buffers) = reorder_buffers.lock() {
-                    for (dev_id, buf) in buffers.iter_mut() {
-                        if let Some(src_info) = sources_in_loop.get(dev_id) {
-                            if let Some(journal) = &src_info.journal {
-                                if let Some(buffer) = journal_buffers.get_mut(dev_id) {
-                                    if !buffer.is_empty() {
-                                        let _ = journal.append_batch(buffer);
-                                        buffer.clear();
-                                    }
+                // Flush Journal Buffers
+                if let Ok(mut buffers_map) = journal_buffers.lock() {
+                    for (dev_id, buffer) in buffers_map.iter_mut() {
+                        if !buffer.is_empty() {
+                            if let Some(src_info) = sources_in_loop.get(dev_id) {
+                                if let Some(journal) = &src_info.journal {
+                                    let _ = journal.append_batch(buffer);
+                                    buffer.clear();
                                 }
                             }
                         }
+                    }
+                }
 
+                if let Ok(mut buffers) = reorder_buffers.lock() {
+                    for (dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
                                 if let Some(projector) = &src_info.projector {

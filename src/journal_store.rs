@@ -182,7 +182,6 @@ impl JournalStore {
                     },
                     Err(e) => {
                         error!("JOURNAL: Failed to open new log file after rotation: {}", e);
-                        // Attempt to rename back to avoid data loss?
                         let _ = std::fs::rename(&archived_path, &self.journal_path);
                     }
                 }
@@ -223,7 +222,6 @@ impl JournalStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Updated for sysinfo 0.30+
         let disks = Disks::new_with_refreshed_list();
 
         let disk_infos: Vec<DiskInfo> = disks.iter().map(|d| {

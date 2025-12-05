@@ -311,8 +311,8 @@ impl Manager {
                 *q_write = queues_for_source.clone();
                 drop(q_write);
                 
-                for (k, v) in queues_for_source {
-                    all_queues_map.entry(k).or_insert_with(Vec::new).extend(v);
+                for (k, v) in &queues_for_source {
+                    all_queues_map.entry(*k).or_insert_with(Vec::new).extend(v.iter().cloned());
                 }
 
                 // [OPTIMIZATION] REPLAY LOGIC
