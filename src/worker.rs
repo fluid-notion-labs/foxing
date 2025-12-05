@@ -1,6 +1,6 @@
 use io_uring::IoUring;
 use tokio::sync::mpsc;
-// Removed static interval import
+use tokio::time::interval;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
@@ -48,6 +48,7 @@ struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
         let shard_count = 128;
+        // Avoid zero capacity panic in LruCache
         let per_shard = (capacity_hint / shard_count).max(100);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
@@ -145,10 +146,13 @@ pub async fn run_worker(
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     
-    // START ADAPTIVE TIMER LOGIC
-    // Initialize with config value, then adapt
+    // ADAPTIVE TIMER LOGIC
     let initial_flush_ms = target_cfg.worker_flush_interval_ms;
-    let mut flush_timer = tokio::time::sleep(Duration::from_millis(initial_flush_ms));
+    // We create the sleep future here
+    let flush_timer = tokio::time::sleep(Duration::from_millis(initial_flush_ms));
+    // We PIN the timer to the stack so it can be safely polled by select!
+    tokio::pin!(flush_timer);
+
     let mut last_capacity_check = Instant::now();
     
     let mut tuner = BbrTuner::new(&target_cfg);
@@ -204,7 +208,8 @@ pub async fn run_worker(
              tokio::select! {
                 _ = shutdown_rx.recv() => break Ok(()),
                 _ = &mut flush_timer => { 
-                    flush_timer = tokio::time::sleep(Duration::from_secs(5)); // Hibernation slow tick
+                    // Reset the pinned timer in place
+                    flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     continue; 
                 }
                 Some(_) = rx_main.recv() => { continue; }
@@ -260,8 +265,9 @@ pub async fn run_worker(
                     );
 
                     // Reset Timer with Adaptive Value
+                    // IMPORTANT: We use as_mut().reset() because it is pinned
                     let next_interval_ms = tuner.current_flush_ms;
-                    flush_timer = tokio::time::sleep(Duration::from_millis(next_interval_ms));
+                    flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(next_interval_ms));
 
                     if !is_control_plane && recommended_depth != buffer_pool.capacity() {
                         // Resizing logic omitted
@@ -438,7 +444,7 @@ async fn process_single_event_inner(
     _tuner: &BbrTuner,
     _capacity_threshold_mb: u64,
     dst: &PathBuf,
-    is_synthetic: bool,
+    _is_synthetic: bool,
     needs_creation: bool,
     src: &PathBuf,
     buffer_pool: &mut BufferPool,
