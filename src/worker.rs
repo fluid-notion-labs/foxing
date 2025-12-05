@@ -504,8 +504,9 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
-            if let Some(new_name_str) = &e.new_name {
-                let new_rel_path = if e.new_parent_inode != 0 {
+            
+            let new_rel_path = if let Some(new_name_str) = &e.new_name {
+                if e.new_parent_inode != 0 {
                     if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.new_parent_inode) {
                         parent_rel.join(new_name_str)
                     } else {
@@ -513,7 +514,12 @@ async fn process_single_event_inner(
                     }
                 } else {
                     PathBuf::from(new_name_str)
-                };
+                }
+            } else {
+                PathBuf::new()
+            };
+
+            if let Some(new_name_str) = &e.new_name {
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,
@@ -528,11 +534,11 @@ async fn process_single_event_inner(
                 if is_dir {
                     source.dir_map.clear();
                 }
-            }
-            if let Some(new_name_str) = &e.new_name {
+
                 let old_dst_final = dst.clone();
                 let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
-                let new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
+                let new_dst_final = target_cfg.path.join(&new_rel_path);
+                
                 let mut resolved_old_dst = old_dst_final.clone();
                 if !resolved_old_dst.exists() {
                     // Race Condition Fix: If the Identity Map points to a "Future" path (updated by Projector)
