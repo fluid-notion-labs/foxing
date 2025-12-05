@@ -1,6 +1,5 @@
 use io_uring::IoUring;
 use tokio::sync::mpsc;
-use tokio::time::interval;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
@@ -148,11 +147,10 @@ pub async fn run_worker(
     
     // ADAPTIVE TIMER LOGIC
     let initial_flush_ms = target_cfg.worker_flush_interval_ms;
-    // We create the sleep future here
-    let flush_timer = tokio::time::sleep(Duration::from_millis(initial_flush_ms));
-    // We PIN the timer to the stack so it can be safely polled by select!
-    tokio::pin!(flush_timer);
-
+    // We create the sleep future here using Box::pin to ensure it is Unpin and stable on the heap.
+    // This avoids PhantomPinned errors associated with stack pinning macros in tokio::select! loops.
+    let mut flush_timer = Box::pin(tokio::time::sleep(Duration::from_millis(initial_flush_ms)));
+    
     let mut last_capacity_check = Instant::now();
     
     let mut tuner = BbrTuner::new(&target_cfg);
