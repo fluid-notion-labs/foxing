@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use serde::{Serialize};
 use crate::event::Event;
-use sysinfo::{Disks, System};
+use sysinfo::Disks;
 use chrono::Utc;
 use tracing::{info, error, debug, warn};
 use glob::glob;
@@ -130,8 +130,7 @@ impl JournalStore {
     pub fn append_batch(&self, events: &[Arc<Event>]) -> io::Result<u64> {
         let mut buffer = Vec::with_capacity(events.len() * 128);
         for evt in events {
-            // Explicitly dereference Arc for serialization
-            if let Ok(json) = serde_json::to_string(&**evt) {
+            if let Ok(json) = serde_json::to_string(evt) {
                 buffer.extend_from_slice(json.as_bytes());
                 buffer.push(b'\n');
             }

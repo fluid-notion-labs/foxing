@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::metrics::{self, GLOBAL_BUFFER_LIMIT};
 use std::mem;
 use libbpf_rs::MapCore;
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 use crate::ordering::ReorderBuffer;
 use std::sync::Mutex;
 use crate::mirror::SourceInfo;
@@ -57,7 +57,7 @@ pub fn run(
     let skel_builder = MirrorSkelBuilder::default();
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    let mut skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
+    let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     
     if initial_seq > 0 {
         let key: u32 = 0;
@@ -83,7 +83,6 @@ pub fn run(
     
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
     
-    // Shared state for journal buffers across threads/closures
     let journal_buffers: Arc<Mutex<HashMap<u32, Vec<Arc<Event>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let journal_buffers_closure = journal_buffers.clone();
     
@@ -102,11 +101,12 @@ pub fn run(
         
         journal_buffers.lock().unwrap().insert(*dev, Vec::with_capacity(128));
         
-        let mut journal_cfg = TargetConfig {
-            path: PathBuf::from("journal"),
-            profile: TargetProfile::SSD, 
-            ..Default::default()
-        };
+        // [FIX] Initialize using default() then mutate public fields
+        // This avoids the "private field" error (E0451) caused by struct update syntax
+        let mut journal_cfg = TargetConfig::default();
+        journal_cfg.path = PathBuf::from("journal");
+        journal_cfg.profile = TargetProfile::SSD;
+        
         let _ = journal_cfg.compile(2, 1024); 
         journal_tuners.insert(*dev, BbrTuner::new(&journal_cfg));
     }
@@ -164,8 +164,7 @@ pub fn run(
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
 
-    // Move journal tuners into closure (exclusive access within the ringbuf thread)
-    let mut journal_tuners_closure = journal_tuners;
+    let mut journal_tuners_closure = journal_tuners; 
 
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
@@ -270,7 +269,6 @@ pub fn run(
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
-                // Flush Journal Buffers for all devices
                 if let Ok(mut buffers_map) = journal_buffers.lock() {
                     for (dev_id, buffer) in buffers_map.iter_mut() {
                         if !buffer.is_empty() {
@@ -285,6 +283,7 @@ pub fn run(
                 }
 
                 if let Ok(mut buffers) = reorder_buffers.lock() {
+                    // Prefix with underscore to suppress unused var warning
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {

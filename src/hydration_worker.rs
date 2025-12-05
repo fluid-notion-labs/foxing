@@ -16,7 +16,6 @@ use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
 use std::os::unix::fs::MetadataExt;
-use crate::versioning;
 use crate::sidecar;
 
 #[derive(Debug)]
@@ -146,7 +145,7 @@ async fn process_hydration_job(
             Ok(new_full_path) => {
                 if let Ok(new_rel) = new_full_path.strip_prefix(&source.mount) {
                     if new_rel != rel_path.as_path() {
-                        info!("Hydration Worker: Correcting renamed path {} -> {}", rel_path.to_string_lossy(), new_rel.to_string_lossy());
+                        debug!("Hydration Worker: Correcting renamed path {} -> {}", rel_path.to_string_lossy(), new_rel.to_string_lossy());
                         target_path = target_cfg.path.join(new_rel);
                         rel_path = new_rel.to_path_buf();
                     }
