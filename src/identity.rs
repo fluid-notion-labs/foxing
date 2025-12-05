@@ -10,6 +10,7 @@ use walkdir;
 use std::io;
 use crate::metrics;
 use std::num::NonZeroUsize;
+
 #[derive(Clone, Debug)]
 pub struct IdentityEntry {
     pub path: PathBuf,
@@ -17,16 +18,20 @@ pub struct IdentityEntry {
     pub timestamp_ns: u64,
     pub seq_num: u64,
 }
+
 impl IdentityEntry {
     pub fn new(path: PathBuf, generation: u32, timestamp_ns: u64, seq_num: u64) -> Self {
         Self { path, generation, timestamp_ns, seq_num }
     }
 }
+
 const SHARD_COUNT: usize = 64;
+
 #[derive(Debug)]
 pub struct ShardedInodeMap {
     shards: Vec<Mutex<LruCache<u64, IdentityEntry>>>,
 }
+
 impl ShardedInodeMap {
     pub fn new(capacity: usize) -> Arc<Self> {
         let per_shard = NonZeroUsize::new((capacity / SHARD_COUNT).max(100)).unwrap();
@@ -36,12 +41,15 @@ impl ShardedInodeMap {
         }
         Arc::new(Self { shards })
     }
+
     fn get_shard(&self, inode: u64) -> &Mutex<LruCache<u64, IdentityEntry>> {
         &self.shards[(inode as usize) % SHARD_COUNT]
     }
+
     pub fn put(&self, inode: u64, entry: IdentityEntry) {
         let mut shard = self.get_shard(inode).lock();
         if let Some(existing) = shard.get(&inode) {
+            // monotonic updates only: ensure we don't overwrite newer state with older events
             let is_hydration = existing.timestamp_ns == u64::MAX;
             if !is_hydration {
                 if existing.timestamp_ns > entry.timestamp_ns { return; }
@@ -50,14 +58,17 @@ impl ShardedInodeMap {
         }
         shard.put(inode, entry);
     }
+
     pub fn get_path(&self, inode: u64) -> Option<PathBuf> {
         let mut shard = self.get_shard(inode).lock();
         shard.get(&inode).map(|e| e.path.clone())
     }
+
     pub fn get_entry_clone(&self, inode: u64) -> Option<IdentityEntry> {
         let mut shard = self.get_shard(inode).lock();
         shard.get(&inode).cloned()
     }
+
     pub fn remove(&self, inode: u64) {
         let mut shard = self.get_shard(inode).lock();
         if shard.pop(&inode).is_some() {
@@ -65,10 +76,12 @@ impl ShardedInodeMap {
         }
     }
 }
+
 #[derive(Debug)]
 pub struct ShardedDirMap {
     shards: Vec<Mutex<LruCache<u64, PathBuf>>>,
 }
+
 impl ShardedDirMap {
     pub fn new(capacity: usize) -> Arc<Self> {
         let per_shard = NonZeroUsize::new((capacity / SHARD_COUNT).max(100)).unwrap();
@@ -78,24 +91,30 @@ impl ShardedDirMap {
         }
         Arc::new(Self { shards })
     }
+
     fn get_shard(&self, inode: u64) -> &Mutex<LruCache<u64, PathBuf>> {
         &self.shards[(inode as usize) % SHARD_COUNT]
     }
+
     pub fn put(&self, inode: u64, path: PathBuf) {
         self.get_shard(inode).lock().put(inode, path);
     }
+
     pub fn get(&self, inode: u64) -> Option<PathBuf> {
         self.get_shard(inode).lock().get(&inode).cloned()
     }
+
     pub fn remove(&self, inode: u64) {
         self.get_shard(inode).lock().pop(&inode);
     }
+
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.lock().clear();
         }
     }
 }
+
 pub fn update_map(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64, path: PathBuf, generation: u32, is_synthetic: bool, is_dir: bool, ts: u64, seq: u64) {
     if !is_synthetic {
         map.put(inode, IdentityEntry::new(path.clone(), generation, ts, seq));
@@ -104,51 +123,56 @@ pub fn update_map(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, ino
         dir_map.put(inode, path);
     }
 }
+
 pub fn update_map_after_rename(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64, new_path: PathBuf, generation: u32, is_dir: bool, ts: u64, seq: u64) {
     map.put(inode, IdentityEntry::new(new_path.clone(), generation, ts, seq));
     if is_dir {
         dir_map.put(inode, new_path);
     }
 }
+
 pub fn remove_entry(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64) {
     map.remove(inode);
     dir_map.remove(inode);
 }
+
 pub fn resolve_target(
     inode_map: &ShardedInodeMap,
     event: &Event,
     target_root: &std::path::Path
 ) -> (PathBuf, bool, bool) {
+    // 1. Check Memory Cache First (Fast Path)
+    // PATTERN: Strict Inode Map Trust.
+    // We assume the InodeMap is the "Shadow Namespace" Source of Truth.
     if let Some(entry) = inode_map.get_entry_clone(event.inode) {
         let match_gen = entry.generation == event.generation
                         || entry.generation == 0
                         || entry.generation == std::u32::MAX;
+        
         if !match_gen {
-            let full_path = target_root.join(&entry.path);
-            let is_synthetic = entry.path.to_string_lossy().contains(".by-identity");
-            if is_synthetic {
-                metrics::IDENTITY_CACHE_HIT_RATE.set(1.0);
-                return (full_path, false, false);
-            }
-            if let Ok(_) = std::fs::metadata(&full_path) {
-                metrics::IDENTITY_CACHE_HIT_RATE.set(1.0);
-                return (full_path, false, false);
-            } else {
-                warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. Invalidating.",
-                      event.inode, entry.generation, event.generation);
-                inode_map.remove(event.inode);
-                metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
-            }
+            // Generation Mismatch is the ONLY reason to invalidate.
+            // It means the Inode was recycled by the OS.
+            warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. Invalidating.",
+                  event.inode, entry.generation, event.generation);
+            inode_map.remove(event.inode);
+            metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
         } else {
+             // CACHE HIT: Trust the path in the map explicitly.
+             // DO NOT verify existence on disk (fs::metadata). Doing so causes TOCTOU races
+             // where we "forget" a file just because it hasn't been flushed to disk yet,
+             // leading to "Source Missing" errors on subsequent renames.
              metrics::IDENTITY_CACHE_HIT_RATE.set(1.0);
              return (target_root.join(&entry.path), false, false);
         }
     } else {
         metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
     }
+
+    // 2. Parent-Based Reconstruction (Heuristic - Only used on Cache Miss)
     if event.parent_inode != 0 {
         if let Some(parent_path) = inode_map.get_path(event.parent_inode) {
             let full_path = parent_path.join(&event.name);
+            // Repair the map since we found the child via the parent
             inode_map.put(event.inode, IdentityEntry::new(
                 full_path.clone(),
                 event.generation,
@@ -158,8 +182,12 @@ pub fn resolve_target(
             return (target_root.join(full_path), false, false);
         }
     }
+
+    // 3. Fallback: Path Name (Interactive/New Files)
+    // Used when BPF gives us a name but we haven't seen the inode before.
     let event_path = PathBuf::from(&event.name);
     if !event.name.is_empty() && !event.name.contains('/') {
+        // Relative path in root, or unknown context. 
     } else if !event.name.is_empty() {
         inode_map.put(event.inode, IdentityEntry::new(
             event_path.clone(),
@@ -169,11 +197,17 @@ pub fn resolve_target(
         ));
         return (target_root.join(event_path), false, false);
     }
+
+    // 4. Synthetic Identity (Last Resort)
+    // If we have no clue where this file is, we operate on a synthetic handle
+    // to preserve the data content until the path is eventually resolved.
     let identity_dir = target_root.join(".mirror").join(".by-identity");
     let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
     let synthetic_path = identity_dir.join(filename);
+    
     (synthetic_path, true, true)
 }
+
 pub fn resolve_directory(dir_map: &ShardedDirMap, inode_map: &ShardedInodeMap, _dev: u32, inode: u64) -> Option<PathBuf> {
     if let Some(p) = dir_map.get(inode) {
         return Some(p);
@@ -184,6 +218,7 @@ pub fn resolve_directory(dir_map: &ShardedDirMap, inode_map: &ShardedInodeMap, _
     }
     None
 }
+
 pub fn resolve_and_update_path(
     source: &crate::mirror::SourceInfo,
     inode: u64,
@@ -191,8 +226,11 @@ pub fn resolve_and_update_path(
     ts_hint: u64,
     seq_hint: u64
 ) -> io::Result<PathBuf> {
+    // Aggressive Lookup - Disk Scan.
+    // This is the "Emergency Recovery" mechanism, not the standard resolution path.
     let start_time = std::time::Instant::now();
     let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
+
     if let Some(watcher) = &source.identity_watcher {
         if let Some(path) = watcher.resolve(inode) {
              debug!("IDENTITY: Reverse Index HIT for Inode {} -> {:?}", inode, path);
@@ -200,11 +238,15 @@ pub fn resolve_and_update_path(
              return Ok(path);
         }
     }
+
     info!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source.mount);
     let mut found_path = None;
+    
+    // Depth limited walk to avoid massive stalls
     for entry in walkdir::WalkDir::new(&source.mount).min_depth(1) {
         if let Ok(entry) = entry {
             if entry.depth() > 20 { continue; }
+            
             if let Ok(metadata) = entry.metadata() {
                 if metadata.ino() == inode {
                     if let Ok(rel_path) = entry.path().strip_prefix(&source.mount) {
@@ -220,11 +262,13 @@ pub fn resolve_and_update_path(
             }
         }
     }
+
     if let Some(path) = found_path {
         if fs::metadata(source.mount.join(&path)).is_ok() {
             return Ok(path);
         }
     }
+
     warn!("IDENTITY: Failed to resolve Inode {} after full walk. Duration: {:?}", inode, start_time.elapsed());
     Err(io::Error::new(io::ErrorKind::NotFound, "Inode not found after aggressive search."))
 }

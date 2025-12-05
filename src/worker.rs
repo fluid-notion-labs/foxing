@@ -1,6 +1,6 @@
 use io_uring::IoUring;
 use tokio::sync::mpsc;
-use tokio::time::interval;
+// Removed static interval import
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
@@ -48,7 +48,6 @@ struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
         let shard_count = 128;
-        // Avoid zero capacity panic in LruCache
         let per_shard = (capacity_hint / shard_count).max(100);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
@@ -70,7 +69,6 @@ impl ShardedLockCache {
     }
 }
 
-// Struct to hold mutable state references for the event processing pipeline
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
@@ -120,7 +118,6 @@ pub async fn run_worker(
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
 
-    // Worker 0 is responsible for seeding the root identity
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
@@ -147,14 +144,16 @@ pub async fn run_worker(
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
-    let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
+    
+    // START ADAPTIVE TIMER LOGIC
+    // Initialize with config value, then adapt
+    let initial_flush_ms = target_cfg.worker_flush_interval_ms;
+    let mut flush_timer = tokio::time::sleep(Duration::from_millis(initial_flush_ms));
     let mut last_capacity_check = Instant::now();
     
-    // Tuners
     let mut tuner = BbrTuner::new(&target_cfg);
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
 
-    // Initialize IoUring
     let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
     let mut ring = match IoUring::new(ring_depth) {
@@ -162,7 +161,6 @@ pub async fn run_worker(
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
     };
 
-    // Calculate buffer limits
     let config_reader = config.read().await;
     let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
@@ -184,7 +182,6 @@ pub async fn run_worker(
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
 
-    // Resilience
     let limiter = ErrorLimiter::new();
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
@@ -195,9 +192,7 @@ pub async fn run_worker(
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
 
-    // Main Event Loop
     let _result: Result<()> = loop {
-        // Hibernation Check
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
                  warn!("Target {:?} failed. Hibernating.", target_cfg.path);
@@ -208,7 +203,10 @@ pub async fn run_worker(
         if is_hibernating {
              tokio::select! {
                 _ = shutdown_rx.recv() => break Ok(()),
-                _ = flush_interval.tick() => { continue; }
+                _ = &mut flush_timer => { 
+                    flush_timer = tokio::time::sleep(Duration::from_secs(5)); // Hibernation slow tick
+                    continue; 
+                }
                 Some(_) = rx_main.recv() => { continue; }
              }
         }
@@ -220,13 +218,11 @@ pub async fn run_worker(
              }
         }
 
-        // --- Event Polling ---
         let event_poll_result = if !shutdown_requested {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("Worker {}: Shutdown requested. Draining queue...", worker_id);
                     shutdown_requested = true;
-                    // Attempt one last drain
                     match rx_main.try_recv() {
                         Ok(e) => {
                             metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
@@ -242,15 +238,15 @@ pub async fn run_worker(
                     metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
                     Some(e)
                 },
-                _ = flush_interval.tick() => {
-                    // Periodic Maintenance
+                _ = &mut flush_timer => {
+                    // ADAPTIVE TICK Logic
                     let tuner_tick_start = Instant::now();
                     let is_stressed = if is_control_plane { false } else { _governor.is_system_stressed() };
                     
                     let pending_len = coalescer.len();
                     let max_pending = target_cfg.queue_max;
                     let target_label = target_cfg.path.to_string_lossy().to_string();
-                    let bytes_processed = 0; // Only updated during actual write processing
+                    let bytes_processed = 0;
 
                     let recommended_depth = tuner.tune(
                         tuner_tick_start.elapsed().as_secs_f64(),
@@ -263,11 +259,14 @@ pub async fn run_worker(
                         buffer_pool.chunk_size() as u64
                     );
 
+                    // Reset Timer with Adaptive Value
+                    let next_interval_ms = tuner.current_flush_ms;
+                    flush_timer = tokio::time::sleep(Duration::from_millis(next_interval_ms));
+
                     if !is_control_plane && recommended_depth != buffer_pool.capacity() {
-                        // Resizing logic omitted for brevity
+                        // Resizing logic omitted
                     }
 
-                    // Capacity Check
                     let path_clone = target_cfg.path.clone();
                     let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
                     
@@ -282,7 +281,6 @@ pub async fn run_worker(
                         }
                     }
 
-                    // WAL Flush
                     if !is_hibernating {
                         let now = Instant::now();
                         let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
@@ -290,7 +288,7 @@ pub async fn run_worker(
                         dirty_stats.retain(|&ino, entry| {
                             if now.duration_since(entry.first_dirty) > Duration::from_secs(force_flush_base_secs) {
                                 flushing_stats.insert(ino, entry.clone());
-                                false // Remove from dirty_stats to process
+                                false
                             } else { true }
                         });
 
@@ -310,7 +308,6 @@ pub async fn run_worker(
                 }
             }
         } else {
-            // Drain mode
             let repair_event = if let Some(rx) = &mut rx_repair {
                 rx.try_recv().ok()
             } else { None };
@@ -336,7 +333,6 @@ pub async fn run_worker(
             }
         }
 
-        // --- Coalescing & Batch Processing ---
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if shutdown_requested {
             256
@@ -352,7 +348,6 @@ pub async fn run_worker(
                 let limit = if shutdown_requested { 0 } else { current_coalesce_limit };
                 if let Some(e) = coalescer.pop_batch(limit) {
                     if is_control_plane && matches!(e.event_type, EventType::Rename | EventType::Fsync | EventType::Barrier) && !batch.is_empty() {
-                         // Structural barriers must break batch in Control Plane unless draining
                         if !shutdown_requested {
                             batch.push(e);
                             break;
@@ -367,12 +362,10 @@ pub async fn run_worker(
         };
 
         for e in events_to_process_raw {
-             // Poison check
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
              }
 
-             // Handle Unlink (Deletion)
              if e.event_type == EventType::Unlink {
                  let src_inode = e.inode;
                  let src_dev = e.dev_id;
@@ -389,7 +382,6 @@ pub async fn run_worker(
                  continue;
              }
 
-             // Prepare Context for Single Event Processing
              let mut ctx = WorkerContext {
                 ring: &mut ring,
                 dirty_stats: &mut dirty_stats,
@@ -402,7 +394,6 @@ pub async fn run_worker(
                 daemon_id: &daemon_id,
             };
 
-            // Serialization Barrier
             let op_kind = match e.event_type {
                 EventType::Rename | EventType::Mkdir | EventType::Rmdir |
                 EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
@@ -410,7 +401,6 @@ pub async fn run_worker(
             };
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
 
-            // Resolve Identity
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
@@ -421,7 +411,6 @@ pub async fn run_worker(
                 }
             };
 
-            // Path Locking
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
 
@@ -460,7 +449,6 @@ async fn process_single_event_inner(
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
     
-    // 1. Creation Handling (Metadata)
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
@@ -478,14 +466,12 @@ async fn process_single_event_inner(
 
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
-                    // Update identity map with new real path
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
                         identity::update_map(&source_map, &source_dir_map, e_dev, e_inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
                     }
                     Ok(())
                 },
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    // Idempotency: Touch to ensure existence
                     let _ = std::fs::OpenOptions::new().write(true).open(&dst_clone);
                     Ok(())
                 },
@@ -501,7 +487,6 @@ async fn process_single_event_inner(
         }
     }
 
-    // 2. WAL Intent (Phase 1)
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::Rename | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
@@ -529,7 +514,6 @@ async fn process_single_event_inner(
         entry.seq = e.seq_num;
     }
 
-    // 3. Operation Dispatch
     let res = match e.event_type {
         EventType::Write | EventType::Create | EventType::WriteRange => {
             let dst_clone = dst.clone();
@@ -539,7 +523,6 @@ async fn process_single_event_inner(
             let daemon_id = ctx.daemon_id.to_string();
             let e_seq = e.seq_num;
             
-            // WAL Phase 2: In Progress
             let dst_for_phase2 = dst_clone.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 sidecar::update_wal(&dst_for_phase2, WalState::InProgress, e_seq, &daemon_id);
@@ -554,7 +537,6 @@ async fn process_single_event_inner(
                     let current_src_size = m.len();
                     let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
 
-                    // --- IO Operation ---
                     let copy_res = SmartCopier::copy(
                         &src,
                         &dst_clone,
@@ -573,7 +555,6 @@ async fn process_single_event_inner(
 
                     match copy_res {
                         Ok(stats) => {
-                            // WAL Phase 3: Commit Pending
                             let dst_for_phase3 = dst_clone.clone();
                             let daemon_id_p3 = ctx.daemon_id.to_string();
                             let _ = tokio::task::spawn_blocking(move || {
@@ -583,7 +564,6 @@ async fn process_single_event_inner(
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
 
-                            // Sync Metadata
                             let apply_dst = dst_clone.clone();
                             let apply_src = src.clone();
                             let _ = tokio::task::spawn_blocking(move || {
@@ -636,47 +616,11 @@ async fn process_single_event_inner(
                 }
 
                 let old_dst_final = dst.clone();
-                let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
                 let new_dst_final = target_cfg.path.join(&new_rel_path);
                 
-                // Heuristics for lost renames (Source Missing)
-                let mut resolved_old_dst = old_dst_final.clone();
-                let heuristic_path = if e.parent_inode != 0 {
-                     if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode) {
-                         target_cfg.path.join(parent_rel).join(&e.name)
-                     } else {
-                         target_cfg.path.join(&e.name)
-                     }
-                } else {
-                     target_cfg.path.join(&e.name)
-                };
-
-                let source_missing = !resolved_old_dst.exists();
-                let source_is_synthetic = is_effective_synthetic;
-                let source_is_future = resolved_old_dst == new_dst_final;
-
-                if (source_missing || source_is_synthetic || source_is_future) && heuristic_path.exists() {
-                     warn!("Rename Source Recovery: Map pointed to {:?} (Missing/Syn/Fut), but found file at {:?}. Using found file.", resolved_old_dst, heuristic_path);
-                     resolved_old_dst = heuristic_path;
-                }
-
-                // Reconstruction
-                if is_effective_synthetic && !resolved_old_dst.exists() {
-                    metrics::SYNTHETIC_MARKER_RECREATIONS.inc();
-                    warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", resolved_old_dst);
-                    if let Some(parent) = resolved_old_dst.parent() {
-                        if !parent.exists() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                    }
-                    if let Err(e) = std::fs::File::create(&resolved_old_dst) {
-                        error!("Failed to recreate synthetic marker: {}", e);
-                    }
-                }
-
-                // Perform Atomic Rename
-                let old_dst_final_clone = resolved_old_dst.clone();
+                let old_dst_final_clone = old_dst_final.clone();
                 let new_dst_final_clone = new_dst_final.clone();
+                
                 let res = tokio::task::spawn_blocking(move || {
                     atomic_rename(&old_dst_final_clone, &new_dst_final_clone).map_err(FoxingError::Io)
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
@@ -684,21 +628,23 @@ async fn process_single_event_inner(
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
-                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, resolved_old_dst, new_dst_final);
+                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if new_dst_final.exists() {
                             debug!("Idempotency check passed: File already at destination {:?}.", new_dst_final);
                             return Ok(None);
                         }
-                        error!("Rename failed and file lost. Triggering resync of parent.");
+                        
+                        error!("Rename failed (Source Missing) and not at Dest: {:?} -> {:?}. System may be eventually consistent.", old_dst_final, new_dst_final);
+                        
                         if let Some(parent) = new_dst_final.parent() {
-                            let _ = hydration_trigger.0.send(parent.to_path_buf()).await;
+                             let _ = hydration_trigger.0.try_send(parent.to_path_buf());
                         }
                         return Ok(None);
                     },
                     Err(e) => {
-                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, resolved_old_dst, new_dst_final, e);
+                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst_final, new_dst_final, e);
                         ctx.failure_state.record_failure();
                         return Err(e);
                     }
@@ -743,7 +689,6 @@ async fn process_single_event_inner(
                      ctx.capacity_breaker.trip();
                      ctx.failure_state.record_failure();
                      
-                     // Emergency Version Pruning
                      let target_root_path = target_cfg.path.parent().unwrap_or(&target_cfg.path).to_path_buf();
                      let _ = tokio::task::spawn_blocking(move || {
                         versioning::prune_global_history(&target_root_path, 512 * 1024 * 1024)

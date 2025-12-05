@@ -78,6 +78,10 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
         }
         self.samples.push_back((now, val));
         
+        // Optimize: If the new value is the new best, we don't need to scan.
+        // But for generic correctness and window expiry, we scan.
+        // For production hot-path, a monotonic deque optimization (like standard BBR)
+        // would be faster, but this is sufficient for user-space tuning frequencies.
         let mut best = val;
         for (_, v) in &self.samples {
             match self.mode {
@@ -90,7 +94,7 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
 
     pub fn get_best(&self) -> Option<T> {
         if self.samples.is_empty() { return None; }
-        
+        // Scan needed because the 'best' might have just expired
         let mut best = self.samples[0].1;
         for (_, v) in &self.samples {
             match self.mode {
@@ -99,6 +103,18 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
             }
         }
         Some(best)
+    }
+
+    /// Returns (min, max) of the current window to determine variance/stability
+    pub fn get_range(&self) -> Option<(T, T)> {
+        if self.samples.is_empty() { return None; }
+        let mut min = self.samples[0].1;
+        let mut max = self.samples[0].1;
+        for (_, v) in &self.samples {
+            if *v < min { min = *v; }
+            if *v > max { max = *v; }
+        }
+        Some((min, max))
     }
 
     pub fn reset(&mut self) {
@@ -185,7 +201,6 @@ impl VdoTuner {
     pub fn update(&mut self, total_bytes: u64, zero_bytes: u64) {
         if !self.enabled { return; }
         if total_bytes == 0 { return; }
-        
         let ratio = zero_bytes as f64 / total_bytes as f64;
         let now = Instant::now();
         let best_ratio = self.zero_ratio_filter.update(ratio, now);
@@ -209,6 +224,7 @@ impl VdoTuner {
 pub struct BbrTuner {
     pub current_batch_size: usize,
     pub current_coalesce_bytes: u64,
+    pub current_flush_ms: u64,
     pub flush_multiplier: u32,
     pub hydration_debounce: Duration,
     pub state: TunerState,
@@ -223,6 +239,7 @@ pub struct BbrTuner {
     last_cycle: Instant,
     last_data_seen: Instant,
     history: BbrHistory,
+    config_flush_ms: u64,
 }
 
 impl BbrTuner {
@@ -240,6 +257,7 @@ impl BbrTuner {
         Self {
             current_batch_size: cfg.batch_size,
             current_coalesce_bytes: min_floor,
+            current_flush_ms: cfg.worker_flush_interval_ms,
             flush_multiplier: flush_min,
             hydration_debounce: Duration::from_secs(1),
             state: TunerState::Startup,
@@ -254,6 +272,19 @@ impl BbrTuner {
             last_cycle: Instant::now(),
             last_data_seen: Instant::now(),
             history: BbrHistory::new(300),
+            config_flush_ms: cfg.worker_flush_interval_ms,
+        }
+    }
+
+    /// Applies hysteresis to prevent "see-sawing" of values.
+    /// Returns the new value only if it differs from the current by > threshold %.
+    fn stabilize_metric(&self, current: f64, target: f64, threshold_pct: f64) -> f64 {
+        let diff = (current - target).abs();
+        let threshold = current * threshold_pct;
+        if diff > threshold {
+            target
+        } else {
+            current
         }
     }
 
@@ -264,12 +295,14 @@ impl BbrTuner {
         self.history.push(bytes_processed, gap, now);
         let idle_threshold = self.history.recommended_idle_timeout();
 
+        // Calculate Rate
         let delivery_rate = if elapsed_secs > 0.0005 {
             bytes_processed as f64 / elapsed_secs
         } else {
             0.0
         };
 
+        // Idle Logic
         if bytes_processed == 0 {
             if gap > idle_threshold {
                 if self.state != TunerState::Startup {
@@ -289,17 +322,19 @@ impl BbrTuner {
             }
         }
 
+        // BBR Updates
         if delivery_rate > 0.0 {
             self.btl_bw_filter.update(delivery_rate, now);
         }
         self.rt_prop_filter.update(elapsed_secs, now);
 
         let raw_bw = self.btl_bw_filter.get_best().unwrap_or(1_000_000.0);
-        let raw_rtt = self.rt_prop_filter.get_best().unwrap_or(0.001);
+        let raw_rtt = self.rt_prop_filter.get_best().unwrap_or(0.001); // Seconds
         
         let smooth_bw = self.smoothed_bw.update(raw_bw);
         let smooth_rtt = self.smoothed_rtt.update(raw_rtt);
 
+        // State Machine
         if is_stressed {
             self.state = TunerState::Muted;
         } else if pending_len as f64 / max_pending as f64 > 0.8 {
@@ -342,10 +377,12 @@ impl BbrTuner {
 
         let effective_state = board.get(Path::new(path_label)).map_or(self.state, |r| *r.value());
 
+        // --- Calculate Outputs ---
         let (batch_override, coalesce_override, target_inflight_bytes) = match effective_state {
             TunerState::CriticalDrain => (1, self.min_coalesce_floor, 0),
             _ => {
                 let bdp_bytes = smooth_bw * smooth_rtt;
+                
                 let pacing_gain = match self.state {
                     TunerState::Startup => 2.89,
                     TunerState::Drain => 0.5,
@@ -353,14 +390,13 @@ impl BbrTuner {
                     TunerState::Muted => 0.75,
                     _ => 1.0,
                 };
-                
+
                 let target_inflight_bytes = (bdp_bytes * pacing_gain) as u64;
-                let target_op_size = (smooth_bw * 0.002) as u64;
-                
+                let target_op_size = (smooth_bw * 0.002) as u64; // 2ms quantum
                 let calculated_coalesce = target_op_size
                     .max(self.min_coalesce_floor)
                     .min(self.max_burst_coalesce_bytes);
-                    
+
                 let calculated_batch = (target_inflight_bytes / calculated_coalesce.max(1)) as usize;
                 
                 (
@@ -371,7 +407,25 @@ impl BbrTuner {
             }
         };
 
-        self.current_batch_size = batch_override;
+        // --- Adaptive Flush Interval Calculation with Hysteresis ---
+        let rtt_ms = smooth_rtt * 1000.0;
+        
+        let flush_target_raw = if effective_state == TunerState::CriticalDrain || effective_state == TunerState::Drain {
+            (rtt_ms / 2.0).max(1.0)
+        } else if effective_state == TunerState::HighLoad {
+            (rtt_ms * 2.0).max(self.config_flush_ms as f64)
+        } else {
+            rtt_ms.max(self.config_flush_ms as f64 / 2.0)
+        };
+
+        // Apply hysteresis: only change flush interval if different by > 15%
+        let stable_flush_target = self.stabilize_metric(self.current_flush_ms as f64, flush_target_raw, 0.15);
+        self.current_flush_ms = (stable_flush_target as u64).max(1).min(5000);
+
+        // Apply hysteresis: only change batch size if different by > 10%
+        let stable_batch = self.stabilize_metric(self.current_batch_size as f64, batch_override as f64, 0.10);
+        self.current_batch_size = stable_batch as usize;
+
         self.current_coalesce_bytes = coalesce_override;
         
         self.hydration_debounce = match self.state {
@@ -396,6 +450,7 @@ impl BbrTuner {
         
         metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_label]).set((self.current_batch_size as i64) as f64);
         metrics::TARGET_COALESCE_BYTES.with_label_values(&[&path_label]).set((self.current_coalesce_bytes as i64) as f64);
+        metrics::TARGET_FLUSH_INTERVAL_MS.with_label_values(&[&path_label]).set(self.current_flush_ms as f64);
         metrics::TUNER_STATE.with_label_values(&[&path_label]).set((self.state as i64) as f64);
         metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[&path_label]).set(pending_len as f64 / max_pending as f64);
 
@@ -419,13 +474,13 @@ impl BbrTuner {
             let effective_scale = scale.max(0.1);
             (cfg.max_versions as f64 * effective_scale, cfg.max_versions_size_mb as f64 * effective_scale)
         } else { (cfg.max_versions as f64, cfg.max_versions_size_mb as f64) };
-        
+
         let count_final = dyn_count.floor() as usize;
         let mb_final = dyn_mb.floor() as u64;
-        
+
         metrics::TARGET_DYNAMIC_VERSION_LIMIT_COUNT.with_label_values(&[&label]).set((count_final as i64) as f64);
         metrics::TARGET_DYNAMIC_VERSION_LIMIT_BYTES.with_label_values(&[&label]).set((mb_final as i64) as f64);
-        
+
         (count_final, mb_final)
     }
 
