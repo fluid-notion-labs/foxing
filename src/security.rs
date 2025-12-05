@@ -19,7 +19,6 @@ use io_uring::{IoUring, opcode, types};
 use std::collections::hash_map::DefaultHasher;
 use std::io::{Read, Seek, SeekFrom};
 use fxhash::FxHasher;
-
 const FS_IOC_FSSETXATTR: u64 = 0x40205820;
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
 const FS_COMPR_FL: u32 = 0x00000004;
@@ -27,11 +26,10 @@ const F2FS_IOC_SET_PIN_FILE: u64 = 0xF50D;
 const FIOCLONERANGE: u64 = 0x4020940D;
 const RWF_UNCACHED: i32 = 0x00000008;
 const F2FS_SUPER_MAGIC: i64 = 0xF2F52010;
-
+const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
 #[repr(C)] struct FileCloneRange { s: i64, so: u64, l: u64, do_: u64 }
 #[repr(C)] #[derive(Default)]
 struct FsxAttr { fsx_xflags: u32, fsx_extsize: u32, fsx_nextents: u32, fsx_projid: u32, fsx_cowextsize: u32, fsx_pad: [u8; 8] }
-
 pub fn calculate_partial_hash(path: &Path) -> Result<u64> {
     let mut file = File::open(path).map_err(FoxingError::Io)?;
     let len = file.metadata().map_err(FoxingError::Io)?.len();
@@ -47,7 +45,6 @@ pub fn calculate_partial_hash(path: &Path) -> Result<u64> {
     }
     Ok(hasher.finish())
 }
-
 pub fn check_capacity(path: &Path, threshold_mb: u64) -> bool {
     if let Ok(s) = statvfs(path) {
         let avail = s.blocks_available() * s.block_size();
@@ -58,7 +55,13 @@ pub fn check_capacity(path: &Path, threshold_mb: u64) -> bool {
     }
     true
 }
-
+pub fn is_filesystem_compressed(path: &Path) -> bool {
+    if let Ok(s) = nix::sys::statfs::statfs(path) {
+        let magic = s.filesystem_type().0 as i64;
+        return magic == BTRFS_SUPER_MAGIC || magic == F2FS_SUPER_MAGIC;
+    }
+    false
+}
 pub fn probe_xattr_support(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_xattr");
     if probe_file.exists() { let _ = std::fs::remove_file(&probe_file); }
@@ -72,7 +75,6 @@ pub fn probe_xattr_support(target_root: &Path) -> bool {
         false
     }
 }
-
 pub fn probe_direct_io(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_dio");
     let mut buf = AlignedBuffer::new(4096);
@@ -86,7 +88,6 @@ pub fn probe_direct_io(target_root: &Path) -> bool {
     let _ = std::fs::remove_file(probe_file);
     ret == 4096
 }
-
 pub fn probe_rwf_uncached(target_root: &Path) -> bool {
     let probe_file = target_root.join(".xfs_mirror_probe_uncached");
     let mut buf = AlignedBuffer::new(4096);
@@ -137,28 +138,24 @@ pub fn probe_rwf_uncached(target_root: &Path) -> bool {
     let _ = std::fs::remove_file(probe_file);
     result
 }
-
 pub fn preallocate(fd: i32, size: u64) {
     if size > 0 {
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let _ = fallocate(borrowed_fd.as_raw_fd(), FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, size as i64);
     }
 }
-
 pub fn enable_compression(fd: i32) -> Result<()> {
     let flags: u32 = FS_COMPR_FL;
     let ret = unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) };
     if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
-
 pub fn enable_f2fs_pinning(fd: i32) -> Result<()> {
     let pin: u32 = 1;
     let ret = unsafe { libc::ioctl(fd, F2FS_IOC_SET_PIN_FILE, &pin) };
     if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
     Ok(())
 }
-
 pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     if projid == 0 { return Ok(()); }
     let mut attr: FsxAttr = Default::default();
@@ -172,7 +169,6 @@ pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     }
     Ok(())
 }
-
 pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     let lock = libc::flock { l_type: libc::F_WRLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
     if unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) } < 0 {
@@ -180,7 +176,6 @@ pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     }
     Ok(())
 }
-
 pub fn get_target_epoch(path: &Path) -> u64 {
     if let Some(val) = sidecar::get_metadata(path, "user.foxing_epoch") {
          if val.len() == 8 {
@@ -189,7 +184,6 @@ pub fn get_target_epoch(path: &Path) -> u64 {
     }
     0
 }
-
 pub fn calc_dir_integrity_hash_target(dir_path: &Path) -> Result<u64> {
     if !dir_path.is_dir() { return Ok(0); }
     let mut hasher = DefaultHasher::new();
@@ -214,7 +208,6 @@ pub fn calc_dir_integrity_hash_target(dir_path: &Path) -> Result<u64> {
     }
     Ok(hasher.finish())
 }
-
 pub fn get_dir_integrity_hash(path: &Path) -> u64 {
     if let Some(val) = sidecar::get_metadata(path, "user.foxing_dir_hash") {
          if val.len() == 8 {
@@ -223,7 +216,6 @@ pub fn get_dir_integrity_hash(path: &Path) -> u64 {
     }
     0
 }
-
 pub fn get_valid_dir_hash(path: &Path) -> u64 {
     let hash_bytes = match sidecar::get_metadata(path, "user.foxing_dir_hash") {
         Some(b) if b.len() == 8 => b,
@@ -242,7 +234,6 @@ pub fn get_valid_dir_hash(path: &Path) -> u64 {
     }
     0
 }
-
 pub fn write_dir_integrity_hash(target_dir: &Path, hash: u64) {
     let hash_bytes = hash.to_le_bytes();
     let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_hash", &hash_bytes);
@@ -251,7 +242,6 @@ pub fn write_dir_integrity_hash(target_dir: &Path, hash: u64) {
         let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_guard", &mtime_bytes);
     }
 }
-
 pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, inode: u64) -> Result<()> {
     let version_dir = root_path.join(".mirror").join(".versions");
     std::fs::create_dir_all(&version_dir)?;
@@ -285,7 +275,6 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
     dst_file.sync_all()?;
     Ok(())
 }
-
 pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let src_file = std::fs::File::open(version_path)?;
     let src_fd = src_file.as_raw_fd();
@@ -306,7 +295,6 @@ pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let _ = apply_metadata(version_path, live_path);
     Ok(())
 }
-
 pub fn commit_epoch(path: &Path, seq: u64, projid: u32) -> Result<()> {
     let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let fd = f.as_raw_fd();
@@ -319,7 +307,6 @@ pub fn commit_epoch(path: &Path, seq: u64, projid: u32) -> Result<()> {
     sidecar::set_dirty_flag(path, false, "COMMIT");
     Ok(())
 }
-
 pub fn sync_xattrs(src: &Path, dst: &Path) {
     if let Ok(list) = xattr::list(src) {
         for name in list.filter(|n| n.to_string_lossy().starts_with("user.")) {
@@ -329,7 +316,6 @@ pub fn sync_xattrs(src: &Path, dst: &Path) {
         }
     }
 }
-
 pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     let m = std::fs::symlink_metadata(src).map_err(FoxingError::Io)?;
     if !m.is_symlink() {
@@ -351,13 +337,11 @@ pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 pub fn truncate_file(dst: &Path, size: u64) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(dst)?;
     f.set_len(size)?;
     Ok(())
 }
-
 pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> {
     let f = std::fs::OpenOptions::new().write(true).open(dst)?;
     let fd = f.as_raw_fd();
@@ -366,21 +350,18 @@ pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> 
     nix::fcntl::fallocate(borrowed.as_raw_fd(), flags, offset as i64, len as i64)?;
     Ok(())
 }
-
 pub fn create_symlink(link_target: &str, dst: &Path) -> Result<()> {
     if dst.exists() || std::fs::symlink_metadata(dst).is_ok() {
         let _ = std::fs::remove_file(dst);
     }
     std::os::unix::fs::symlink(link_target, dst).map_err(FoxingError::Io)
 }
-
 pub fn create_hard_link(original: &Path, link: &Path) -> Result<()> {
     if link.exists() {
         let _ = std::fs::remove_file(link);
     }
     std::fs::hard_link(original, link).map_err(FoxingError::Io)
 }
-
 pub fn create_mknod(dst: &Path, mode: u32, dev: u64) -> Result<()> {
     if dst.exists() {
         let _ = std::fs::remove_file(dst);

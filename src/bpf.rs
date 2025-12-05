@@ -15,15 +15,12 @@ use crate::mirror::SourceInfo;
 use crate::tuner::{BbrTuner};
 use crate::config::{TargetConfig, TargetProfile};
 use std::path::PathBuf;
-
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
-
 lazy_static::lazy_static! {
     static ref SEQUENCE_TRACKER: DashMap<u32, AtomicU64> = DashMap::new();
     static ref DEVICE_EVENT_COUNTER: DashMap<u32, AtomicU64> = DashMap::new();
 }
-
 pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
     let mut stats = HashMap::new();
     for r in DEVICE_EVENT_COUNTER.iter() {
@@ -34,7 +31,6 @@ pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
     }
     stats
 }
-
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct RawEvent {
@@ -47,9 +43,8 @@ struct RawEvent {
     name: [u8;256], nname: [u8;256],
     comm: [u8;16]
 }
-
 pub fn run(
-    queues: HashMap<u32, Vec<Arc<EventQueue>>>, 
+    queues: HashMap<u32, Vec<Arc<EventQueue>>>,
     shutdown: Arc<AtomicBool>,
     sources: HashMap<u32, Arc<SourceInfo>>,
     initial_seq: u64
@@ -58,7 +53,6 @@ pub fn run(
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
     let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    
     if initial_seq > 0 {
         let key: u32 = 0;
         let val = initial_seq + 1;
@@ -68,27 +62,20 @@ pub fn run(
             info!("BPF: Restored Global Sequence to {}", val);
         }
     }
-
     let self_pid = std::process::id();
     let pid_val: u8 = 1;
     skel.maps.ignored_pids.update(&self_pid.to_ne_bytes(), &pid_val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .map_err(|e| FoxingError::Bpf(format!("Failed to register PID filter: {}", e)))?;
-
     info!("BPF: Registering {} watched device(s)", queues.len());
-    
     let queues_in_closure = Arc::new(queues);
     let sources_in_closure = Arc::new(sources);
     let queues_in_loop = queues_in_closure.clone();
     let sources_in_loop = sources_in_closure.clone();
-    
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
-    
     let journal_buffers: Arc<Mutex<HashMap<u32, Vec<Arc<Event>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let journal_buffers_closure = journal_buffers.clone();
-    
     let mut journal_tuners: HashMap<u32, BbrTuner> = HashMap::new();
     let dummy_board = Arc::new(DashMap::new());
-
     for dev in queues_in_closure.keys() {
         let key = dev.to_ne_bytes();
         let val = 1u8;
@@ -97,25 +84,18 @@ pub fn run(
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
-        reorder_buffers_map.insert(*dev, ReorderBuffer::new(250, 64 * 1024 * 1024));
-        
+        reorder_buffers_map.insert(*dev, ReorderBuffer::new(50, 64 * 1024 * 1024));
         journal_buffers.lock().unwrap().insert(*dev, Vec::with_capacity(128));
-        
-        // [FIX] Initialize using default() then mutate public fields
-        // This avoids the "private field" error (E0451) caused by struct update syntax
         let mut journal_cfg = TargetConfig::default();
         journal_cfg.path = PathBuf::from("journal");
         journal_cfg.profile = TargetProfile::SSD;
-        
-        let _ = journal_cfg.compile(2, 1024); 
+        let _ = journal_cfg.compile(2, 1024);
         journal_tuners.insert(*dev, BbrTuner::new(&journal_cfg));
     }
-
     let reorder_buffers = Arc::new(Mutex::new(reorder_buffers_map));
     let reorder_buffers_in_closure = reorder_buffers.clone();
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
-    
     let progs = &skel.progs;
     let probes = [
         ("trace_xfs_write", &progs.trace_xfs_write),
@@ -154,22 +134,17 @@ pub fn run(
             }
         }
     }
-
     if attached_count == 0 {
         return Err(FoxingError::Bpf("Failed to attach ANY BPF probes.".into()));
     }
     info!("BPF: Successfully attached {} probes", attached_count);
-
     let maps = skel.maps;
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
-
-    let mut journal_tuners_closure = journal_tuners; 
-
+    let mut journal_tuners_closure = journal_tuners;
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
-        
         if data.len() != std::mem::size_of::<RawEvent>() {
             crate::metrics::EVENTS_MALFORMED.inc();
             return 0;
@@ -185,7 +160,6 @@ pub fn run(
         let name = String::from_utf8_lossy(&raw.name[..name_len]).to_string();
         let comm_len = raw.comm.iter().position(|&c| c == 0).unwrap_or(raw.comm.len());
         let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
-        
         if !queues_in_closure.contains_key(&raw.dev) {
             metrics::EVENTS_UNWATCHED.inc();
             return 0;
@@ -196,7 +170,6 @@ pub fn run(
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
                 Some(String::from_utf8_lossy(&raw.nname[..nname_len]).to_string())
         } else { None };
-        
         let evt = Arc::new(Event {
             event_type: EventType::from(raw.type_),
             dev_id: raw.dev,
@@ -217,19 +190,16 @@ pub fn run(
             interactive: raw.interactive == 1,
             created_at: std::time::Instant::now()
         });
-
         if let Some(src_info) = sources_in_closure.get(&raw.dev) {
             if let Some(journal) = &src_info.journal {
                 if let Ok(mut buffers_map) = journal_buffers_closure.lock() {
                     if let Some(buffer) = buffers_map.get_mut(&raw.dev) {
                         buffer.push(evt.clone());
-                        
                         let tuner = journal_tuners_closure.get_mut(&raw.dev).unwrap();
                         if buffer.len() >= tuner.current_batch_size {
                             let start = std::time::Instant::now();
                             let res = journal.append_batch(buffer);
                             let duration = start.elapsed().as_secs_f64();
-                            
                             let bytes = res.unwrap_or(0);
                             tuner.tune(duration, bytes, false, 0, 10000, &dummy_board, "journal", 0);
                             buffer.clear();
@@ -238,7 +208,6 @@ pub fn run(
                 }
             }
         }
-
         if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
             if let Some(buf) = buffers.get_mut(&raw.dev) {
                 if buf.push(evt) {
@@ -248,7 +217,6 @@ pub fn run(
                                 projector.project(&ordered_evt);
                             }
                         }
-
                         metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
                         if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) {
                             for q in qs { q.push(ordered_evt.clone()); }
@@ -261,10 +229,8 @@ pub fn run(
         }
         0
     }).map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    
     let ring = builder.build().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     info!("BPF: Event processing started");
-    
     let mut last_report = std::time::Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
@@ -281,9 +247,7 @@ pub fn run(
                         }
                     }
                 }
-
                 if let Ok(mut buffers) = reorder_buffers.lock() {
-                    // Prefix with underscore to suppress unused var warning
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
@@ -291,7 +255,6 @@ pub fn run(
                                     projector.project(&ordered_evt);
                                 }
                             }
-
                             metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
                             if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) {
                                 for q in qs { q.push(ordered_evt.clone()); }

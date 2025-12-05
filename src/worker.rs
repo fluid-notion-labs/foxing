@@ -33,16 +33,13 @@ use crate::versioning;
 use crate::mirror::SourceInfo;
 use std::os::unix::fs::MetadataExt;
 use libc;
-
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
-
 impl Clone for HydrationSender {
     fn clone(&self) -> Self {
         HydrationSender(self.0.clone())
     }
 }
-
 struct ShardedLockCache { shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>> }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -65,7 +62,6 @@ impl ShardedLockCache {
         self.get(hasher.finish())
     }
 }
-
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
     dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
@@ -77,7 +73,6 @@ struct WorkerContext<'a> {
     _cur_cap_total: u64,
     daemon_id: &'a str,
 }
-
 fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_bytes: usize) -> Result<BufferPool> {
     let mut pool = BufferPool::new(num_buffers, chunk_size_bytes);
     let iovs = pool.as_io_vecs();
@@ -94,7 +89,6 @@ fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
     }
     Ok(())
 }
-
 pub async fn run_worker(
     mut rx_main: mpsc::Receiver<Arc<Event>>,
     source: Arc<SourceInfo>,
@@ -113,7 +107,6 @@ pub async fn run_worker(
     let is_control_plane = worker_id == 0;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
-    
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
@@ -133,7 +126,6 @@ pub async fn run_worker(
             );
         }
     }
-
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
@@ -141,15 +133,12 @@ pub async fn run_worker(
     let mut flush_interval = interval(Duration::from_millis(target_cfg.worker_flush_interval_ms));
     let mut last_capacity_check = Instant::now();
     let mut tuner = BbrTuner::new(&target_cfg);
-    
     let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
-    
     let mut ring = match IoUring::new(ring_depth) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
     };
-    
     let config_reader = config.read().await;
     let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
@@ -162,15 +151,12 @@ pub async fn run_worker(
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let initial_num_buffers = current_max_buffers.min(target_cfg.batch_size);
     drop(config_reader);
-
     let mut buffer_pool = match initialize_buffer_pool(&mut ring, initial_num_buffers, buffer_chunk_size_bytes) {
         Ok(pool) => pool,
         Err(e) => return Err(e),
     };
-
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
-    
     let limiter = ErrorLimiter::new();
     let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
     let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
@@ -180,7 +166,6 @@ pub async fn run_worker(
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
-
     let _result: Result<()> = loop {
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
@@ -201,7 +186,6 @@ pub async fn run_worker(
                  continue;
              }
         }
-
         let event_poll_result = if !shutdown_requested {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -239,7 +223,6 @@ pub async fn run_worker(
                         &target_label,
                         buffer_pool.chunk_size() as u64
                     );
-                    
                     let path_clone = target_cfg.path.clone();
                     let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
                     if last_capacity_check.elapsed() >= cap_check_interval {
@@ -252,17 +235,15 @@ pub async fn run_worker(
                             metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
                         }
                     }
-
                     if !is_hibernating {
                         let now = Instant::now();
                         let mut flushing_stats: HashMap<u64, DirtyEntry> = HashMap::new();
                         dirty_stats.retain(|&ino, entry| {
                             if now.duration_since(entry.first_dirty) > Duration::from_secs(force_flush_base_secs) {
                                 flushing_stats.insert(ino, entry.clone());
-                                false 
+                                false
                             } else { true }
                         });
-                        
                         let _committed_inos = tokio::task::spawn_blocking(move || {
                             let mut committed = Vec::new();
                             for (ino, entry) in flushing_stats.into_iter() {
@@ -281,7 +262,6 @@ pub async fn run_worker(
              let repair_event = if let Some(rx) = &mut rx_repair {
                 rx.try_recv().ok()
             } else { None };
-            
             if let Some(e) = repair_event {
                 Some(e)
             } else {
@@ -294,7 +274,6 @@ pub async fn run_worker(
                 }
             }
         };
-
         if let Some(event_ptr) = event_poll_result {
             coalescer.push(event_ptr.clone());
         } else if shutdown_requested {
@@ -302,16 +281,14 @@ pub async fn run_worker(
                 break Ok(());
             }
         }
-
         let current_coalesce_limit = if is_control_plane { 0 } else { tuner.current_coalesce_bytes };
         let effective_batch_size = if shutdown_requested {
             256
         } else if is_control_plane {
-            if coalescer.len() > 50 { 4 } else { 1 }
+            if coalescer.len() > 10 { 16 } else { 2 }
         } else {
             tuner.current_batch_size
         };
-
         let events_to_process_raw = {
             let mut batch = Vec::new();
             while batch.len() < effective_batch_size {
@@ -330,7 +307,6 @@ pub async fn run_worker(
             }
             batch
         };
-
         for e in events_to_process_raw {
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
@@ -349,7 +325,6 @@ pub async fn run_worker(
                  }).await;
                  continue;
              }
-             
              let mut ctx = WorkerContext {
                 ring: &mut ring,
                 dirty_stats: &mut dirty_stats,
@@ -361,17 +336,13 @@ pub async fn run_worker(
                 _cur_cap_total: cur_cap_total,
                 daemon_id: &daemon_id,
             };
-
             let op_kind = match e.event_type {
                 EventType::Rename | EventType::Mkdir | EventType::Rmdir |
                 EventType::Link | EventType::Symlink | EventType::Unlink => OpKind::Rename,
                 _ => OpKind::Write,
             };
-            
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
-            
             let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
-            
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -380,10 +351,8 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
-            
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
-
             let _ = process_single_event_inner(
                 &mut ctx, e, &source, &target_cfg, &tuner,
                 capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
@@ -398,7 +367,6 @@ pub async fn run_worker(
     let _ = unregister_buffers(&mut ring);
     Ok(())
 }
-
 async fn process_single_event_inner(
     ctx: &mut WorkerContext<'_>,
     e: Arc<Event>,
@@ -557,45 +525,67 @@ async fn process_single_event_inner(
                     e.timestamp_ns,
                     e.seq_num
                 );
+                if is_dir {
+                    source.dir_map.clear();
+                }
             }
             if let Some(new_name_str) = &e.new_name {
                 let old_dst_final = dst.clone();
                 let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
                 let new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
-                
                 let mut resolved_old_dst = old_dst_final.clone();
-
                 if !resolved_old_dst.exists() {
+                    // Race Condition Fix: If the Identity Map points to a "Future" path (updated by Projector)
+                    // which doesn't exist yet, try to reconstruct the "Present" path from the Event data.
+                    if !is_effective_synthetic {
+                        let potential_present_path = if e.parent_inode != 0 {
+                            if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode) {
+                                target_cfg.path.join(parent_rel).join(&e.name)
+                            } else {
+                                target_cfg.path.join(&e.name)
+                            }
+                        } else {
+                            target_cfg.path.join(&e.name)
+                        };
+                        
+                        if potential_present_path.exists() && potential_present_path != resolved_old_dst {
+                            warn!("Rename Source Correction: Map pointed to missing {:?}, but Event data found file at {:?}. Assuming Map race.", resolved_old_dst, potential_present_path);
+                            resolved_old_dst = potential_present_path;
+                        }
+                    }
+
                     let src_inode = e.inode;
                     let e_generation = e.generation;
                     let e_ts = e.timestamp_ns;
                     let e_seq = e.seq_num;
-                    let lookup_result = tokio::task::spawn_blocking({
-                        let source_clone = source.clone();
-                        move || identity::resolve_and_update_path(&source_clone, src_inode, e_generation, e_ts, e_seq)
-                    }).await;
-                    if let Ok(Ok(resolved_path)) = lookup_result {
-                        let potential_source = target_cfg.path.join(&resolved_path);
-                        if potential_source.exists() {
-                            warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, resolved_old_dst);
-                            resolved_old_dst = potential_source;
+                    if !resolved_old_dst.exists() {
+                        let lookup_result = tokio::task::spawn_blocking({
+                            let source_clone = source.clone();
+                            move || identity::resolve_and_update_path(&source_clone, src_inode, e_generation, e_ts, e_seq)
+                        }).await;
+                        if let Ok(Ok(resolved_path)) = lookup_result {
+                            let potential_source = target_cfg.path.join(&resolved_path);
+                            if potential_source.exists() {
+                                warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, resolved_old_dst);
+                                resolved_old_dst = potential_source;
+                            } else {
+                                if new_dst_final.exists() {
+                                    return Ok(None);
+                                }
+                                if !is_effective_synthetic {
+                                    warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion (Ghost Move).", src_inode);
+                                    return Ok(None);
+                                }
+                            }
                         } else {
-                            if new_dst_final.exists() {
-                                return Ok(None);
-                            }
-                            if !is_effective_synthetic {
-                                warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion (Ghost Move).", src_inode);
-                                return Ok(None);
-                            }
+                             if new_dst_final.exists() {
+                                 return Ok(None);
+                             }
+                             if !is_effective_synthetic {
+                                 warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion (Ghost Move).", e.inode);
+                                 return Ok(None);
+                             }
                         }
-                    } else {
-                         if new_dst_final.exists() {
-                             return Ok(None);
-                         }
-                         if !is_effective_synthetic {
-                             warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion (Ghost Move).", e.inode);
-                             return Ok(None);
-                         }
                     }
                 }
                 if is_effective_synthetic && !resolved_old_dst.exists() {
@@ -616,10 +606,8 @@ async fn process_single_event_inner(
                         }
                     }
                 }
-                
                 let old_dst_final_clone = resolved_old_dst.clone();
                 let new_dst_final_clone = new_dst_final.clone();
-
                 let res = tokio::task::spawn_blocking(move || {
                     atomic_rename(&old_dst_final_clone, &new_dst_final_clone).map_err(FoxingError::Io)
                 }).await.map_err(FoxingError::Join).and_then(|r| r);

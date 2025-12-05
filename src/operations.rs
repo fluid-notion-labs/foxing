@@ -86,7 +86,8 @@ impl SmartCopier {
         let sf = File::open(src)?;
         let sfd = sf.as_raw_fd();
         let is_full_replace = offset == 0 && length == src_file_size;
-        let is_sparse_source = if is_full_replace && src_file_size > 1024 * 1024 {
+        let is_compressed = security::is_filesystem_compressed(src);
+        let is_sparse_source = if !is_compressed && is_full_replace && src_file_size > 1024 * 1024 {
             let metadata = sf.metadata()?;
             let blocks = metadata.blocks();
             let allocated_size = blocks * 512;
@@ -112,11 +113,8 @@ impl SmartCopier {
         } else {
             libc::O_RDWR
         };
-        
-        // FIX: Direct I/O Alignment Violation Unchecked #6
         let aligned_io = offset % 4096 == 0;
         let use_direct_io_for_delta = !is_sparse_source && direct_io_ok && !is_full_replace && length >= 4096 && (length % 4096 == 0) && aligned_io;
-        
         let final_flags = if use_direct_io_for_delta {
             open_flags | libc::O_DIRECT
         } else {
@@ -334,11 +332,13 @@ impl SmartCopier {
         while current_offset < end_offset || !inflight_reads.is_empty() || buffer_pool.free_count() < num_buffers {
             loop_iterations += 1;
             if submit_reads_pending {
+                let mut loop_blocked = true;
                 while current_offset < end_offset && !buffer_pool.is_empty() && inflight_reads.len() < max_concurrent_io as usize {
                     if ring.submission().is_full() {
                         break;
                     }
                     if let Some(buf_idx) = buffer_pool.acquire() {
+                        loop_blocked = false;
                         let rlen = (end_offset - current_offset).min(chunk_size) as usize;
                         let buf_ptr = buffer_pool.get_ptr(buf_idx);
                         if Self::submit_read(ring, sfd, current_offset, rlen, buf_idx, buf_ptr, rw_flags_val_read) {
@@ -354,6 +354,9 @@ impl SmartCopier {
                     } else {
                         break;
                     }
+                }
+                if loop_blocked && inflight_reads.is_empty() {
+                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
             let ops_to_submit = ring.submission().len();
@@ -383,7 +386,7 @@ impl SmartCopier {
                     if op_type == WRITE_OP {
                         buffer_pool.release(buf_idx);
                         submit_reads_pending = true;
-                        vdo_stall_counter = vdo_stall_counter.saturating_sub(1);
+                        vdo_stall_counter = 0;
                         if skip_vdo_opt_temp {
                             skip_vdo_opt_temp = false;
                             trace!("VDO optimization re-enabled after successful non-zero block write.");
@@ -423,7 +426,6 @@ impl SmartCopier {
                                 warn!("fallocate(PUNCH_HOLE) failed permanently (errno: {}). Disabling VDO for this copy.", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
                                 skip_vdo_opt_temp = true;
                             } else {
-                                // FIX: VDO Stall Counter Overflow Risk #5
                                 vdo_stall_counter = vdo_stall_counter.saturating_add(1);
                             }
                             buffer_pool.release(buf_idx);
