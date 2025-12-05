@@ -25,9 +25,9 @@ impl IdentityEntry {
     }
 }
 
-// --- Phase 3: Sharded Read Models ---
 const SHARD_COUNT: usize = 64;
 
+#[derive(Debug)]
 pub struct ShardedInodeMap {
     shards: Vec<Mutex<LruCache<u64, IdentityEntry>>>,
 }
@@ -76,6 +76,7 @@ impl ShardedInodeMap {
     }
 }
 
+#[derive(Debug)]
 pub struct ShardedDirMap {
     shards: Vec<Mutex<LruCache<u64, PathBuf>>>,
 }
@@ -106,8 +107,6 @@ impl ShardedDirMap {
         self.get_shard(inode).lock().pop(&inode);
     }
 }
-
-// --- Compatibility Adapters ---
 
 pub fn update_map(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64, path: PathBuf, generation: u32, is_synthetic: bool, is_dir: bool, ts: u64, seq: u64) {
     if !is_synthetic {

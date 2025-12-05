@@ -9,6 +9,7 @@ pub const MAX_FAILURE_BACKOFF: u64 = 600;
 pub const ERROR_LIMITER_SECS: u64 = 60;
 const BASE_AUTOTUNE_VDO_THRESHOLD: u32 = 128;
 
+// Magic numbers for filesystem types (from linux/magic.h)
 const TMPFS_MAGIC: i64 = 0x01021994;
 const RAMFS_MAGIC: i64 = 0x858458f6;
 
@@ -22,7 +23,7 @@ fn d_st() -> u64 { 30 }
 fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
 fn d_zero_u32() -> u32 { 0 }
 
-fn d_journal_dir() -> PathBuf { PathBuf::new() }
+fn d_journal_dir() -> PathBuf { PathBuf::new() } // Empty signals autotune
 fn d_journal_size_mb() -> u64 { 0 }
 fn d_journal_retention() -> usize { 0 }
 
@@ -64,7 +65,18 @@ pub fn autotune_vdo_stall_threshold(profile: &TargetProfile) -> u32 {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
+    match profile {
+        TargetProfile::NVMe => (1, 4),
+        TargetProfile::SSD => (2, 8),
+        TargetProfile::HDD => (4, 32),
+        TargetProfile::NFS => (2, 16),
+        TargetProfile::Network => (2, 16),
+        TargetProfile::Auto => (2, 8),
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize, Default)]
 pub struct Config {
     #[serde(default="d_zero_usize")] pub worker_count: usize,
     #[serde(default="d_zero_usize")] pub queue_max: usize,
@@ -84,6 +96,7 @@ pub struct Config {
     #[serde(default="d_zero_f64")] pub governor_psi_io_threshold: f64,
     #[serde(default="d_zero_f64")] pub governor_psi_cpu_threshold: f64,
     
+    // [NEW] Journal Config
     #[serde(default="d_journal_dir")] pub journal_dir: PathBuf,
     #[serde(default="d_journal_size_mb")] pub journal_size_limit_mb: u64,
     #[serde(default="d_journal_retention")] pub journal_retention_count: usize,
@@ -144,6 +157,58 @@ pub struct TargetConfig {
     #[serde(default="d_zero_u64")] pub worker_gap_recovery_max_backoff: u64,
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_startup_mb: u64,
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_drain_mb: u64,
+}
+
+// Manually implement Default for TargetConfig because Arc<AtomicBool> and RegexSet are tricky
+impl Default for TargetConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            profile: d_profile(),
+            initial_sync: d_bool_true(),
+            vdo_optimization: d_bool_false(),
+            btrfs_compression: d_bool_false(),
+            f2fs_compression: d_bool_false(),
+            f2fs_pinning: d_bool_false(),
+            enable_versioning: d_bool_false(),
+            paranoid_deduplication: d_bool_true(),
+            max_versions: d_zero_usize(),
+            max_versions_size_mb: d_zero_u64(),
+            version_excludes: Vec::new(),
+            version_includes: Vec::new(),
+            force_versioning: d_bool_false(),
+            force_version_includes: Vec::new(),
+            force_retention_count: None,
+            worker_count: d_zero_usize(),
+            queue_max: d_zero_usize(),
+            batch_size: d_zero_usize(),
+            io_buffer_size_mib: d_zero_u64(),
+            autotune_target_latency_ms: d_zero_u64(),
+            excludes: Vec::new(),
+            includes: Vec::new(),
+            regex_ex: None,
+            regex_in: None,
+            regex_vex: None,
+            regex_vin: None,
+            regex_force_vin: None,
+            supports_reflink: def_abool(),
+            direct_io_ok: def_abool(),
+            rwf_uncached_ok: def_abool(),
+            xattr_supported: def_abool(),
+            vdo_stall_threshold: d_zero_u32(),
+            ordering_max_pending_bytes: d_zero_u64(),
+            ordering_scan_depth: d_zero_usize(),
+            worker_hibernation_secs: d_zero_u64(),
+            worker_flush_interval_ms: d_zero_u64(),
+            worker_gap_recovery_secs: d_zero_u64(),
+            worker_critical_drain_threshold: d_zero_usize(),
+            worker_capacity_check_interval_ms: d_zero_u64(),
+            worker_gap_recovery_batch: d_zero_u64(),
+            worker_gap_recovery_max_backoff: d_zero_u64(),
+            hydration_large_file_threshold_startup_mb: d_zero_u64(),
+            hydration_large_file_threshold_drain_mb: d_zero_u64(),
+        }
+    }
 }
 
 impl TargetConfig {
@@ -345,7 +410,6 @@ impl Config {
                 let magic = stat.filesystem_type().0 as i64;
                 if magic == TMPFS_MAGIC || magic == RAMFS_MAGIC {
                     let mut p = path.to_path_buf();
-                    // Stable directory for reuse
                     p.push("foxing_ephemeral_data");
                     return p;
                 }

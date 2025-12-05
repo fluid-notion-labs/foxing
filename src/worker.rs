@@ -559,11 +559,13 @@ async fn process_single_event_inner(
                 );
             }
             if let Some(new_name_str) = &e.new_name {
-                let mut old_dst_final = dst.clone();
+                let old_dst_final = dst.clone();
                 let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
-                let mut new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
+                let new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
                 
-                if !old_dst_final.exists() {
+                let mut resolved_old_dst = old_dst_final.clone();
+
+                if !resolved_old_dst.exists() {
                     let src_inode = e.inode;
                     let e_generation = e.generation;
                     let e_ts = e.timestamp_ns;
@@ -575,8 +577,8 @@ async fn process_single_event_inner(
                     if let Ok(Ok(resolved_path)) = lookup_result {
                         let potential_source = target_cfg.path.join(&resolved_path);
                         if potential_source.exists() {
-                            warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, old_dst_final);
-                            old_dst_final = potential_source;
+                            warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, resolved_old_dst);
+                            resolved_old_dst = potential_source;
                         } else {
                             if new_dst_final.exists() {
                                 return Ok(None);
@@ -596,31 +598,35 @@ async fn process_single_event_inner(
                          }
                     }
                 }
-                if is_effective_synthetic && !old_dst_final.exists() {
+                if is_effective_synthetic && !resolved_old_dst.exists() {
                     let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
                     if potential_real.exists() {
-                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
-                        old_dst_final = potential_real;
+                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", resolved_old_dst, potential_real);
+                        resolved_old_dst = potential_real;
                     } else {
                         metrics::SYNTHETIC_MARKER_RECREATIONS.inc();
-                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
-                        if let Some(parent) = old_dst_final.parent() {
+                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", resolved_old_dst);
+                        if let Some(parent) = resolved_old_dst.parent() {
                             if !parent.exists() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
                         }
-                        if let Err(e) = std::fs::File::create(&old_dst_final) {
+                        if let Err(e) = std::fs::File::create(&resolved_old_dst) {
                             error!("Failed to recreate synthetic marker: {}", e);
                         }
                     }
                 }
+                
+                let old_dst_final_clone = resolved_old_dst.clone();
+                let new_dst_final_clone = new_dst_final.clone();
+
                 let res = tokio::task::spawn_blocking(move || {
-                    atomic_rename(&old_dst_final, &new_dst_final).map_err(FoxingError::Io)
+                    atomic_rename(&old_dst_final_clone, &new_dst_final_clone).map_err(FoxingError::Io)
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
-                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
+                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, resolved_old_dst, new_dst_final);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if new_dst_final.exists() {
@@ -634,7 +640,7 @@ async fn process_single_event_inner(
                         return Ok(None);
                     },
                     Err(e) => {
-                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst_final, new_dst_final, e);
+                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, resolved_old_dst, new_dst_final, e);
                         ctx.failure_state.record_failure();
                         return Err(e);
                     }

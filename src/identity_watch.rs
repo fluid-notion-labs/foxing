@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
 use std::os::unix::fs::MetadataExt;
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, error};
 use walkdir::WalkDir;
 
+#[derive(Debug)]
 pub struct InotifyIndex {
     index: DashMap<u64, PathBuf>,
     root: PathBuf,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use serde::{Serialize};
 use crate::event::Event;
-use sysinfo::{System, DiskExt};
+use sysinfo::{Disks, System};
 use chrono::Utc;
 use tracing::{info, error, debug, warn};
 use glob::glob;
@@ -29,6 +29,7 @@ struct DiskInfo {
     is_removable: bool,
 }
 
+#[derive(Debug)]
 pub struct JournalStore {
     event_writer: Arc<Mutex<BufWriter<File>>>,
     bytes_written: Arc<Mutex<u64>>,
@@ -36,7 +37,6 @@ pub struct JournalStore {
     size_limit_bytes: u64,
     retention_count: usize,
     buffer_capacity: usize,
-    // [OPTIMIZATION] Atomic tracker updated during replay
     last_recovered_seq: AtomicU64,
 }
 
@@ -55,9 +55,6 @@ impl JournalStore {
             std::fs::create_dir_all(parent)?;
         }
         
-        // [OPTIMIZATION] Removed the initial scan_for_last_sequence here.
-        // We will discover the sequence during the Replay phase in Manager::start.
-        
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -68,7 +65,6 @@ impl JournalStore {
         let writer = BufWriter::with_capacity(buffer_size_bytes, file);
 
         let target_meta_path = target_root.join(".mirror").join(format!("source_layout_{}.json", daemon_id));
-        // Best effort write for recovery layout
         if let Err(e) = Self::write_recovery_layout(&target_meta_path, source_mount, daemon_id, tuning_profile) {
             warn!("JOURNAL: Could not write recovery layout: {}", e);
         } else {
@@ -92,7 +88,6 @@ impl JournalStore {
         self.last_recovered_seq.load(Ordering::Relaxed)
     }
 
-    // [OPTIMIZATION] Single-pass replay that updates sequence state
     pub fn replay<F>(&self, mut callback: F) -> io::Result<usize> 
     where F: FnMut(Event) {
         if !self.journal_path.exists() { return Ok(0); }
@@ -160,7 +155,6 @@ impl JournalStore {
     }
 
     fn check_rotation_needed(&self) {
-        // Optimization: Loose check without lock
         if let Ok(bw) = self.bytes_written.lock() {
             if *bw < self.size_limit_bytes { return; }
         }
@@ -195,7 +189,6 @@ impl JournalStore {
             }
         }
         
-        // Background cleanup
         let pattern = format!("{}.*", self.journal_path.to_string_lossy());
         let retention = self.retention_count;
         std::thread::spawn(move || {
@@ -230,10 +223,10 @@ impl JournalStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut sys = System::new_all();
-        sys.refresh_disks();
+        // Updated for sysinfo 0.30+
+        let disks = Disks::new_with_refreshed_list();
 
-        let disks: Vec<DiskInfo> = sys.disks().iter().map(|d| {
+        let disk_infos: Vec<DiskInfo> = disks.iter().map(|d| {
             DiskInfo {
                 name: d.name().to_string_lossy().to_string(),
                 kind: format!("{:?}", d.kind()),
@@ -248,7 +241,7 @@ impl JournalStore {
             timestamp: Utc::now().to_rfc3339(),
             source_path: source_mount.to_path_buf(),
             daemon_id: daemon_id.to_string(),
-            disks,
+            disks: disk_infos,
             tuning_profile: tuning_profile.to_string(),
         };
 

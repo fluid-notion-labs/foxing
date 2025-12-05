@@ -4,6 +4,7 @@ use crate::event::{Event, EventType};
 use std::path::PathBuf;
 use libc;
 
+#[derive(Debug)]
 pub struct IdentityProjector {
     inode_map: Arc<ShardedInodeMap>,
     dir_map: Arc<ShardedDirMap>,
@@ -61,7 +62,7 @@ impl IdentityProjector {
         }
     }
 
-    fn update_identity(&self, inode: u64, path: PathBuf, gen: u32, ts: u64, seq: u64) {
-        self.inode_map.put(inode, IdentityEntry::new(path, gen, ts, seq));
+    fn update_identity(&self, inode: u64, path: PathBuf, generation: u32, ts: u64, seq: u64) {
+        self.inode_map.put(inode, IdentityEntry::new(path, generation, ts, seq));
     }
 }
