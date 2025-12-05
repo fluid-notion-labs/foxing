@@ -1,5 +1,4 @@
 use parking_lot::Mutex;
-use std::num::NonZeroUsize;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use crate::consistency::SerializationEngine;
 use crate::tuner::{TunerState, TunerBoard};
 use crate::hydration_worker::HydrationQueue;
 use crate::hydration::Hydrator;
-use crate::identity::{self, ShardedInodeMap, ShardedDirMap};
+use crate::identity::{ShardedInodeMap, ShardedDirMap};
 use crate::worker;
 use crate::worker::HydrationSender;
 use dashmap::{DashMap, DashSet};
@@ -91,7 +90,6 @@ pub struct Manager {
     hydrators: Vec<Arc<Hydrator>>,
     pub governor: Arc<Governor>,
     pub tuner_board: TunerBoard,
-    repair_tracker: Arc<DashMap<PathBuf, Instant>>,
     bulk_hydration_handles: Vec<tokio::task::JoinHandle<Result<()>>>,
     pub daemon_id: String,
 }
@@ -241,7 +239,6 @@ impl Manager {
             hydrators: Vec::new(),
             governor,
             tuner_board: Arc::new(DashMap::new()),
-            repair_tracker: Arc::new(DashMap::new()),
             bulk_hydration_handles: Vec::new(),
             daemon_id,
         }
@@ -311,7 +308,6 @@ impl Manager {
                 *q_write = queues_for_source.clone();
                 drop(q_write);
                 
-                // Iterate by reference to avoid moving queues_for_source
                 for (k, v) in &queues_for_source {
                     all_queues_map.entry(*k).or_insert_with(Vec::new).extend(v.iter().cloned());
                 }
