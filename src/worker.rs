@@ -592,62 +592,6 @@ async fn process_single_event_inner(
                 let mut old_dst_final = dst.clone();
                 let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
                 
-                if is_effective_synthetic {
-                    if !old_dst_final.exists() {
-                        let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
-                        if potential_real.exists() {
-                            warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
-                            old_dst_final = potential_real;
-                        } else {
-                            warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
-                            if let Some(parent) = old_dst_final.parent() {
-                                if !parent.exists() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                            }
-                            if let Err(e) = std::fs::File::create(&old_dst_final) {
-                                error!("Failed to recreate synthetic marker: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                if e.parent_inode != 0 {
-                    let mut old_parent_opt = identity::resolve_directory(
-                        &source.dir_map,
-                        &source.inode_map,
-                        e.dev_id,
-                        e.parent_inode
-                    );
-                    
-                    if old_parent_opt.is_none() {
-                         let src_clone_lookup = source.clone();
-                         let parent_ino = e.parent_inode;
-                         let _ = tokio::task::spawn_blocking(move || {
-                             let _ = identity::resolve_and_update_path(
-                                 &src_clone_lookup.inode_map,
-                                 &src_clone_lookup.dir_map,
-                                 &src_clone_lookup.mount,
-                                 parent_ino,
-                                 0, 0, 0
-                             );
-                         }).await;
-                         old_parent_opt = identity::resolve_directory(
-                             &source.dir_map,
-                             &source.inode_map,
-                             e.dev_id,
-                             e.parent_inode
-                         );
-                    }
-
-                    if let Some(parent) = old_parent_opt {
-                        let candidate = target_cfg.path.join(parent).join(&e.name);
-                        if !old_dst_final.exists() && candidate.exists() {
-                             old_dst_final = candidate;
-                        }
-                    }
-                }
-
                 let mut new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
                 
                 if e.new_parent_inode != 0 {
@@ -691,13 +635,21 @@ async fn process_single_event_inner(
                     }
                 }
 
+                // Check idempotency for synthetic markers first
+                if is_effective_synthetic && new_dst_final.exists() {
+                    if !old_dst_final.exists() {
+                        debug!("Synthetic Idempotency: Destination {:?} exists and Source {:?} missing. Skipping rename.", new_dst_final, old_dst_final);
+                        return Ok(None);
+                    }
+                }
+
                 if old_dst_final == new_dst_final {
                     warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst_final);
                     return Ok(None);
                 }
 
-                // FIX: Fallback lookup for non-synthetic missing files
-                if !old_dst_final.exists() && !is_effective_synthetic {
+                if !old_dst_final.exists() {
+                    // Try to find the file via aggressive lookup using the inode
                     let src_inode = e.inode;
                     let e_generation = e.generation;
                     let e_ts = e.timestamp_ns;
@@ -716,24 +668,41 @@ async fn process_single_event_inner(
                             warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, old_dst_final);
                             old_dst_final = potential_source;
                         } else {
-                            // File not found on Source or Target. It's truly gone.
-                            // Check if Destination already exists (idempotency)
                             if new_dst_final.exists() {
                                 return Ok(None);
                             }
-                            // Otherwise, assume it was deleted and we don't need to rename it.
-                            warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion.", src_inode);
-                            // Ensure map points to new location (ghost) so subsequent events fail gracefully
-                            // identity::update_map_after_rename(...) was already called above.
-                            return Ok(None);
+                            if !is_effective_synthetic {
+                                warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion (Ghost Move).", src_inode);
+                                return Ok(None);
+                            }
                         }
                     } else {
-                         // Lookup failed on source (file deleted?)
                          if new_dst_final.exists() {
                              return Ok(None);
                          }
-                         warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion.", e.inode);
-                         return Ok(None);
+                         if !is_effective_synthetic {
+                             warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion (Ghost Move).", e.inode);
+                             return Ok(None);
+                         }
+                    }
+                }
+
+                // If it's synthetic and STILL missing after lookup, recreate it
+                if is_effective_synthetic && !old_dst_final.exists() {
+                    let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
+                    if potential_real.exists() {
+                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
+                        old_dst_final = potential_real;
+                    } else {
+                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
+                        if let Some(parent) = old_dst_final.parent() {
+                            if !parent.exists() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                        }
+                        if let Err(e) = std::fs::File::create(&old_dst_final) {
+                            error!("Failed to recreate synthetic marker: {}", e);
+                        }
                     }
                 }
 
@@ -742,7 +711,6 @@ async fn process_single_event_inner(
                 let new_dst_for_rename_clone = new_dst_final.clone();
                 let parent_dir = new_dst_final.parent().map(|p| p.to_path_buf());
                 let parent_dir_clone = parent_dir.clone();
-                let e_inode = e.inode;
 
                 let parent_check_res = tokio::task::spawn_blocking(move || {
                     if let Some(parent) = parent_dir_clone {
@@ -770,68 +738,10 @@ async fn process_single_event_inner(
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
                         info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
-                        
-                        let hydration_tx_for_move = hydration_trigger.clone();
-                        let new_full_path_for_validation = new_dst_final.clone();
-                        tokio::task::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            if !new_full_path_for_validation.exists() {
-                                warn!("Identity drift detected for inode {}: Rename succeeded but file missing at {:?}. Triggering targeted hydration repair.",
-                                      e_inode, new_full_path_for_validation);
-                                let _ = hydration_tx_for_move.0.send(new_full_path_for_validation.clone()).await;
-                            }
-                        });
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                        let mut recovered = false;
-                        let is_identity_path = is_effective_synthetic;
-                        
-                        if is_identity_path {
-                            warn!("Rename Source Missing for Identity File: {:?}. Regenerating and retrying.", old_dst_final);
-                            let retry_src = old_dst_final.clone();
-                            let retry_dst = new_dst_final.clone();
-                            let retry_res = tokio::task::spawn_blocking(move || {
-                                if let Some(parent) = retry_src.parent() {
-                                    if !parent.exists() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                }
-                                if let Err(e) = std::fs::File::create(&retry_src) {
-                                    warn!("Failed to recreate marker during retry: {}", e);
-                                    return Err(FoxingError::Io(e));
-                                }
-                                atomic_rename(&retry_src, &retry_dst).map_err(FoxingError::Io)
-                            }).await.map_err(FoxingError::Join).and_then(|r| r);
-
-                            if retry_res.is_ok() {
-                                info!("Worker {}: Recovered Atomic Rename: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
-                                metrics::RENAME_EVENTS.inc();
-                                metrics::JOURNAL_RECOVERIES.inc();
-                                recovered = true;
-                            } else {
-                                error!("Worker {}: Recovery Rename FAILED: {:?}", worker_id, retry_res);
-                            }
-                        }
-                        
-                        if recovered {
-                            if let Some(entry) = ctx.dirty_stats.get_mut(&e.inode) { entry.path = new_dst_final.clone(); }
-                            return Ok(None);
-                        }
-
-                        warn!("Rename source missing: {:?}. Attempting fallback checks.", old_dst_final);
-                        let dest_exists = tokio::task::spawn_blocking({
-                            let path = new_dst_final.clone();
-                            move || {
-                                if path.exists() {
-                                    if let Ok(_meta) = std::fs::metadata(&path) {
-                                        return true;
-                                    }
-                                }
-                                false
-                            }
-                        }).await.unwrap_or(false);
-
-                        if dest_exists {
+                        // Check if idempotency was satisfied during the race
+                        if new_dst_final.exists() {
                             debug!("Idempotency check passed: File already at destination {:?}.", new_dst_final);
                             return Ok(None);
                         }
