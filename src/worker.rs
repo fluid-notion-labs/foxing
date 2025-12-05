@@ -564,6 +564,8 @@ async fn process_single_event_inner(
         },
         EventType::Rename => {
             let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
+            // PRE-FLIGHT (CQRS Write Model): Update map immediately with the NEW identity state.
+            // This ensures subsequent events see the new path, even if disk I/O lags.
             if let Some(new_name_str) = &e.new_name {
                  let new_rel_path = if e.new_parent_inode != 0 {
                     if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.new_parent_inode) {
@@ -591,9 +593,9 @@ async fn process_single_event_inner(
             if let Some(new_name_str) = &e.new_name {
                 let mut old_dst_final = dst.clone();
                 let is_effective_synthetic = is_synthetic || old_dst_final.to_string_lossy().contains(".by-identity");
-                
                 let mut new_dst_final = if !is_synthetic { dst.clone() } else { target_cfg.path.join(new_name_str) };
                 
+                // --- Parent Resolution Logic ---
                 if e.new_parent_inode != 0 {
                     let mut new_parent_path_opt = identity::resolve_directory(
                         &source.dir_map,
@@ -635,21 +637,48 @@ async fn process_single_event_inner(
                     }
                 }
 
-                // Check idempotency for synthetic markers first
-                if is_effective_synthetic && new_dst_final.exists() {
+                // --- STATE TELEPORTATION (Synthetic Markers) ---
+                // If this is a synthetic marker rename, and the source is missing, DO NOT attempt to find or recreate the source.
+                // Instead, assert the target state directly by creating the new marker at the destination.
+                // This bypasses the race condition where the source marker is deleted before it can be renamed.
+                if is_effective_synthetic {
                     if !old_dst_final.exists() {
-                        debug!("Synthetic Idempotency: Destination {:?} exists and Source {:?} missing. Skipping rename.", new_dst_final, old_dst_final);
-                        return Ok(None);
+                        if new_dst_final.exists() {
+                            debug!("Synthetic Idempotency: Target {:?} already exists. Skipping.", new_dst_final);
+                            return Ok(None);
+                        }
+                        
+                        warn!("Synthetic Teleport: Source {:?} missing. Creating marker directly at {:?}.", old_dst_final, new_dst_final);
+                        
+                        // Ensure parent exists
+                        if let Some(parent) = new_dst_final.parent() {
+                            if !parent.exists() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                        }
+                        
+                        // Create target directly (Teleport)
+                        match std::fs::File::create(&new_dst_final) {
+                            Ok(_) => {
+                                metrics::RENAME_EVENTS.inc();
+                                return Ok(None); // Success via teleport
+                            },
+                            Err(e) => {
+                                error!("Synthetic Teleport Failed: {}", e);
+                                return Err(FoxingError::Io(e));
+                            }
+                        }
                     }
                 }
 
+                // --- Standard Rename Logic (Real Files & Existing Synthetics) ---
                 if old_dst_final == new_dst_final {
-                    warn!("Worker {}: Rename event for Inode {} resulted in identical paths: {:?}. Skipping atomic rename.", worker_id, e.inode, new_dst_final);
+                    warn!("Worker {}: Rename resulted in identical paths: {:?}. Skipping.", worker_id, new_dst_final);
                     return Ok(None);
                 }
 
                 if !old_dst_final.exists() {
-                    // Try to find the file via aggressive lookup using the inode
+                    // Fallback for REAL files only (Synthetic handled above)
                     let src_inode = e.inode;
                     let e_generation = e.generation;
                     let e_ts = e.timestamp_ns;
@@ -665,44 +694,17 @@ async fn process_single_event_inner(
                     if let Ok(Ok(resolved_path)) = lookup_result {
                         let potential_source = target_cfg.path.join(&resolved_path);
                         if potential_source.exists() {
-                            warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, old_dst_final);
+                            warn!("Rename Recovery: Found file at {:?} instead of {:?}", potential_source, old_dst_final);
                             old_dst_final = potential_source;
                         } else {
-                            if new_dst_final.exists() {
-                                return Ok(None);
-                            }
-                            if !is_effective_synthetic {
-                                warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion (Ghost Move).", src_inode);
-                                return Ok(None);
-                            }
+                            if new_dst_final.exists() { return Ok(None); }
+                            warn!("Rename Source Lost: Inode {} missing from Source and Target. Assuming Ghost Move.", src_inode);
+                            return Ok(None);
                         }
                     } else {
-                         if new_dst_final.exists() {
-                             return Ok(None);
-                         }
-                         if !is_effective_synthetic {
-                             warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion (Ghost Move).", e.inode);
-                             return Ok(None);
-                         }
-                    }
-                }
-
-                // If it's synthetic and STILL missing after lookup, recreate it
-                if is_effective_synthetic && !old_dst_final.exists() {
-                    let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
-                    if potential_real.exists() {
-                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", old_dst_final, potential_real);
-                        old_dst_final = potential_real;
-                    } else {
-                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", old_dst_final);
-                        if let Some(parent) = old_dst_final.parent() {
-                            if !parent.exists() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                        }
-                        if let Err(e) = std::fs::File::create(&old_dst_final) {
-                            error!("Failed to recreate synthetic marker: {}", e);
-                        }
+                         if new_dst_final.exists() { return Ok(None); }
+                         warn!("Rename Source Lost: Lookup failed for Inode {}. Assuming Ghost Move.", e.inode);
+                         return Ok(None);
                     }
                 }
 
@@ -740,10 +742,17 @@ async fn process_single_event_inner(
                         info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                        // Check if idempotency was satisfied during the race
+                        // Final Idempotency Check
                         if new_dst_final.exists() {
-                            debug!("Idempotency check passed: File already at destination {:?}.", new_dst_final);
+                            debug!("Idempotency: Target {:?} exists despite rename failure. Success.", new_dst_final);
                             return Ok(None);
+                        }
+                        
+                        // If it was synthetic, we should have caught it above, but double check
+                        if is_effective_synthetic {
+                             warn!("Synthetic Late Recovery: Source {:?} vanished during rename. Creating {:?} directly.", old_dst_final, new_dst_final);
+                             let _ = std::fs::File::create(&new_dst_final);
+                             return Ok(None);
                         }
 
                         error!("Rename failed and file lost. Triggering resync of parent.");
