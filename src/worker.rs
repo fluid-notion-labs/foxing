@@ -540,78 +540,44 @@ async fn process_single_event_inner(
                 let new_dst_final = target_cfg.path.join(&new_rel_path);
                 
                 let mut resolved_old_dst = old_dst_final.clone();
-                if !resolved_old_dst.exists() {
-                    // Race Condition Fix: If the Identity Map points to a "Future" path (updated by Projector)
-                    // which doesn't exist yet, try to reconstruct the "Present" path from the Event data.
-                    if !is_effective_synthetic {
-                        let potential_present_path = if e.parent_inode != 0 {
-                            if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode) {
-                                target_cfg.path.join(parent_rel).join(&e.name)
-                            } else {
-                                target_cfg.path.join(&e.name)
-                            }
-                        } else {
-                            target_cfg.path.join(&e.name)
-                        };
-                        
-                        if potential_present_path.exists() && potential_present_path != resolved_old_dst {
-                            warn!("Rename Source Correction: Map pointed to missing {:?}, but Event data found file at {:?}. Assuming Map race.", resolved_old_dst, potential_present_path);
-                            resolved_old_dst = potential_present_path;
-                        }
-                    }
+                
+                // Heuristic: If the "old" path provided by the map/resolution logic seems wrong
+                // (doesn't exist, or is synthetic), try to reconstruct it from the event's parent/name data.
+                // This handles both "Future Map Race" (map ahead of disk) and "Missing Identity" (map missing root).
+                
+                let heuristic_path = if e.parent_inode != 0 {
+                     if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode) {
+                         target_cfg.path.join(parent_rel).join(&e.name)
+                     } else {
+                         // Missing Root Identity case: Parent is Root (nonzero) but not in map -> Assume root-relative.
+                         target_cfg.path.join(&e.name)
+                     }
+                } else {
+                     target_cfg.path.join(&e.name)
+                };
 
-                    let src_inode = e.inode;
-                    let e_generation = e.generation;
-                    let e_ts = e.timestamp_ns;
-                    let e_seq = e.seq_num;
-                    if !resolved_old_dst.exists() {
-                        let lookup_result = tokio::task::spawn_blocking({
-                            let source_clone = source.clone();
-                            move || identity::resolve_and_update_path(&source_clone, src_inode, e_generation, e_ts, e_seq)
-                        }).await;
-                        if let Ok(Ok(resolved_path)) = lookup_result {
-                            let potential_source = target_cfg.path.join(&resolved_path);
-                            if potential_source.exists() {
-                                warn!("Rename recovery: Found file at {:?} instead of {:?}", potential_source, resolved_old_dst);
-                                resolved_old_dst = potential_source;
-                            } else {
-                                if new_dst_final.exists() {
-                                    return Ok(None);
-                                }
-                                if !is_effective_synthetic {
-                                    warn!("Rename Source Lost: File Inode {} missing from Source and Target. Assuming deletion (Ghost Move).", src_inode);
-                                    return Ok(None);
-                                }
-                            }
-                        } else {
-                             if new_dst_final.exists() {
-                                 return Ok(None);
-                             }
-                             if !is_effective_synthetic {
-                                 warn!("Rename Source Lost: Aggressive lookup failed for Inode {}. Assuming deletion (Ghost Move).", e.inode);
-                                 return Ok(None);
-                             }
-                        }
-                    }
+                let source_missing = !resolved_old_dst.exists();
+                let source_is_synthetic = is_effective_synthetic;
+                let source_is_future = resolved_old_dst == new_dst_final;
+
+                if (source_missing || source_is_synthetic || source_is_future) && heuristic_path.exists() {
+                     warn!("Rename Source Recovery: Map pointed to {:?} (Missing/Syn/Fut), but found file at {:?}. Using found file.", resolved_old_dst, heuristic_path);
+                     resolved_old_dst = heuristic_path;
                 }
+
                 if is_effective_synthetic && !resolved_old_dst.exists() {
-                    let potential_real = target_cfg.path.join(e.name.trim_start_matches('/'));
-                    if potential_real.exists() {
-                        warn!("Rename Source Heuristic: Synthetic path {:?} missing, but found {:?}. Switching.", resolved_old_dst, potential_real);
-                        resolved_old_dst = potential_real;
-                    } else {
-                        metrics::SYNTHETIC_MARKER_RECREATIONS.inc();
-                        warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", resolved_old_dst);
-                        if let Some(parent) = resolved_old_dst.parent() {
-                            if !parent.exists() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                        }
-                        if let Err(e) = std::fs::File::create(&resolved_old_dst) {
-                            error!("Failed to recreate synthetic marker: {}", e);
+                    metrics::SYNTHETIC_MARKER_RECREATIONS.inc();
+                    warn!("Rename Source Missing: Synthetic {:?} is missing. PROACTIVELY recreating marker to preserve tree topology.", resolved_old_dst);
+                    if let Some(parent) = resolved_old_dst.parent() {
+                        if !parent.exists() {
+                            let _ = std::fs::create_dir_all(parent);
                         }
                     }
+                    if let Err(e) = std::fs::File::create(&resolved_old_dst) {
+                        error!("Failed to recreate synthetic marker: {}", e);
+                    }
                 }
+                
                 let old_dst_final_clone = resolved_old_dst.clone();
                 let new_dst_final_clone = new_dst_final.clone();
                 let res = tokio::task::spawn_blocking(move || {
