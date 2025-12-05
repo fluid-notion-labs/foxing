@@ -21,5 +21,8 @@ pub mod wal;
 pub mod resilience;
 pub mod tuner;
 pub mod consistency;
+pub mod identity_watch;
+pub mod journal_store;
+pub mod projector;
 pub use mirror::SharedConfig;
 pub use error::Result;

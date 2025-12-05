@@ -1,12 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, fs, sync::{Arc, atomic::AtomicBool}, collections::HashSet};
+use std::{path::{Path, PathBuf}, fs, sync::{Arc, atomic::AtomicBool}, collections::HashSet};
 use crate::error::{Result, FoxingError as MirrorError};
 use regex::RegexSet;
-use sysinfo::System;
+use sysinfo::{System};
+use nix::sys::statfs::statfs;
 
 pub const MAX_FAILURE_BACKOFF: u64 = 600;
 pub const ERROR_LIMITER_SECS: u64 = 60;
 const BASE_AUTOTUNE_VDO_THRESHOLD: u32 = 128;
+
+// Magic numbers for filesystem types (from linux/magic.h)
+const TMPFS_MAGIC: i64 = 0x01021994;
+const RAMFS_MAGIC: i64 = 0x858458f6;
 
 fn d_bool_false() -> bool { false }
 fn d_bool_true() -> bool { true }
@@ -17,6 +22,10 @@ fn d_mp() -> u16 { 9100 }
 fn d_st() -> u64 { 30 }
 fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
 fn d_zero_u32() -> u32 { 0 }
+
+fn d_journal_dir() -> PathBuf { PathBuf::new() } // Empty signals autotune
+fn d_journal_size_mb() -> u64 { 0 }
+fn d_journal_retention() -> usize { 0 }
 
 fn default_worker_count(sys: &System) -> usize {
     sys.cpus().len().max(2)
@@ -75,6 +84,12 @@ pub struct Config {
     #[serde(default="d_zero_u64")] pub io_buffer_size_mib: u64,
     #[serde(default="d_zero_f64")] pub governor_psi_io_threshold: f64,
     #[serde(default="d_zero_f64")] pub governor_psi_cpu_threshold: f64,
+    
+    // [NEW] Journal Config
+    #[serde(default="d_journal_dir")] pub journal_dir: PathBuf,
+    #[serde(default="d_journal_size_mb")] pub journal_size_limit_mb: u64,
+    #[serde(default="d_journal_retention")] pub journal_retention_count: usize,
+    
     #[serde(default="d_zero_usize", skip)] pub max_workers_sys: usize,
     #[serde(default)] pub sources: Vec<SourceConfig>
 }
@@ -85,7 +100,6 @@ pub struct SourceConfig {
     pub targets: Vec<TargetConfig>,
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
 }
-
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct TargetConfig {
     pub path: PathBuf,
@@ -96,10 +110,7 @@ pub struct TargetConfig {
     #[serde(default="d_bool_false")] pub f2fs_compression: bool,
     #[serde(default="d_bool_false")] pub f2fs_pinning: bool,
     #[serde(default="d_bool_false")] pub enable_versioning: bool,
-    
-    // FIX #5: Enable hash-based verification for time-travel
     #[serde(default="d_bool_true")] pub paranoid_deduplication: bool,
-
     #[serde(default="d_zero_usize")] pub max_versions: usize,
     #[serde(default="d_zero_u64")] pub max_versions_size_mb: u64,
     #[serde(default)] pub version_excludes: Vec<String>,
@@ -119,12 +130,10 @@ pub struct TargetConfig {
     #[serde(skip)] regex_vex: Option<RegexSet>,
     #[serde(skip)] regex_vin: Option<RegexSet>,
     #[serde(skip)] regex_force_vin: Option<RegexSet>,
-    
     #[serde(skip, default="def_abool")] pub supports_reflink: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub direct_io_ok: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
     #[serde(skip, default="def_abool")] pub xattr_supported: Arc<AtomicBool>,
-
     #[serde(default = "d_zero_u32")] pub vdo_stall_threshold: u32,
     #[serde(default="d_zero_u64")] pub ordering_max_pending_bytes: u64,
     #[serde(default="d_zero_usize")] pub ordering_scan_depth: usize,
@@ -137,37 +146,6 @@ pub struct TargetConfig {
     #[serde(default="d_zero_u64")] pub worker_gap_recovery_max_backoff: u64,
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_startup_mb: u64,
     #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_drain_mb: u64,
-}
-
-pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
-    match profile {
-        TargetProfile::NVMe => (1, 4),
-        TargetProfile::SSD => (2, 8),
-        TargetProfile::HDD => (4, 32),
-        TargetProfile::NFS => (2, 16),
-        TargetProfile::Network => (2, 16),
-        TargetProfile::Auto => (2, 8),
-    }
-}
-pub fn get_default_target_workers(profile: &TargetProfile) -> usize {
-    match profile {
-        TargetProfile::NVMe => 8,
-        TargetProfile::SSD => 4,
-        TargetProfile::HDD => 2,
-        TargetProfile::NFS => 4,
-        TargetProfile::Network => 4,
-        TargetProfile::Auto => 2,
-    }
-}
-pub fn get_default_batch_size(profile: &TargetProfile) -> usize {
-    match profile {
-        TargetProfile::NVMe => 16,
-        TargetProfile::SSD => 8,
-        TargetProfile::HDD => 4,
-        TargetProfile::NFS => 8,
-        TargetProfile::Network => 32,
-        TargetProfile::Auto => 4,
-    }
 }
 
 impl TargetConfig {
@@ -271,8 +249,9 @@ impl TargetConfig {
 
 impl Config {
     pub fn calculate_defaults(mut self) -> Self {
-        // ... (Existing calculate_defaults implementation) ...
-        let sys = System::new_all();
+        let mut sys = System::new_all();
+        sys.refresh_memory(); // Force refresh to get accurate available memory
+
         if self.worker_count == 0 {
             self.worker_count = default_worker_count(&sys);
             tracing::info!("Auto-Config: Worker Count set to {} (All Cores)", self.worker_count);
@@ -285,7 +264,7 @@ impl Config {
         if self.queue_max == 0 { self.queue_max = 500_000; }
         if self.max_system_load_avg == 0.0 {
             let cores = sys.cpus().len() as f64;
-            self.max_system_load_avg = cores * 4.0; 
+            self.max_system_load_avg = cores * 4.0;
         }
         if self.governor_psi_io_threshold == 0.0 { self.governor_psi_io_threshold = 60.0; }
         if self.governor_psi_cpu_threshold == 0.0 { self.governor_psi_cpu_threshold = 80.0; }
@@ -294,9 +273,143 @@ impl Config {
         if self.force_flush_interval_secs == 0 { self.force_flush_interval_secs = 5; }
         if self.hydration_delay_ms == 0 { self.hydration_delay_ms = 1; }
         if self.io_priority.is_empty() { self.io_priority = "Realtime".to_string(); }
+        
+        // [OPTIMIZATION] RAM-backed Journal Autotuning
+        if self.journal_dir.as_os_str().is_empty() {
+            // 1. Probe for optimal ephemeral location (tmpfs/ramfs)
+            self.journal_dir = Self::probe_ephemeral_storage();
+
+            // 2. Rescue Environment Detection
+            let is_rescue = Self::is_likely_rescue_env();
+
+            // 3. Autotune Size
+            let total_mem_mb = sys.total_memory() / 1024 / 1024;
+            
+            // Strategy:
+            // - Normal: Use 5% of TOTAL RAM.
+            // - Rescue: Use 1% of AVAILABLE RAM (to avoid starving the OS which lives in RAM).
+            let target_total_mb = if is_rescue {
+                let avail_mem_mb = sys.available_memory() / 1024 / 1024;
+                tracing::info!("Config: Rescue Mode Detected! Scaling journal based on AVAILABLE memory ({} MB) instead of TOTAL.", avail_mem_mb);
+                (avail_mem_mb as f64 * 0.01) as u64
+            } else {
+                (total_mem_mb as f64 * 0.05) as u64
+            };
+            
+            // 4. Safety Caps
+            let (min_cap, max_cap) = if is_rescue { (32, 512) } else { (64, 4096) };
+            let effective_total_mb = target_total_mb.max(min_cap).min(max_cap);
+            
+            // 5. Retention Policy
+            self.journal_retention_count = 10;
+            self.journal_size_limit_mb = effective_total_mb / self.journal_retention_count as u64;
+            
+            if self.journal_size_limit_mb < 8 { self.journal_size_limit_mb = 8; }
+
+            tracing::info!(
+                "Config: Journal autotuned to Ephemeral (RAM/Tmp). Path: {:?}. Total Buffer: ~{} MB ({} segs x {} MB). RescueMode: {}", 
+                self.journal_dir,
+                self.journal_size_limit_mb * self.journal_retention_count as u64,
+                self.journal_retention_count,
+                self.journal_size_limit_mb,
+                is_rescue
+            );
+        } else {
+            // User Override (Persistent Mode)
+            if self.journal_size_limit_mb == 0 { self.journal_size_limit_mb = 100; }
+            if self.journal_retention_count == 0 { self.journal_retention_count = 10; }
+        }
+
+        // [SAFETY] Safeguard against journaling loops
+        self.ensure_journal_safety();
+        
         self
     }
-    // ... (rest of Config implementation) ...
+
+    fn is_likely_rescue_env() -> bool {
+        // 1. Negative Check: Bootc / OSTree / Image Mode
+        if Path::new("/run/ostree-booted").exists() {
+            return false;
+        }
+
+        // 2. Positive Check: Kernel Command Line
+        if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+            let s = cmdline.to_lowercase();
+            if s.contains("rd.live.image") || s.contains("boot=live") || s.contains("casper") || s.contains("archisobasedir") {
+                return true;
+            }
+        }
+
+        // 3. Filesystem Magic Check
+        let root = Path::new("/");
+        if let Ok(stat) = statfs(root) {
+            let magic = stat.filesystem_type().0 as i64;
+            // Pure RAM root (initramfs, very minimal rescue shells)
+            if magic == TMPFS_MAGIC || magic == RAMFS_MAGIC {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn probe_ephemeral_storage() -> PathBuf {
+        let candidates = ["/dev/shm", "/run/shm", "/tmp", "/run"];
+        for &path_str in &candidates {
+            let path = Path::new(path_str);
+            if !path.exists() { continue; }
+            
+            if let Ok(stat) = statfs(path) {
+                let magic = stat.filesystem_type().0 as i64;
+                if magic == TMPFS_MAGIC || magic == RAMFS_MAGIC {
+                    let mut p = path.to_path_buf();
+                    // Stable path for resumption: "foxing_ephemeral_data"
+                    p.push("foxing_ephemeral_data");
+                    return p;
+                }
+            }
+        }
+        
+        let mut temp = std::env::temp_dir();
+        // Stable path fallback
+        temp.push("foxing_ephemeral_data");
+        tracing::warn!("Config: Could not find explicit RAM disk. Falling back to system temp: {:?}", temp);
+        temp
+    }
+
+    fn ensure_journal_safety(&mut self) {
+        if !self.journal_dir.exists() {
+            let _ = std::fs::create_dir_all(&self.journal_dir);
+        }
+        
+        let abs_journal = self.journal_dir.canonicalize().unwrap_or(self.journal_dir.clone());
+        
+        for source in &mut self.sources {
+            let abs_source = source.path.canonicalize().unwrap_or(source.path.clone());
+            
+            if abs_journal.starts_with(&abs_source) {
+                let rel_journal = if abs_journal == abs_source {
+                    PathBuf::from("") 
+                } else {
+                    abs_journal.strip_prefix(&abs_source).unwrap_or(Path::new("")).to_path_buf()
+                };
+                
+                let pattern_base = if rel_journal.as_os_str().is_empty() {
+                    "source_.*\\.wal$".to_string()
+                } else {
+                    let s = rel_journal.to_string_lossy();
+                    format!("^{}.*", regex::escape(&s))
+                };
+                
+                for target in &mut source.targets {
+                    if !target.excludes.iter().any(|e| e == &pattern_base) {
+                        tracing::warn!("SAFETY: Journal {:?} is inside Source {:?}. Auto-excluding '{}' to prevent loops.", abs_journal, abs_source, pattern_base);
+                        target.excludes.push(pattern_base.clone());
+                    }
+                }
+            }
+        }
+    }
+
     pub fn load(p: &str) -> Result<Self> {
         let s = fs::read_to_string(p)?;
         let mut c: Config = toml::from_str(&s).map_err(|e| MirrorError::Config(e.to_string()))?;

@@ -1,5 +1,4 @@
 use parking_lot::Mutex;
-use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock};
@@ -14,7 +13,7 @@ use crate::consistency::SerializationEngine;
 use crate::tuner::{TunerState, TunerBoard};
 use crate::hydration_worker::HydrationQueue;
 use crate::hydration::Hydrator;
-use crate::identity;
+use crate::identity::{self, ShardedInodeMap, ShardedDirMap};
 use crate::worker;
 use crate::worker::HydrationSender;
 use dashmap::{DashMap, DashSet};
@@ -25,6 +24,9 @@ use crate::governor::Governor;
 use crate::security;
 use uuid::Uuid;
 use crate::versioning::VersionIndex;
+use crate::identity_watch::InotifyIndex;
+use crate::journal_store::JournalStore;
+use crate::projector::IdentityProjector;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
@@ -52,20 +54,13 @@ fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration
             _ => 0,
         }
     }).max().unwrap_or(0);
-
+    
     match max_stress_level {
         0 => (Duration::from_millis(50), Duration::from_millis(500)),
         1 => (Duration::from_millis(200), Duration::from_secs(2)),
         2 => (Duration::from_millis(1000), Duration::from_secs(5)),
         _ => (Duration::from_secs(2), Duration::from_secs(10)),
     }
-}
-
-fn _calculate_adaptive_registry_limit(tuner_board: &TunerBoard) -> usize {
-    for r in tuner_board.iter() {
-        if matches!(*r.value(), TunerState::CriticalDrain) { return 10; }
-    }
-    1000
 }
 
 #[derive(Debug)]
@@ -75,14 +70,17 @@ pub struct SourceInfo {
     pub dev: u32,
     pub dev_ids: Vec<u32>,
     pub hydration: Arc<crate::hydration::HydrationState>,
-    pub inode_map: identity::InodeMap,
-    pub dir_map: identity::DirMap,
+    pub inode_map: Arc<ShardedInodeMap>,
+    pub dir_map: Arc<ShardedDirMap>,
     pub lru_size: usize,
     pub bulk_job_queue: Mutex<Option<HydrationQueue>>,
     pub queues: RwLock<HashMap<u32, Vec<Arc<EventQueue>>>>,
     pub active_repairs: Arc<DashSet<PathBuf>>,
     pub rwf_uncached_ok: Arc<AtomicBool>,
     pub version_index: Arc<VersionIndex>,
+    pub identity_watcher: Option<Arc<InotifyIndex>>,
+    pub projector: Option<Arc<IdentityProjector>>,
+    pub journal: Option<Arc<JournalStore>>,
 }
 
 pub struct Manager {
@@ -120,6 +118,7 @@ impl Manager {
     pub async fn new(cfg: SharedConfig) -> Self {
         let daemon_id = Uuid::new_v4().to_string();
         info!("Daemon Session ID: {}", daemon_id);
+        
         let config_reader = cfg.read().await;
         let governor = Arc::new(crate::governor::Governor::new(
             config_reader.max_system_load_avg,
@@ -127,11 +126,16 @@ impl Manager {
             config_reader.governor_psi_io_threshold,
             config_reader.governor_psi_cpu_threshold,
         ));
+        
         let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
-        let cache_size = NonZeroUsize::new(cache_size_raw.max(10000)).unwrap_or_else(|| NonZeroUsize::new(10000).unwrap());
-        let dir_cache_size = NonZeroUsize::new(cache_size.get().min(10000)).unwrap_or_else(|| NonZeroUsize::new(1000).unwrap());
+        let lru_size_val = cache_size_raw.max(10000);
+
+        let journal_buf_size = (config_reader.io_buffer_size_mib * 1024 * 1024) as usize;
+        let journal_buf_final = journal_buf_size.max(64 * 1024).min(16 * 1024 * 1024);
+
         let mut sources: HashMap<u32, Arc<SourceInfo>> = HashMap::new();
         let mut target_ids_to_exclude = Vec::new();
+
         for sc in &config_reader.sources {
             for tc in &sc.targets {
                 if let Ok(meta) = fs::metadata(&tc.path) {
@@ -144,27 +148,59 @@ impl Manager {
                 }
             }
         }
+
         for sc in &config_reader.sources {
             match resolve_all_device_ids(&sc.path) {
                 Ok((mount_path, mut dev_ids)) => {
                     dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
+                    
                     if dev_ids.is_empty() {
                         error!("Source {:?} has NO device IDs left after excluding Targets!", sc.path);
                         continue;
                     }
+                    
                     let primary_dev = dev_ids[0];
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
                     
-                    // Initialize VersionIndex for this source's PRIMARY target
-                    // Note: This assumes one primary target per source for versioning scope, 
-                    // or that they share a root. In complex multi-target setups, we might need a map.
-                    // For now, we take the path of the first target to root the index.
                     let version_root = if let Some(first_target) = sc.targets.first() {
                         first_target.path.clone()
                     } else {
-                        sc.path.clone() // Fallback, unlikely to have versions
+                        sc.path.clone()
                     };
                     let version_index = Arc::new(VersionIndex::new(version_root));
+                    
+                    info!("Initializing Inotify Reverse Index for {:?}", sc.path);
+                    let identity_watcher = Some(InotifyIndex::new(sc.path.clone()));
+
+                    let inode_map = ShardedInodeMap::new(lru_size_val);
+                    let dir_map = ShardedDirMap::new(lru_size_val);
+
+                    let projector = Arc::new(IdentityProjector::new(
+                        inode_map.clone(),
+                        dir_map.clone(),
+                        primary_dev
+                    ));
+
+                    let mut journal = None;
+                    if let Some(tgt) = sc.targets.first() {
+                        let journal_dir = &config_reader.journal_dir;
+                        let journal_path = journal_dir.join(format!("source_{}.wal", primary_dev));
+                        let tuning_profile_str = format!("{:?}", tgt.profile);
+                        
+                        match JournalStore::new(
+                            &journal_path, 
+                            &tgt.path, 
+                            &mount_path, 
+                            &daemon_id,
+                            journal_buf_final,
+                            &tuning_profile_str,
+                            config_reader.journal_size_limit_mb,
+                            config_reader.journal_retention_count
+                        ) {
+                            Ok(j) => journal = Some(Arc::new(j)),
+                            Err(e) => error!("Failed to initialize Journal Store at {:?}: {}", journal_path, e),
+                        }
+                    }
 
                     sources.insert(primary_dev, Arc::new(SourceInfo {
                         path: sc.path.clone(),
@@ -172,19 +208,23 @@ impl Manager {
                         dev: primary_dev,
                         dev_ids: dev_ids.clone(),
                         hydration: Arc::new(crate::hydration::HydrationState::default()),
-                        inode_map: Arc::new(Mutex::new(LruCache::new(cache_size))),
-                        dir_map: Arc::new(Mutex::new(LruCache::new(dir_cache_size))),
-                        lru_size: cache_size.get(),
+                        inode_map,
+                        dir_map,
+                        lru_size: lru_size_val,
                         bulk_job_queue: Mutex::new(None),
                         queues: RwLock::new(HashMap::new()),
                         active_repairs: Arc::new(DashSet::new()),
                         rwf_uncached_ok: sc.rwf_uncached_ok.clone(),
                         version_index,
+                        identity_watcher,
+                        projector: Some(projector),
+                        journal,
                     }));
                 },
                 Err(e) => error!("Failed to resolve device IDs for {:?}: {}", sc.path, e),
             }
         }
+
         for sc in &config_reader.sources {
             for t in &sc.targets {
                 let xattr_ok = security::probe_xattr_support(&t.path);
@@ -192,6 +232,7 @@ impl Manager {
             }
         }
         drop(config_reader);
+
         Self {
             config: cfg,
             sources,
@@ -216,18 +257,15 @@ impl Manager {
         let config_reader = self.config.read().await;
 
         for (_primary_dev, src) in self.sources.iter_mut() {
-            // Kick off Version Indexing in background
             let v_index = src.version_index.clone();
             std::thread::spawn(move || {
                 v_index.index_directory();
             });
-
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets = Vec::new();
                 let mut hydration_repair_txs = Vec::new();
                 let mut queues_for_source: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
                 let mut serialization_engines: HashMap<PathBuf, Arc<SerializationEngine>> = HashMap::new();
-
                 for tgt_cfg in &source_cfg.targets {
                     let serialization_engine = SerializationEngine::new();
                     serialization_engines.insert(tgt_cfg.path.clone(), serialization_engine.clone());
@@ -239,12 +277,10 @@ impl Manager {
                         hydration_repair_txs.push(tx.clone());
                     }
                     let mut repair_rx_option = Some(repair_rx_raw.into_iter().next().unwrap());
-
                     for alt_dev_id in &src.dev_ids {
                         queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
                     }
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
-
                     for (i, rx) in fanout_rxs_vec.into_iter().enumerate() {
                         let (sd_tx, sd_rx) = mpsc::channel(1);
                         shutdowns.push(sd_tx);
@@ -270,11 +306,29 @@ impl Manager {
                         hydration_targets.push(tgt_cfg.clone());
                     }
                 }
+                
                 let mut q_write = src.queues.write().await;
                 *q_write = queues_for_source.clone();
                 drop(q_write);
+                
                 for (k, v) in queues_for_source {
                     all_queues_map.entry(k).or_insert_with(Vec::new).extend(v);
+                }
+
+                let queues_copy = queues_for_source.clone();
+                if let Some(journal) = &src.journal {
+                    let projector = src.projector.clone();
+                    let replay_count = journal.replay(|evt| {
+                        let evt_arc = Arc::new(evt);
+                        if let Some(p) = &projector { p.project(&evt_arc); }
+                        if let Some(qs) = queues_copy.get(&evt_arc.dev_id) {
+                            for q in qs { q.push(evt_arc.clone()); }
+                        }
+                    }).unwrap_or(0);
+                    
+                    if replay_count > 0 {
+                        info!("MANAGER: Replayed {} pending events from journal.", replay_count);
+                    }
                 }
 
                 let bulk_worker_count = config_reader.worker_count.min(4);
@@ -287,7 +341,6 @@ impl Manager {
                 );
                 *src.bulk_job_queue.lock() = Some(queue);
                 self.bulk_hydration_handles.extend(bulk_handles);
-
                 if !hydration_targets.is_empty() {
                     let hydrator = Arc::new(Hydrator::new(
                         src.clone(),
@@ -311,10 +364,10 @@ impl Manager {
                 }
             }
         }
-
+        
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
-        let _repair_tracker_clone = self.repair_tracker.clone();
+        
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
         ).unwrap_or_else(|_| PathBuf::from("/"));
@@ -325,7 +378,6 @@ impl Manager {
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
                 let is_targeted_repair = path.exists() && !is_root_request;
-
                 if is_targeted_repair {
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
@@ -339,7 +391,6 @@ impl Manager {
                     }
                     continue;
                 }
-
                 if is_root_request {
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
@@ -359,7 +410,6 @@ impl Manager {
             Ok(())
         });
         handles.push(debounce_handle);
-
         (all_queues_map, handles, shutdowns, hydration_rx_dummy)
     }
 
