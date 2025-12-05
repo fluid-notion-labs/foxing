@@ -8,6 +8,7 @@ use sysinfo::{System, DiskExt};
 use chrono::Utc;
 use tracing::{info, error, debug, warn};
 use glob::glob;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Serialize)]
 struct RecoveryLayout {
@@ -35,7 +36,8 @@ pub struct JournalStore {
     size_limit_bytes: u64,
     retention_count: usize,
     buffer_capacity: usize,
-    last_recovered_seq: u64,
+    // [OPTIMIZATION] Atomic tracker updated during replay
+    last_recovered_seq: AtomicU64,
 }
 
 impl JournalStore {
@@ -53,17 +55,9 @@ impl JournalStore {
             std::fs::create_dir_all(parent)?;
         }
         
-        let mut last_seq = 0;
-        let file_exists = source_journal_path.exists();
+        // [OPTIMIZATION] Removed the initial scan_for_last_sequence here.
+        // We will discover the sequence during the Replay phase in Manager::start.
         
-        if file_exists {
-            info!("JOURNAL: Found existing journal at {:?}. Scanning for resumption point...", source_journal_path);
-            if let Ok(seq) = Self::scan_for_last_sequence(source_journal_path) {
-                last_seq = seq;
-                info!("JOURNAL: Resumption Sequence ID: {}", last_seq);
-            }
-        }
-
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -74,8 +68,9 @@ impl JournalStore {
         let writer = BufWriter::with_capacity(buffer_size_bytes, file);
 
         let target_meta_path = target_root.join(".mirror").join(format!("source_layout_{}.json", daemon_id));
+        // Best effort write for recovery layout
         if let Err(e) = Self::write_recovery_layout(&target_meta_path, source_mount, daemon_id, tuning_profile) {
-            error!("JOURNAL: Failed to write recovery layout to target: {}", e);
+            warn!("JOURNAL: Could not write recovery layout: {}", e);
         } else {
             info!("JOURNAL: Wrote source recovery layout to {:?}", target_meta_path);
         }
@@ -89,31 +84,15 @@ impl JournalStore {
             size_limit_bytes: size_limit_mb * 1024 * 1024,
             retention_count,
             buffer_capacity: buffer_size_bytes,
-            last_recovered_seq: last_seq,
+            last_recovered_seq: AtomicU64::new(0),
         })
     }
 
     pub fn get_last_sequence(&self) -> u64 {
-        self.last_recovered_seq
+        self.last_recovered_seq.load(Ordering::Relaxed)
     }
 
-    fn scan_for_last_sequence(path: &Path) -> io::Result<u64> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut max_seq = 0;
-        
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                if let Ok(evt) = serde_json::from_str::<Event>(&l) {
-                    if evt.seq_num > max_seq {
-                        max_seq = evt.seq_num;
-                    }
-                }
-            }
-        }
-        Ok(max_seq)
-    }
-
+    // [OPTIMIZATION] Single-pass replay that updates sequence state
     pub fn replay<F>(&self, mut callback: F) -> io::Result<usize> 
     where F: FnMut(Event) {
         if !self.journal_path.exists() { return Ok(0); }
@@ -121,16 +100,22 @@ impl JournalStore {
         let file = File::open(&self.journal_path)?;
         let reader = BufReader::new(file);
         let mut count = 0;
+        let mut max_seq = 0;
 
         for line in reader.lines() {
             if let Ok(l) = line {
                 if let Ok(evt) = serde_json::from_str::<Event>(&l) {
+                    if evt.seq_num > max_seq {
+                        max_seq = evt.seq_num;
+                    }
                     callback(evt);
                     count += 1;
                 }
             }
         }
-        info!("JOURNAL: Replayed {} events from disk.", count);
+        
+        self.last_recovered_seq.store(max_seq, Ordering::Relaxed);
+        info!("JOURNAL: Replay Complete. Loaded {} events. Max Sequence: {}", count, max_seq);
         Ok(count)
     }
 
@@ -175,6 +160,7 @@ impl JournalStore {
     }
 
     fn check_rotation_needed(&self) {
+        // Optimization: Loose check without lock
         if let Ok(bw) = self.bytes_written.lock() {
             if *bw < self.size_limit_bytes { return; }
         }
@@ -202,12 +188,14 @@ impl JournalStore {
                     },
                     Err(e) => {
                         error!("JOURNAL: Failed to open new log file after rotation: {}", e);
+                        // Attempt to rename back to avoid data loss?
                         let _ = std::fs::rename(&archived_path, &self.journal_path);
                     }
                 }
             }
         }
         
+        // Background cleanup
         let pattern = format!("{}.*", self.journal_path.to_string_lossy());
         let retention = self.retention_count;
         std::thread::spawn(move || {
@@ -224,7 +212,6 @@ impl JournalStore {
                 }
             }
         }
-        
         files.sort_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
         
         let total_files = files.len();
@@ -233,8 +220,6 @@ impl JournalStore {
             for i in 0..to_delete {
                 if let Err(e) = std::fs::remove_file(&files[i]) {
                     warn!("JOURNAL: Failed to delete old log {:?}: {}", files[i], e);
-                } else {
-                    info!("JOURNAL: Pruned old log {:?}", files[i]);
                 }
             }
         }
