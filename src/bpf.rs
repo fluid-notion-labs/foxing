@@ -15,15 +15,12 @@ use crate::mirror::SourceInfo;
 use crate::tuner::{BbrTuner};
 use crate::config::{TargetConfig, TargetProfile};
 use std::path::PathBuf;
-
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
-
 lazy_static::lazy_static! {
     static ref SEQUENCE_TRACKER: DashMap<u32, AtomicU64> = DashMap::new();
     static ref DEVICE_EVENT_COUNTER: DashMap<u32, AtomicU64> = DashMap::new();
 }
-
 pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
     let mut stats = HashMap::new();
     for r in DEVICE_EVENT_COUNTER.iter() {
@@ -34,7 +31,6 @@ pub fn get_device_stats() -> HashMap<u32, (u64, u64)> {
     }
     stats
 }
-
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct RawEvent {
@@ -47,7 +43,6 @@ struct RawEvent {
     name: [u8;256], nname: [u8;256],
     comm: [u8;16]
 }
-
 pub fn run(
     queues: HashMap<u32, Vec<Arc<EventQueue>>>,
     shutdown: Arc<AtomicBool>,
@@ -58,90 +53,56 @@ pub fn run(
     let mut open_obj = mem::MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_obj).map_err(|e| FoxingError::Bpf(e.to_string()))?;
     let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
-
     if initial_seq > 0 {
-        // PERCPU Array Logic:
-        // We need to update the map for ALL CPUs.
-        // libbpf-rs handles this if we provide a slice of values.
-        // The value is u64 (8 bytes).
-        
-        let num_cpus = libbpf_rs::num_possible_cpus().unwrap_or(1);
         let key: u32 = 0;
+        // CHANGED: Correctly restore global sequence number.
+        // Previously this logic was broken because it attempted to update a PERCPU_ARRAY with 
+        // derived CPU-specific values, causing "Update Failed" warnings and inconsistent state.
+        // Now that the map is a global ARRAY, we just update the single counter.
+        let next_seq = initial_seq + 1;
+        let val_bytes = next_seq.to_ne_bytes();
         
-        // BPF logic uses the lower 32 bits as the counter.
-        // We restore it as (initial_seq & 0xFFFFFFFF) + 1.
-        let seq_part = (initial_seq & 0xFFFFFFFF) + 1;
-        
-        let mut values = Vec::with_capacity(num_cpus);
-        for _ in 0..num_cpus {
-             values.push(seq_part);
-        }
-
-        // Flatten to bytes
-        let mut bytes = Vec::new();
-        for v in values {
-            bytes.extend_from_slice(&v.to_ne_bytes());
-        }
-
-        if let Err(e) = skel.maps.local_seq_map.update(&key.to_ne_bytes(), &bytes, libbpf_rs::MapFlags::ANY) {
-            warn!("BPF: Failed to restore sequence number {}: {}", seq_part, e);
+        if let Err(e) = skel.maps.local_seq_map.update(&key.to_ne_bytes(), &val_bytes, libbpf_rs::MapFlags::ANY) {
+            warn!("BPF: Failed to restore global sequence number {}: {}", next_seq, e);
         } else {
-            info!("BPF: Restored Global Sequence to {} (across {} CPUs)", seq_part, num_cpus);
+            info!("BPF: Restored Global Sequence to {}", next_seq);
         }
     }
-
     let self_pid = std::process::id();
     let pid_val: u8 = 1;
     skel.maps.ignored_pids.update(&self_pid.to_ne_bytes(), &pid_val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .map_err(|e| FoxingError::Bpf(format!("Failed to register PID filter: {}", e)))?;
-
     info!("BPF: Registering {} watched device(s)", queues.len());
     let queues_in_closure = Arc::new(queues);
     let sources_in_closure = Arc::new(sources);
     let queues_in_loop = queues_in_closure.clone();
     let sources_in_loop = sources_in_closure.clone();
-
-    // Reorder Buffer & Journal Tuner Setup
     let mut reorder_buffers_map: HashMap<u32, ReorderBuffer> = HashMap::new();
     let journal_buffers: Arc<Mutex<HashMap<u32, Vec<Arc<Event>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let journal_buffers_closure = journal_buffers.clone();
-    
-    // Create dummy tuners for journaling to measure write throughput
     let mut journal_tuners: HashMap<u32, BbrTuner> = HashMap::new();
-    let dummy_board = Arc::new(DashMap::new()); // No persistent board for journal tuner
-
+    let dummy_board = Arc::new(DashMap::new());
     for dev in queues_in_closure.keys() {
         let key = dev.to_ne_bytes();
         let val = 1u8;
         info!("BPF: Watching device 0x{:08x} ({})", dev, dev);
         skel.maps.watched_devs.update(&key, &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
             .map_err(|e| FoxingError::Bpf(e.to_string()))?;
-
         DEVICE_EVENT_COUNTER.insert(*dev, AtomicU64::new(0));
         SEQUENCE_TRACKER.insert(*dev, AtomicU64::new(0));
-        
-        // Reorder buffer (50ms latency target, 64MB max pending)
         reorder_buffers_map.insert(*dev, ReorderBuffer::new(50, 64 * 1024 * 1024));
-        
-        // Journal batching buffer
         journal_buffers.lock().unwrap().insert(*dev, Vec::with_capacity(128));
-
-        // Journal Tuner
         let mut journal_cfg = TargetConfig::default();
         journal_cfg.path = PathBuf::from("journal");
         journal_cfg.profile = TargetProfile::SSD;
         let _ = journal_cfg.compile(2, 1024);
         journal_tuners.insert(*dev, BbrTuner::new(&journal_cfg));
     }
-
     let reorder_buffers = Arc::new(Mutex::new(reorder_buffers_map));
     let reorder_buffers_in_closure = reorder_buffers.clone();
-
-    // Attach Probes
     let mut _held_links = Vec::new();
     let mut attached_count = 0;
     let progs = &skel.progs;
-    
     let probes = [
         ("trace_xfs_write", &progs.trace_xfs_write),
         ("trace_btrfs_write", &progs.trace_btrfs_write),
@@ -167,7 +128,6 @@ pub fn run(
         ("trace_fallocate", &progs.trace_fallocate),
         ("trace_xfs_commit", &progs.trace_xfs_commit),
     ];
-
     for (name, prog) in probes.iter() {
         match prog.attach() {
             Ok(link) => {
@@ -180,60 +140,42 @@ pub fn run(
             }
         }
     }
-
     if attached_count == 0 {
         return Err(FoxingError::Bpf("Failed to attach ANY BPF probes.".into()));
     }
     info!("BPF: Successfully attached {} probes", attached_count);
-
-    // Ring Buffer Consumer
     let maps = skel.maps;
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
     let mut journal_tuners_closure = journal_tuners;
-
     builder.add(events_map, move |data| {
         let current_count = metrics::GLOBAL_BUFFER_COUNT.load(Ordering::SeqCst);
         let global_limit = GLOBAL_BUFFER_LIMIT.get() as u64;
-
         if data.len() != std::mem::size_of::<RawEvent>() {
             crate::metrics::EVENTS_MALFORMED.inc();
             return 0;
         }
-
         let raw = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RawEvent) };
-
-        // Global Backpressure Check
         if current_count >= global_limit * 3 / 4 {
             metrics::EVENTS_DROPPED.inc();
             return 0;
         }
-
-        // Stats Update
         let counter = DEVICE_EVENT_COUNTER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let _event_count = counter.fetch_add(1, Ordering::Relaxed);
-
-        // String Parse
         let name_len = raw.name.iter().position(|&c| c == 0).unwrap_or(raw.name.len());
         let name = String::from_utf8_lossy(&raw.name[..name_len]).to_string();
-        
         let comm_len = raw.comm.iter().position(|&c| c == 0).unwrap_or(raw.comm.len());
         let comm = String::from_utf8_lossy(&raw.comm[..comm_len]).to_string();
-
         if !queues_in_closure.contains_key(&raw.dev) {
             metrics::EVENTS_UNWATCHED.inc();
             return 0;
         }
-
-        // Update Sequence Tracker
         let tracker = SEQUENCE_TRACKER.entry(raw.dev).or_insert(AtomicU64::new(0));
         let _ = tracker.fetch_max(raw.seq, Ordering::Relaxed);
-
-        let new_name = if raw.type_ == 7 { // EVENT_RENAME
+        let new_name = if raw.type_ == 7 {
                 let nname_len = raw.nname.iter().position(|&c| c == 0).unwrap_or(raw.nname.len());
                 Some(String::from_utf8_lossy(&raw.nname[..nname_len]).to_string())
         } else { None };
-
         let evt = Arc::new(Event {
             event_type: EventType::from(raw.type_),
             dev_id: raw.dev,
@@ -254,23 +196,17 @@ pub fn run(
             interactive: raw.interactive == 1,
             created_at: std::time::Instant::now()
         });
-
-        // 1. Journaling Path (Immediate, Tuned)
         if let Some(src_info) = sources_in_closure.get(&raw.dev) {
             if let Some(journal) = &src_info.journal {
                 if let Ok(mut buffers_map) = journal_buffers_closure.lock() {
                     if let Some(buffer) = buffers_map.get_mut(&raw.dev) {
                         buffer.push(evt.clone());
-                        
                         let tuner = journal_tuners_closure.get_mut(&raw.dev).unwrap();
-                        
                         if buffer.len() >= tuner.current_batch_size {
                             let start = std::time::Instant::now();
                             let res = journal.append_batch(buffer);
                             let duration = start.elapsed().as_secs_f64();
                             let bytes = res.unwrap_or(0);
-                            
-                            // Feed tuner to optimize journal flush rate
                             tuner.tune(duration, bytes, false, 0, 10000, &dummy_board, "journal", 0);
                             buffer.clear();
                         }
@@ -278,50 +214,36 @@ pub fn run(
                 }
             }
         }
-
-        // 2. Replication Path (Reordered)
         if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
             if let Some(buf) = buffers.get_mut(&raw.dev) {
                 if buf.push(evt) {
-                    // Drain available ordered events
                     while let Some(ordered_evt) = buf.pop() {
-                        
-                        // Project Identity State BEFORE dispatch
                         if let Some(src_info) = sources_in_closure.get(&ordered_evt.dev_id) {
                             if let Some(projector) = &src_info.projector {
                                 projector.project(&ordered_evt);
                             }
                         }
-
-                        // Count and Dispatch
                         metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
                         if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) {
                             for q in qs { q.push(ordered_evt.clone()); }
                         }
                     }
                 } else {
-                    // Buffer Full (Ingress Spike)
                     metrics::EVENTS_DROPPED.inc();
                 }
             }
         }
         0
     }).map_err(|e| FoxingError::Bpf(e.to_string()))?;
-
     let ring = builder.build().map_err(|e| FoxingError::Bpf(e.to_string()))?;
-    
     info!("BPF: Event processing started");
     let mut last_report = std::time::Instant::now();
-
-    // Main Polling Loop
     while !shutdown.load(Ordering::Relaxed) {
         match ring.poll(std::time::Duration::from_millis(100)) {
             Ok(_) => {
-                // Background Flush for Journal Buffers (Time-based)
                 if let Ok(mut buffers_map) = journal_buffers.lock() {
                     for (dev_id, buffer) in buffers_map.iter_mut() {
                         if !buffer.is_empty() {
-                            // TODO: Add time check to avoid over-flushing small batches
                             if let Some(src_info) = sources_in_loop.get(dev_id) {
                                 if let Some(journal) = &src_info.journal {
                                     let _ = journal.append_batch(buffer);
@@ -331,8 +253,6 @@ pub fn run(
                         }
                     }
                 }
-
-                // Check Reorder Buffers for Timeouts
                 if let Ok(mut buffers) = reorder_buffers.lock() {
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
@@ -348,8 +268,6 @@ pub fn run(
                         }
                     }
                 }
-
-                // Stats Reporting
                 if last_report.elapsed().as_secs() >= 30 {
                     for entry in DEVICE_EVENT_COUNTER.iter() {
                         let dev_id = entry.key();
@@ -365,7 +283,6 @@ pub fn run(
             }
         }
     }
-
     info!("BPF: Shutting down");
     Ok(())
 }
