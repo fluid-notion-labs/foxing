@@ -601,9 +601,26 @@ async fn process_single_event_inner(
                 let new_dst_final = target_cfg.path.join(&new_rel_path);
                 let old_dst_final_clone = old_dst_final.clone();
                 let new_dst_final_clone = new_dst_final.clone();
+                
+                // Retry logic handles race between Data Plane (Create) and Control Plane (Rename)
                 let res = tokio::task::spawn_blocking(move || {
-                    atomic_rename(&old_dst_final_clone, &new_dst_final_clone).map_err(FoxingError::Io)
+                    let mut attempts = 0;
+                    loop {
+                        match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
+                            Ok(_) => return Ok(()),
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+                                if attempts < 10 {
+                                    attempts += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    continue;
+                                }
+                                return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after retries: {}", e))));
+                            },
+                            Err(e) => return Err(FoxingError::Io(e)),
+                        }
+                    }
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
+                
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
@@ -612,10 +629,12 @@ async fn process_single_event_inner(
                         let _ = tokio::task::spawn_blocking(move || {
                             sidecar::clear_wal_state(&cleanup_path);
                         });
+                        // Critical: Remove from dirty_stats on success to prevent WAL desync on future ops
                         ctx.dirty_stats.remove(&e.inode);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if new_dst_final.exists() {
+                            ctx.dirty_stats.remove(&e.inode);
                             return Ok(None);
                         }
                         error!("Rename failed (Source Missing) and not at Dest: {:?} -> {:?}. Triggering delayed repair.", old_dst_final, new_dst_final);
@@ -629,11 +648,13 @@ async fn process_single_event_inner(
                             active_repairs_clone.remove(&dst_clone_cleanup);
                             let _ = trigger_clone.0.try_send(parent_clone);
                         });
+                        // Critical: Remove from dirty_stats on failure to prevent phantom tracking
                         ctx.dirty_stats.remove(&e.inode);
                         return Ok(None);
                     },
                     Err(e) => {
                         ctx.failure_state.record_failure();
+                        ctx.dirty_stats.remove(&e.inode);
                         return Err(e);
                     }
                 }
