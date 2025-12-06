@@ -35,12 +35,29 @@ use libc;
 use std::os::unix::io::AsRawFd;
 
 fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
-    let src_file = std::fs::File::open(src)?;
+    if let Some(parent) = dst.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!("Copy Reflink: Failed to create parent {:?}: {}", parent, e);
+            }
+        }
+    }
+
+    let src_file = std::fs::File::open(src).map_err(|e| {
+        warn!("Copy Reflink: Failed to open source {:?}: {}", src, e);
+        e
+    })?;
+    
     let dst_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(dst)?;
+        .open(dst)
+        .map_err(|e| {
+            warn!("Copy Reflink: Failed to open destination {:?}: {}", dst, e);
+            e
+        })?;
+
     let src_fd = src_file.as_raw_fd();
     let dst_fd = dst_file.as_raw_fd();
     let len = src_file.metadata()?.len();
@@ -851,11 +868,16 @@ async fn process_single_event_inner(
                                         if current_src_abs.exists() {
                                             debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}",
                                                     old_dst_final_clone, current_src_abs, new_dst_final_clone);
-                                            if let Ok(_) = copy_with_reflink_sync(&current_src_abs, &new_dst_final_clone) {
+                                            match copy_with_reflink_sync(&current_src_abs, &new_dst_final_clone) {
+                                                Ok(_) => {
                                                     // Clean up ghost if it appeared
                                                     let _ = std::fs::remove_file(&old_dst_final_clone);
                                                     debug!("Worker: SELF-HEAL Success.");
                                                     return Ok(());
+                                                }
+                                                Err(e) => {
+                                                    warn!("Worker: SELF-HEAL Failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
