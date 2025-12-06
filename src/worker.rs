@@ -44,7 +44,7 @@ fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
     }
 
     let src_file = std::fs::File::open(src).map_err(|e| {
-        warn!("Copy Reflink: Failed to open source {:?}: {}", src, e);
+        debug!("Copy Reflink: Source {:?} not accessible: {}", src, e);
         e
     })?;
     
@@ -474,17 +474,13 @@ pub async fn run_worker(
 
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
 
-            // --- RESOLUTION LOGIC FIX ---
-            // For Rename/Unlink/Rmdir, we MUST use the parent_inode to reconstruct the
-            // OLD path because the IdentityProjector (BPF thread) may have already
-            // updated the inode_map to point to the NEW path.
+            // --- RESOLUTION LOGIC ---
             let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
                     let rel_path = pp.join(&e.name);
                     (target_cfg.path.join(rel_path), false, false)
                 } else {
-                    // Fallback to standard resolution if parent not found (rare, usually root)
                     match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                         ResolveResult::Success(p, s, n) => (p, s, n),
                         ResolveResult::NeedsRepair(synthetic_path) => {
@@ -497,7 +493,6 @@ pub async fn run_worker(
                     }
                 }
             } else {
-                // For Writes, Mkdir, etc., standard resolution (inode-based) is correct/preferred
                 match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                     ResolveResult::Success(p, s, n) => (p, s, n),
                     ResolveResult::NeedsRepair(synthetic_path) => {
@@ -565,7 +560,26 @@ pub async fn run_worker(
                         }
                         
                         if !src.exists() {
-                            debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Accepting deletion and dropping event {}.", worker_id, src, e.seq_num);
+                            // If source file is gone, verify if it was moved to the expected destination
+                            // This often happens in Rename events where the kernel processes the move faster than we do
+                            if let Some(new_name) = &e.new_name {
+                                let new_parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
+                                let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, new_parent_ino);
+                                if let Some(pp) = parent_path_opt {
+                                    let expected_rel = pp.join(new_name);
+                                    let expected_src = source.mount.join(&expected_rel);
+                                    if let Ok(meta) = std::fs::metadata(&expected_src) {
+                                        if meta.ino() == e.inode {
+                                            debug!("Worker {}: Source Race - File moved to {:?}. Updating operation.", worker_id, expected_src);
+                                            src = expected_src;
+                                            dst = target_cfg.path.join(expected_rel);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Accepting deletion.", worker_id, src);
                             break;
                         }
                         
@@ -862,11 +876,27 @@ async fn process_single_event_inner(
                                     }
                                     
                                     // Attempt to find where the source file actually is on source disk
-                                    let mut resolved_path = source_clone.inode_map.get_path(e_inode);
+                                    // HEURISTIC: First check where it *should* be (the new path) to save a full walk
+                                    let mut resolved_path = None;
+                                    let mut tried_heuristic = false;
                                     
-                                    // If RAM cache misses, try Full Walk
-                                    if resolved_path.is_none() {
-                                        resolved_path = identity::resolve_and_update_path(&source_clone, e_inode, 0, 0, 0).ok();
+                                    if let Ok(new_rel) = new_dst_final_clone.strip_prefix(&target_cfg_clone.path) {
+                                        let expected_src = source_mount.join(new_rel);
+                                        if let Ok(meta) = std::fs::metadata(&expected_src) {
+                                            if meta.ino() == e_inode {
+                                                 resolved_path = Some(new_rel.to_path_buf());
+                                                 tried_heuristic = true;
+                                            }
+                                        }
+                                    }
+
+                                    // Fallback to cache/walk
+                                    if !tried_heuristic {
+                                        resolved_path = source_clone.inode_map.get_path(e_inode);
+                                        
+                                        if resolved_path.is_none() {
+                                            resolved_path = identity::resolve_and_update_path(&source_clone, e_inode, 0, 0, 0).ok();
+                                        }
                                     }
 
                                     if let Some(rel) = resolved_path {
