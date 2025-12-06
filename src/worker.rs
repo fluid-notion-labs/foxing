@@ -1,7 +1,6 @@
 use io_uring::IoUring;
 use tokio::sync::mpsc;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
 use std::io;
 use crate::metrics;
@@ -9,7 +8,8 @@ use parking_lot::Mutex;
 use lru::LruCache;
 use crate::identity::{self, ResolveResult};
 use crate::security;
-use crate::wal::{WalStateMap, WalState, clear_wal_state_for_inode};
+// Cleaned up unused imports: WalGuard was unused.
+use crate::wal::{WalState};
 use nix::sys::statvfs::statvfs;
 use crate::config::{Config, TargetConfig};
 use crate::error::{FoxingError, Result};
@@ -32,9 +32,8 @@ use crate::mirror::SourceInfo;
 use std::os::unix::fs::MetadataExt;
 use libc;
 use std::os::unix::io::AsRawFd;
-
-// Removed: use crate::collections::HashMap;
-// Removed: use crate::wal::WalStateMap;
+// Re-import WalGuard as it is used inside the retry loop
+use crate::wal::WalGuard;
 
 fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
     if let Some(parent) = dst.parent() {
@@ -80,6 +79,7 @@ fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
     if ret == 0 {
         return Ok(len);
     }
+    // Fallback if reflink fails
     std::fs::copy(src, dst)
 }
 #[derive(Debug)]
@@ -115,7 +115,6 @@ impl ShardedLockCache {
 }
 struct WorkerContext<'a> {
     ring: &'a mut IoUring,
-    // Removed: dirty_stats: &'a mut HashMap<u64, DirtyEntry>,
     vdo_tuner: &'a mut VdoTuner,
     failure_state: &'a mut FailureState,
     capacity_breaker: &'a CircuitBreaker,
@@ -224,6 +223,10 @@ pub async fn run_worker(
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
     let mut recent_bytes_processed = 0u64;
+    
+    // Alias wal_map outside the loop
+    let wal_map = &source.wal_state_map;
+
     // --- Main Event Loop ---
     let _result: Result<()> = loop {
         // 1. Hibernation Check
@@ -404,15 +407,18 @@ pub async fn run_worker(
             };
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
             let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
+                // If it's a structural metadata event, try to resolve the parent path first
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
                     let rel_path = pp.join(&e.name);
                     (target_cfg.path.join(rel_path), false, false)
                 } else {
+                    // Fallback to name-only resolution
                     let rel_path = PathBuf::from(e.name.trim_start_matches('/'));
                     (target_cfg.path.join(rel_path), true, false)
                 }
             } else {
+                // Use the standard resolution path
                 match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                     ResolveResult::Success(p, s, n) => (p, s, n),
                     ResolveResult::NeedsRepair(synthetic_path) => {
@@ -448,10 +454,27 @@ pub async fn run_worker(
                 ).await;
                 match res {
                     Ok(Some(stats)) => {
+                        // Success path for Write/Create/WriteRange
                         recent_bytes_processed += stats.bytes_processed;
+                        if e.inode != 0 {
+                            // Fixed E0451: Using WalStateMap::get_entry_for_inode() and WalStateMap::rearm_guard()
+                            if let Some(entry) = wal_map.get_entry_for_inode(e.inode) {
+                                if entry.state == WalState::CommitPending { // Check state first
+                                    if let Some(mut guard) = wal_map.rearm_guard(entry) {
+                                        wal_map.commit(&mut guard);
+                                    }
+                                }
+                            }
+                        }
                         break;
                     },
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // Success path for Mkdir, Unlink, Rmdir, etc. (non-copy ops)
+                        if e.inode != 0 {
+                            wal_map.clear_wal_state(e.inode);
+                        }
+                        break;
+                    },
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if attempts >= max_retries {
                              warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping & Repairing.", worker_id, e.seq_num, e.inode, max_retries);
@@ -489,7 +512,7 @@ pub async fn run_worker(
                                     let expected_src = source.mount.join(&expected_rel);
                                     if let Ok(meta) = std::fs::metadata(&expected_src) {
                                         if meta.ino() == e.inode {
-                                            debug!("Worker {}: Source Race - File moved from {:?} to {:?}. Retrying op.", worker_id, src, expected_src);
+                                            debug!("Worker {}: Source Race: File moved from {:?} to {:?}. Retrying op.", worker_id, src, expected_src);
                                             src = expected_src;
                                             dst = target_cfg.path.join(expected_rel);
                                             continue;
@@ -504,8 +527,12 @@ pub async fn run_worker(
                         sleep(sleep_duration).await;
                         continue;
                     },
-                    Err(e) => {
-                        error!("Worker {}: Event failed with non-recoverable error: {:?}", worker_id, e);
+                    Err(err) => {
+                        error!("Worker {}: Event failed with non-recoverable error: {:?}", worker_id, err);
+                        // Ensure WAL state is cleared on non-recoverable errors
+                        if e.inode != 0 { 
+                            wal_map.clear_wal_state(e.inode);
+                        }
                         break;
                     }
                 }
@@ -534,24 +561,26 @@ async fn process_single_event_inner(
 ) -> Result<Option<CopyStats>> {
     let inode = e.inode;
     let wal_map = &source.wal_state_map;
+    let source_clone = source.clone(); // Clone Arc<SourceInfo> here for spawn_blocking blocks
     
-    // Sidecar / Synthetic Identity Creation (unchanged)
+    // ... [Creation Logic remains the same] ...
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
-        let target_cfg_clone = target_cfg.clone();
+        let _target_cfg_path_clone = target_cfg.path.clone();
         let e_dev = e.dev_id;
         let e_generation = e.generation;
         let e_ts = e.timestamp_ns;
         let e_seq = e.seq_num;
-        let source_map = source.inode_map.clone();
-        let source_dir_map = source.dir_map.clone();
+        let source_map_clone = source.inode_map.clone();
+        let source_dir_map_clone = source.dir_map.clone(); // Unused, but kept for context if needed later
+        
         let res = tokio::task::spawn_blocking(move || {
-            let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
+            let identity_dir = _target_cfg_path_clone.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
-                    if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
-                        identity::update_map(&source_map, &source_dir_map, e_dev, inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
+                    if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
+                        identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
                     }
                     Ok(())
                 },
@@ -568,10 +597,9 @@ async fn process_single_event_inner(
             return Ok(None);
         }
     }
-    
-    // WAL State Tracking (Phase 1: Intent)
     let mut wal_guard = None;
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
+        // Attempt to begin WAL write
         match wal_map.begin_write(inode, dst.clone(), e.seq_num, ctx.daemon_id.to_string(), e.projid) {
             Ok(guard) => wal_guard = Some(guard),
             Err(e) => {
@@ -585,33 +613,30 @@ async fn process_single_event_inner(
             }
         }
     }
-
     let res = match e.event_type {
         EventType::Write | EventType::Create | EventType::WriteRange => {
             let mut wal_guard_val = wal_guard.ok_or_else(|| {
                 FoxingError::Io(io::Error::new(io::ErrorKind::Other, "WAL guard missing for write operation"))
             })?;
-            
             let dst_clone = dst.clone();
             let e_offset = e.offset;
             let e_len = e.length;
             let mut src_clone_for_metadata = src.clone();
             
-            // WAL Phase 2: InProgress (updates the guard and map state)
+            // Advance WAL state to InProgress before starting IO
             wal_map.advance(&mut wal_guard_val, WalState::InProgress)?;
-
-            // Metadata check with race handling
+            
             let mut metadata_result = tokio::task::spawn_blocking({
                 let p = src_clone_for_metadata.clone();
                 move || std::fs::metadata(&p)
             }).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
-            
+
             if metadata_result.is_err() {
+                // Aggressive lookup on source path failure
                 let resolved_path = tokio::task::spawn_blocking({
-                    let source_clone = source.clone();
+                    let source_clone = source_clone.clone();
                     move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
                 }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-                
                 if let Ok(new_rel_path) = resolved_path {
                     let new_src = source.mount.join(new_rel_path);
                     debug!("Source Race: File moved from {:?} to {:?}. Retrying op.", src_clone_for_metadata, new_src);
@@ -619,12 +644,10 @@ async fn process_single_event_inner(
                     metadata_result = tokio::task::spawn_blocking(move || std::fs::metadata(&new_src)).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
                 }
             }
-            
             if let Ok(m) = metadata_result {
                 if m.is_file() {
                     let current_src_size = m.len();
                     let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
-                    
                     let copy_res = SmartCopier::copy(
                         &src_clone_for_metadata,
                         &dst_clone,
@@ -640,36 +663,36 @@ async fn process_single_event_inner(
                         dst_rwf_uncached_ok,
                         target_cfg.vdo_stall_threshold,
                     ).await;
-                    
                     match copy_res {
                         Ok(stats) => {
-                            // WAL Phase 3: CommitPending (updates the guard and map state)
+                            // Advance WAL state to CommitPending after successful copy
                             wal_map.advance(&mut wal_guard_val, WalState::CommitPending)?;
                             
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
-
-                            // Background metadata sync
+                            
                             let apply_dst = dst_clone.clone();
                             let apply_src = src_clone_for_metadata.clone();
-                            let source_clone_apply = source.clone(); // <-- FIX: Clone source for 'static closure
                             let _ = tokio::task::spawn_blocking(move || {
                                 security::sync_xattrs(&apply_src, &apply_dst);
                                 security::apply_metadata(&apply_src, &apply_dst)
                             }).await;
                             
-                            // The WalGuard remains active until the Fsync event completes.
+                            // Commit the WAL explicitly before returning Ok
+                            wal_map.commit(&mut wal_guard_val);
+                            
                             Ok(Some(stats))
                         },
-                        Err(e) => Err(e) 
+                        Err(e) => Err(e)
                     }
                 } else {
-                    // If metadata is lost during copy, clear WAL state
+                    // Source exists but is not a file (e.g., directory), clear WAL and skip.
                     wal_map.clear_wal_state(inode);
-                    Ok(None) 
+                    Ok(None)
                 }
             } else {
                 warn!("Source Missing: Failed to locate source for inode {} even after retry. ", inode);
+                // Source disappeared, clear WAL and indicate failure to outer loop (for possible retry/deletion)
                 wal_map.clear_wal_state(inode);
                 Ok(None)
             }
@@ -682,7 +705,7 @@ async fn process_single_event_inner(
                     match identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, parent_ino) {
                         Some(parent_rel) => parent_rel.join(new_name_str),
                         None => {
-                            let source_clone = source.clone();
+                            let source_clone = source_clone.clone();
                             let resolved = tokio::task::spawn_blocking(move || {
                                 identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
                             }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
@@ -702,6 +725,7 @@ async fn process_single_event_inner(
                 PathBuf::new()
             };
             if let Some(_new_name_str) = &e.new_name {
+                // Update identity map immediately for subsequent events
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,
@@ -713,21 +737,17 @@ async fn process_single_event_inner(
                     e.timestamp_ns,
                     e.seq_num
                 );
+                // Clear the directory map if a directory was renamed, forcing re-resolution of children
                 if is_dir {
                     source.dir_map.clear();
                 }
-                // Clone needed for logging OUTSIDE the closure.
-                let old_dst_final_log = dst.clone(); 
+                let old_dst_final_log = dst.clone();
                 let new_dst_final_log = target_cfg.path.join(&new_rel_path);
-                
-                // Paths moved into the closure must be cloned for it.
-                let old_dst_final_move = old_dst_final_log.clone(); 
+                let old_dst_final_move = old_dst_final_log.clone();
                 let new_dst_final_move = new_dst_final_log.clone();
-                
                 let source_mount = source.mount.clone();
-                let source_clone_rename = source.clone(); // Capture clone for blocking call
-                let wal_map_clone = wal_map.clone(); // Clone WalMap for use inside blocking loop
-                let target_cfg_clone = target_cfg.clone();
+                let source_clone_rename = source_clone.clone();
+                let wal_map_clone = wal_map.clone();
                 let new_rel_path_clone = new_rel_path.clone();
                 
                 let res = tokio::task::spawn_blocking(move || {
@@ -736,12 +756,12 @@ async fn process_single_event_inner(
                     loop {
                         match atomic_rename(&old_dst_final_move, &new_dst_final_move) {
                             Ok(_) => {
+                                // WAL clear handled by atomic_rename's internal Journal::end() on the target
                                 wal_map_clone.clear_wal_state(inode);
                                 return Ok(());
                             },
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                                 let elapsed = start.elapsed();
-                                
                                 if let Some(parent) = new_dst_final_move.parent() {
                                     if !parent.exists() {
                                         debug!("Worker: Rename target dir {:?} missing. Creating.", parent);
@@ -749,21 +769,21 @@ async fn process_single_event_inner(
                                         continue;
                                     }
                                 }
-                                
                                 if !old_dst_final_move.exists() {
                                     if new_dst_final_move.exists() {
+                                         // Target exists, source disappeared -> assume success from a previous attempt
                                          debug!("Worker: Rename target {:?} already exists. Assuming previous success.", new_dst_final_move);
-                                         wal_map_clone.clear_wal_state(inode); 
+                                         wal_map_clone.clear_wal_state(inode);
                                          return Ok(());
                                     }
-                                    
+                                    // Source disappeared, target doesn't exist -> self-heal from current source path
                                     let resolved_path = identity::resolve_and_update_path(&source_clone_rename, inode, 0, 0, 0).ok();
-                                    
                                     if let Some(rel) = resolved_path {
                                         let current_src_abs = source_mount.join(&rel);
                                         if current_src_abs.exists() {
                                             debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}",
                                                     old_dst_final_move, current_src_abs, new_dst_final_move);
+                                            // The self-heal target MUST be the final destination to correctly clear the WAL/locks.
                                             match copy_with_reflink_sync(&current_src_abs, &new_dst_final_move) {
                                                 Ok(_) => {
                                                     let _ = std::fs::remove_file(&old_dst_final_move);
@@ -777,10 +797,8 @@ async fn process_single_event_inner(
                                             }
                                         }
                                     }
-                                    
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, "Source disappeared")));
                                 }
-                                
                                 if elapsed > max_wait {
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
                                 }
@@ -802,11 +820,10 @@ async fn process_single_event_inner(
                         }
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
-                
+
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
-                        // Use the variables kept outside the closure for logging
                         info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final_log, new_dst_final_log);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
@@ -814,6 +831,8 @@ async fn process_single_event_inner(
                             wal_map.clear_wal_state(inode);
                             return Ok(None);
                         }
+                        // This case implies both source and target are missing. Send a hydration trigger for the NEW path
+                        // in case the source identity has shifted again, or the file exists somewhere else.
                         warn!("Worker {}: Source disappeared during rename. Triggering repair for NEW path: {:?}.", worker_id, new_rel_path_clone);
                         let new_src = source.mount.join(&new_rel_path_clone);
                         if let Err(_) = hydration_trigger.0.try_send((new_src, Some(inode))) {
@@ -823,6 +842,7 @@ async fn process_single_event_inner(
                         return Ok(None);
                     },
                     Err(io_err) => {
+                        // All other errors are true failures, record and propagate
                         ctx.failure_state.record_failure();
                         wal_map.clear_wal_state(inode);
                         return Err(io_err);
@@ -831,15 +851,18 @@ async fn process_single_event_inner(
                 return Ok(None);
             } else { return Ok(None); }
         },
+        // ... [Remaining EventType match arms remain the same] ...
         EventType::Mkdir => {
             let dst_clone = dst.clone();
-            let source_map_clone = source.inode_map.clone();
-            let source_dir_map_clone = source.dir_map.clone();
+            let _target_cfg_path_clone = target_cfg.path.clone();
             let e_dev = e.dev_id;
             let e_generation = e.generation;
             let e_seq = e.seq_num;
             let e_ts = e.timestamp_ns;
-            let _target_cfg_path_clone = target_cfg.path.clone(); // FIX: Prefix unused variable with _
+            // Cloned outside move closure to satisfy 'static requirement
+            let source_map_clone = source.inode_map.clone();
+            let source_dir_map_clone = source.dir_map.clone();
+
             let res = tokio::task::spawn_blocking(move || {
                 let r = std::fs::create_dir_all(&dst_clone);
                 if r.is_ok() {
@@ -866,43 +889,62 @@ async fn process_single_event_inner(
              Ok(None)
         },
         EventType::Fsync => {
-            // Find if there's a CommitPending entry for this inode
-            if let Some(wal_guard_entry) = wal_map.get_entry_for_inode(inode) { 
+            if let Some(wal_guard_entry) = wal_map.get_entry_for_inode(inode) {
                 if wal_guard_entry.state == WalState::CommitPending {
                     debug!("Fsync: Committing epoch for Inode {} (Seq {})", inode, wal_guard_entry.seq);
                     let dst_clone = wal_guard_entry.path.clone();
                     let seq = wal_guard_entry.seq;
-                    let projid = wal_guard_entry.projid; 
-                    
-                    // Epoch commit requires I/O.
+                    let projid = wal_guard_entry.projid;
                     let commit_res = tokio::task::spawn_blocking(move || {
                         security::commit_epoch(&dst_clone, seq, projid)
                     }).await.map_err(FoxingError::Join).and_then(|r| r);
-                    
                     match commit_res {
                         Ok(_) => {
-                            // Epoch successfully committed, remove state.
                             wal_map.clear_wal_state(inode);
                             info!("Fsync: Inode {} Commit & WAL Clear OK.", inode);
                         },
                         Err(e) => {
-                            error!("Fsync: Failed to commit epoch for Inode {}: {:?}", inode, e);
-                            // Leave WAL state as CommitPending for recovery
+                            error!("Fsync: Failed to commit epoch for Inode {}: {:?}. Clearing WAL state for next attempt.", inode, e);
+                            wal_map.clear_wal_state(inode); // Clear on Fsync failure to prevent deadlock
                         }
                     }
+                } else if wal_guard_entry.state == WalState::InProgress {
+                    // Ignore Fsync if still in progress, the final commit will handle it.
+                    debug!("Fsync: Inode {} ignored, still InProgress.", inode);
                 }
             }
             Ok(None)
         }
-        _ => { 
-            Ok(None) 
+        EventType::Rmdir => {
+            let src_dev = e.dev_id;
+            identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
+            wal_map.clear_wal_state(inode);
+            let dst_clone = dst.clone();
+            let _res = tokio::task::spawn_blocking(move || {
+                if dst_clone.exists() {
+                    std::fs::remove_dir(&dst_clone)
+                } else {
+                    Ok(())
+                }
+            }).await;
+            Ok(None)
+        }
+        _ => {
+            // For other metadata, we just rely on the identity map update which happened earlier.
+            // Clear WAL state for safety if it exists (e.g., in case of stale Write Intent).
+            wal_map.clear_wal_state(inode);
+            Ok(None)
         }
     };
     match res {
-        Ok(stats_opt) => Ok(stats_opt),
+        Ok(stats_opt) => {
+            // This is the clean path for all operations. If a WAL guard existed and the operation
+            // completed, the necessary commit was performed inside the Write/Rename block.
+            Ok(stats_opt)
+        },
         Err(err) => {
+            // Error path - WAL was cleared inside the match arm or needs clearing here
             wal_map.clear_wal_state(inode);
-            
             if let FoxingError::Io(io_err) = &err {
                 if let Some(28) = io_err.raw_os_error() {
                      error!("TARGET FULL (ENOSPC).");

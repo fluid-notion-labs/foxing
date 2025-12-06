@@ -1,5 +1,4 @@
 use thiserror::Error;
-
 #[derive(Error, Debug)]
 pub enum FoxingError {
     #[error("Config: {0}")] Config(String),
