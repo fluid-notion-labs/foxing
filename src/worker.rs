@@ -427,7 +427,10 @@ pub async fn run_worker(
              if e.event_type == EventType::SequenceGap {
                  warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
                  let path = target_cfg.path.clone();
-                 let _ = hydration_trigger.0.try_send(path);
+                 // Add error checking for trigger
+                 if let Err(_) = hydration_trigger.0.try_send(path.clone()) {
+                     warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for gap at {:?}", worker_id, path);
+                 }
                  continue;
              }
 
@@ -530,8 +533,10 @@ pub async fn run_worker(
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if attempts >= max_retries {
                              warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping & Repairing.", worker_id, e.seq_num, e.inode, max_retries);
-                             // FOXING FIX: Trigger repair on give-up
-                             let _ = hydration_trigger.0.try_send(src.clone());
+                             // FOXING FIX: Trigger repair on give-up, with logging
+                             if let Err(_) = hydration_trigger.0.try_send(src.clone()) {
+                                 warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for {:?}", worker_id, src);
+                             }
                              break;
                         }
                         
@@ -951,7 +956,9 @@ async fn process_single_event_inner(
                         
                         // Trigger repair for the NEW relative path (which should exist on source now)
                         let new_src = source.mount.join(&new_rel_path_clone);
-                        let _ = hydration_trigger.0.try_send(new_src);
+                        if let Err(_) = hydration_trigger.0.try_send(new_src) {
+                            warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for Rename Target", worker_id);
+                        }
                         
                         ctx.dirty_stats.remove(&e.inode);
                         return Ok(None);

@@ -60,8 +60,7 @@ impl HydrationQueue {
         tuner_board: TunerBoard,
         worker_count: usize
     ) -> (Self, Vec<tokio::task::JoinHandle<Result<()>>>) {
-        // FOXING DEBUG: Increased queue size from 1,000 to 100,000 to handle Metadata Storms.
-        // During torture tests, ~5000 events can generate thousands of repair requests if dropped.
+        // FOXING FIX: Queue size set to 100,000 to match the Channel in Mirror Manager
         let (tx, rx) = mpsc::channel(100_000);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let tracker = Arc::new(DashMap::new());
@@ -231,7 +230,9 @@ async fn process_hydration_job(
     if governor.is_system_stressed() || 
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain) 
     {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // FOXING FIX: Reduced stress throttle from 200ms to 10ms.
+        // During a storm, hydration is critical for recovery. 200ms was causing backup.
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // 3. Ensure Parent Exists
