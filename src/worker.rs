@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use lru::LruCache;
 use crate::identity::{self, ResolveResult};
 use crate::security;
-use crate::wal::{WalStateMap, WalState}; 
+use crate::wal::{WalStateMap, WalState, clear_wal_state_for_inode};
 use nix::sys::statvfs::statvfs;
 use crate::config::{Config, TargetConfig};
 use crate::error::{FoxingError, Result};
@@ -33,10 +33,8 @@ use std::os::unix::fs::MetadataExt;
 use libc;
 use std::os::unix::io::AsRawFd;
 
-// Note: DirtyEntry is now obsolete.
-// Removed: use crate::wal::{DirtyEntry, ExpectedState};
-// Removed: use crate::sidecar::{self, WalState};
-// Only import WalState and WalStateMap from wal module.
+// Removed: use crate::collections::HashMap;
+// Removed: use crate::wal::WalStateMap;
 
 fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
     if let Some(parent) = dst.parent() {
@@ -201,7 +199,7 @@ pub async fn run_worker(
     let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
     let capacity_threshold_mb = config_reader.capacity_threshold_mb;
-    let force_flush_base_secs = config_reader.force_flush_interval_secs;
+    let _force_flush_base_secs = config_reader.force_flush_interval_secs;
     let total_workers = config_reader.worker_count.max(1);
     let global_limit_mib = config.read().await.global_buffer_limit;
     // Dynamic memory partitioning
@@ -466,7 +464,7 @@ pub async fn run_worker(
                         let mut resolved_via_agressive_lookup = false;
                         if attempts == 1 {
                              let lookup_res = tokio::task::spawn_blocking({
-                                 let source_clone = source.clone();
+                                 let source_clone = source.clone(); // Capture clone for spawn_blocking
                                  let inode = e.inode;
                                  move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
                              }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
@@ -574,7 +572,7 @@ async fn process_single_event_inner(
     // WAL State Tracking (Phase 1: Intent)
     let mut wal_guard = None;
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
-        match wal_map.begin_write(inode, dst.clone(), e.seq_num, ctx.daemon_id.to_string()) {
+        match wal_map.begin_write(inode, dst.clone(), e.seq_num, ctx.daemon_id.to_string(), e.projid) {
             Ok(guard) => wal_guard = Some(guard),
             Err(e) => {
                 if let FoxingError::Io(io_err) = &e {
@@ -654,6 +652,7 @@ async fn process_single_event_inner(
                             // Background metadata sync
                             let apply_dst = dst_clone.clone();
                             let apply_src = src_clone_for_metadata.clone();
+                            let source_clone_apply = source.clone(); // <-- FIX: Clone source for 'static closure
                             let _ = tokio::task::spawn_blocking(move || {
                                 security::sync_xattrs(&apply_src, &apply_dst);
                                 security::apply_metadata(&apply_src, &apply_dst)
@@ -717,10 +716,17 @@ async fn process_single_event_inner(
                 if is_dir {
                     source.dir_map.clear();
                 }
-                let old_dst_final = dst.clone();
-                let new_dst_final = target_cfg.path.join(&new_rel_path);
+                // Clone needed for logging OUTSIDE the closure.
+                let old_dst_final_log = dst.clone(); 
+                let new_dst_final_log = target_cfg.path.join(&new_rel_path);
+                
+                // Paths moved into the closure must be cloned for it.
+                let old_dst_final_move = old_dst_final_log.clone(); 
+                let new_dst_final_move = new_dst_final_log.clone();
                 
                 let source_mount = source.mount.clone();
+                let source_clone_rename = source.clone(); // Capture clone for blocking call
+                let wal_map_clone = wal_map.clone(); // Clone WalMap for use inside blocking loop
                 let target_cfg_clone = target_cfg.clone();
                 let new_rel_path_clone = new_rel_path.clone();
                 
@@ -728,15 +734,15 @@ async fn process_single_event_inner(
                     let start = Instant::now();
                     let max_wait = Duration::from_secs(5);
                     loop {
-                        match atomic_rename(&old_dst_final, &new_dst_final) {
+                        match atomic_rename(&old_dst_final_move, &new_dst_final_move) {
                             Ok(_) => {
-                                wal_map.clear_wal_state(inode);
+                                wal_map_clone.clear_wal_state(inode);
                                 return Ok(());
                             },
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                                 let elapsed = start.elapsed();
                                 
-                                if let Some(parent) = new_dst_final.parent() {
+                                if let Some(parent) = new_dst_final_move.parent() {
                                     if !parent.exists() {
                                         debug!("Worker: Rename target dir {:?} missing. Creating.", parent);
                                         let _ = std::fs::create_dir_all(parent);
@@ -744,26 +750,25 @@ async fn process_single_event_inner(
                                     }
                                 }
                                 
-                                if !old_dst_final.exists() {
-                                    if new_dst_final.exists() {
-                                         debug!("Worker: Rename target {:?} already exists. Assuming previous success.", new_dst_final);
-                                         wal_map.clear_wal_state(inode); 
+                                if !old_dst_final_move.exists() {
+                                    if new_dst_final_move.exists() {
+                                         debug!("Worker: Rename target {:?} already exists. Assuming previous success.", new_dst_final_move);
+                                         wal_map_clone.clear_wal_state(inode); 
                                          return Ok(());
                                     }
                                     
-                                    let resolved_path = identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0).ok();
+                                    let resolved_path = identity::resolve_and_update_path(&source_clone_rename, inode, 0, 0, 0).ok();
                                     
                                     if let Some(rel) = resolved_path {
                                         let current_src_abs = source_mount.join(&rel);
                                         if current_src_abs.exists() {
                                             debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}",
-                                                    old_dst_final, current_src_abs, new_dst_final);
-                                            match copy_with_reflink_sync(&current_src_abs, &new_dst_final) {
+                                                    old_dst_final_move, current_src_abs, new_dst_final_move);
+                                            match copy_with_reflink_sync(&current_src_abs, &new_dst_final_move) {
                                                 Ok(_) => {
-                                                    let _ = std::fs::remove_file(&old_dst_final);
+                                                    let _ = std::fs::remove_file(&old_dst_final_move);
                                                     info!("Worker: SELF-HEAL Success.");
-                                                    // CRITICAL: Clear WAL state since self-heal bypasses WAL phases.
-                                                    wal_map.clear_wal_state(inode);
+                                                    wal_map_clone.clear_wal_state(inode);
                                                     return Ok(());
                                                 }
                                                 Err(e) => {
@@ -791,7 +796,7 @@ async fn process_single_event_inner(
                                 continue;
                             },
                             Err(e) => {
-                                wal_map.clear_wal_state(inode);
+                                wal_map_clone.clear_wal_state(inode);
                                 return Err(FoxingError::Io(e));
                             },
                         }
@@ -801,10 +806,11 @@ async fn process_single_event_inner(
                 match res {
                     Ok(_) => {
                         metrics::RENAME_EVENTS.inc();
-                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
+                        // Use the variables kept outside the closure for logging
+                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final_log, new_dst_final_log);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                        if new_dst_final.exists() {
+                        if new_dst_final_log.exists() {
                             wal_map.clear_wal_state(inode);
                             return Ok(None);
                         }
@@ -833,11 +839,11 @@ async fn process_single_event_inner(
             let e_generation = e.generation;
             let e_seq = e.seq_num;
             let e_ts = e.timestamp_ns;
-            let target_cfg_path_clone = target_cfg.path.clone();
+            let _target_cfg_path_clone = target_cfg.path.clone(); // FIX: Prefix unused variable with _
             let res = tokio::task::spawn_blocking(move || {
                 let r = std::fs::create_dir_all(&dst_clone);
                 if r.is_ok() {
-                    if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_path_clone) {
+                    if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
                         identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, true, e_ts, e_seq);
                     }
                 }
@@ -861,13 +867,13 @@ async fn process_single_event_inner(
         },
         EventType::Fsync => {
             // Find if there's a CommitPending entry for this inode
-            if let Some(mut wal_guard_entry) = wal_map.states.get_mut(&inode) {
+            if let Some(wal_guard_entry) = wal_map.get_entry_for_inode(inode) { 
                 if wal_guard_entry.state == WalState::CommitPending {
                     debug!("Fsync: Committing epoch for Inode {} (Seq {})", inode, wal_guard_entry.seq);
                     let dst_clone = wal_guard_entry.path.clone();
                     let seq = wal_guard_entry.seq;
-                    let projid = wal_guard_entry.projid;
-
+                    let projid = wal_guard_entry.projid; 
+                    
                     // Epoch commit requires I/O.
                     let commit_res = tokio::task::spawn_blocking(move || {
                         security::commit_epoch(&dst_clone, seq, projid)

@@ -8,6 +8,7 @@ use crate::error::{FoxingError, Result};
 use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
 use crate::metrics;
+use std::sync::Arc; // Needed for WalStateMap Arc in mirror.rs compile error
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalState {
@@ -30,10 +31,12 @@ pub struct PersistedWalEntry {
     pub daemon_id: String,
     // Note: Path is kept here for crash recovery logs/hydration checks
     pub path: PathBuf,
+    pub projid: u32, // <-- CONFIRMED: This is needed
     pub crc: u64,
 }
 
 // The core in-memory, inode-based WAL state store
+#[derive(Debug)] // <-- CONFIRMED: This is needed
 pub struct WalStateMap {
     // Keyed by inode (u64)
     states: DashMap<u64, PersistedWalEntry>,
@@ -53,7 +56,7 @@ impl WalStateMap {
     }
 
     /// Attempts to start a write operation and register IntentPending state.
-    pub fn begin_write(&self, inode: u64, path: PathBuf, seq: u64, daemon_id: String) -> Result<WalGuard> {
+    pub fn begin_write(&self, inode: u64, path: PathBuf, seq: u64, daemon_id: String, projid: u32) -> Result<WalGuard> {
         let current_state = self.get_state_for_inode(inode);
 
         if current_state != WalState::None {
@@ -64,38 +67,40 @@ impl WalStateMap {
             )));
         }
 
-        let entry = self.create_wal_entry(inode, WalState::IntentPending, seq, daemon_id, path);
+        let entry = self.create_wal_entry(inode, WalState::IntentPending, seq, daemon_id, path, projid);
 
-        match self.states.try_insert(inode, entry.clone()) {
-            Ok(_) => {
-                debug!("WAL: Inode {} -> IntentPending", inode);
-                Ok(WalGuard {
-                    map: self,
-                    inode,
-                    entry,
-                    needs_commit: true,
-                })
-            }
-            Err(e) => {
-                // Another thread beat us to the insertion.
-                Err(FoxingError::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("WAL Insertion Failed for Inode {}: {:?}", inode, e.current)
-                )))
-            }
+        // FIX: DashMap 5.x uses .insert(), not .try_insert()
+        if self.states.contains_key(&inode) {
+            // Should not happen due to the check above, but DashMap insert returns the old value
+            return Err(FoxingError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("WAL Insertion Failed for Inode {}: Key already present.", inode)
+            )));
         }
+        
+        self.states.insert(inode, entry.clone());
+        
+        debug!("WAL: Inode {} -> IntentPending", inode);
+        Ok(WalGuard {
+            map: self,
+            inode,
+            entry,
+            needs_commit: true,
+        })
     }
 
     /// Attempts to advance the WAL state for an existing guard.
     /// Fails if the current state in the map does not match the guard's expected state.
     pub fn advance(&self, guard: &mut WalGuard, to_state: WalState) -> Result<()> {
         let inode = guard.inode;
-        let expected_from = guard.entry.state;
+        // FIX: Clone the state to avoid move
+        let expected_from = guard.entry.state.clone(); 
 
         match self.states.get_mut(&inode) {
             Some(mut dash_entry) => {
+                // FIX: Clone the state to avoid move
                 if dash_entry.state != expected_from {
-                    let found = dash_entry.state;
+                    let found = dash_entry.state.clone();
                     metrics::WAL_COHERENCE_FAILURES.with_label_values(&["advance"]).inc();
                     error!("WAL Transition Mismatch for Inode {}: Expected {:?}, Found {:?}", inode, expected_from, found);
                     return Err(FoxingError::Io(io::Error::new(
@@ -104,12 +109,19 @@ impl WalStateMap {
                     )));
                 }
                 
-                // Create the new entry and update the DashMap and the guard's local copy
-                let new_entry = self.create_wal_entry(inode, to_state, guard.entry.seq, guard.entry.daemon_id.clone(), guard.entry.path.clone());
+                // FIX: Clone the state to avoid move
+                let new_entry = self.create_wal_entry(
+                    inode, 
+                    to_state.clone(), 
+                    guard.entry.seq, 
+                    guard.entry.daemon_id.clone(), 
+                    guard.entry.path.clone(),
+                    guard.entry.projid, // <-- FIX: Pass existing projid
+                );
                 *dash_entry = new_entry.clone();
                 guard.entry = new_entry;
                 
-                debug!("WAL: Inode {} Advanced to {:?}", inode, to_state);
+                debug!("WAL: Inode {} Advanced to {:?}", inode, to_state); // FIX: Borrow here
                 Ok(())
             }
             None => {
@@ -141,14 +153,15 @@ impl WalStateMap {
     }
 
     pub fn get_state_for_inode(&self, inode: u64) -> WalState {
-        self.states.get(&inode).map(|e| e.state).unwrap_or(WalState::None)
+        // FIX: Clone the state to avoid move
+        self.states.get(&inode).map(|e| e.state.clone()).unwrap_or(WalState::None)
     }
 
     pub fn get_entry_for_inode(&self, inode: u64) -> Option<PersistedWalEntry> {
         self.states.get(&inode).map(|r| r.clone())
     }
     
-    fn create_wal_entry(&self, inode: u64, state: WalState, seq: u64, daemon_id: String, path: PathBuf) -> PersistedWalEntry {
+    fn create_wal_entry(&self, inode: u64, state: WalState, seq: u64, daemon_id: String, path: PathBuf, projid: u32) -> PersistedWalEntry { // <-- FIX: Added projid
         let mut hasher = DefaultHasher::new();
         hasher.write_u64(seq);
         hasher.write(daemon_id.as_bytes());
@@ -161,6 +174,7 @@ impl WalStateMap {
             timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
             daemon_id,
             path,
+            projid, // <-- FIX: Set projid
             crc,
         }
     }
@@ -178,6 +192,11 @@ impl Drop for WalGuard<'_> {
 }
 
 // Helper function for external use (hydration/recovery)
-pub fn get_wal_state(wal_map: &WalStateMap, inode: u64) -> Option<PersistedWalEntry> {
+pub fn get_wal_state(wal_map: &Arc<WalStateMap>, inode: u64) -> Option<PersistedWalEntry> { // FIX: Changed signature to take Arc for hydration.rs
     wal_map.get_entry_for_inode(inode)
+}
+
+// Helper function for external use (hydration/worker self-heal/unlink)
+pub fn clear_wal_state_for_inode(wal_map: &Arc<WalStateMap>, inode: u64) {
+    wal_map.clear_wal_state(inode);
 }

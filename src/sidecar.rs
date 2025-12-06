@@ -6,9 +6,9 @@ use std::os::unix::io::AsRawFd;
 use libc;
 use std::io::{self, Seek, SeekFrom};
 use xattr;
-use tracing::{debug};
-use std::hash::Hasher;
-use std::collections::hash_map::DefaultHasher;
+// Removed: use tracing::{debug};
+// Removed: use std::hash::Hasher;
+// Removed: use std::collections::hash_map::DefaultHasher;
 
 // Note: WalState and PersistedWalEntry definitions have been moved to src/wal.rs
 
