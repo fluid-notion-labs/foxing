@@ -113,7 +113,6 @@ pub async fn run_worker(
     serialization: Arc<SerializationEngine>,
     daemon_id: String,
 ) -> Result<()> {
-    // Inode-Centric Causal Lanes: All workers are equal peers.
     info!("Worker {} started (Causal Lane)", worker_id);
 
     // If this is worker 0, we treat it as a seed worker for root identity, 
@@ -194,6 +193,9 @@ pub async fn run_worker(
     let mut cur_cap_total = 0u64;
     let mut is_hibernating = false;
     let mut shutdown_requested = false;
+    
+    // Accumulator for bandwidth tuning
+    let mut recent_bytes_processed = 0u64;
 
     let _result: Result<()> = loop {
         if !is_hibernating && failure_state.check_hibernation_needed() {
@@ -265,11 +267,10 @@ pub async fn run_worker(
                     let pending_len = coalescer.len();
                     let max_pending = target_cfg.queue_max;
                     let target_label = target_cfg.path.to_string_lossy().to_string();
-                    let bytes_processed = 0; // Stats are pushed on copy completion, this is just tick
                     
                     let _recommended_depth = tuner.tune(
                         tuner_tick_start.elapsed().as_secs_f64(),
-                        bytes_processed,
+                        recent_bytes_processed,
                         is_stressed,
                         pending_len,
                         max_pending,
@@ -277,6 +278,9 @@ pub async fn run_worker(
                         &target_label,
                         buffer_pool.chunk_size() as u64
                     );
+                    
+                    // Reset accumulator after feeding the tuner
+                    recent_bytes_processed = 0;
 
                     let next_interval_ms = tuner.current_flush_ms;
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(next_interval_ms));
@@ -456,7 +460,12 @@ pub async fn run_worker(
                 ).await;
 
                 match res {
-                    Ok(_) => break,
+                    Ok(Some(stats)) => {
+                        // Capture bandwidth stats for the tuner
+                        recent_bytes_processed += stats.bytes_processed;
+                        break;
+                    },
+                    Ok(None) => break,
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if attempts >= max_retries {
                              warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping.", worker_id, e.seq_num, e.inode, max_retries);
