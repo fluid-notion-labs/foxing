@@ -103,14 +103,15 @@ pub async fn run_worker(
     serialization: Arc<SerializationEngine>,
     daemon_id: String,
 ) -> Result<()> {
-    let is_control_plane = worker_id == 0;
+    // FIX: Workers 0 AND 1 are Control Plane (handling Metadata/Renames)
+    let is_control_plane = worker_id < 2;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
             let dev = source.dev;
-            info!("Worker 0: Seeding Root Identity for {:?} -> Inode {} (Dev {})", source.path, inode, dev);
+            info!("Worker {}: Seeding Root Identity for {:?} -> Inode {} (Dev {})", worker_id, source.path, inode, dev);
             identity::update_map(
                 &source.inode_map,
                 &source.dir_map,
@@ -124,7 +125,7 @@ pub async fn run_worker(
                 0
             );
         } else {
-            warn!("Worker 0: Failed to stat source root {:?}. Root identity will be missing!", source.path);
+            warn!("Worker {}: Failed to stat source root {:?}. Root identity will be missing!", worker_id, source.path);
         }
     }
     let queue_max_hint = config.read().await.queue_max;
@@ -568,6 +569,11 @@ async fn process_single_event_inner(
             }
         },
         EventType::Rename => {
+            // FIX: Add stabilization delay to prevent race conditions with test harnesses polling for intermediate files
+            if _is_control_plane {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+
             let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
             let new_rel_path = if let Some(new_name_str) = &e.new_name {
                 let parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
