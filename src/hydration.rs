@@ -17,12 +17,14 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use crate::consistency::SerializationEngine;
 use crate::wal::{WalState, get_wal_state};
+
 #[derive(Debug)]
 pub struct HydrationState {
     pub active: AtomicBool,
     pub scanned: AtomicU64,
     pub synced: AtomicU64,
 }
+
 impl Default for HydrationState {
     fn default() -> Self {
         Self {
@@ -32,6 +34,7 @@ impl Default for HydrationState {
         }
     }
 }
+
 pub struct Hydrator {
     pub source: Arc<SourceInfo>,
     pub targets: Vec<TargetConfig>,
@@ -41,6 +44,7 @@ pub struct Hydrator {
     serialization_engines: HashMap<PathBuf, Arc<SerializationEngine>>,
     daemon_id: String,
 }
+
 impl Hydrator {
     pub fn new(
         source: Arc<SourceInfo>,
@@ -53,6 +57,7 @@ impl Hydrator {
     ) -> Self {
         Self { source, targets, governor, tuner_board, repair_txs, serialization_engines, daemon_id }
     }
+
     pub fn repair_path(&self, path: PathBuf) {
         debug!("Hydration: Targeted repair requested for {:?}", path);
         if let Ok(metadata) = fs::metadata(&path) {
@@ -79,7 +84,7 @@ impl Hydrator {
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
-                     self.queue_deletion(rel, path.is_dir()); // Pass type flag
+                     self.queue_deletion(rel, path.is_dir());
                  }
              }
              return;
@@ -88,13 +93,14 @@ impl Hydrator {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }
     }
+
     fn queue_deletion(&self, rel: &Path, is_dir: bool) {
         if self.repair_txs.is_empty() { return; }
         let path_str = rel.to_string_lossy();
         let idx = (path_str.len()) % self.repair_txs.len();
         let event_type = if is_dir { EventType::Rmdir } else { EventType::Unlink };
         let evt = Event {
-            event_type, // Use determined event type
+            event_type,
             dev_id: self.source.dev,
             inode: 0, parent_inode: 0, new_parent_inode: 0,
             seq_num: 0, offset: 0, length: 0,
@@ -107,6 +113,7 @@ impl Hydrator {
             warn!("Hydration: Priority Lane FULL for deletion of {:?}. This implies extreme overload.", rel);
         }
     }
+
     pub fn full_scan(&self) {
         if self.source.hydration.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             warn!("Hydration: Scan requested but ALREADY ACTIVE for {:?}. Skipping.", self.source.path);
@@ -153,7 +160,7 @@ impl Hydrator {
                                         let _ = fs::create_dir_all(&parent_path);
                                     }
                                 }
-                                self.queue_deletion(rel, target_path.is_dir()); // Pass type flag
+                                self.queue_deletion(rel, target_path.is_dir());
                             }
                         }
                     }
@@ -164,6 +171,7 @@ impl Hydrator {
         self.source.hydration.active.store(false, Ordering::SeqCst);
         metrics::HYDRATION_ACTIVE.with_label_values(&[&dev_str]).set(0.0);
     }
+
     pub fn start_watcher(self: Arc<Self>) -> Result<RecommendedWatcher> {
         let s = self.clone();
         let path = self.source.path.clone();
@@ -180,6 +188,7 @@ impl Hydrator {
                 debug!("Hydration: Processor thread stopped.");
             })
             .map_err(|e| crate::error::FoxingError::Io(e))?;
+
         let mut watcher = notify::recommended_watcher(move |res: std::result::Result<notify::Event, notify::Error>| {
             match res {
                 Ok(event) => {
@@ -194,11 +203,14 @@ impl Hydrator {
                 Err(e) => warn!("Inotify watch error: {:?}", e),
             }
         }).map_err(|e| crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
         watcher.watch(&path, RecursiveMode::Recursive)
             .map_err(|e| crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
         info!("Hydration: Inotify watcher started for {:?}", path);
         Ok(watcher)
     }
+
     pub fn process_path(&self, path: &Path, urgent: bool, kind: Option<EventKind>) -> Result<()> {
         let rel = match path.strip_prefix(&self.source.mount) {
             Ok(r) => r.to_path_buf(),
@@ -208,9 +220,11 @@ impl Hydrator {
             Ok(meta) => meta,
             Err(_) => return Ok(()),
         };
+
         let ino = m.ino();
         let dev = m.dev() as u32;
         let is_dir = m.is_dir();
+
         identity::update_map(
             &self.source.inode_map,
             &self.source.dir_map,
@@ -223,21 +237,27 @@ impl Hydrator {
             u64::MAX,
             u64::MAX
         );
+
         if !urgent {
             self.source.hydration.scanned.fetch_add(1, Ordering::Relaxed);
         } else {
             metrics::LIVE_ADDITIONS.inc();
         }
+
         if let Some(EventKind::Modify(_)) = kind {
             return Ok(());
         }
+
         let bulk_job_queue = self.source.bulk_job_queue.lock();
         let queue_sender = bulk_job_queue.as_ref().expect("Bulk hydration queue must be initialized.");
+
         for target_cfg in &self.targets {
             if !urgent {
                 self.check_tuner_pause(target_cfg);
             }
+
             let is_dir_meta = m.is_dir() || m.is_symlink();
+
             if m.is_file() && (m.len() > 0 || urgent) {
                 if self.sync_file_needed(path, rel.as_path(), &m, ino, target_cfg)? {
                     queue_sender.submit_job(rel.clone(), target_cfg.clone(), None);
@@ -259,6 +279,7 @@ impl Hydrator {
         }
         Ok(())
     }
+
     fn priority_mkdir(&self, rel: &Path, ino: u64) {
         if self.repair_txs.is_empty() { return; }
         let evt = Event {
@@ -276,6 +297,7 @@ impl Hydrator {
             warn!("Hydration: Priority Lane FULL for deletion of {:?}. This implies extreme overload.", rel);
         }
     }
+
     fn sync_symlink(&self, src_path: &Path, rel: &Path, _m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<()> {
         let dst_path = target_cfg.path.join(rel);
         let needs_sync = if let Ok(target) = fs::read_link(src_path) {
@@ -283,6 +305,7 @@ impl Hydrator {
                 target != existing
             } else { true }
         } else { false };
+
         if needs_sync {
             if !self.repair_txs.is_empty() {
                 let path_str = rel.to_string_lossy();
@@ -302,6 +325,7 @@ impl Hydrator {
         }
         Ok(())
     }
+
     fn sync_file_needed(&self, src_path: &Path, rel: &Path, m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<bool> {
         let dst_path = target_cfg.path.join(rel);
         if let Some(wal_entry) = get_wal_state(&self.source.wal_state_map, ino) {
@@ -310,45 +334,49 @@ impl Hydrator {
                 self.source.wal_state_map.clear_wal_state(ino);
                 return Ok(true);
             }
+
             let mut is_active_worker = false;
             if let Some(engine) = self.serialization_engines.get(&target_cfg.path) {
                 if engine.is_active(ino) {
                     is_active_worker = true;
                 }
             }
+
             if is_active_worker {
                 debug!("Hydration: Skipping {:?} - active write in progress by worker", dst_path);
                 return Ok(false);
             }
+
             match wal_entry.state {
                 WalState::IntentPending => {
-                    info!("Hydration: Clearing stale INTENT_PENDING flag for {:?}.", dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino);
+                    info!("Hydration: Attempting to clear stale INTENT_PENDING flag for {:?}.", dst_path);
+                    self.source.wal_state_map.remove_stale_wal_entry(ino, WalState::IntentPending);
                 },
                 WalState::InProgress => {
-                    warn!("Hydration: Found STALE/CRASHED write ({:?}) for {:?}. Forcing repair.", wal_entry.state, dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino);
+                    warn!("Hydration: Found STALE/CRASHED write for {:?}. Forcing repair.", dst_path);
+                    self.source.wal_state_map.remove_stale_wal_entry(ino, WalState::InProgress);
                     return Ok(true);
                 },
                 WalState::CommitPending => {
                     if let Ok(meta) = std::fs::metadata(&dst_path) {
                         if meta.len() == m.len() && meta.mtime() == m.mtime() {
                              info!("Hydration: WAL CommitPending but file matches source. Assuming valid: {:?}", dst_path);
-                             self.source.wal_state_map.clear_wal_state(ino);
+                             self.source.wal_state_map.remove_stale_wal_entry(ino, WalState::CommitPending);
                              return Ok(false);
                         }
                     }
                     warn!("Hydration: Found UNCOMMITTED write for {:?}. Forcing repair.", dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino);
+                    self.source.wal_state_map.remove_stale_wal_entry(ino, WalState::CommitPending);
                     return Ok(true);
                 },
                 _ => {
-                    warn!("Hydration: Found Unknown WAL state for {:?}. Forcing repair.", dst_path);
+                    warn!("Hydration: Found Unknown WAL state for {:?}. Clearing for repair.", dst_path);
                     self.source.wal_state_map.clear_wal_state(ino);
                     return Ok(true);
                 }
             }
         }
+
         let needs_sync = {
             match std::fs::OpenOptions::new().read(true).write(true).open(&dst_path) {
                 Ok(df) => {
@@ -360,6 +388,7 @@ impl Hydrator {
                         let dst_parent = dst_path.parent().unwrap_or(&dst_path);
                         let integrity_hash = security::get_valid_dir_hash(src_parent);
                         let target_hash = security::calc_dir_integrity_hash_target(dst_parent).unwrap_or(0);
+
                         if dm.len() != m.len() { true }
                         else if integrity_hash != 0 && integrity_hash == target_hash {
                             metrics::HYDRATION_HASH_SKIPPED.inc();
@@ -372,8 +401,10 @@ impl Hydrator {
                 Err(_) => true
             }
         };
+
         Ok(needs_sync)
     }
+
     fn sync_special(&self, _src_path: &Path, rel: &Path, m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<()> {
         let dst_path = target_cfg.path.join(rel);
         if !dst_path.exists() {
@@ -395,6 +426,7 @@ impl Hydrator {
         }
         Ok(())
     }
+
     fn sync_dir_hash(&self, rel: &Path, target_cfg: &TargetConfig) -> Result<()> {
         let dst_dir_path = target_cfg.path.join(rel);
         if !dst_dir_path.exists() {
@@ -413,6 +445,7 @@ impl Hydrator {
         }
         Ok(())
     }
+
     fn check_tuner_pause(&self, target_cfg: &TargetConfig) {
         if let Some(state) = self.tuner_board.get(&target_cfg.path) {
             match *state.value() {

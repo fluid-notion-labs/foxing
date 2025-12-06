@@ -1,3 +1,4 @@
+
 use std::path::PathBuf;
 use std::time::SystemTime;
 use serde::{Serialize, Deserialize};
@@ -39,16 +40,18 @@ pub struct WalGuard<'a> {
     map: &'a WalStateMap,
     inode: u64,
     entry: PersistedWalEntry,
-    needs_commit: bool,
+    // Flag to indicate if the caller successfully committed the operation.
+    // If true, drop() will NOT rollback. If false, drop() performs rollback.
+    committed: bool,
 }
 impl WalStateMap {
-    // --- FIX: Restore missing constructor ---
     pub fn new() -> Self {
         Self { states: DashMap::new() }
     }
-    // ----------------------------------------
-
     pub fn begin_write<'a>(&'a self, inode: u64, path: PathBuf, seq: u64, daemon_id: String, projid: u32) -> Result<WalGuard<'a>> {
+        if inode == 0 {
+             return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, "Inode 0 is forbidden for WAL entries.")));
+        }
         let current_state = self.get_state_for_inode(inode);
         if current_state != WalState::None {
             return Err(FoxingError::Io(io::Error::new(
@@ -70,24 +73,32 @@ impl WalStateMap {
             map: self,
             inode,
             entry,
-            needs_commit: true,
+            committed: false,
         })
     }
-
-    // NEW: Public method to rearm the guard for external commitment (e.g., after successful copy).
+    // NEW: Public method to signal success without relying on drop() to commit.
+    pub fn mark_committed(&self, guard: &mut WalGuard) {
+        if let Some((_, entry)) = self.states.remove(&guard.inode) {
+            debug!("WAL: Inode {} Commit OK (State was {:?}). Removed from map.", guard.inode, entry.state);
+        } else {
+            debug!("WAL: Inode {} Commit OK: Entry already missing (Acceptable Race).", guard.inode);
+        }
+        guard.committed = true;
+    }
+    // Updated signature: use WalGuard
     pub fn rearm_guard<'a>(&'a self, entry: PersistedWalEntry) -> Option<WalGuard<'a>> {
         if entry.state == WalState::CommitPending {
              Some(WalGuard {
                  map: self,
                  inode: entry.inode,
                  entry,
-                 needs_commit: true, // It needs a commit call to clean up state
+                 committed: false,
              })
         } else {
             None
         }
     }
-
+    // Updated to handle WalGuard struct
     pub fn advance(&self, guard: &mut WalGuard, to_state: WalState) -> Result<()> {
         let inode = guard.inode;
         let expected_from = guard.entry.state.clone();
@@ -96,8 +107,6 @@ impl WalStateMap {
                 if dash_entry.state != expected_from {
                     let found = dash_entry.state.clone();
                     metrics::WAL_COHERENCE_FAILURES.with_label_values(&["advance"]).inc();
-                    // This is a major issue: the state of the entry changed outside of the guard's control.
-                    // We must fail hard, but also ensure the entry is cleaned up if it's already committed.
                     error!("WAL Transition Mismatch for Inode {}: Expected {:?}, Found {:?}", inode, expected_from, found);
                     return Err(FoxingError::Io(io::Error::new(
                         io::ErrorKind::Other,
@@ -127,22 +136,16 @@ impl WalStateMap {
             }
         }
     }
+    // Updated: Use mark_committed instead of this public commit function for WalGuard.
+    // Kept only for non-guarded operations if necessary, but marked for removal.
     pub fn commit(&self, guard: &mut WalGuard) {
-        // Only attempt to remove and set needs_commit=false. Don't worry if it's already gone.
-        if let Some((_, entry)) = self.states.remove(&guard.inode) {
-            debug!("WAL: Inode {} Commit OK (State was {:?}). Removed from map.", guard.inode, entry.state);
-        } else {
-            // This is acceptable in a highly concurrent, race-prone system
-            debug!("WAL: Inode {} Commit OK: Entry already missing (Acceptable Race).", guard.inode);
-        }
-        guard.needs_commit = false;
+        self.mark_committed(guard);
     }
+    // Updated: Do not log "already missing" noise.
     pub fn clear_wal_state(&self, inode: u64) {
+        if inode == 0 { return; }
         if self.states.remove(&inode).is_some() {
             debug!("WAL: Inode {} state cleared via explicit API.", inode);
-        } else {
-            // Change from error/warn to debug, as other threads might clear it in recovery/rename.
-            debug!("WAL: Inode {} clear requested, but entry was already missing.", inode);
         }
     }
     pub fn get_state_for_inode(&self, inode: u64) -> WalState {
@@ -167,24 +170,26 @@ impl WalStateMap {
             crc,
         }
     }
+    pub fn remove_stale_wal_entry(&self, inode: u64, expected_state: WalState) -> bool {
+        let result = self.states.remove_if(&inode, |_, entry| {
+            entry.state == expected_state
+        });
+        if result.is_some() {
+            debug!("WAL: Inode {} state {:?} conditionally removed as stale.", inode, expected_state);
+            return true;
+        }
+        false
+    }
 }
 impl Drop for WalGuard<'_> {
     fn drop(&mut self) {
-        if self.needs_commit {
-            // If needs_commit is true, check the current state before rolling back.
-            let current_state = self.map.get_state_for_inode(self.inode);
-            if current_state == WalState::CommitPending {
-                // If it reached CommitPending but the guard is being dropped prematurely (e.g., op returned error
-                // before final commit call), we should still attempt a commit rather than a rollback, as the
-                // data is likely fine on disk (CommitPending means write/copy succeeded).
-                warn!("WAL Auto-Commit: Guard dropped at CommitPending for Inode {}. Committing instead of rolling back.", self.inode);
-                self.map.commit(self);
-                return;
-            }
-            // All other states should trigger a genuine rollback / cleanup
+        if !self.committed {
             metrics::WAL_COHERENCE_FAILURES.with_label_values(&["rollback_drop"]).inc();
             error!("WAL Rollback: Operation failed or guard dropped prematurely for Inode {}. State was {:?}", self.inode, self.entry.state);
-            self.map.states.remove(&self.inode);
+            // Attempt to remove the entry if it's still present in any state
+            if self.map.states.remove(&self.inode).is_some() {
+                 debug!("WAL: Inode {} manually cleared during rollback.", self.inode);
+            }
         }
     }
 }

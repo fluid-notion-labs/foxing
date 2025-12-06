@@ -83,7 +83,6 @@ impl Clone for HydrationSender {
         HydrationSender(self.0.clone())
     }
 }
-// FIX: Remove unused Mutex import
 struct ShardedLockCache {
     shards: Vec<std::sync::Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>>
 }
@@ -145,12 +144,11 @@ pub async fn run_worker(
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
-    _rx_repair: Option<mpsc::Receiver<Arc<Event>>>, // FIX: Remove unused mut
+    _rx_repair: Option<mpsc::Receiver<Arc<Event>>>,
     serialization: Arc<SerializationEngine>,
     daemon_id: String,
 ) -> Result<()> {
     info!("Worker {} started (Causal Lane)", worker_id);
-
     // FIX (High Priority): Re-introduce Root Identity Seeding, coordinated by Worker 0.
     if worker_id == 0 {
         if let Ok(meta) = std::fs::metadata(&source.path) {
@@ -175,7 +173,6 @@ pub async fn run_worker(
             warn!("Worker {}: Failed to stat source root {:?}. Root identity will be missing!", worker_id, source.path);
         }
     }
-    
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
@@ -315,7 +312,6 @@ pub async fn run_worker(
                 Err(_) => None
             }
         };
-
         if let Some(event_ptr) = event_poll_result {
             coalescer.push(event_ptr.clone());
         } else if shutdown_requested {
@@ -323,14 +319,12 @@ pub async fn run_worker(
                 break Ok(())
             }
         }
-
         let current_coalesce_limit = tuner.current_coalesce_bytes;
         let effective_batch_size = if shutdown_requested {
             256
         } else {
             tuner.current_batch_size
         };
-
         // If we have any structural events, we process the single event and then
         // yield, effectively achieving serialization at the worker level.
         let mut events_to_process_raw = Vec::new();
@@ -339,7 +333,6 @@ pub async fn run_worker(
                 events_to_process_raw.push(e);
             }
             let is_structural = events_to_process_raw.len() == 1 && events_to_process_raw[0].event_type.requires_global_ordering();
-            
             if is_structural {
                 // If the event is structural, process only this one event, regardless of batch size.
             } else {
@@ -353,13 +346,8 @@ pub async fn run_worker(
                 }
             }
         }
-
-        // FIX (E0382): Iterate over a reference to prevent moving the Vec before the check.
         for e in &events_to_process_raw {
-            
-            // --- Determine Target Path DST for structural checks ---
             let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
-                // If it's a structural metadata event, try to resolve the parent path first
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
                     let rel_path = pp.join(&e.name);
@@ -380,8 +368,6 @@ pub async fn run_worker(
                     }
                 }
             };
-            
-             // FIX (E0425): Move Structural Deletion Existence Check AFTER DST is assigned
              if matches!(e.event_type, EventType::Rmdir | EventType::Unlink) {
                  let target_exists = std::fs::symlink_metadata(&dst).is_ok();
                  if !target_exists {
@@ -390,7 +376,6 @@ pub async fn run_worker(
                      continue;
                  }
              }
-
              if e.event_type == EventType::SequenceGap {
                  warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
                  let path = target_cfg.path.clone();
@@ -427,11 +412,7 @@ pub async fn run_worker(
             } else {
                 e.inode
             };
-            // The SerializationEngine (Mutex-based) ensures that operations on the SAME INODE
-            // are serialized/batched correctly (Renames exclusive, Writes concurrent).
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
-
-            // This block determines SRC, which depends on DST, so it must run here.
             let mut src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -461,7 +442,7 @@ pub async fn run_worker(
                             if let Some(entry) = wal_map.get_entry_for_inode(e.inode) {
                                 if entry.state == WalState::CommitPending {
                                     if let Some(mut guard) = wal_map.rearm_guard(entry) {
-                                        wal_map.commit(&mut guard);
+                                        wal_map.mark_committed(&mut guard); // Use new function
                                     }
                                 }
                             }
@@ -537,8 +518,6 @@ pub async fn run_worker(
             }
         }
         if events_to_process_raw.len() == 1 && events_to_process_raw[0].event_type.requires_global_ordering() {
-             // Yield immediately after a structural operation to allow other workers
-             // to run their structural operations serially by receiving the next event.
              tokio::task::yield_now().await;
         }
     };
@@ -565,8 +544,9 @@ async fn process_single_event_inner(
     let inode = e.inode;
     let wal_map = &source.wal_state_map;
     let source_clone = source.clone(); // Clone Arc<SourceInfo> here for spawn_blocking blocks
-    
-    // FIX (Critical): Use the main worker context for Identity map updates.
+    // FIX (High Priority): Refactor to move all Identity map updates for structural
+    // events out of the spawn_blocking blocks to ensure consistency *before* the operation
+    // completes (which is needed for subsequent events).
     let identity_update_sync = |rel: PathBuf, is_dir: bool| {
         identity::update_map(
             &source.inode_map,
@@ -581,24 +561,22 @@ async fn process_single_event_inner(
             e.seq_num
         );
     };
-
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let _target_cfg_path_clone = target_cfg.path.clone();
-        let _e_dev = e.dev_id; // FIX: Mark unused
-        let _e_generation = e.generation; // FIX: Mark unused
-        let _e_ts = e.timestamp_ns; // FIX: Mark unused
-        let _e_seq = e.seq_num; // FIX: Mark unused
-        let _source_map_clone = source.inode_map.clone(); // FIX: Mark unused
-        let _source_dir_map_clone = source.dir_map.clone(); // FIX: Mark unused
+        let _e_dev = e.dev_id;
+        let _e_generation = e.generation;
+        let _e_ts = e.timestamp_ns;
+        let _e_seq = e.seq_num;
+        let _source_map_clone = source.inode_map.clone();
+        let _source_dir_map_clone = source.dir_map.clone();
         let res = tokio::task::spawn_blocking(move || {
             let identity_dir = _target_cfg_path_clone.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
-                        // FIX: Move map update out of spawn_blocking, rely on caller.
-                        // identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
+                        // Identity update happens in the parent scope if successful.
                         return Ok(Some(rel.to_path_buf()));
                     }
                     Ok(None)
@@ -695,7 +673,7 @@ async fn process_single_event_inner(
                                 security::apply_metadata(&apply_src, &apply_dst)
                             }).await;
                             // Commit the WAL explicitly before returning Ok
-                            wal_map.commit(&mut wal_guard_val);
+                            wal_map.mark_committed(&mut wal_guard_val); // Use new function
                             Ok(Some(stats))
                         },
                         Err(e) => Err(e)
@@ -742,7 +720,7 @@ async fn process_single_event_inner(
                 PathBuf::new()
             };
             if let Some(_new_name_str) = &e.new_name {
-                // FIX (High Priority): Update map directly.
+                // FIX (High Priority): Update map *before* rename blocking call begins.
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,
@@ -754,7 +732,6 @@ async fn process_single_event_inner(
                     e.timestamp_ns,
                     e.seq_num
                 );
-                
                 let old_dst_final_log = dst.clone();
                 let new_dst_final_log = target_cfg.path.join(&new_rel_path);
                 let old_dst_final_move = old_dst_final_log.clone();
@@ -782,14 +759,12 @@ async fn process_single_event_inner(
                                         continue;
                                     }
                                 }
-                                // FIX: If the target destination already exists, assume a concurrent rename succeeded (Stale event).
                                 if !old_dst_final_move.exists() {
                                     if new_dst_final_move.exists() {
                                          debug!("Worker: Rename target {:?} already exists. Assuming previous success (Stale event).", new_dst_final_move);
                                          wal_map_clone.clear_wal_state(inode);
                                          return Ok(());
                                     }
-
                                     let resolved_path = identity::resolve_and_update_path(&source_clone_rename, inode, 0, 0, 0).ok();
                                     if let Some(rel) = resolved_path {
                                         let current_src_abs = source_mount.join(&rel);
@@ -871,7 +846,6 @@ async fn process_single_event_inner(
                 }
                 Ok(None)
             }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-            
             if let Ok(path_opt) = res {
                 if let Some(rel_path) = path_opt {
                     identity_update_sync(rel_path, true);
@@ -881,7 +855,6 @@ async fn process_single_event_inner(
         },
         EventType::Unlink => {
              let src_dev = e.dev_id;
-             // Identity map updates handled outside spawn_blocking
              identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
              wal_map.clear_wal_state(inode);
              let dst_clone = dst.clone();
@@ -922,7 +895,6 @@ async fn process_single_event_inner(
         }
         EventType::Rmdir => {
             let src_dev = e.dev_id;
-             // Identity map updates handled outside spawn_blocking
             identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
             wal_map.clear_wal_state(inode);
             let dst_clone = dst.clone();
@@ -932,6 +904,117 @@ async fn process_single_event_inner(
                 } else {
                     Ok(())
                 }
+            }).await;
+            Ok(None)
+        }
+        EventType::Link => {
+             let src_dev = e.dev_id;
+             let new_path = src.to_path_buf(); // src is the new link target (relative to mount)
+             identity::update_map_after_rename(
+                &source.inode_map,
+                &source.dir_map,
+                src_dev,
+                inode,
+                new_path.clone(),
+                e.generation,
+                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
+                e.timestamp_ns,
+                e.seq_num
+            );
+            let new_dst = dst.clone();
+            let src_clone = source.mount.join(src);
+            let res = tokio::task::spawn_blocking(move || {
+                security::create_hard_link(&src_clone, &new_dst)
+            }).await.map_err(FoxingError::Join).and_then(|r| r);
+            if res.is_err() {
+                 error!("Link failed for {:?} -> {:?}: {:?}", src, new_dst, res);
+                 return Err(res.unwrap_err());
+            }
+            Ok(None)
+        }
+        EventType::Symlink => {
+            let src_dev = e.dev_id;
+            // Name contains the target link content
+            let target_content = e.name.clone();
+            let link_path = dst.clone();
+            let link_path_rel = link_path.strip_prefix(&target_cfg.path).unwrap_or(link_path.as_path()).to_path_buf();
+            identity::update_map_after_rename(
+                &source.inode_map,
+                &source.dir_map,
+                src_dev,
+                inode,
+                link_path_rel,
+                e.generation,
+                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
+                e.timestamp_ns,
+                e.seq_num
+            );
+            let res = tokio::task::spawn_blocking(move || {
+                security::create_symlink(&target_content, &link_path)
+            }).await.map_err(FoxingError::Join).and_then(|r| r);
+            if res.is_err() {
+                error!("Symlink failed for {} -> {:?}: {:?}", target_content, link_path, res);
+                return Err(res.unwrap_err());
+            }
+            Ok(None)
+        }
+        EventType::Mknod => {
+             let src_dev = e.dev_id;
+             let new_path_rel = dst.strip_prefix(&target_cfg.path).unwrap_or(dst.as_path()).to_path_buf();
+             let dev = e.length; // Kernel sends device ID in length for mknod/device files
+             identity::update_map_after_rename(
+                &source.inode_map,
+                &source.dir_map,
+                src_dev,
+                inode,
+                new_path_rel,
+                e.generation,
+                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
+                e.timestamp_ns,
+                e.seq_num
+            );
+            let new_dst = dst.clone();
+            let mode = e.mode;
+            let res = tokio::task::spawn_blocking(move || {
+                security::create_mknod(&new_dst, mode, dev)
+            }).await.map_err(FoxingError::Join).and_then(|r| r);
+            if res.is_err() {
+                error!("Mknod failed for {:?}: {:?}", new_dst, res);
+                return Err(res.unwrap_err());
+            }
+            Ok(None)
+        }
+        EventType::Truncate | EventType::Fallocate => {
+            let dst_clone = dst.clone();
+            let new_size = e.length;
+            let offset = e.offset;
+            let flags = e.flags as i32;
+            let res = tokio::task::spawn_blocking(move || {
+                if e.event_type == EventType::Truncate {
+                    security::truncate_file(&dst_clone, new_size)
+                } else {
+                    security::do_fallocate(&dst_clone, offset, new_size, flags)
+                }
+            }).await.map_err(FoxingError::Join).and_then(|r| r);
+            if res.is_err() {
+                error!("{} failed for {:?}: {:?}", e.event_type.as_str(), dst, res);
+                return Err(res.unwrap_err());
+            }
+            Ok(None)
+        }
+        EventType::SetXattr | EventType::RemoveXattr => {
+            let dst_clone = dst.clone();
+            let apply_src = src.clone();
+            let _res = tokio::task::spawn_blocking(move || {
+                security::sync_xattrs(&apply_src, &dst_clone)
+            }).await;
+            Ok(None)
+        }
+        EventType::Chmod | EventType::Chown | EventType::Utimes => {
+            let dst_clone = dst.clone();
+            let apply_src = src.clone();
+            let _res = tokio::task::spawn_blocking(move || {
+                security::apply_metadata(&apply_src, &dst_clone)
             }).await;
             Ok(None)
         }
