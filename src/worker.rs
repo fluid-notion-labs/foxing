@@ -85,7 +85,7 @@ fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
 }
 
 #[derive(Debug)]
-pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
+pub struct HydrationSender(pub mpsc::Sender<(PathBuf, Option<u64>)>);
 impl Clone for HydrationSender {
     fn clone(&self) -> Self {
         HydrationSender(self.0.clone())
@@ -177,7 +177,7 @@ pub async fn run_worker(
                 &source.dir_map,
                 dev,
                 inode,
-                PathBuf::from(""), // Relative path of root is empty string
+                PathBuf::from(""), 
                 0,
                 false,
                 true,
@@ -408,7 +408,7 @@ pub async fn run_worker(
              if e.event_type == EventType::SequenceGap {
                  warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
                  let path = target_cfg.path.clone();
-                 if let Err(_) = hydration_trigger.0.try_send(path.clone()) {
+                 if let Err(_) = hydration_trigger.0.try_send((path.clone(), None)) {
                      warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for gap at {:?}", worker_id, path);
                  }
                  continue;
@@ -464,7 +464,7 @@ pub async fn run_worker(
                     ResolveResult::NeedsRepair(synthetic_path) => {
                         warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
                         if let Some(parent) = synthetic_path.parent() {
-                             let _ = hydration_trigger.0.try_send(parent.to_path_buf());
+                             let _ = hydration_trigger.0.try_send((parent.to_path_buf(), Some(e.inode)));
                         }
                         continue;
                     }
@@ -505,7 +505,7 @@ pub async fn run_worker(
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if attempts >= max_retries {
                              warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping & Repairing.", worker_id, e.seq_num, e.inode, max_retries);
-                             if let Err(_) = hydration_trigger.0.try_send(src.clone()) {
+                             if let Err(_) = hydration_trigger.0.try_send((src.clone(), Some(e.inode))) {
                                  warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for {:?}", worker_id, src);
                              }
                              break;
@@ -904,7 +904,7 @@ async fn process_single_event_inner(
                         warn!("Worker {}: Source disappeared during rename. Triggering repair for NEW path: {:?}.", worker_id, new_rel_path_clone);
                         
                         let new_src = source.mount.join(&new_rel_path_clone);
-                        if let Err(_) = hydration_trigger.0.try_send(new_src) {
+                        if let Err(_) = hydration_trigger.0.try_send((new_src, Some(e.inode))) {
                             warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for Rename Target", worker_id);
                         }
                         

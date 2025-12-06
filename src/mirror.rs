@@ -29,8 +29,9 @@ use crate::projector::IdentityProjector;
 use crate::identity;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
-pub type HydrationTx = mpsc::Sender<PathBuf>;
-pub type HydrationRx = mpsc::Receiver<PathBuf>;
+// FOXING CHANGE: Channel now carries (Path, Option<Inode>) to allow robust repair of moved files
+pub type HydrationTx = mpsc::Sender<(PathBuf, Option<u64>)>;
+pub type HydrationRx = mpsc::Receiver<(PathBuf, Option<u64>)>;
 
 #[allow(dead_code)]
 struct RepairGuard {
@@ -59,7 +60,6 @@ fn calculate_adaptive_debounces(tuner_board: &TunerBoard) -> (Duration, Duration
         0 => (Duration::from_millis(50), Duration::from_millis(500)),
         1 => (Duration::from_millis(200), Duration::from_secs(1)),
         2 => (Duration::from_millis(500), Duration::from_secs(3)),
-        // FOXING TUNING: Reduced max debounce from 10s to 5s to ensure a scan hits during the 15s test window
         _ => (Duration::from_secs(1), Duration::from_secs(5)),
     }
 }
@@ -260,8 +260,7 @@ impl Manager {
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
 
-        // FOXING FIX: CRITICAL - Increased repair channel capacity from 32 to 100,000.
-        // This prevents Workers from dropping repair requests during high-churn events (Metadata Storm).
+        // 100k capacity to handle storms
         let (raw_hydration_tx, hydration_rx_moved) = mpsc::channel(100_000);
         let hydration_tx = Arc::new(HydrationSender(raw_hydration_tx));
         
@@ -421,7 +420,6 @@ impl Manager {
             }
         }
 
-        // Debouncer for Hydration Triggers
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
         
@@ -433,23 +431,18 @@ impl Manager {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
 
-            while let Some(path) = hydration_rx.recv().await {
+            while let Some((path, inode_opt)) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
-                
-                // FOXING FIX: Removed `path.exists()` check. 
-                // In a race condition (rename/delete), the path sent by the worker (e.g. source of a rename)
-                // might already be gone. We MUST forward this to the Hydrator so it can reconcile/cleanup 
-                // the target state, otherwise we leave orphaned files.
                 let is_targeted_repair = !is_root_request; 
 
                 if is_targeted_repair {
-                    // Dispatch Targeted Repair
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
                             if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
                                 if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
-                                    info!("Hydration MANAGER: IMMEDIATE repair dispatch for file {:?}", path);
-                                    queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone());
+                                    info!("Hydration MANAGER: IMMEDIATE repair dispatch for file {:?} (Inode: {:?})", path, inode_opt);
+                                    // FOXING FIX: Pass the inode to the queue
+                                    queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone(), inode_opt);
                                 }
                             }
                         }
@@ -457,7 +450,6 @@ impl Manager {
                     continue;
                 }
 
-                // Debounced Full Scan for Root requests
                 if is_root_request {
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
