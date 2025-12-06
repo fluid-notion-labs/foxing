@@ -26,3 +26,4 @@ pub mod journal_store;
 pub mod projector;
 pub use mirror::SharedConfig;
 pub use error::Result;
+pub use wal::WalStateMap;
