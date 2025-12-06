@@ -55,13 +55,10 @@ pub fn run(
     let skel = open_skel.load().map_err(|e| FoxingError::Bpf(e.to_string()))?;
     if initial_seq > 0 {
         let key: u32 = 0;
-        // CHANGED: Correctly restore global sequence number.
-        // Previously this logic was broken because it attempted to update a PERCPU_ARRAY with 
-        // derived CPU-specific values, causing "Update Failed" warnings and inconsistent state.
-        // Now that the map is a global ARRAY, we just update the single counter.
         let next_seq = initial_seq + 1;
         let val_bytes = next_seq.to_ne_bytes();
         
+        // Correctly update the Global ARRAY map
         if let Err(e) = skel.maps.local_seq_map.update(&key.to_ne_bytes(), &val_bytes, libbpf_rs::MapFlags::ANY) {
             warn!("BPF: Failed to restore global sequence number {}: {}", next_seq, e);
         } else {
