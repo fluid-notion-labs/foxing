@@ -4,6 +4,7 @@ use crate::event::{Event, EventType};
 use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
+
 pub struct ReorderBuffer {
     buffer: BTreeMap<u64, Arc<Event>>,
     pub next_seq: u64,
@@ -12,9 +13,10 @@ pub struct ReorderBuffer {
     stalled_since: Option<Instant>,
     base_stall_timeout: Duration,
 }
+
 impl ReorderBuffer {
     pub fn new(target_latency_ms: u64, max_pending_bytes: u64) -> Self {
-        let timeout_ms = (target_latency_ms * 2).max(50).min(500); 
+        let timeout_ms = (target_latency_ms * 2).max(50).min(500);
         Self {
             buffer: BTreeMap::new(),
             next_seq: 0,
@@ -24,6 +26,7 @@ impl ReorderBuffer {
             base_stall_timeout: Duration::from_millis(timeout_ms),
         }
     }
+
     pub fn push(&mut self, event: Arc<Event>) -> bool {
         let event_size = 256 + event.name.len() as u64;
         if self.current_pending_bytes + event_size > self.max_pending_bytes {
@@ -39,18 +42,29 @@ impl ReorderBuffer {
         metrics::ORDERING_BUF_SIZE.with_label_values(&["ingress"]).set((self.buffer.len() as i64) as f64);
         true
     }
+
     pub fn pop(&mut self) -> Option<Arc<Event>> {
         let (&seq, _) = self.buffer.iter().next()?;
         if seq > self.next_seq {
             let pending_count = self.buffer.len();
             let utilization = self.current_pending_bytes as f64 / self.max_pending_bytes as f64;
-            let effective_timeout = if pending_count > 200 || utilization > 0.8 {
+            
+            // PRIORITY CHECK: Ensure we don't skip gaps if critical metadata is waiting
+            let has_structural_event = self.buffer.values().any(|evt| 
+                evt.event_type.is_structural_metadata() || evt.event_type == EventType::Rename
+            );
+
+            let effective_timeout = if has_structural_event {
+                // Force a minimum wait for structural operations, even under load
+                self.base_stall_timeout.max(Duration::from_millis(500)) 
+            } else if pending_count > 200 || utilization > 0.8 {
                 Duration::from_millis(0)
             } else if pending_count > 50 || utilization > 0.5 {
                 Duration::from_millis(10)
             } else {
                 self.base_stall_timeout
             };
+
             if let Some(time) = self.stalled_since {
                 if time.elapsed() > effective_timeout {
                     if effective_timeout.as_millis() > 10 {
@@ -86,10 +100,12 @@ impl ReorderBuffer {
         Some(evt)
     }
 }
+
 pub struct Coalescer {
     buffer: Vec<Arc<Event>>,
     scan_depth: usize,
 }
+
 impl Coalescer {
     pub fn new(scan_depth: usize) -> Self {
         Self {

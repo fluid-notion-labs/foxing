@@ -8,6 +8,7 @@ use std::time::Instant;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
+const CONTROL_PLANE_POOL_SIZE: usize = 2; // Reserved workers for metadata
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -17,6 +18,7 @@ pub enum EventType {
     Barrier=15, Mknod=16, Symlink=17, Fallocate=18, Utimes=19,
     SequenceGap=255, Unknown=0
 }
+
 impl From<u8> for EventType {
     fn from(v: u8) -> Self {
         match v {
@@ -30,6 +32,7 @@ impl From<u8> for EventType {
         }
     }
 }
+
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -42,8 +45,7 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-    // Only strictly directory-structural events go to Control Plane by default.
-    // Rename is handled conditionally in push().
+
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir |
@@ -51,43 +53,67 @@ impl EventType {
         )
     }
 }
+
 #[derive(Debug)]
 pub struct EventQueue {
     pub senders: Vec<mpsc::Sender<Arc<Event>>>
 }
+
 impl EventQueue {
     pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
         Self { senders }
     }
+
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         if self.senders.is_empty() { return; }
-        let target_idx = if self.senders.len() > 1 {
-            if e.event_type == EventType::Rename {
-                if (e.mode & S_IFMT) == S_IFDIR {
-                    0
+
+        let pool_size = self.senders.len();
+        
+        // --- CONTROL PLANE / DATA PLANE SPLIT ---
+        // If we have enough workers, reserve 0..CONTROL_PLANE_POOL_SIZE for metadata
+        // Otherwise, Worker 0 takes all metadata.
+        let target_idx = if pool_size > CONTROL_PLANE_POOL_SIZE {
+            if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
+                // Control Plane Logic: Distribute based on Parent Inode to strictly serialize directory ops
+                let mut hasher = DefaultHasher::new();
+                if e.parent_inode != 0 {
+                    e.parent_inode.hash(&mut hasher);
                 } else {
-                    let mut hasher = DefaultHasher::new();
-                    e.inode.hash(&mut hasher);
-                    let hash = hasher.finish();
-                    1 + (hash as usize % (self.senders.len() - 1))
+                    e.inode.hash(&mut hasher); // Fallback if no parent info (rare for mkdir/rename)
                 }
-            } else if e.event_type.is_structural_metadata() {
-                0
+                let hash = hasher.finish();
+                hash as usize % CONTROL_PLANE_POOL_SIZE
             } else {
+                // Data Plane Logic: Distribute based on Inode to allow parallel file IO
                 let mut hasher = DefaultHasher::new();
                 e.inode.hash(&mut hasher);
                 let hash = hasher.finish();
-                1 + (hash as usize % (self.senders.len() - 1))
+                // Map to range [CONTROL_PLANE_POOL_SIZE .. pool_size]
+                CONTROL_PLANE_POOL_SIZE + (hash as usize % (pool_size - CONTROL_PLANE_POOL_SIZE))
             }
         } else {
-            0
+            // Low worker count fallback
+             if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
+                 0 // All metadata serialized on Worker 0
+             } else {
+                 let mut hasher = DefaultHasher::new();
+                 e.inode.hash(&mut hasher);
+                 let hash = hasher.finish();
+                 if pool_size > 1 {
+                     1 + (hash as usize % (pool_size - 1))
+                 } else {
+                     0
+                 }
+             }
         };
+
         if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
         }
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub event_type: EventType,
@@ -110,6 +136,7 @@ pub struct Event {
     #[serde(skip, default="Instant::now")]
     pub created_at: Instant
 }
+
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
     let actual_workers = workers.max(1);
     let (mut txs, mut rxs) = (Vec::new(), Vec::new());

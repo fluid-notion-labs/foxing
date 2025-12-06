@@ -24,7 +24,6 @@ const NFS_SUPER_MAGIC: i64 = 0x6969;
 const SMB_SUPER_MAGIC: i64 = 0x517B;
 const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
 
-// User data bitmasks for io_uring completion handling
 const OP_TYPE_MASK: u64 = 0xFFFF0000;
 const INDEX_MASK: u64 = 0x0000FFFF;
 const READ_OP: u64 = 1 << 16;
@@ -47,7 +46,6 @@ impl TmpFileGuard {
         debug!("TmpFileGuard: Armed for {:?}", path);
         Self { path, armed: true }
     }
-
     fn disarm(&mut self) {
         debug!("TmpFileGuard: Disarmed for {:?}", self.path);
         self.armed = false;
@@ -96,11 +94,10 @@ impl SmartCopier {
 
         let sf = File::open(src)?;
         let sfd = sf.as_raw_fd();
-
+        
         let is_full_replace = offset == 0 && length == src_file_size;
         let is_compressed = security::is_filesystem_compressed(src);
         
-        // Detect sparse files to avoid inflating them
         let is_sparse_source = if !is_compressed && is_full_replace && src_file_size > 1024 * 1024 {
             let metadata = sf.metadata()?;
             let blocks = metadata.blocks();
@@ -114,7 +111,6 @@ impl SmartCopier {
             info!("SmartCopier: Detected SPARSE source {:?} (Allocated: {} < Size: {}).", src, 0, src_file_size);
         }
 
-        // Setup atomic write strategy
         let target_path = if is_full_replace {
             dst.with_extension(format!("tmp.{}", Uuid::new_v4()))
         } else {
@@ -133,7 +129,6 @@ impl SmartCopier {
             libc::O_RDWR
         };
 
-        // Align IO for DirectIO if possible
         let aligned_io = offset % 4096 == 0;
         let use_direct_io_for_delta = !is_sparse_source && direct_io_ok && !is_full_replace && length >= 4096 && (length % 4096 == 0) && aligned_io;
         
@@ -145,14 +140,12 @@ impl SmartCopier {
 
         let path_c = CString::new(target_path.to_string_lossy().as_bytes())
             .map_err(|_| FoxingError::Security("Invalid path".into()))?;
-
-        // Open Destination FD
+        
         let dfd = unsafe { libc::open(path_c.as_ptr(), final_flags, 0o644) };
         if dfd < 0 {
             return Err(FoxingError::Io(std::io::Error::last_os_error()));
         }
 
-        // Preallocate if full replace to reduce fragmentation
         if is_full_replace && !is_sparse_source {
             security::preallocate(dfd, src_file_size);
         }
@@ -160,7 +153,6 @@ impl SmartCopier {
         let mut transfer_done = false;
         let mut stats = CopyStats::default();
 
-        // Attempt Reflink (CoW) first
         if is_full_replace && reflink_ok.load(Ordering::Relaxed) {
             let start = Instant::now();
             let mut total_reflinked = 0usize;
@@ -170,16 +162,13 @@ impl SmartCopier {
             if src_file_size > 0 {
                 let mut off_in = 0i64;
                 let mut off_out = 0i64;
-                
                 while total_reflinked < size_usize {
                     let remaining = size_usize - total_reflinked;
-                    let chunk = std::cmp::min(remaining, 1024 * 1024 * 1024); // 1GB chunks
-                    
+                    let chunk = std::cmp::min(remaining, 1024 * 1024 * 1024);
                     let ret = unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, chunk, 0) };
                     
                     if ret < 0 {
                         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        // EXDEV means cross-device, which is expected and shouldn't disable reflink globally
                         if errno != libc::EXDEV {
                             warn!("Reflink failed for {:?}, disabling opt. Errno: {}", dst, errno);
                             reflink_ok.store(false, Ordering::Relaxed);
@@ -197,7 +186,6 @@ impl SmartCopier {
                 transfer_done = true;
                 stats.bytes_processed = src_file_size;
                 stats.io_duration = start.elapsed();
-                
                 let is_network_fs = match statfs::statfs(dst) {
                     Ok(s) => {
                         let magic = s.filesystem_type().0 as i64;
@@ -205,11 +193,10 @@ impl SmartCopier {
                     },
                     Err(_) => false,
                 };
-                
                 if is_network_fs { metrics::COPY_METHOD_OFFLOAD.inc(); }
                 else { metrics::COPY_METHOD_REFLINK.inc(); }
             } else {
-                // Reset file offsets if reflink failed partially
+                // Reset FDs for fallback
                 unsafe {
                     libc::lseek(dfd, 0, libc::SEEK_SET);
                     libc::lseek(sfd, 0, libc::SEEK_SET);
@@ -219,15 +206,12 @@ impl SmartCopier {
 
         if !transfer_done {
             metrics::COPY_METHOD_STANDARD.inc();
-            
             if is_sparse_source {
-                // Sparse Copy (Blocking/Sync) - simpler for hole preservation
                 let src_path_debug = src.to_path_buf();
                 stats = spawn_blocking(move || {
                     Self::perform_sparse_copy_blocking(sfd, dfd, src_file_size, &src_path_debug)
                 }).await.unwrap_or_else(|e| Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))))?;
             } else {
-                // Async io_uring pipeline
                 stats = Self::perform_delta_uring_pipelined(
                     ring, sfd, dfd, offset, length, vdo_opt, buffer_pool,
                     target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold
@@ -235,7 +219,6 @@ impl SmartCopier {
             }
         }
 
-        // Fsync to ensure durability before rename
         let sync_res = unsafe { libc::fsync(dfd) };
         if sync_res != 0 {
             let err = io::Error::last_os_error();
@@ -244,7 +227,6 @@ impl SmartCopier {
             return Err(FoxingError::Io(err));
         }
 
-        // Close FD explicitly before rename
         unsafe {
             libc::close(dfd);
         }
@@ -270,26 +252,23 @@ impl SmartCopier {
         let mut bytes_processed = 0u64;
         let mut offset = 0i64;
         let end_offset = total_size as i64;
-
+        
         if unsafe { libc::ftruncate(dfd, total_size as i64) } < 0 {
              return Err(FoxingError::Io(io::Error::last_os_error()));
         }
 
         let buf = AlignedBuffer::new(1024 * 1024);
-
+        
         while offset < end_offset {
-            // Find next data segment
             let data_pos = unsafe { libc::lseek(sfd, offset, libc::SEEK_DATA) };
-            
             if data_pos < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::ENXIO) {
-                    // No more data
-                    break;
+                    break; // EOF
                 }
-                warn!("Sparse Copy: SEEK_DATA failed for {:?}: {}. Degrading.", path_debug, err);
                 
-                // Fallback to dumb copy if SEEK_DATA fails (some FS don't support it)
+                warn!("Sparse Copy: SEEK_DATA failed for {:?}: {}. Degrading to linear copy.", path_debug, err);
+                // Fallback: Linear Copy
                 if unsafe { libc::lseek(sfd, offset, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
                 if unsafe { libc::lseek(dfd, offset, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
                 
@@ -307,7 +286,6 @@ impl SmartCopier {
                 break;
             }
 
-            // Find next hole
             let hole_pos = unsafe { libc::lseek(sfd, data_pos, libc::SEEK_HOLE) };
             if hole_pos < 0 {
                 return Err(FoxingError::Io(io::Error::last_os_error()));
@@ -316,23 +294,29 @@ impl SmartCopier {
             let mut chunk_start = data_pos;
             let chunk_end = if hole_pos > 0 && hole_pos < end_offset { hole_pos } else { end_offset };
 
-            // Seek both FDs to data start
             if unsafe { libc::lseek(sfd, chunk_start, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
             if unsafe { libc::lseek(dfd, chunk_start, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
 
-            // Copy data segment
             while chunk_start < chunk_end {
                 let to_read = std::cmp::min((chunk_end - chunk_start) as usize, buf.capacity());
                 let read_res = unsafe { libc::read(sfd, buf.ptr() as *mut libc::c_void, to_read) };
                 if read_res <= 0 { break; }
+                
                 let write_res = unsafe { libc::write(dfd, buf.ptr() as *const libc::c_void, read_res as usize) };
                 if write_res < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
                 
                 chunk_start += read_res as i64;
                 bytes_processed += read_res as u64;
             }
-
             offset = chunk_end;
+        }
+
+        // FIX: Verify file size after sparse copy / fallback
+        // This ensures the degraded linear copy actually completed the full file
+        let current_size = unsafe { libc::lseek(dfd, 0, libc::SEEK_END) };
+        if current_size != total_size as i64 {
+            error!("Sparse Copy VERIFICATION FAILED for {:?}: Expected {}, Got {}", path_debug, total_size, current_size);
+             return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Size mismatch after copy")));
         }
 
         info!("Sparse Copy Success: {:?} ({} bytes).", path_debug, bytes_processed);
@@ -354,7 +338,6 @@ impl SmartCopier {
         .rw_flags(rw_flags_val)
         .build()
         .user_data(READ_OP | buf_idx as u64);
-
         unsafe { ring.submission().push(&r_op) }.is_ok()
     }
 
@@ -369,14 +352,13 @@ impl SmartCopier {
         .rw_flags(rw_flags_val)
         .build()
         .user_data(WRITE_OP | buf_idx as u64);
-
         unsafe { ring.submission().push(&w_op) }.is_ok()
     }
 
     async fn perform_delta_uring_pipelined(
         ring: &mut IoUring,
         sfd: i32,
-        dfd: i32, // Passed destination FD (already opened)
+        dfd: i32,
         mut current_offset: u64,
         length: u64,
         vdo_opt: bool,
@@ -388,27 +370,25 @@ impl SmartCopier {
     ) -> Result<CopyStats> {
         let max_sqe = ring.submission().capacity();
         let num_buffers = buffer_pool.capacity();
-        // Limit inflight to prevent head-of-line blocking in small rings
         let max_concurrent_io = num_buffers.min(max_sqe as usize).min(8) as u32;
         let chunk_size = buffer_pool.chunk_size() as u64;
         let end_offset = current_offset + length;
         let start_time = Instant::now();
-        
+
         let rw_flags_val_read: i32 = if src_rwf_uncached_ok { RWF_UNCACHED } else { 0 };
         let rw_flags_val_write: i32 = if dst_rwf_uncached_ok { RWF_UNCACHED } else { 0 };
 
         let mut inflight_reads: Vec<InflightRead> = Vec::with_capacity(num_buffers);
         let mut stats = CopyStats::default();
         let mut submit_reads_pending = true;
-
         let mut vdo_stall_counter: u32 = 0;
         let mut skip_vdo_opt_temp = false;
         let mut loop_iterations = 0u64;
 
         while current_offset < end_offset || !inflight_reads.is_empty() || buffer_pool.free_count() < num_buffers {
             loop_iterations += 1;
-
-            // 1. Submit Reads
+            
+            // Submit Reads
             if submit_reads_pending {
                 let mut loop_blocked = true;
                 while current_offset < end_offset && !buffer_pool.is_empty() && inflight_reads.len() < max_concurrent_io as usize {
@@ -420,7 +400,7 @@ impl SmartCopier {
                         loop_blocked = false;
                         let rlen = (end_offset - current_offset).min(chunk_size) as usize;
                         let buf_ptr = buffer_pool.get_ptr(buf_idx);
-                        
+
                         if Self::submit_read(ring, sfd, current_offset, rlen, buf_idx, buf_ptr, rw_flags_val_read) {
                             inflight_reads.push(InflightRead {
                                 offset: current_offset,
@@ -428,7 +408,6 @@ impl SmartCopier {
                             });
                             current_offset += rlen as u64;
                         } else {
-                            // Submission failed (ring full?), roll back
                             buffer_pool.release(buf_idx);
                             break;
                         }
@@ -437,28 +416,25 @@ impl SmartCopier {
                     }
                 }
                 
-                // Small sleep if we are CPU spinning waiting for buffers
                 if loop_blocked && inflight_reads.is_empty() {
                      std::thread::sleep(Duration::from_millis(1));
                 }
             }
 
-            // 2. Poll / Wait for Completions
+            // Submit/Wait
             let ops_to_submit = ring.submission().len();
             let _inflight_count = inflight_reads.len();
             let buffers_busy = buffer_pool.free_count() < num_buffers;
 
             if ops_to_submit > 0 || buffers_busy {
-                // If we have buffers out, wait for at least 1 completion to make progress
                 let wait_min = if buffers_busy { 1 } else { 0 };
                 let num_completed = ring.submit_and_wait(wait_min)?;
                 
                 let mut cqes = Vec::new();
-                // Drain completion queue
                 for cqe in ring.completion().take(num_completed as usize) {
                     cqes.push(cqe);
                 }
-                // Check if more arrived
+                // Drain remaining
                 for cqe in ring.completion() {
                     cqes.push(cqe);
                 }
@@ -470,18 +446,16 @@ impl SmartCopier {
                     let op_type = user_data & OP_TYPE_MASK;
 
                     if res < 0 {
-                        // IO Error
                         let errno = -res;
                         buffer_pool.release(buf_idx);
                         return Err(FoxingError::Io(io::Error::from_raw_os_error(errno)));
                     }
 
                     if op_type == WRITE_OP {
-                        // Write complete, free buffer
                         buffer_pool.release(buf_idx);
                         submit_reads_pending = true;
                         
-                        // VDO heuristic reset on successful write
+                        // Reset stall counter on successful write
                         vdo_stall_counter = 0;
                         if skip_vdo_opt_temp {
                             skip_vdo_opt_temp = false;
@@ -501,22 +475,22 @@ impl SmartCopier {
                         };
 
                         if bytes_read == 0 {
-                            // EOF
                             buffer_pool.release(buf_idx);
                             continue;
                         }
 
-                        // Mark buffer used len
                         buffer_pool.set_len(buf_idx, bytes_read);
                         stats.bytes_processed += bytes_read as u64;
 
-                        // Check for Zero Block (VDO Optimization)
                         let buf_ptr = buffer_pool.get_ptr(buf_idx);
-                        let is_zero_block = vdo_opt && Self::is_block_zero(unsafe { 
-                            std::slice::from_raw_parts(buf_ptr, bytes_read) 
+                        
+                        // VDO (Virtual Data Optimizer) - Zero Block Detection
+                        let is_zero_block = vdo_opt && Self::is_block_zero(unsafe {
+                            std::slice::from_raw_parts(buf_ptr, bytes_read)
                         });
 
-                        // Anti-Stall: If we punch too many holes consecutively, some backends stall.
+                        // VDO Stall Logic: If we see too many sequential zeros, we force a write 
+                        // to keep the pipeline moving, otherwise read-buffers might fill up waiting for punch-hole ops.
                         if vdo_stall_counter >= vdo_stall_threshold {
                              if !skip_vdo_opt_temp {
                                  warn!("VDO stall threshold hit ({} consecutive zero blocks). Temporarily writing zeros to unblock pipeline.", vdo_stall_threshold);
@@ -526,24 +500,26 @@ impl SmartCopier {
 
                         if is_zero_block && !skip_vdo_opt_temp {
                             stats.bytes_zeros += bytes_read as u64;
-                            let ret = unsafe { 
-                                libc::fallocate(dfd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, read_offset as i64, bytes_read as i64) 
+                            let ret = unsafe {
+                                libc::fallocate(dfd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, read_offset as i64, bytes_read as i64)
                             };
-                            
+
                             if ret != 0 {
                                 warn!("fallocate(PUNCH_HOLE) failed permanently (errno: {}). Disabling VDO for this copy.", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
                                 skip_vdo_opt_temp = true;
                             } else {
                                 vdo_stall_counter = vdo_stall_counter.saturating_add(1);
                             }
-                            // Punching holes is metadata op, no Write op needed
+                            
+                            // Buffer is "done" from pipeline perspective since we didn't submit a write SQE
                             buffer_pool.release(buf_idx);
                             submit_reads_pending = true;
+
                         } else {
                             if is_zero_block && skip_vdo_opt_temp {
                                 vdo_stall_counter = 0;
                             }
-                            // Submit Write Op
+                            
                             if !Self::submit_write(ring, dfd, read_offset, bytes_read, buf_idx, buf_ptr, rw_flags_val_write) {
                                 error!("Failed to submit write op. Ring likely full despite checks.");
                                 buffer_pool.release(buf_idx);
@@ -553,25 +529,20 @@ impl SmartCopier {
                     }
                 }
             } else {
-                // Pipeline empty check
                 if current_offset < end_offset {
                      error!("STALL DETECTED: Offset {} < End {}, but pipeline empty.", current_offset, end_offset);
                      return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Pipeline Stalled")));
                 }
                 let _ = ring.submit();
             }
-            
-            // Yield for reactor if running long
+
             if loop_iterations % 1000 == 0 {
                 tokio::task::yield_now().await;
             }
-
-            // Exit conditions
             if current_offset >= end_offset && buffer_pool.free_count() == num_buffers {
                 break;
             }
         }
-
         stats.io_duration = start_time.elapsed();
         Ok(stats)
     }
