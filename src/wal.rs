@@ -1,9 +1,8 @@
-
 use std::path::PathBuf;
 use std::time::SystemTime;
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, info};
 use std::io;
 use crate::error::{FoxingError, Result};
 use std::hash::Hasher;
@@ -42,7 +41,7 @@ pub struct WalGuard<'a> {
     entry: PersistedWalEntry,
     // Flag to indicate if the caller successfully committed the operation.
     // If true, drop() will NOT rollback. If false, drop() performs rollback.
-    committed: bool,
+    committed: bool, 
 }
 impl WalStateMap {
     pub fn new() -> Self {
