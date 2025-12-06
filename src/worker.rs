@@ -103,7 +103,6 @@ pub async fn run_worker(
     serialization: Arc<SerializationEngine>,
     daemon_id: String,
 ) -> Result<()> {
-    // FIX: Workers 0 AND 1 are Control Plane (handling Metadata/Renames)
     let is_control_plane = worker_id < 2;
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
@@ -373,7 +372,9 @@ pub async fn run_worker(
                 e.inode
             };
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
-            let (dst, is_synthetic, needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
+            
+            // Resolve Target: Do this AFTER barrier to ensure we see updates from Rename operations
+            let (mut dst, is_synthetic, needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                 ResolveResult::Success(p, s, n) => (p, s, n),
                 ResolveResult::NeedsRepair(synthetic_path) => {
                     warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
@@ -383,7 +384,8 @@ pub async fn run_worker(
                     continue;
                 }
             };
-            let src = if is_synthetic {
+            
+            let mut src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
                 match dst.strip_prefix(&target_cfg.path) {
@@ -391,17 +393,59 @@ pub async fn run_worker(
                     Err(_) => source.mount.join(e.name.trim_start_matches('/'))
                 }
             };
+
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
-            let _ = process_single_event_inner(
-                &mut ctx, e, &source, &target_cfg, &tuner,
-                capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
-                src_rwf_uncached_ok,
-                dst_rwf_uncached_ok,
-                is_control_plane,
-                worker_id,
-                hydration_trigger.clone(),
-            ).await;
+            
+            // RETRY LOOP for handling Race Conditions (e.g. WAL Race where file moved during queueing)
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                let res = process_single_event_inner(
+                    &mut ctx, e.clone(), &source, &target_cfg, &tuner,
+                    capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
+                    src_rwf_uncached_ok,
+                    dst_rwf_uncached_ok,
+                    is_control_plane,
+                    worker_id,
+                    hydration_trigger.clone(),
+                ).await;
+
+                match res {
+                    Ok(_) => break,
+                    Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
+                        if attempts >= 3 {
+                             warn!("Worker {}: Event {}/Inode {} failed after 3 retries (NotFound). Dropping.", worker_id, e.seq_num, e.inode);
+                             break;
+                        }
+                        // AGGRESSIVE RECOVERY:
+                        // The file isn't where we thought it was. A rename likely raced us.
+                        // Force a fresh lookup from the source to find the new path.
+                        debug!("Worker {}: Event {} failed (NotFound). Retrying with fresh lookup (Attempt {}).", worker_id, e.seq_num, attempts);
+                        let lookup_res = tokio::task::spawn_blocking({
+                            let source_clone = source.clone();
+                            let inode = e.inode;
+                            move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
+                        }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+                        if let Ok(new_src_rel) = lookup_res {
+                             let new_src = source.mount.join(&new_src_rel);
+                             let new_dst = target_cfg.path.join(&new_src_rel);
+                             debug!("Worker {}: Recovery found new path: {:?} -> {:?}", worker_id, dst, new_dst);
+                             src = new_src;
+                             dst = new_dst;
+                        } else {
+                             // If we can't find it on source, it's truly gone. Stop retrying.
+                             break;
+                        }
+                    },
+                    Err(e) => {
+                        // Other errors (e.g. ENOSPC) are fatal for this event
+                        error!("Worker {}: Event failed with non-recoverable error: {:?}", worker_id, e);
+                        break;
+                    }
+                }
+            }
         }
     };
     let _ = unregister_buffers(&mut ring);
@@ -456,7 +500,7 @@ async fn process_single_event_inner(
             metrics::SIDECAR_FILES_CREATED.inc();
         } else {
             ctx.failure_state.record_failure();
-            return Err(FoxingError::Io(io::ErrorKind::Other.into()));
+            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Creation failed")));
         }
     }
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
@@ -499,8 +543,9 @@ async fn process_single_event_inner(
             }).await.unwrap_or(Ok(false));
             if let Ok(false) = phase2_success {
                  if !dst_clone.exists() {
-                     debug!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Aborting write.", dst_clone);
-                     return Ok(None);
+                     debug!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Triggering retry.", dst_clone);
+                     // CHANGED: Return explicit error to trigger retry loop in caller
+                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, "WAL Target Lost")));
                  }
                  error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
                  return Ok(None);
@@ -623,30 +668,20 @@ async fn process_single_event_inner(
                 let is_stressed = matches!(tuner.state, crate::tuner::TunerState::HighLoad | crate::tuner::TunerState::Muted | crate::tuner::TunerState::CriticalDrain);
                 let hydration_trigger_clone = hydration_trigger.clone();
                 let target_root_path = target_cfg.path.clone();
-                
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    // Robust Retry Loop with Active Repair: Wait up to 120s for the source file to appear (created by Data Plane)
-                    // before giving up. This handles priority inversion between Control and Data planes.
                     let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(30), Duration::from_secs(120));
                     let mut triggered_hydration = false;
-
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                                 let elapsed = start.elapsed();
-                                // ACTIVE REPAIR: If source is missing for >200ms, force hydration to fetch it.
-                                // CRITICAL FIX: Convert ABSOLUTE target path to RELATIVE path from target root.
-                                // The HydrationWorker expects a path relative to the Source/Target root, not an absolute path.
                                 if !triggered_hydration && elapsed > Duration::from_millis(200) {
-                                    // 1. Repair missing source file
                                     if let Ok(rel_path) = old_dst_final_clone.strip_prefix(&target_root_path) {
                                         let _ = hydration_trigger_clone.0.try_send(rel_path.to_path_buf());
                                     }
-                                    
-                                    // 2. Repair missing destination parent directory (handles pending Mkdir)
                                     if let Some(parent) = new_dst_final_clone.parent() {
                                         if !parent.exists() {
                                             if let Ok(rel_parent) = parent.strip_prefix(&target_root_path) {
@@ -656,7 +691,6 @@ async fn process_single_event_inner(
                                     }
                                     triggered_hydration = true;
                                 }
-
                                 if elapsed > max_wait {
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
                                 }
