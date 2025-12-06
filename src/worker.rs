@@ -475,22 +475,20 @@ pub async fn run_worker(
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
 
             // --- RESOLUTION LOGIC ---
+            // Calculate paths before entering retry loop
             let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
                     let rel_path = pp.join(&e.name);
                     (target_cfg.path.join(rel_path), false, false)
                 } else {
-                    match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
-                        ResolveResult::Success(p, s, n) => (p, s, n),
-                        ResolveResult::NeedsRepair(synthetic_path) => {
-                             warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
-                             if let Some(parent) = synthetic_path.parent() {
-                                  let _ = hydration_trigger.0.try_send(parent.to_path_buf());
-                             }
-                             continue;
-                        }
-                    }
+                    // Fallback: If parent not found, assume root-relative.
+                    // CRITICAL: Do NOT use resolve_target() or look up the inode_map here.
+                    // The Projector (BPF) has likely already updated the map to the NEW path.
+                    // Using the map would result in src == dst (New -> New), failing the rename.
+                    // We use the event name (Old Name) relative to target root.
+                    let rel_path = PathBuf::from(e.name.trim_start_matches('/'));
+                    (target_cfg.path.join(rel_path), true, false)
                 }
             } else {
                 match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
@@ -909,7 +907,7 @@ async fn process_single_event_inner(
                                                 Ok(_) => {
                                                     // Clean up ghost if it appeared
                                                     let _ = std::fs::remove_file(&old_dst_final_clone);
-                                                    debug!("Worker: SELF-HEAL Success.");
+                                                    info!("Worker: SELF-HEAL Success.");
                                                     return Ok(());
                                                 }
                                                 Err(e) => {
