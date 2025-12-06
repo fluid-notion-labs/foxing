@@ -625,23 +625,10 @@ async fn process_single_event_inner(
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    // Increased clamp from 5s to 30s to handle deep Data Plane backlogs.
-                    // Previous clamp(5s, 60s) allowed only 5s waits on low latency systems, causing race failures.
+                    // Robust Retry Loop: Wait up to 120s for the source file to appear (created by Data Plane)
+                    // before giving up. This handles priority inversion between Control and Data planes.
                     let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(30), Duration::from_secs(120));
                     
-                    // VISIBILITY BARRIER: Ensure file exists and is visible for a moment before renaming
-                    // This prevents "Too Fast" renames from breaking external observers/tests
-                    if _is_control_plane {
-                        let wait_start = Instant::now();
-                        while !old_dst_final_clone.exists() {
-                            if wait_start.elapsed() > max_wait { break; }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        if old_dst_final_clone.exists() {
-                            std::thread::sleep(Duration::from_millis(500));
-                        }
-                    }
-
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
