@@ -760,14 +760,11 @@ async fn process_single_event_inner(
                     source.dir_map.clear();
                 }
 
-                // Calculate paths
-                let old_rel_path = if let Some(parent_rel) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode) {
-                     parent_rel.join(&e.name)
-                } else {
-                     PathBuf::from(&e.name)
-                };
-
-                let old_dst_final = target_cfg.path.join(&old_rel_path);
+                // CRITICAL FIX: Use the recovered `dst` path as the authoritative source for the rename.
+                // In a high-frequency race, the event's `e.name` may point to a stale path.
+                // `dst` has been updated by the retry loop if identity resolution succeeded,
+                // so it points to the *current* location of the file on the target filesystem.
+                let old_dst_final = dst.clone();
                 let new_dst_final = target_cfg.path.join(&new_rel_path);
                 
                 let old_dst_final_clone = old_dst_final.clone();
