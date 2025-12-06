@@ -849,6 +849,7 @@ async fn process_single_event_inner(
                 let source_mount = source.mount.clone();
                 let e_inode = e.inode;
                 let source_clone = source.clone();
+                let target_cfg_clone = target_cfg.clone(); // CAPTURE CONFIG
 
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
