@@ -179,6 +179,10 @@ class TestEnvironment:
 
     def create_config(self):
         config_path = RUN_DIR / "foxing.toml"
+        # Ensure journal is isolated to this specific test run to prevent ghost replays
+        journal_dir = RUN_DIR / "journal"
+        journal_dir.mkdir(exist_ok=True)
+        
         logger.info(f"Generating config at {config_path}")
         
         # NOTE: Reduced queue_max to 50k to prevent allocation timeouts
@@ -189,6 +193,7 @@ class TestEnvironment:
 #shutdown_timeout_secs = 2
 metrics_port = {METRICS_PORT}
 #max_system_load_avg = 100.0 
+journal_dir = "{journal_dir.absolute()}"
 
 [[sources]]
 path = "{MNT_SOURCE.absolute()}"

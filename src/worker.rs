@@ -496,7 +496,8 @@ pub async fn run_worker(
                         // RECOVERY ATTEMPT 2: Fallback Existence Check
                         // If lookup failed, AND the old path is missing, then it's really gone.
                         if !src.exists() {
-                            debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Aborting retry for event {}.", worker_id, src, e.seq_num);
+                            debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Accepting deletion and dropping event {}.", worker_id, src, e.seq_num);
+                            // This is the critical fix: treating this as "Success/Handled" rather than aborting the loop with error.
                             break;
                         }
 
