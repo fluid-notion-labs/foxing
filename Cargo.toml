@@ -54,3 +54,13 @@ rayon = "1.11.0"
 
 [build-dependencies]
 libbpf-cargo = "0.25.0"
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+
+[profile.release]
+opt-level = 3
+debug = true  # Include debug info in release builds for profiling/debugging symbols
+strip = false
