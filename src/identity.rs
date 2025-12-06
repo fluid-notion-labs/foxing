@@ -12,15 +12,10 @@ use crate::metrics;
 use std::num::NonZeroUsize;
 use dashmap::DashMap;
 use std::time::{Instant, Duration};
-
 lazy_static::lazy_static! {
-    // Patch 3: Global cache for recent aggressive lookups to prevent thrashing
-    // Inode -> (Timestamp, PathBuf)
     static ref RECENT_LOOKUPS: DashMap<u64, (Instant, PathBuf)> = DashMap::new();
 }
-
 const LOOKUP_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
-
 #[derive(Clone, Debug)]
 pub struct IdentityEntry {
     pub path: PathBuf,
@@ -59,9 +54,21 @@ impl ShardedInodeMap {
         let mut shard = self.get_shard(inode).lock();
         if let Some(existing) = shard.get(&inode) {
             let is_hydration = existing.timestamp_ns == u64::MAX;
-            if !is_hydration {
-                if existing.timestamp_ns > entry.timestamp_ns { return; }
-                if existing.timestamp_ns == entry.timestamp_ns && existing.seq_num >= entry.seq_num { return; }
+
+            // CRITICAL FIX: Check sequence number/timestamp before overwriting an existing entry.
+            // Only update if the new entry is strictly newer (higher sequence number OR newer timestamp).
+            // Hydration entries (ts=u64::MAX) always yield to real events.
+            if existing.timestamp_ns != u64::MAX {
+                // If timestamps are the same, check sequence number
+                if existing.timestamp_ns == entry.timestamp_ns {
+                    if existing.seq_num >= entry.seq_num {
+                        return;
+                    }
+                } 
+                // If the existing entry is newer, skip the update
+                else if existing.timestamp_ns > entry.timestamp_ns {
+                    return;
+                }
             }
         }
         shard.put(inode, entry);
@@ -202,19 +209,15 @@ pub fn resolve_and_update_path(
 ) -> io::Result<PathBuf> {
     let start_time = std::time::Instant::now();
     let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
-
-    // Patch 3: Debounce Check
     if let Some(entry) = RECENT_LOOKUPS.get(&inode) {
         if entry.0.elapsed() < LOOKUP_DEBOUNCE_DURATION {
             let path = entry.1.clone();
-            drop(entry); // Release DashMap lock
+            drop(entry);
             debug!("IDENTITY: Debounced aggressive lookup for Inode {} -> {:?}. Cached for {:?}.", inode, path, start_time.elapsed());
-            // Optionally update the main map since we have the path, but the aggressive walk is what we're debouncing
             source.inode_map.put(inode, IdentityEntry::new(path.clone(), generation_hint, ts_hint, seq_hint));
             return Ok(path);
         }
     }
-
     if let Some(watcher) = &source.identity_watcher {
         if let Some(path) = watcher.resolve(inode) {
              debug!("IDENTITY: Reverse Index HIT for Inode {} -> {:?}", inode, path);
@@ -243,9 +246,7 @@ pub fn resolve_and_update_path(
         }
     }
     if let Some(path) = found_path {
-        // Patch 3: Insert successful lookup into debounce cache
         RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone()));
-
         if fs::metadata(source.mount.join(&path)).is_ok() {
             return Ok(path);
         }
