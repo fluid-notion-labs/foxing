@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
-use tracing::{debug, error, warn, info};
+use tracing::{debug, error}; // Removed unused imports: warn, info
 use std::io;
 use crate::error::{FoxingError, Result};
 use std::hash::Hasher;
