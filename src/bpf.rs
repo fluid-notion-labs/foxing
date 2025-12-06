@@ -214,15 +214,15 @@ pub fn run(
                 if buf.push(evt.clone()) { // Clone Arc for push
                     while let Some(ordered_evt) = buf.pop() {
                         // FIX 6: Project identity BEFORE dispatching event to workers
-                        if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
+                        if let Some(src_info) = sources_in_closure.get(&ordered_evt.dev_id).cloned() { // Clone Arc for use inside loop
                             if let Some(projector) = &src_info.projector {
                                 projector.project(&ordered_evt); // Project FIRST
                             }
-                        }
-                        
-                        metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                        if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) {
-                            for q in qs { q.push(ordered_evt.clone()); }
+                            
+                            metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                            if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) { // queues_in_closure is an Arc, clone not strictly needed here but for safety
+                                for q in qs { q.push(ordered_evt.clone()); }
+                            }
                         }
                     }
                 } else {
@@ -241,7 +241,7 @@ pub fn run(
                 if let Ok(mut buffers_map) = journal_buffers.lock() {
                     for (dev_id, buffer) in buffers_map.iter_mut() {
                         if !buffer.is_empty() {
-                            if let Some(src_info) = sources_in_loop.get(dev_id) {
+                            if let Some(src_info) = sources_in_loop.get(dev_id).cloned() { // FIX: Clone Arc for use inside loop
                                 if let Some(journal) = &src_info.journal {
                                     let _ = journal.append_batch(buffer);
                                     buffer.clear();
@@ -254,15 +254,16 @@ pub fn run(
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
                              // FIX 6: Project identity BEFORE dispatching event to workers
-                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
+                             if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id).cloned() { // FIX: Clone Arc for use inside loop
                                 if let Some(projector) = &src_info.projector {
                                     projector.project(&ordered_evt); // Project FIRST
                                 }
-                            }
-                            metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                            if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) {
-                                for q in qs { q.push(ordered_evt.clone()); }
-                            }
+                                
+                                metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
+                                if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) { // FIX: queues_in_loop is Arc, use get reference
+                                    for q in qs { q.push(ordered_evt.clone()); }
+                                }
+                             }
                         }
                     }
                 }

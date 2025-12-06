@@ -18,7 +18,7 @@ use crate::security;
 use crate::metrics;
 use std::sync::atomic::fence;
 use std::os::unix::fs::MetadataExt;
-use std::io::{Read, Seek, SeekFrom}; // Fix: Remove unused imports: Read, Seek, SeekFrom
+// Fix: Removed unused imports: Seek, SeekFrom, Read
 const RWF_UNCACHED: i32 = 0x00000008;
 const NFS_SUPER_MAGIC: i64 = 0x6969;
 const SMB_SUPER_MAGIC: i64 = 0x517B;
@@ -204,17 +204,17 @@ impl SmartCopier {
             }).await;
             
             if let Err(e_join) = fsync_res {
-                let e = e_join.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Join error during pre-rename sync: {}", e))).unwrap_err();
+                // Fix E0599 on map_err on JoinError: Just propagate the JoinError after logging
+                let e = io::Error::new(io::ErrorKind::Other, format!("Join error during pre-rename sync: {}", e_join));
                 error!("Critical: Pre-rename fsync failed for {:?}: {:?}", target_path, e);
                 unsafe { libc::close(dfd); } // Close fd before erroring out
                 return Err(FoxingError::Io(e));
             }
             // Check inner io::Result from spawn_blocking
-            if fsync_res.as_ref().map_err(|e| e.to_string()).unwrap_or_default().is_err() {
-                 let e = fsync_res.unwrap().unwrap_err();
-                 error!("Critical: Pre-rename io::sync failed: {:?}", e);
+            if let Err(e_inner) = fsync_res.unwrap() {
+                 error!("Critical: Pre-rename io::sync failed: {:?}", e_inner);
                  unsafe { libc::close(dfd); } // Close fd before erroring out
-                 return Err(FoxingError::Io(e));
+                 return Err(FoxingError::Io(e_inner));
             }
         }
         
@@ -260,7 +260,7 @@ impl SmartCopier {
         while offset < end_offset {
             let data_pos = unsafe { libc::lseek(sfd, offset, libc::SEEK_DATA) };
             if data_pos < 0 {
-                let err = io::Error::last_os_error(); // Fix: Typo removed
+                let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::ENXIO) {
                     break;
                 }
@@ -393,7 +393,7 @@ impl SmartCopier {
                 let mut cqes = Vec::new();
                 for cqe in ring.completion().take(num_completed as usize) { cqes.push(cqe); }
                 for cqe in ring.completion() { cqes.push(cqe); }
-                for cqe in cqes {
+                    for cqe in cqes {
                     let user_data = cqe.user_data();
                     let res = cqe.result();
                     let buf_idx = (user_data & INDEX_MASK) as u16;
