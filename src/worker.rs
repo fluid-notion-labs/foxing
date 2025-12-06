@@ -347,8 +347,8 @@ pub async fn run_worker(
             }
         }
         // Start of problematic loop:
-        for e_ref in &events_to_process_raw {
-            let e = e_ref.clone(); // FIX: Clone the Arc<Event> for the loop body scope
+        for e in &events_to_process_raw {
+            let e = e.clone(); // Clone the Arc<Event> for the loop body scope
             let (initial_dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
@@ -476,6 +476,14 @@ pub async fn run_worker(
                         break;
                     },
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
+                        // --- Deletion Check (Prioritized) ---
+                        if !src.exists() {
+                            // The file is gone from the source. No need for aggressive lookup.
+                            // We rely on the initial destination path (`dst`) for the corresponding unlink/rmdir event later.
+                            debug!("Worker {}: Source file {:?} disappeared. Accepting deletion/missing status.", worker_id, src);
+                            break;
+                        }
+                        // --- Aggressive Lookup Logic (Only if file still potentially exists) ---
                         if attempts >= max_retries {
                              warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping & Repairing.", worker_id, e.seq_num, e.inode, max_retries);
                              if let Err(_) = hydration_trigger.0.try_send((src.clone(), Some(e.inode))) {
@@ -488,7 +496,7 @@ pub async fn run_worker(
 
                         // OPTIMIZATION: Only trigger the expensive walkdir lookup after repeated failures
                         if attempts >= 3 {
-                             let e_clone_for_spawn = e.clone(); // FIX: Clone the Arc for the spawned task
+                             let e_clone_for_spawn = e.clone(); // Clone the Arc for the spawned task
                              let lookup_res = tokio::task::spawn_blocking({
                                  // FIX E0425: Capture `source_clone` correctly
                                  let source_clone = source_clone.clone();

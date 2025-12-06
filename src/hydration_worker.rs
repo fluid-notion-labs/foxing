@@ -100,11 +100,7 @@ async fn run_hydration_worker_loop(
     }
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     loop {
-        // --- Adaptive Pacing based on Governor Status ---
-        if governor.is_system_stressed() {
-            // Sleep longer when system is under load to reduce repair contention
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // --- Adaptive Pacing removed to prioritize running repairs immediately ---
         let job = {
             let mut lock = rx.lock().await;
             lock.recv().await
@@ -180,8 +176,8 @@ async fn process_hydration_job(
     if governor.is_system_stressed() ||
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
-        // Workers are currently struggling; yield before performing the IO copy.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Workers are currently struggling; yield before performing the IO copy (still useful yield, but removed sleep).
+        tokio::task::yield_now().await; 
     }
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
