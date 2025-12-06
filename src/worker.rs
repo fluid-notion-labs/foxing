@@ -1,6 +1,6 @@
 use io_uring::IoUring;
 use tokio::sync::mpsc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
 use std::io;
@@ -32,6 +32,50 @@ use crate::versioning;
 use crate::mirror::SourceInfo;
 use std::os::unix::fs::MetadataExt;
 use libc;
+use std::os::unix::io::AsRawFd;
+
+// Synchronous Smart Copy for Fallback (Blocking)
+fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
+    let src_file = std::fs::File::open(src)?;
+    let dst_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+
+    let src_fd = src_file.as_raw_fd();
+    let dst_fd = dst_file.as_raw_fd();
+    let len = src_file.metadata()?.len();
+
+    // Try Reflink (FICLONERANGE)
+    let ret = unsafe {
+        // define FICLONERANGE 0x4020940D
+        let req = 0x4020940D; 
+        #[repr(C)]
+        struct FileCloneRange {
+            src_fd: i64,
+            src_offset: u64,
+            src_length: u64,
+            dest_offset: u64,
+        }
+        let args = FileCloneRange {
+            src_fd: src_fd as i64,
+            src_offset: 0,
+            src_length: len,
+            dest_offset: 0,
+        };
+        libc::ioctl(dst_fd, req, &args)
+    };
+
+    if ret == 0 {
+        return Ok(len);
+    }
+
+    // Fallback to sendfile (Standard Copy) if Reflink fails
+    // We use std::fs::copy for simplicity in this sync fallback, 
+    // but verify if sparse is needed.
+    std::fs::copy(src, dst)
+}
 
 #[derive(Debug)]
 pub struct HydrationSender(pub mpsc::Sender<PathBuf>);
@@ -770,12 +814,13 @@ async fn process_single_event_inner(
                 let old_dst_final_clone = old_dst_final.clone();
                 let new_dst_final_clone = new_dst_final.clone();
                 
-                let hydration_trigger_clone = hydration_trigger.clone();
-                let target_root_path = target_cfg.path.clone();
-
+                // Capture paths for recovery logic inside the blocking task
+                let src_clone_for_recovery = src.clone();
+                let _hydration_trigger_clone = hydration_trigger.clone();
+                let _target_root_path = target_cfg.path.clone();
+                
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
-                    // Rename should be relatively fast, but we retry short glitches
                     let max_wait = Duration::from_secs(5);
                     let mut triggered_hydration = false;
 
@@ -784,30 +829,51 @@ async fn process_single_event_inner(
                             Ok(_) => return Ok(()),
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                                 let elapsed = start.elapsed();
+                                
+                                // CHECK 1: Is the DESTINATION DIRECTORY missing?
+                                // atomic_rename returns ENOENT if the new path's directory doesn't exist.
+                                if let Some(parent) = new_dst_final_clone.parent() {
+                                    if !parent.exists() {
+                                        debug!("Worker: Rename target dir {:?} missing. Creating.", parent);
+                                        let _ = std::fs::create_dir_all(parent);
+                                        // Retry loop immediately
+                                        continue;
+                                    }
+                                }
+
+                                // CHECK 2: Is the SOURCE FILE missing on target?
                                 if !old_dst_final_clone.exists() {
-                                    // Source missing.
+                                    // Source missing on target. 
+                                    // This is the "Lost File" scenario. We try to recover by copying from Source.
+                                    // Since we are in a blocking thread, we can do a simple copy.
+                                    if src_clone_for_recovery.exists() && !triggered_hydration {
+                                        debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}", 
+                                               old_dst_final_clone, src_clone_for_recovery, new_dst_final_clone);
+                                        
+                                        // Attempt copy
+                                        if let Ok(_) = copy_with_reflink_sync(&src_clone_for_recovery, &new_dst_final_clone) {
+                                             // Cleanup old path just in case it was a ghost/flake
+                                             let _ = std::fs::remove_file(&old_dst_final_clone);
+                                             debug!("Worker: SELF-HEAL Success.");
+                                             return Ok(());
+                                        }
+                                    }
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, "Source disappeared")));
                                 }
                                 
-                                // Source exists but rename failed? Could be parent directory missing.
-                                if !triggered_hydration && elapsed > Duration::from_millis(200) {
-                                    if let Ok(rel_path) = old_dst_final_clone.strip_prefix(&target_root_path) {
-                                        let _ = hydration_trigger_clone.0.try_send(rel_path.to_path_buf());
-                                    }
-                                    if let Some(parent) = new_dst_final_clone.parent() {
-                                        if !parent.exists() {
-                                            if let Ok(rel_parent) = parent.strip_prefix(&target_root_path) {
-                                                let _ = hydration_trigger_clone.0.try_send(rel_parent.to_path_buf());
-                                            }
-                                        }
-                                    }
-                                    triggered_hydration = true;
-                                }
-
                                 if elapsed > max_wait {
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
                                 }
                                 std::thread::sleep(Duration::from_millis(10));
+                                continue;
+                            },
+                            // RETRY ON BUSY/LOCKED FILES
+                            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::ETXTBSY) => {
+                                let elapsed = start.elapsed();
+                                if elapsed > max_wait {
+                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::TimedOut, format!("Timeout on BUSY file: {}", e))));
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
                                 continue;
                             },
                             Err(e) => return Err(FoxingError::Io(e)),
