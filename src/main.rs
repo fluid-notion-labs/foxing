@@ -22,6 +22,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
+
 #[derive(Subcommand)]
 enum Commands {
     Daemon {
@@ -41,6 +42,7 @@ enum Commands {
     Status,
     Metrics,
 }
+
 #[derive(Subcommand)]
 enum VersionCommands {
     List { path: String },
@@ -57,6 +59,7 @@ enum VersionCommands {
         tag: String
     }
 }
+
 #[derive(Clone)]
 struct AppState {
     tuner_board: TunerBoard,
@@ -65,16 +68,23 @@ struct AppState {
 fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus {
     use foxing::api::BpfDeviceStat;
     use foxing::api::TargetStatus;
+    
     let mut status = foxing::api::SystemStatus::default();
+    
+    // Global Metrics
     status.load_avg_1m = metrics::GOVERNOR_LOAD_AVERAGE.with_label_values(&["1m"]).get();
     status.governor_stressed = metrics::GOVERNOR_STRESSED.get() == 1.0;
     status.global_events_dropped = metrics::EVENTS_DROPPED.get() as u64;
     status.live_additions = metrics::LIVE_ADDITIONS.get() as u64;
+
+    // Debug Metrics
     status.debug.bpf_events_malformed = metrics::EVENTS_MALFORMED.get() as u64;
     status.debug.bpf_events_unwatched = metrics::EVENTS_UNWATCHED.get() as u64;
     status.debug.worker_shutdown_timeouts = metrics::WORKER_SHUTDOWN_TIMEOUTS.get() as u64;
     status.debug.sidecars_created = metrics::SIDECAR_FILES_CREATED.get() as u64;
     status.debug.generation_mismatches = metrics::GENERATION_MISMATCHES.get() as u64;
+
+    // BPF Device Stats
     let dev_stats = foxing::bpf::get_device_stats();
     for (dev_id, (seq, count)) in dev_stats {
         let hex_id = format!("0x{:08x}", dev_id);
@@ -83,15 +93,20 @@ fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus 
             event_count: count,
         });
     }
+
+    // Per-Target Status from TunerBoard
     for r in tuner_board.iter() {
         let path_str = r.key().to_string_lossy().to_string();
         let tuner_state = *r.value();
+        
         let lat = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_sum();
         let count = metrics::REPLICATION_LATENCY.with_label_values(&[&path_str]).get_sample_count();
         let latency_ms = if count > 0 { (lat / count as f64) * 1000.0 } else { 0.0 };
+
         let wal_failures = metrics::WAL_COHERENCE_FAILURES.with_label_values(&[&path_str]).get() as u64;
         let batch_size = metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_str]).get() as usize;
         let coalesce_bytes = metrics::TARGET_COALESCE_BYTES.with_label_values(&[&path_str]).get() as u64;
+        
         let t_status = TargetStatus {
             latency_ms,
             pending_events: metrics::ORDERING_BUF_SIZE.with_label_values(&[&path_str]).get() as usize,
@@ -117,7 +132,9 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
     let cli = Cli::parse();
+
     match cli.command {
         Some(Commands::Daemon { config, tui }) => {
             run_daemon_logic(config, tui).await?;
@@ -168,23 +185,27 @@ async fn main() -> anyhow::Result<()> {
             println!("Foxing Daemon. Use --help for usage.");
         }
     }
+
     Ok(())
 }
 
 async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Result<()> {
     info!("Starting Foxing Daemon (Config: {})", config_path);
+    
     let config = Config::load(&config_path)?;
     let global_limit = config.global_buffer_limit;
     let metrics_port = config.metrics_port;
-    metrics::initialize_metrics(global_limit);
-    let shared_config = Arc::new(RwLock::new(config));
     
+    metrics::initialize_metrics(global_limit);
+
+    let shared_config = Arc::new(RwLock::new(config));
     let mut manager = Manager::new(shared_config.clone()).await;
+
+    // Start Manager (Spawns Workers, Hydrators)
     let (queues, handles, mut shutdowns, _) = manager.start().await;
     
+    // Retrieve initial sequence for BPF resumption
     let sources_map = manager.sources.clone();
-    
-    // Determine max recovered sequence to initialize BPF
     let mut initial_seq = 0;
     for src in sources_map.values() {
         if let Some(journal) = &src.journal {
@@ -194,7 +215,8 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             }
         }
     }
-    
+
+    // Start BPF Thread
     let bpf_shutdown = Arc::new(AtomicBool::new(false));
     let bpf_shutdown_clone = bpf_shutdown.clone();
     
@@ -203,7 +225,8 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             error!("BPF Thread crashed: {}", e);
         }
     });
-    
+
+    // Start API Server
     let tuner_board = manager.tuner_board.clone();
     let app_state = AppState { tuner_board: tuner_board.clone() };
     
@@ -214,20 +237,23 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
         }))
         .with_state(app_state)
         .layer(TraceLayer::new_for_http());
-        
+
     let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
     let api_server = axum::serve(tokio::net::TcpListener::bind(addr).await?, api_app);
+    
     let api_handle = tokio::spawn(async move {
         if let Err(e) = api_server.await {
             error!("API Server Error: {}", e);
         }
     });
-    
+
     info!("Metrics API listening on http://{}", addr);
-    
+
+    // TUI or Signal Handling
     if start_tui {
         let t_board = manager.tuner_board.clone();
         let mut app = tui::TuiApp::new(tui::DataMode::Local);
+        // TUI runs in a blocking thread to not stall the reactor, though here we just join it.
         let _ = std::thread::spawn(move || {
             let _ = app.run(|| Some(collect_system_status(&t_board)));
         }).join();
@@ -240,11 +266,15 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
             _ = sigint.recv() => info!("Received SIGINT"),
         }
     }
-    
+
+    // Graceful Shutdown
     info!("Initiating Graceful Shutdown...");
+    
+    // 1. Stop BPF
     bpf_shutdown.store(true, Ordering::Relaxed);
     let _ = bpf_handle.join();
     
+    // 2. Stop Workers
     for tx in shutdowns.drain(..) {
         let _ = tx.send(()).await;
     }
@@ -252,7 +282,10 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
         let _ = h.await;
     }
     
+    // 3. Stop Hydrators
     manager.wait_hydration();
+    
+    // 4. Stop API
     api_handle.abort();
     
     info!("Shutdown Complete.");
@@ -261,6 +294,7 @@ async fn run_daemon_logic(config_path: String, start_tui: bool) -> anyhow::Resul
 
 mod metrics_wrapper {
     use prometheus::{Encoder, TextEncoder};
+    
     pub fn gather() -> String {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();

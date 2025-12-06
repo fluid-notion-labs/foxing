@@ -10,7 +10,6 @@ use std::time::Instant;
 const S_IFMT: u32 = 0o170000;
 #[allow(dead_code)]
 const S_IFDIR: u32 = 0o040000;
-const CONTROL_PLANE_POOL_SIZE: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -47,7 +46,7 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-    
+
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir |
@@ -66,6 +65,11 @@ impl EventQueue {
         Self { senders }
     }
 
+    /// Inode-Centric Causal Lanes (ICCL) routing.
+    /// All events for a specific inode are routed to the same worker (Lane).
+    /// This guarantees that Create -> Write -> Rename -> Delete sequences
+    /// for a single file are always processed linearly, eliminating
+    /// race conditions between workers.
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
         
@@ -73,41 +77,13 @@ impl EventQueue {
         
         let pool_size = self.senders.len();
         
-        // Hashing / Sharding Logic
-        let target_idx = if pool_size > CONTROL_PLANE_POOL_SIZE {
-            // If we have dedicated data plane workers
-            if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
-                // Metadata events go to Control Plane (Workers 0..CONTROL_PLANE_POOL_SIZE)
-                let mut hasher = DefaultHasher::new();
-                if e.parent_inode != 0 {
-                    e.parent_inode.hash(&mut hasher);
-                } else {
-                    e.inode.hash(&mut hasher);
-                }
-                let hash = hasher.finish();
-                hash as usize % CONTROL_PLANE_POOL_SIZE
-            } else {
-                // Data events go to Data Plane (Workers CONTROL_PLANE_POOL_SIZE..)
-                let mut hasher = DefaultHasher::new();
-                e.inode.hash(&mut hasher);
-                let hash = hasher.finish();
-                CONTROL_PLANE_POOL_SIZE + (hash as usize % (pool_size - CONTROL_PLANE_POOL_SIZE))
-            }
-        } else {
-             // Fallback for low worker count
-             if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
-                 0
-             } else {
-                 let mut hasher = DefaultHasher::new();
-                 e.inode.hash(&mut hasher);
-                 let hash = hasher.finish();
-                 if pool_size > 1 {
-                     1 + (hash as usize % (pool_size - 1))
-                 } else {
-                     0
-                 }
-             }
-        };
+        // Simple modulo sharding ensures strict inode affinity.
+        // We use a hasher to ensure good distribution even if inodes are sequential.
+        let mut hasher = DefaultHasher::new();
+        e.inode.hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        let target_idx = (hash as usize) % pool_size;
 
         if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
