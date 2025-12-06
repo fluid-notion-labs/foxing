@@ -362,10 +362,6 @@ pub async fn run_worker(
                 continue;
              }
 
-             // NOTE: Removed `Unlink` early-exit block here to enforce barrier synchronization.
-             // Previously `Unlink` events bypassed `serialization.acquire_barrier`, causing race conditions
-             // where Hydration could delete a file while Rename was processing it.
-
              let mut ctx = WorkerContext {
                 ring: &mut ring,
                 dirty_stats: &mut dirty_stats,
@@ -384,8 +380,21 @@ pub async fn run_worker(
                 _ => OpKind::Write,
             };
 
-            // ACQUIRE BARRIER - This now protects Unlink operations too!
-            let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
+            // CRITICAL FIX: Inode Resolution for Synthetic Events
+            // If we receive a Synthetic Unlink (Inode 0), we must resolve the TARGET inode
+            // to ensure we lock against other operations (like Rename) on the same file.
+            let barrier_inode = if e.inode == 0 && e.event_type == EventType::Unlink {
+                let rough_target_path = target_cfg.path.join(e.name.trim_start_matches('/'));
+                if let Ok(meta) = std::fs::symlink_metadata(&rough_target_path) {
+                    meta.ino()
+                } else {
+                    0 // File likely already gone, locking 0 is fine
+                }
+            } else {
+                e.inode
+            };
+
+            let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
 
             let (dst, is_synthetic, needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                 ResolveResult::Success(p, s, n) => (p, s, n),
@@ -485,14 +494,25 @@ async fn process_single_event_inner(
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
-            let daemon_id = ctx.daemon_id.to_string();
-            let seq = e.seq_num;
-            let transition_success = tokio::task::spawn_blocking(move || {
-                sidecar::atomic_wal_transition(&dst_for_wal, WalState::None, WalState::IntentPending, &daemon_id, seq)
-            }).await.unwrap_or(Ok(false));
+            // OPTIMIZATION: Check existence before attempting WAL transition to avoid "WAL Race" warning
+            // on files that haven't been created yet (common in Rename flows)
+            let exists_check = if e.event_type == EventType::Rename {
+                 !dst_for_wal.exists()
+            } else { false };
 
-            if let Ok(false) = transition_success {
-                warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst);
+            if !exists_check {
+                let daemon_id = ctx.daemon_id.to_string();
+                let seq = e.seq_num;
+                let transition_success = tokio::task::spawn_blocking(move || {
+                    sidecar::atomic_wal_transition(&dst_for_wal, WalState::None, WalState::IntentPending, &daemon_id, seq)
+                }).await.unwrap_or(Ok(false));
+
+                if let Ok(false) = transition_success {
+                    // Only warn if the file actually exists, otherwise it's just a new file
+                    if dst.exists() {
+                         warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst);
+                    }
+                }
             }
         }
         let entry = ctx.dirty_stats.entry(e.inode).or_insert_with(|| DirtyEntry {
@@ -521,8 +541,6 @@ async fn process_single_event_inner(
             }).await.unwrap_or(Ok(false));
 
             if let Ok(false) = phase2_success {
-                 // Enhanced logic: If the file is missing, it's likely a race with a deletion.
-                 // We shouldn't log "CRITICAL" for a file that isn't there.
                  if !dst_clone.exists() {
                      warn!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Aborting write.", dst_clone);
                      return Ok(None);
@@ -649,7 +667,6 @@ async fn process_single_event_inner(
                         metrics::RENAME_EVENTS.inc();
                         info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
                         
-                        // FIX: Clean up WAL state on the destination to prevent "IntentPending" from sticking
                         let cleanup_path = new_dst_final.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             sidecar::clear_wal_state(&cleanup_path);
