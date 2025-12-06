@@ -621,19 +621,42 @@ async fn process_single_event_inner(
                 let new_dst_final_clone = new_dst_final.clone();
                 let io_latency_ms = tuner.current_flush_ms.max(1);
                 let is_stressed = matches!(tuner.state, crate::tuner::TunerState::HighLoad | crate::tuner::TunerState::Muted | crate::tuner::TunerState::CriticalDrain);
+                let hydration_trigger_clone = hydration_trigger.clone();
+                let target_root_path = target_cfg.path.clone();
                 
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    // Robust Retry Loop: Wait up to 120s for the source file to appear (created by Data Plane)
+                    // Robust Retry Loop with Active Repair: Wait up to 120s for the source file to appear (created by Data Plane)
                     // before giving up. This handles priority inversion between Control and Data planes.
                     let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(30), Duration::from_secs(120));
-                    
+                    let mut triggered_hydration = false;
+
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                                 let elapsed = start.elapsed();
+                                // ACTIVE REPAIR: If source is missing for >200ms, force hydration to fetch it.
+                                // CRITICAL FIX: Convert ABSOLUTE target path to RELATIVE path from target root.
+                                // The HydrationWorker expects a path relative to the Source/Target root, not an absolute path.
+                                if !triggered_hydration && elapsed > Duration::from_millis(200) {
+                                    // 1. Repair missing source file
+                                    if let Ok(rel_path) = old_dst_final_clone.strip_prefix(&target_root_path) {
+                                        let _ = hydration_trigger_clone.0.try_send(rel_path.to_path_buf());
+                                    }
+                                    
+                                    // 2. Repair missing destination parent directory (handles pending Mkdir)
+                                    if let Some(parent) = new_dst_final_clone.parent() {
+                                        if !parent.exists() {
+                                            if let Ok(rel_parent) = parent.strip_prefix(&target_root_path) {
+                                                let _ = hydration_trigger_clone.0.try_send(rel_parent.to_path_buf());
+                                            }
+                                        }
+                                    }
+                                    triggered_hydration = true;
+                                }
+
                                 if elapsed > max_wait {
                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
                                 }
