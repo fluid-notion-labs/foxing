@@ -39,9 +39,7 @@ pub struct WalGuard<'a> {
     map: &'a WalStateMap,
     inode: u64,
     entry: PersistedWalEntry,
-    // Flag to indicate if the caller successfully committed the operation.
-    // If true, drop() will NOT rollback. If false, drop() performs rollback.
-    committed: bool, 
+    committed: bool,
 }
 impl WalStateMap {
     pub fn new() -> Self {
@@ -86,7 +84,8 @@ impl WalStateMap {
     }
     // Updated signature: use WalGuard
     pub fn rearm_guard<'a>(&'a self, entry: PersistedWalEntry) -> Option<WalGuard<'a>> {
-        if entry.state == WalState::CommitPending {
+        // Fix: Only rearm entries that failed to commit on target but are still pending cleanup
+        if matches!(entry.state, WalState::CommitPending | WalState::InProgress | WalState::IntentPending) {
              Some(WalGuard {
                  map: self,
                  inode: entry.inode,
@@ -97,7 +96,6 @@ impl WalStateMap {
             None
         }
     }
-    // Updated to handle WalGuard struct
     pub fn advance(&self, guard: &mut WalGuard, to_state: WalState) -> Result<()> {
         let inode = guard.inode;
         let expected_from = guard.entry.state.clone();
@@ -106,6 +104,7 @@ impl WalStateMap {
                 if dash_entry.state != expected_from {
                     let found = dash_entry.state.clone();
                     metrics::WAL_COHERENCE_FAILURES.with_label_values(&["advance"]).inc();
+                    // Fix: Log the specific error that led to the non-recoverable error in the logs
                     error!("WAL Transition Mismatch for Inode {}: Expected {:?}, Found {:?}", inode, expected_from, found);
                     return Err(FoxingError::Io(io::Error::new(
                         io::ErrorKind::Other,
@@ -126,6 +125,7 @@ impl WalStateMap {
                 Ok(())
             }
             None => {
+                // If the entry is missing, it means another thread successfully removed it (e.g., via rollback/clear)
                 metrics::WAL_COHERENCE_FAILURES.with_label_values(&["missing_advance"]).inc();
                 error!("WAL Transition Mismatch for Inode {}: Entry missing during advance from {:?}", inode, expected_from);
                 Err(FoxingError::Io(io::Error::new(
@@ -135,12 +135,9 @@ impl WalStateMap {
             }
         }
     }
-    // Updated: Use mark_committed instead of this public commit function for WalGuard.
-    // Kept only for non-guarded operations if necessary, but marked for removal.
     pub fn commit(&self, guard: &mut WalGuard) {
         self.mark_committed(guard);
     }
-    // Updated: Do not log "already missing" noise.
     pub fn clear_wal_state(&self, inode: u64) {
         if inode == 0 { return; }
         if self.states.remove(&inode).is_some() {
@@ -185,9 +182,18 @@ impl Drop for WalGuard<'_> {
         if !self.committed {
             metrics::WAL_COHERENCE_FAILURES.with_label_values(&["rollback_drop"]).inc();
             error!("WAL Rollback: Operation failed or guard dropped prematurely for Inode {}. State was {:?}", self.inode, self.entry.state);
-            // Attempt to remove the entry if it's still present in any state
-            if self.map.states.remove(&self.inode).is_some() {
-                 debug!("WAL: Inode {} manually cleared during rollback.", self.inode);
+
+            // CRITICAL FIX: Only attempt to manually clear if the state implies an ongoing operation.
+            // This prevents racing with a successful commit or an upstream rollback that already cleared the map.
+            if matches!(self.entry.state, WalState::IntentPending | WalState::InProgress) {
+                // Attempt to remove the entry if it's still present in IntentPending or InProgress
+                if self.map.states.remove(&self.inode).is_some() {
+                     debug!("WAL: Inode {} manually cleared during rollback.", self.inode);
+                } else {
+                     debug!("WAL Rollback: Inode {} entry already missing (race won by another clear).", self.inode);
+                }
+            } else {
+                 debug!("WAL Rollback: Inode {} entry in state {:?} not forcibly cleared.", self.inode, self.entry.state);
             }
         }
     }

@@ -442,7 +442,7 @@ pub async fn run_worker(
                             if let Some(entry) = wal_map.get_entry_for_inode(e.inode) {
                                 if entry.state == WalState::CommitPending {
                                     if let Some(mut guard) = wal_map.rearm_guard(entry) {
-                                        wal_map.mark_committed(&mut guard); // Use new function
+                                        wal_map.mark_committed(&mut guard);
                                     }
                                 }
                             }
@@ -465,9 +465,11 @@ pub async fn run_worker(
                         }
                         debug!("Worker {}: Event {} failed (NotFound). Retrying with fresh lookup (Attempt {}).", worker_id, e.seq_num, attempts);
                         let mut resolved_via_agressive_lookup = false;
-                        if attempts == 1 {
+
+                        // OPTIMIZATION: Only trigger the expensive walkdir lookup after repeated failures
+                        if attempts >= 3 {
                              let lookup_res = tokio::task::spawn_blocking({
-                                 let source_clone = source.clone();
+                                 let source_clone = source_clone.clone();
                                  let inode = e.inode;
                                  move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
                              }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
@@ -480,9 +482,11 @@ pub async fn run_worker(
                                  resolved_via_agressive_lookup = true;
                              }
                         }
+
                         if resolved_via_agressive_lookup {
                             continue;
                         }
+                        // Original "Source Race" check (faster path resolution for renames)
                         if !src.exists() {
                             if let Some(new_name) = &e.new_name {
                                 let new_parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
@@ -544,7 +548,6 @@ async fn process_single_event_inner(
     let inode = e.inode;
     let wal_map = &source.wal_state_map;
     let source_clone = source.clone(); // Clone Arc<SourceInfo> here for spawn_blocking blocks
-    
     let identity_update_sync = |rel: PathBuf, is_dir: bool| {
         identity::update_map(
             &source.inode_map,
@@ -701,7 +704,6 @@ async fn process_single_event_inner(
                             let resolved = tokio::task::spawn_blocking(move || {
                                 identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
                             }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-                            
                             match resolved {
                                 Ok(parent_rel) => parent_rel.join(new_name_str),
                                 Err(_) => {
@@ -725,7 +727,6 @@ async fn process_single_event_inner(
                     e.dev_id,
                     inode,
                     new_rel_path.clone(),
-                    e.generation,
                     is_dir,
                     e.timestamp_ns,
                     e.seq_num
@@ -759,6 +760,7 @@ async fn process_single_event_inner(
                                 }
                                 if !old_dst_final_move.exists() {
                                     if new_dst_final_move.exists() {
+                                         // FIX: If old source is gone but new target exists, assume success from prior run/race.
                                          debug!("Worker: Rename target {:?} already exists. Assuming previous success (Stale event).", new_dst_final_move);
                                          wal_map_clone.clear_wal_state(inode);
                                          return Ok(());
@@ -907,7 +909,7 @@ async fn process_single_event_inner(
         }
         EventType::Link => {
              let src_dev = e.dev_id;
-             let new_path = src.to_path_buf(); // src is the new link target (relative to mount)
+             let new_path = src.to_path_buf();
              identity::update_map_after_rename(
                 &source.inode_map,
                 &source.dir_map,
@@ -920,20 +922,19 @@ async fn process_single_event_inner(
                 e.seq_num
             );
             let new_dst = dst.clone();
-            let new_dst_clone_for_log = new_dst.clone(); // FIX: Clone for logging
+            let new_dst_clone_for_log = new_dst.clone();
             let src_clone = source.mount.join(src);
             let res = tokio::task::spawn_blocking(move || {
                 security::create_hard_link(&src_clone, &new_dst)
             }).await.map_err(FoxingError::Join).and_then(|r| r);
             if res.is_err() {
-                 error!("Link failed for {:?} -> {:?}: {:?}", src, new_dst_clone_for_log, res); // FIX: Use cloned path
+                 error!("Link failed for {:?} -> {:?}: {:?}", src, new_dst_clone_for_log, res);
                  return Err(res.unwrap_err());
             }
             Ok(None)
         }
         EventType::Symlink => {
             let src_dev = e.dev_id;
-            // Name contains the target link content
             let target_content = e.name.clone();
             let link_path = dst.clone();
             let link_path_rel = link_path.strip_prefix(&target_cfg.path).unwrap_or(link_path.as_path()).to_path_buf();
@@ -948,13 +949,13 @@ async fn process_single_event_inner(
                 e.timestamp_ns,
                 e.seq_num
             );
-            let target_content_clone = target_content.clone(); // FIX: Clone for logging
-            let link_path_clone_for_log = link_path.clone(); // FIX: Clone for logging
+            let target_content_clone = target_content.clone();
+            let link_path_clone_for_log = link_path.clone();
             let res = tokio::task::spawn_blocking(move || {
                 security::create_symlink(&target_content, &link_path)
             }).await.map_err(FoxingError::Join).and_then(|r| r);
             if res.is_err() {
-                error!("Symlink failed for {} -> {:?}: {:?}", target_content_clone, link_path_clone_for_log, res); // FIX: Use cloned paths
+                error!("Symlink failed for {} -> {:?}: {:?}", target_content_clone, link_path_clone_for_log, res);
                 return Err(res.unwrap_err());
             }
             Ok(None)
@@ -962,7 +963,7 @@ async fn process_single_event_inner(
         EventType::Mknod => {
              let src_dev = e.dev_id;
              let new_path_rel = dst.strip_prefix(&target_cfg.path).unwrap_or(dst.as_path()).to_path_buf();
-             let dev = e.length; // Kernel sends device ID in length for mknod/device files
+             let dev = e.length;
              identity::update_map_after_rename(
                 &source.inode_map,
                 &source.dir_map,
@@ -975,13 +976,13 @@ async fn process_single_event_inner(
                 e.seq_num
             );
             let new_dst = dst.clone();
-            let new_dst_clone_for_log = new_dst.clone(); // FIX: Clone for logging
+            let new_dst_clone_for_log = new_dst.clone();
             let mode = e.mode;
             let res = tokio::task::spawn_blocking(move || {
                 security::create_mknod(&new_dst, mode, dev)
             }).await.map_err(FoxingError::Join).and_then(|r| r);
             if res.is_err() {
-                error!("Mknod failed for {:?}: {:?}", new_dst_clone_for_log, res); // FIX: Use cloned path
+                error!("Mknod failed for {:?}: {:?}", new_dst_clone_for_log, res);
                 return Err(res.unwrap_err());
             }
             Ok(None)
@@ -991,7 +992,7 @@ async fn process_single_event_inner(
             let new_size = e.length;
             let offset = e.offset;
             let flags = e.flags as i32;
-            let e_clone_for_log = e.clone(); // FIX: Clone Arc<Event> for logging
+            let e_clone_for_log = e.clone();
             let res = tokio::task::spawn_blocking(move || {
                 if e.event_type == EventType::Truncate {
                     security::truncate_file(&dst_clone, new_size)
@@ -1000,7 +1001,7 @@ async fn process_single_event_inner(
                 }
             }).await.map_err(FoxingError::Join).and_then(|r| r);
             if res.is_err() {
-                error!("{} failed for {:?}: {:?}", e_clone_for_log.event_type.as_str(), dst, res); // FIX: Use cloned event
+                error!("{} failed for {:?}: {:?}", e_clone_for_log.event_type.as_str(), dst, res);
                 return Err(res.unwrap_err());
             }
             Ok(None)
