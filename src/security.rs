@@ -17,6 +17,7 @@ use io_uring::{IoUring, opcode, types};
 use std::collections::hash_map::DefaultHasher;
 use std::io::{Read, Seek, SeekFrom};
 use fxhash::FxHasher;
+use tracing::warn;
 
 const FS_IOC_FSSETXATTR: u64 = 0x40205820;
 const FS_IOC_SETFLAGS: u64 = 0x40086602;
@@ -270,7 +271,7 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
         }
     }
     if ret != 0 {
-        // Fallback handled by caller usually or simple warning
+        warn!("IOCTL FICLONERANGE failed (errno: {} / {:?}). Fallback copy.", ret, std::io::Error::last_os_error());
         let mut off_in = 0i64;
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };
@@ -295,6 +296,7 @@ pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let range = FileCloneRange { s: src_fd as i64, so: 0, l: size, do_: 0 };
     let ret = unsafe { libc::ioctl(dst_fd, FIOCLONERANGE, &range) };
     if ret != 0 {
+        warn!("IOCTL FICLONERANGE failed revert. Fallback copy.");
         let mut off_in = 0i64;
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };

@@ -368,7 +368,7 @@ pub async fn run_worker(
                  identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, src_inode);
                  let (dst, _is_synthetic, _needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                      ResolveResult::Success(p, s, n) => (p, s, n),
-                     ResolveResult::NeedsRepair(_) => { continue; } // Skip unlink if ID bad
+                     ResolveResult::NeedsRepair(_) => { continue; } 
                  };
                  let _res = tokio::task::spawn_blocking(move || {
                      if dst.exists() {
@@ -563,7 +563,6 @@ async fn process_single_event_inner(
                         src_rwf_uncached_ok,
                         dst_rwf_uncached_ok,
                         target_cfg.vdo_stall_threshold,
-                        // Issue 5 Fix: Removed Duplicate Argument
                     ).await;
 
                     match copy_res {

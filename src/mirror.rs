@@ -228,7 +228,6 @@ impl Manager {
                 
                 // RECOVERY: Scan for pending Directory Hash commits from previous crash (Issue 6)
                 if t.path.exists() {
-                    // Fix: Use correct module for remove_metadata
                     let _ = crate::sidecar::remove_metadata(&t.path, "user.foxing_dir_hash_pending");
                 }
             }
@@ -333,7 +332,7 @@ impl Manager {
                 let queues_copy = queues_for_source.clone();
                 if let Some(journal) = &src.journal {
                     let projector = src.projector.clone();
-                    // This now calls the sorted replay from Issue 7 fix
+                    // Issue 7: Uses sorted replay internally
                     let replay_count = journal.replay(|evt| {
                         let evt_arc = Arc::new(evt);
                         if let Some(p) = &projector { p.project(&evt_arc); }

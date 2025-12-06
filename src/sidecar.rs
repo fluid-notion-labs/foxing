@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use libc;
 use std::io::{self, Seek, SeekFrom};
 use xattr;
-use tracing::{debug}; // Removed 'warn'
+use tracing::{debug};
 use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
 
@@ -160,6 +160,7 @@ pub fn remove_metadata(path: &Path, key: &str) -> std::io::Result<()> {
     }
 }
 
+// ISSUE 1 FIX: Atomic WAL Transition
 pub fn atomic_wal_transition(path: &Path, from_state: WalState, to_state: WalState, daemon_id: &str, seq: u64) -> std::io::Result<bool> {
     let file = match fs::File::open(path) {
         Ok(f) => f,

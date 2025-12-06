@@ -211,7 +211,6 @@ impl SmartCopier {
                     Self::perform_sparse_copy_blocking(sfd, dfd, src_file_size, &src_path_debug)
                 }).await.unwrap_or_else(|e| Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))))?;
             } else {
-                // Corrected Call Signature
                 stats = Self::perform_delta_uring_pipelined(
                     ring, sfd, dfd, offset, length, vdo_opt, buffer_pool,
                     target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold
@@ -370,7 +369,6 @@ impl SmartCopier {
         src_rwf_uncached_ok: bool,
         dst_rwf_uncached_ok: bool,
         vdo_stall_threshold: u32,
-        // Removed src_file_size from signature as verification moved to caller
     ) -> Result<CopyStats> {
         let max_sqe = ring.submission().capacity();
         let num_buffers = buffer_pool.capacity();
