@@ -7,10 +7,9 @@ use std::os::unix::io::AsRawFd;
 use libc;
 use std::io::{self, Seek, SeekFrom};
 use xattr;
-use tracing::{debug};
+use tracing::{debug, warn};
 use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 pub enum WalState {
     None,
@@ -22,7 +21,6 @@ pub enum WalState {
     PendingRename,
     Unknown
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PersistedWalEntry {
     pub seq: u64,
@@ -31,31 +29,26 @@ pub struct PersistedWalEntry {
     pub daemon_id: String,
     pub crc: u64,
 }
-
 pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
     let file_name = target_path.file_name()?.to_str()?;
     let sidecar_name = format!(".{}.foxing_meta", file_name);
     Some(target_path.with_file_name(sidecar_name))
 }
-
 fn lock_file(file: &File, exclusive: bool) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
     let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
     let ret = unsafe { libc::flock(fd, op) };
     if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
-
 fn unlock_file(file: &File) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_UN) };
     if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
-
 pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.is_symlink() { return Ok(()); }
     } else { return Ok(()); }
-
     match xattr::set(path, key, value) {
         Ok(_) => {
             if let Some(sp) = get_sidecar_path(path) {
@@ -76,36 +69,28 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()>
             }
         }
     }
-
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine sidecar path")),
     };
-
     let mut file = fs::OpenOptions::new().read(true).write(true).create(true).open(&sp)?;
     lock_file(&file, true)?;
-    
     let mut map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
     let val_str = hex::encode(value);
     map.insert(key.to_string(), val_str);
-    
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
     serde_json::to_writer(&file, &map)?;
-    
     unlock_file(&file)?;
     Ok(())
 }
-
 pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.is_symlink() { return None; }
     } else { return None; }
-
     if let Ok(Some(val)) = xattr::get(path, key) {
         return Some(val);
     }
-
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {
             if let Ok(file) = File::open(&sp) {
@@ -123,10 +108,8 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
     }
     None
 }
-
 pub fn remove_metadata(path: &Path, key: &str) -> std::io::Result<()> {
     let xattr_res = xattr::remove(path, key);
-    
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {
             if let Ok(mut file) = fs::OpenOptions::new().read(true).write(true).open(&sp) {
@@ -159,38 +142,43 @@ pub fn remove_metadata(path: &Path, key: &str) -> std::io::Result<()> {
         }
     }
 }
-
-// ISSUE 1 FIX: Atomic WAL Transition
 pub fn atomic_wal_transition(path: &Path, from_state: WalState, to_state: WalState, daemon_id: &str, seq: u64) -> std::io::Result<bool> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-
     lock_file(&file, true)?;
-
     let current_state_entry = get_wal_state_internal(path);
     let current_state = current_state_entry.map(|e| e.state).unwrap_or(WalState::None);
 
+    // NEW: Allow IntentPending -> InProgress transition even if current state is None,
+    // which happens after an atomic rename on the source path if the worker is racing with the rename.
+    if from_state == WalState::IntentPending && current_state == WalState::None {
+        if to_state == WalState::InProgress {
+            debug!("WAL: Allowing Intent->InProgress despite missing Intent (likely post-rename race)");
+            update_wal_internal(path, to_state, seq, daemon_id);
+            unlock_file(&file)?;
+            return Ok(true);
+        }
+    }
+
     if current_state != from_state {
         debug!("WAL Transition Mismatch for {:?}: Expected {:?}, Found {:?}", path, from_state, current_state);
+        // Increment metric for coherence failure
+        crate::metrics::WAL_COHERENCE_FAILURES.with_label_values(&["unknown"]).inc();
         unlock_file(&file)?;
         return Ok(false);
     }
-
     update_wal_internal(path, to_state, seq, daemon_id);
-    
     unlock_file(&file)?;
     Ok(true)
 }
-
 fn update_wal_internal(path: &Path, state: WalState, seq: u64, daemon_id: &str) {
     let mut hasher = DefaultHasher::new();
     hasher.write_u64(seq);
     hasher.write(daemon_id.as_bytes());
     let crc = hasher.finish();
-    
     let entry = PersistedWalEntry {
         seq,
         state,
@@ -198,12 +186,10 @@ fn update_wal_internal(path: &Path, state: WalState, seq: u64, daemon_id: &str) 
         daemon_id: daemon_id.to_string(),
         crc,
     };
-    
     if let Ok(json) = serde_json::to_string(&entry) {
         let _ = set_metadata(path, "user.foxing.wal", json.as_bytes());
     }
 }
-
 fn get_wal_state_internal(path: &Path) -> Option<PersistedWalEntry> {
     if let Some(bytes) = get_metadata(path, "user.foxing.wal") {
         if let Ok(entry) = serde_json::from_slice::<PersistedWalEntry>(&bytes) {
@@ -217,15 +203,12 @@ fn get_wal_state_internal(path: &Path) -> Option<PersistedWalEntry> {
     }
     None
 }
-
 pub fn update_wal(path: &Path, state: WalState, seq: u64, daemon_id: &str) {
     update_wal_internal(path, state, seq, daemon_id);
 }
-
 pub fn get_wal_state(path: &Path) -> Option<PersistedWalEntry> {
     get_wal_state_internal(path)
 }
-
 pub fn clear_wal_state(path: &Path) {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if meta.is_symlink() { return; }
@@ -233,7 +216,6 @@ pub fn clear_wal_state(path: &Path) {
     let _ = remove_metadata(path, "user.foxing.wal");
     let _ = remove_metadata(path, "user.foxing.dirty");
 }
-
 pub fn is_dirty(path: &Path) -> bool {
     if get_metadata(path, "user.foxing.wal").is_some() {
         return true;
@@ -243,7 +225,6 @@ pub fn is_dirty(path: &Path) -> bool {
     }
     false
 }
-
 pub fn set_dirty_flag(path: &Path, active: bool, _reason: &str) {
     if active {
         let _ = set_metadata(path, "user.foxing.dirty", &[1]);
