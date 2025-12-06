@@ -16,7 +16,7 @@ use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
 use std::os::unix::fs::MetadataExt;
-use crate::wal::clear_wal_state_for_inode; // <-- FIX: Import new helper
+use crate::wal::clear_wal_state_for_inode;
 use dashmap::DashMap;
 #[derive(Debug)]
 pub struct HydrationJob {
@@ -100,6 +100,11 @@ async fn run_hydration_worker_loop(
     }
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
     loop {
+        // --- Adaptive Pacing based on Governor Status ---
+        if governor.is_system_stressed() {
+            // Sleep longer when system is under load to reduce repair contention
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let job = {
             let mut lock = rx.lock().await;
             lock.recv().await
@@ -127,14 +132,11 @@ async fn process_hydration_job(
     let HydrationJob { mut rel_path, target_cfg, inode: job_inode } = job;
     let wal_map = &source.wal_state_map;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
-    
-    // Attempt to get the inode from the path if it wasn't provided
     let inode = if let Some(ino) = job_inode {
         ino
     } else {
         std::fs::metadata(&source.mount.join(&rel_path)).map(|m| m.ino()).unwrap_or(0)
     };
-
     if inode != 0 {
         match spawn_blocking({
             let source_clone = source.clone();
@@ -154,7 +156,7 @@ async fn process_hydration_job(
     }
     let source_path = source.mount.join(&rel_path);
     let target_path = target_cfg.path.join(&rel_path);
-    if let Ok(_metadata) = std::fs::metadata(&source_path) { // FIX: Use _metadata to silence unused warning
+    if let Ok(_metadata) = std::fs::metadata(&source_path) {
         tracker.remove(&inode);
     } else {
         if !source_path.exists() {
@@ -169,7 +171,6 @@ async fn process_hydration_job(
                     }
                 }).await;
             }
-            // Clear WAL state for the deleted inode
             if inode != 0 { clear_wal_state_for_inode(wal_map, inode); }
             return Ok(None);
         }
@@ -179,7 +180,8 @@ async fn process_hydration_job(
     if governor.is_system_stressed() ||
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Workers are currently struggling; yield before performing the IO copy.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
@@ -231,12 +233,11 @@ async fn process_hydration_job(
                 metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(stats.bytes_processed as f64);
                 let src_path_clone = source_path.clone();
                 let dst_path_clone = target_path.clone();
-                let wal_map_clone = wal_map.clone(); // <-- FIX: Clone wal_map for 'static closure
+                let wal_map_clone = wal_map.clone();
                 let apply_res = spawn_blocking(move || {
                     security::sync_xattrs(&src_path_clone, &dst_path_clone);
                     let _ = security::apply_metadata(&src_path_clone, &dst_path_clone);
-                    // Clear WAL state for the copied inode
-                    if inode != 0 { clear_wal_state_for_inode(&wal_map_clone, inode); } // Use cloned map
+                    if inode != 0 { clear_wal_state_for_inode(&wal_map_clone, inode); }
                 }).await;
                 if apply_res.is_err() {
                     warn!("Hydration: Failed to apply metadata/clear state for {:?}. Retrying.", target_path);
@@ -265,7 +266,6 @@ async fn process_hydration_job(
                     tokio::time::sleep(delay).await;
                 } else {
                     error!("Hydration copy POISONED after {} attempts for {:?}: {:?}", max_attempts, rel_path, e);
-                    // Clear WAL state on hard failure
                     if inode != 0 { clear_wal_state_for_inode(wal_map, inode); }
                     return Err(e);
                 }

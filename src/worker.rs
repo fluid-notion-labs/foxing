@@ -141,7 +141,7 @@ pub async fn run_worker(
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     hydration_trigger: Arc<HydrationSender>,
     _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>,
-    _governor: Arc<Governor>,
+    governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
     _rx_repair: Option<mpsc::Receiver<Arc<Event>>>,
@@ -270,7 +270,7 @@ pub async fn run_worker(
                 },
                 _ = &mut flush_timer => {
                     let tuner_tick_start = Instant::now();
-                    let is_stressed = _governor.is_system_stressed();
+                    let is_stressed = governor.is_system_stressed(); // Use passed governor
                     let pending_len = coalescer.len();
                     let max_pending = target_cfg.queue_max;
                     let target_label = target_cfg.path.to_string_lossy().to_string();
@@ -368,14 +368,7 @@ pub async fn run_worker(
                     }
                 }
             };
-            
-            // --- Path Binding Cleanup (Primary Fix for E0308, E0277) ---
-            // 'dst' is now a mutable PathBuf initialized from the initial lookup result.
-            let mut dst = initial_dst; 
-            
-            // Re-assign initial_dst path to `dst` for consistency inside the loop (This was the source of E0308)
-            // Removed redundant reassignment: dst = &mut dst_file;
-            
+            let mut dst = initial_dst;
              if matches!(e.event_type, EventType::Rmdir | EventType::Unlink) {
                  let target_exists = std::fs::symlink_metadata(&dst).is_ok();
                  if !target_exists {
@@ -421,25 +414,21 @@ pub async fn run_worker(
                 e.inode
             };
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
-            
-            // --- Source Path Resolution (Proactive) ---
             let initial_rel_path = if let Ok(rel) = dst.strip_prefix(&target_cfg.path) {
                 rel.to_path_buf()
             } else {
                 PathBuf::from(e.name.trim_start_matches('/'))
             };
-            
             let mut src = source.mount.join(&initial_rel_path);
-            
             let lock = locks.get_by_path(&e.name);
             let _g = lock.lock().await;
             let mut attempts = 0;
             let max_retries = 5;
-            // FIX E0425: Clone Arc<SourceInfo> outside the loop for use in spawned blocking tasks
             let source_clone = source.clone();
-
             loop {
                 attempts += 1;
+                let is_stressed = governor.is_system_stressed(); // Use passed governor
+
                 // Before starting I/O, check if the Identity Map has a newer path for this Inode.
                 // This is a fast, internal check that avoids expensive disk lookups or failed I/O.
                 if attempts > 1 && e.inode != 0 {
@@ -501,7 +490,7 @@ pub async fn run_worker(
                                  // FIX E0425: Capture `source_clone` correctly
                                  let source_clone = source_clone.clone();
                                  let inode = e.inode;
-                                 move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
+                                 move || identity::resolve_and_update_path(&source_clone, inode, e.generation, e.timestamp_ns, e.seq_num) // Pass full metadata to ID resolver
                              }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
                              if let Ok(new_rel_path) = lookup_res {
                                  let new_src = source.mount.join(&new_rel_path);
@@ -537,7 +526,11 @@ pub async fn run_worker(
                             debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Accepting deletion.", worker_id, src);
                             break;
                         }
-                        let sleep_duration = Duration::from_millis(50 * (attempts as u64));
+                        
+                        // --- Adaptive Retry Delay (New Adjustment) ---
+                        // Base sleep (50ms * attempt) scaled by governor stress state.
+                        let stress_multiplier = if is_stressed { 2 } else { 1 };
+                        let sleep_duration = Duration::from_millis(50 * (attempts as u64) * stress_multiplier);
                         sleep(sleep_duration).await;
                         continue;
                     },
@@ -805,7 +798,6 @@ async fn process_single_event_inner(
                                 }
                                 if !old_dst_final_move.exists() {
                                     if new_dst_final_move.exists() {
-                                         // FIX: If old source is gone but new target exists, assume success from prior run/race.
                                          debug!("Worker: Rename target {:?} already exists. Assuming previous success (Stale event).", new_dst_final_move);
                                          wal_map_clone.clear_wal_state(inode);
                                          return Ok(());
@@ -955,14 +947,13 @@ async fn process_single_event_inner(
         EventType::Link => {
              let src_dev = e.dev_id;
              let new_path = src.to_path_buf();
-             // FIX E0061: Add missing `generation` argument (`e.generation`)
              identity::update_map_after_rename(
                 &source.inode_map,
                 &source.dir_map,
                 src_dev,
                 inode,
                 new_path.clone(),
-                e.generation, // <-- MISSING ARGUMENT
+                e.generation,
                 (e.mode & libc::S_IFMT) == libc::S_IFDIR,
                 e.timestamp_ns,
                 e.seq_num
@@ -984,14 +975,13 @@ async fn process_single_event_inner(
             let target_content = e.name.clone();
             let link_path = dst.clone();
             let link_path_rel = link_path.strip_prefix(&target_cfg.path).unwrap_or(link_path.as_path()).to_path_buf();
-            // FIX E0061: Add missing `generation` argument (`e.generation`)
             identity::update_map_after_rename(
                 &source.inode_map,
                 &source.dir_map,
                 src_dev,
                 inode,
                 link_path_rel,
-                e.generation, // <-- MISSING ARGUMENT
+                e.generation,
                 (e.mode & libc::S_IFMT) == libc::S_IFDIR,
                 e.timestamp_ns,
                 e.seq_num
@@ -1011,14 +1001,13 @@ async fn process_single_event_inner(
              let src_dev = e.dev_id;
              let new_path_rel = dst.strip_prefix(&target_cfg.path).unwrap_or(dst.as_path()).to_path_buf();
              let dev = e.length;
-             // FIX E0061: Add missing `generation` argument (`e.generation`)
              identity::update_map_after_rename(
                 &source.inode_map,
                 &source.dir_map,
                 src_dev,
                 inode,
                 new_path_rel,
-                e.generation, // <-- MISSING ARGUMENT
+                e.generation,
                 (e.mode & libc::S_IFMT) == libc::S_IFDIR,
                 e.timestamp_ns,
                 e.seq_num
