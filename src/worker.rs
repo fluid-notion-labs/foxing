@@ -569,11 +569,6 @@ async fn process_single_event_inner(
             }
         },
         EventType::Rename => {
-            // FIX: Add stabilization delay to prevent race conditions with test harnesses polling for intermediate files
-            if _is_control_plane {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-
             let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
             let new_rel_path = if let Some(new_name_str) = &e.new_name {
                 let parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
@@ -626,12 +621,27 @@ async fn process_single_event_inner(
                 let new_dst_final_clone = new_dst_final.clone();
                 let io_latency_ms = tuner.current_flush_ms.max(1);
                 let is_stressed = matches!(tuner.state, crate::tuner::TunerState::HighLoad | crate::tuner::TunerState::Muted | crate::tuner::TunerState::CriticalDrain);
+                
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    // Fix: Increased lower bound from 5s to 30s to handle deep Data Plane backlogs.
+                    // Increased clamp from 5s to 30s to handle deep Data Plane backlogs.
                     // Previous clamp(5s, 60s) allowed only 5s waits on low latency systems, causing race failures.
                     let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(30), Duration::from_secs(120));
+                    
+                    // VISIBILITY BARRIER: Ensure file exists and is visible for a moment before renaming
+                    // This prevents "Too Fast" renames from breaking external observers/tests
+                    if _is_control_plane {
+                        let wait_start = Instant::now();
+                        while !old_dst_final_clone.exists() {
+                            if wait_start.elapsed() > max_wait { break; }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        if old_dst_final_clone.exists() {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
