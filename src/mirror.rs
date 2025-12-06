@@ -26,7 +26,7 @@ use crate::versioning::VersionIndex;
 use crate::identity_watch::InotifyIndex;
 use crate::journal_store::JournalStore;
 use crate::projector::IdentityProjector;
-use crate::identity; // Added for manual seeding
+use crate::identity;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::Sender<PathBuf>;
@@ -99,19 +99,21 @@ fn resolve_all_device_ids(path: &PathBuf) -> Result<(PathBuf, Vec<u32>)> {
     let canonical = path.canonicalize().map_err(|e| crate::error::FoxingError::Io(e))?;
     let mut ids = Vec::new();
     
-    // Get primary ID from stat
     if let Ok(meta) = fs::metadata(&canonical) {
         use std::os::unix::fs::MetadataExt;
         let rdev = meta.dev();
-        // Convert dev_t to kernel device ID format (Major << 20 | Minor)
+        // Major/Minor extraction for Linux
         let maj = ((rdev >> 8) & 0xfff) as u32;
         let min = ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32;
+        // Construct kernel-style device ID (32-bit)
         let stat_id = (maj << 20) | min;
         ids.push(stat_id);
     }
-
-    let mount_point = canonical.clone(); // Simplified mount point detection for now
     
+    // We might need to handle bind mounts or btrfs subvolumes more specifically here in future
+    // For now, we assume the stat ID is sufficient for BPF filtering
+    let mount_point = canonical.clone(); // In complex setups, we'd traverse up to find mount point
+
     if ids.is_empty() {
         return Err(crate::error::FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "Could not determine device ID for path.")));
     }
@@ -123,26 +125,26 @@ impl Manager {
     pub async fn new(cfg: SharedConfig) -> Self {
         let daemon_id = Uuid::new_v4().to_string();
         info!("Daemon Session ID: {}", daemon_id);
-        
+
         let config_reader = cfg.read().await;
-        
         let governor = Arc::new(crate::governor::Governor::new(
             config_reader.max_system_load_avg,
             config_reader.hydration_delay_ms,
             config_reader.governor_psi_io_threshold,
             config_reader.governor_psi_cpu_threshold,
         ));
-
-        let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
-        let lru_size_val = cache_size_raw.max(10000);
+        
+        // Calculate dynamic cache sizes
+        let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize; // 20% of buffer limit for metadata
+        let lru_size_val = cache_size_raw.max(10000); // Minimum 10k entries
 
         let journal_buf_size = (config_reader.io_buffer_size_mib * 1024 * 1024) as usize;
         let journal_buf_final = journal_buf_size.max(64 * 1024).min(16 * 1024 * 1024);
 
         let mut sources: HashMap<u32, Arc<SourceInfo>> = HashMap::new();
+        
+        // Pre-calculate target device IDs to avoid monitoring our own writes
         let mut target_ids_to_exclude = Vec::new();
-
-        // Identify target devices to avoid self-replication loops
         for sc in &config_reader.sources {
             for tc in &sc.targets {
                 if let Ok(meta) = fs::metadata(&tc.path) {
@@ -159,14 +161,14 @@ impl Manager {
         for sc in &config_reader.sources {
             match resolve_all_device_ids(&sc.path) {
                 Ok((mount_path, mut dev_ids)) => {
-                    // Filter out target devices if they are nested/mounted within source
+                    // Filter out device IDs that belong to targets (loop prevention)
                     dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
                     
                     if dev_ids.is_empty() {
                         error!("Source {:?} has NO device IDs left after excluding Targets!", sc.path);
                         continue;
                     }
-                    
+
                     let primary_dev = dev_ids[0];
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
 
@@ -175,9 +177,8 @@ impl Manager {
                     } else {
                         sc.path.clone()
                     };
-                    
                     let version_index = Arc::new(VersionIndex::new(version_root));
-                    
+
                     info!("Initializing Inotify Reverse Index for {:?}", sc.path);
                     let identity_watcher = Some(InotifyIndex::new(sc.path.clone()));
 
@@ -189,7 +190,7 @@ impl Manager {
                         dir_map.clone(),
                         primary_dev
                     ));
-                    
+
                     let mut journal = None;
                     if let Some(tgt) = sc.targets.first() {
                         let journal_dir = &config_reader.journal_dir;
@@ -233,14 +234,14 @@ impl Manager {
                 Err(e) => error!("Failed to resolve device IDs for {:?}: {}", sc.path, e),
             }
         }
-        
-        // Probe target capabilities
+
+        // Feature Probing
         for sc in &config_reader.sources {
             for t in &sc.targets {
                 let xattr_ok = security::probe_xattr_support(&t.path);
                 t.xattr_supported.store(xattr_ok, std::sync::atomic::Ordering::Relaxed);
                 
-                // Clear stale state
+                // Clean up stale markers
                 if t.path.exists() {
                     let _ = crate::sidecar::remove_metadata(&t.path, "user.foxing_dir_hash_pending");
                 }
@@ -266,24 +267,20 @@ impl Manager {
         let mut all_queues_map: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
-        
-        // Hydration feedback channel
         let (raw_hydration_tx, hydration_rx_moved) = mpsc::channel(32);
         let hydration_tx = Arc::new(HydrationSender(raw_hydration_tx));
-        let (_, hydration_rx_dummy) = mpsc::channel(1);
+        let (_, hydration_rx_dummy) = mpsc::channel(1); // Dummy placeholder
 
         let config_reader = self.config.read().await;
 
         for (_primary_dev, src) in self.sources.iter_mut() {
-            // Version indexing (background)
+            // Version Indexing (Async)
             let v_index = src.version_index.clone();
             std::thread::spawn(move || {
                 v_index.index_directory();
             });
 
-            // --- ROOT SEEDING (Critical for ICCL) ---
-            // We must seed the root inode so that any worker receiving an event relative
-            // to the root can resolve it immediately.
+            // Seed Root Identity
             if let Ok(meta) = fs::metadata(&src.path) {
                 use std::os::unix::fs::MetadataExt;
                 let inode = meta.ino();
@@ -310,12 +307,12 @@ impl Manager {
                 let mut hydration_repair_txs = Vec::new();
                 let mut queues_for_source: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
                 let mut serialization_engines: HashMap<PathBuf, Arc<SerializationEngine>> = HashMap::new();
-                
+
                 for tgt_cfg in &source_cfg.targets {
                     // Per-target serialization engine
                     let serialization_engine = SerializationEngine::new();
                     serialization_engines.insert(tgt_cfg.path.clone(), serialization_engine.clone());
-                    
+
                     let target_workers = tgt_cfg.worker_count.max(2);
                     let (fanout_tx, fanout_rxs_vec) = crate::event::create_fanout(config_reader.queue_max, target_workers);
                     let fanout_queue_arc = Arc::new(fanout_tx);
@@ -327,12 +324,15 @@ impl Manager {
                     }
                     let mut repair_rx_option = Some(repair_rx_raw.into_iter().next().unwrap());
 
+                    // Register queues for all device IDs (including partitions)
                     for alt_dev_id in &src.dev_ids {
                         queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
                     }
-                    
+
+                    // Init Tuner Board
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
-                    
+
+                    // Spawn Workers
                     for (i, rx) in fanout_rxs_vec.into_iter().enumerate() {
                         let (sd_tx, sd_rx) = mpsc::channel(1);
                         shutdowns.push(sd_tx);
@@ -341,7 +341,7 @@ impl Manager {
                         let repair_channel = if i == 0 { repair_rx_option.take() } else { None };
                         
                         let worker_daemon_id = self.daemon_id.clone();
-                        
+
                         handles.push(tokio::spawn(worker::run_worker(
                             rx,
                             src.clone(),
@@ -358,7 +358,7 @@ impl Manager {
                             worker_daemon_id,
                         )));
                     }
-                    
+
                     if tgt_cfg.initial_sync {
                         hydration_targets.push(tgt_cfg.clone());
                     }
@@ -368,19 +368,21 @@ impl Manager {
                 let mut q_write = src.queues.write().await;
                 *q_write = queues_for_source.clone();
                 drop(q_write);
-                
+
                 // Aggregate for BPF return
                 for (k, v) in &queues_for_source {
                     all_queues_map.entry(*k).or_insert_with(Vec::new).extend(v.iter().cloned());
                 }
-                
+
                 // Journal Replay
                 let queues_copy = queues_for_source.clone();
                 if let Some(journal) = &src.journal {
                     let projector = src.projector.clone();
                     let replay_count = journal.replay(|evt| {
                         let evt_arc = Arc::new(evt);
+                        // Project identity forward during replay
                         if let Some(p) = &projector { p.project(&evt_arc); }
+                        
                         if let Some(qs) = queues_copy.get(&evt_arc.dev_id) {
                             for q in qs { q.push(evt_arc.clone()); }
                         }
@@ -427,9 +429,8 @@ impl Manager {
                     if let Ok(watcher) = hydrator.clone().start_watcher() {
                         self.watchers.push(watcher);
                     }
-                    
                     self.hydrators.push(hydrator.clone());
-                    
+
                     // Run initial full scan in background thread
                     let h_clone = hydrator.clone();
                     let thread_handle = std::thread::spawn(move || {
@@ -444,14 +445,15 @@ impl Manager {
         // Debouncer for Hydration Triggers
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
+        
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
         ).unwrap_or_else(|_| PathBuf::from("/"));
-        
+
         let debounce_handle = tokio::spawn(async move {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
-            
+
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
                 let is_targeted_repair = path.exists() && !is_root_request;
@@ -492,7 +494,6 @@ impl Manager {
             }
             Ok(())
         });
-        
         handles.push(debounce_handle);
 
         (all_queues_map, handles, shutdowns, hydration_rx_dummy)
@@ -503,7 +504,6 @@ impl Manager {
         for h in handles.drain(..) {
             let _ = h.join();
         }
-        
         for h in self.bulk_hydration_handles.drain(..) {
             h.abort();
         }
