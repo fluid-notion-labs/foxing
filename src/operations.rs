@@ -211,10 +211,10 @@ impl SmartCopier {
                     Self::perform_sparse_copy_blocking(sfd, dfd, src_file_size, &src_path_debug)
                 }).await.unwrap_or_else(|e| Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))))?;
             } else {
+                // Corrected Call Signature
                 stats = Self::perform_delta_uring_pipelined(
                     ring, sfd, dfd, offset, length, vdo_opt, buffer_pool,
-                    target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold,
-                    src_file_size
+                    target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold
                 ).await?;
             }
         }
@@ -231,7 +231,6 @@ impl SmartCopier {
             libc::close(dfd);
         }
 
-        // ISSUE 5 FIX: Post-Copy Size Verification
         if is_full_replace {
             let final_len = std::fs::metadata(&target_path)?.len();
             if final_len != src_file_size {
@@ -371,7 +370,7 @@ impl SmartCopier {
         src_rwf_uncached_ok: bool,
         dst_rwf_uncached_ok: bool,
         vdo_stall_threshold: u32,
-        src_file_size: u64, 
+        // Removed src_file_size from signature as verification moved to caller
     ) -> Result<CopyStats> {
         let max_sqe = ring.submission().capacity();
         let num_buffers = buffer_pool.capacity();
@@ -387,7 +386,6 @@ impl SmartCopier {
         let mut stats = CopyStats::default();
         let mut submit_reads_pending = true;
         
-        // ISSUE 5 FIX: Improved VDO Stall Tracking
         let mut consecutive_zero_blocks: u32 = 0;
         let mut total_zero_blocks: u64 = 0;
         let mut skip_vdo_opt_temp = false;

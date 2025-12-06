@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use libc;
 use std::io::{self, Seek, SeekFrom};
 use xattr;
-use tracing::{warn, debug};
+use tracing::{debug}; // Removed 'warn'
 use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
 
@@ -160,8 +160,6 @@ pub fn remove_metadata(path: &Path, key: &str) -> std::io::Result<()> {
     }
 }
 
-// ISSUE 1 FIX: Atomic WAL Transition
-// Uses file locking to ensure check-and-set atomicity
 pub fn atomic_wal_transition(path: &Path, from_state: WalState, to_state: WalState, daemon_id: &str, seq: u64) -> std::io::Result<bool> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -169,7 +167,6 @@ pub fn atomic_wal_transition(path: &Path, from_state: WalState, to_state: WalSta
         Err(e) => return Err(e),
     };
 
-    // Exclusive lock ensures no other worker transitions state simultaneously
     lock_file(&file, true)?;
 
     let current_state_entry = get_wal_state_internal(path);

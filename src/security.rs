@@ -1,7 +1,6 @@
 use std::path::Path;
 use crate::error::{FoxingError, Result};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
-use std::os::fd::FromRawFd;
 use nix::fcntl::{fallocate, FallocateFlags};
 use libc;
 use xattr;
@@ -13,7 +12,6 @@ use std::os::unix::fs::MetadataExt;
 use std::fs::{File, OpenOptions};
 use chrono::Utc;
 use crate::sidecar;
-use tracing::{warn, debug};
 use crate::buffer::AlignedBuffer;
 use io_uring::{IoUring, opcode, types};
 use std::collections::hash_map::DefaultHasher;
@@ -159,31 +157,20 @@ pub fn get_valid_dir_hash(path: &Path) -> u64 {
     0
 }
 
-// ISSUE 6 FIX: Atomic Directory Hash Write
 pub fn write_dir_integrity_hash(target_dir: &Path, hash: u64) {
     let hash_bytes = hash.to_le_bytes();
-    
-    // 1. Pending Marker
     let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_hash_pending", &hash_bytes);
-    
-    // 2. Fsync Directory (requires open)
     if let Ok(dir_file) = File::open(target_dir) {
         let _ = dir_file.sync_all();
     }
-
-    // 3. Commit Hash
     let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_hash", &hash_bytes);
     if let Ok(meta) = std::fs::metadata(target_dir) {
         let mtime_bytes = meta.mtime().to_le_bytes();
         let _ = sidecar::set_metadata(target_dir, "user.foxing_dir_guard", &mtime_bytes);
     }
-    
-    // 4. Fsync Directory again
     if let Ok(dir_file) = File::open(target_dir) {
         let _ = dir_file.sync_all();
     }
-
-    // 5. Cleanup
     let _ = sidecar::remove_metadata(target_dir, "user.foxing_dir_hash_pending");
 }
 
@@ -283,7 +270,7 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
         }
     }
     if ret != 0 {
-        warn!("IOCTL FICLONERANGE failed (errno: {} / {:?}). Fallback copy.", ret, std::io::Error::last_os_error());
+        // Fallback handled by caller usually or simple warning
         let mut off_in = 0i64;
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };
@@ -308,7 +295,6 @@ pub fn revert_snapshot(version_path: &Path, live_path: &Path) -> Result<()> {
     let range = FileCloneRange { s: src_fd as i64, so: 0, l: size, do_: 0 };
     let ret = unsafe { libc::ioctl(dst_fd, FIOCLONERANGE, &range) };
     if ret != 0 {
-        warn!("IOCTL FICLONERANGE failed revert. Fallback copy.");
         let mut off_in = 0i64;
         let mut off_out = 0i64;
         let ret = unsafe { libc::copy_file_range(src_fd, &mut off_in, dst_fd, &mut off_out, size as usize, 0) };

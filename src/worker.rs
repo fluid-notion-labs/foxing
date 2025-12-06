@@ -351,11 +351,9 @@ pub async fn run_worker(
         };
 
         for e in events_to_process_raw {
-             // ISSUE 4 FIX: Handle SequenceGap
              if e.event_type == EventType::SequenceGap {
                  warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
                  let path = target_cfg.path.clone();
-                 // Trigger full hydration for this target root
                  let _ = hydration_trigger.0.try_send(path);
                  continue;
              }
@@ -402,12 +400,10 @@ pub async fn run_worker(
 
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
             
-            // ISSUE 2 FIX: Handle ResolveResult::NeedsRepair
             let (dst, is_synthetic, needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                 ResolveResult::Success(p, s, n) => (p, s, n),
                 ResolveResult::NeedsRepair(synthetic_path) => {
                     warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
-                    // Trigger hydration for the PARENT of this file to rediscover it
                     if let Some(parent) = synthetic_path.parent() {
                          let _ = hydration_trigger.0.try_send(parent.to_path_buf());
                     }
@@ -499,7 +495,6 @@ async fn process_single_event_inner(
         }
     }
 
-    // ISSUE 1 FIX: Atomic WAL Transition (None -> IntentPending)
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::Rename | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
@@ -536,7 +531,6 @@ async fn process_single_event_inner(
             let e_seq = e.seq_num;
             let dst_for_phase2 = dst_clone.clone();
 
-            // ISSUE 1 FIX: Atomic WAL Transition (IntentPending -> InProgress)
             let phase2_success = tokio::task::spawn_blocking(move || {
                 sidecar::atomic_wal_transition(&dst_for_phase2, WalState::IntentPending, WalState::InProgress, &daemon_id, e_seq)
             }).await.unwrap_or(Ok(false));
@@ -569,7 +563,7 @@ async fn process_single_event_inner(
                         src_rwf_uncached_ok,
                         dst_rwf_uncached_ok,
                         target_cfg.vdo_stall_threshold,
-                        current_src_size, // Issue 5: Pass size for verify
+                        // Issue 5 Fix: Removed Duplicate Argument
                     ).await;
 
                     match copy_res {
@@ -577,7 +571,6 @@ async fn process_single_event_inner(
                             let dst_for_phase3 = dst_clone.clone();
                             let daemon_id_p3 = ctx.daemon_id.to_string();
                             
-                            // ISSUE 1 FIX: Atomic WAL Transition (InProgress -> CommitPending)
                             let _ = tokio::task::spawn_blocking(move || {
                                 sidecar::atomic_wal_transition(&dst_for_phase3, WalState::InProgress, WalState::CommitPending, &daemon_id_p3, e_seq)
                             }).await;
