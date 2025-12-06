@@ -456,7 +456,6 @@ async fn process_single_event_inner(
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
-            // Removed the exists_check logic for Rename since Rename is no longer handled here
             let daemon_id = ctx.daemon_id.to_string();
             let seq = e.seq_num;
             let wal_path = dst_for_wal.clone();
@@ -629,9 +628,9 @@ async fn process_single_event_inner(
                     // Adaptive max wait: 
                     // Normal: 10x measured latency (e.g., 5ms -> 50ms)
                     // Stressed: 50x measured latency (e.g., 5ms -> 250ms)
-                    // Clamped between 50ms and 5s
+                    // Clamped between 2s and 10s to handle significant BPF/FS propagation delays
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_millis(50), Duration::from_secs(5));
+                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(2), Duration::from_secs(10));
 
                     while !old_dst_final_clone.exists() {
                         let elapsed = start.elapsed();
