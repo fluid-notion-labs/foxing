@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::io;
 use xattr;
+use tracing::{debug, warn};
 
 const INTENT_XATTR_KEY: &str = "user.foxing.intent";
 
@@ -49,12 +50,22 @@ impl Journal {
                             let _ = Self::end(path);
                             return Ok(true);
                         }
+                        
                         if let Some(parent) = dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                warn!("Journal Recovery: Failed to create parent {:?}: {}", parent, e);
+                            }
                         }
+
                         match std::fs::rename(path, &dest) {
                             Ok(_) => {
                                 let _ = Self::end(&dest);
+                                // Ensure durability on recovery
+                                if let Some(parent) = dest.parent() {
+                                    if let Ok(f) = std::fs::File::open(parent) {
+                                        let _ = f.sync_all();
+                                    }
+                                }
                                 return Ok(true);
                             },
                             Err(_) => return Ok(false),
@@ -69,13 +80,34 @@ impl Journal {
 
 pub fn atomic_rename(src: &Path, dst: &Path) -> io::Result<()> {
     Journal::begin(src, Intent::Rename { dest: dst.to_path_buf() })?;
+
+    // Ensure parent directory exists before rename
+    if let Some(parent) = dst.parent() {
+        if !parent.exists() {
+            debug!("Atomic Rename: Auto-creating parent directory {:?}", parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!("Atomic Rename: Failed to create parent directory {:?}: {}", parent, e);
+                // We proceed to rename() so that if it fails, we get the correct FS error (e.g. ENOENT)
+            }
+        }
+    }
+
     match std::fs::rename(src, dst) {
         Ok(_) => {
             Journal::end(dst)?;
+            
+            // CRITICAL FIX: fsync the parent directory to ensure the rename is durable.
+            // This prevents "missing file" race conditions in tests and on crash.
+            if let Some(parent) = dst.parent() {
+                match std::fs::File::open(parent) {
+                    Ok(f) => { let _ = f.sync_all(); },
+                    Err(e) => debug!("Atomic Rename: Failed to open parent for sync: {}", e),
+                }
+            }
             Ok(())
         },
         Err(e) => {
-            let _ = Journal::end(src); 
+            let _ = Journal::end(src);
             Err(e)
         }
     }
