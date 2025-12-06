@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::error::{FoxingError, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, Duration};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 use crate::consistency::SerializationEngine;
 use crate::tuner::{TunerState, TunerBoard};
 use crate::hydration_worker::HydrationQueue;

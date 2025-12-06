@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use tracing::{info, error, debug};
+use tracing::{info, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};

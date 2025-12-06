@@ -862,9 +862,15 @@ async fn process_single_event_inner(
                                     }
                                     
                                     // Attempt to find where the source file actually is on source disk
-                                    let current_src_res = identity::resolve_and_update_path(&source_clone, e_inode, 0, 0, 0);
-                                    if let Ok(rel) = current_src_res {
-                                        let current_src_abs = source_mount.join(rel);
+                                    let mut resolved_path = source_clone.inode_map.get_path(e_inode);
+                                    
+                                    // If RAM cache misses, try Full Walk
+                                    if resolved_path.is_none() {
+                                        resolved_path = identity::resolve_and_update_path(&source_clone, e_inode, 0, 0, 0).ok();
+                                    }
+
+                                    if let Some(rel) = resolved_path {
+                                        let current_src_abs = source_mount.join(&rel);
                                         if current_src_abs.exists() {
                                             debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}",
                                                     old_dst_final_clone, current_src_abs, new_dst_final_clone);
