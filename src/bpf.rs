@@ -58,7 +58,7 @@ pub fn run(
         let next_seq = initial_seq + 1;
         let val_bytes = next_seq.to_ne_bytes();
         
-        // Correctly update the Global ARRAY map
+        // Correctly restore global sequence number in the ARRAY map
         if let Err(e) = skel.maps.local_seq_map.update(&key.to_ne_bytes(), &val_bytes, libbpf_rs::MapFlags::ANY) {
             warn!("BPF: Failed to restore global sequence number {}: {}", next_seq, e);
         } else {

@@ -71,8 +71,7 @@ struct stats {
     __u64 incomplete_rename;
 };
 
-// CRITICAL FIX: Use ARRAY instead of PERCPU_ARRAY to enforce strict global ordering.
-// This prevents time-travel/reordering issues between CPUs.
+// FIX 1: Use Global ARRAY for strict sequential ordering across all CPUs
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -85,17 +84,14 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16); __type(key, _
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1); __type(key, __u32); __type(value, struct stats); } statistics SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
 
-// CRITICAL FIX: Increased map size from 1024 to 65536.
-// A Torture Test spawns thousands of concurrent threads. If this map fills up,
-// 'stash_dentry' fails, and the subsequent 'create' event is silently dropped.
-// This causes "Source file didn't replicate" errors because the daemon never knows the file was created.
+// FIX 2: Increased map size to 65536 to prevent event loss during Torture Tests
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key, __u64); __type(value, __u64); } temp_dentries SEC(".maps");
 
 static __always_inline __u64 get_next_seq() {
     __u32 key = 0;
     __u64 *seq = bpf_map_lookup_elem(&local_seq_map, &key);
     if (!seq) return 0;
-    // Atomic fetch_and_add ensures monotonic sequences even with the global map
+    // Atomic increment ensures global monotonic sequence
     return __sync_fetch_and_add(seq, 1);
 }
 

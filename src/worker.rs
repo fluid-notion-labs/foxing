@@ -399,6 +399,8 @@ pub async fn run_worker(
             
             // RETRY LOOP for handling Race Conditions (e.g. WAL Race where file moved during queueing)
             let mut attempts = 0;
+            // Increased max retries for high-concurrency/torture tests where lookup might lag
+            let max_retries = 10;
             loop {
                 attempts += 1;
                 let res = process_single_event_inner(
@@ -414,13 +416,17 @@ pub async fn run_worker(
                 match res {
                     Ok(_) => break,
                     Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                        if attempts >= 3 {
-                             warn!("Worker {}: Event {}/Inode {} failed after 3 retries (NotFound). Dropping.", worker_id, e.seq_num, e.inode);
+                        if attempts >= max_retries {
+                             warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping.", worker_id, e.seq_num, e.inode, max_retries);
                              break;
                         }
                         // AGGRESSIVE RECOVERY:
                         // The file isn't where we thought it was. A rename likely raced us.
                         // Force a fresh lookup from the source to find the new path.
+                        // Add linear backoff to let file system settle.
+                        let sleep_duration = Duration::from_millis(50 * (attempts as u64));
+                        sleep(sleep_duration).await;
+                        
                         debug!("Worker {}: Event {} failed (NotFound). Retrying with fresh lookup (Attempt {}).", worker_id, e.seq_num, attempts);
                         let lookup_res = tokio::task::spawn_blocking({
                             let source_clone = source.clone();
