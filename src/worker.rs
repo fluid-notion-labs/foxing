@@ -404,7 +404,7 @@ async fn process_single_event_inner(
     e: Arc<Event>,
     source: &Arc<SourceInfo>,
     target_cfg: &TargetConfig,
-    _tuner: &BbrTuner,
+    tuner: &BbrTuner,
     _capacity_threshold_mb: u64,
     dst: &PathBuf,
     _is_synthetic: bool,
@@ -451,24 +451,21 @@ async fn process_single_event_inner(
             return Err(FoxingError::Io(io::ErrorKind::Other.into()));
         }
     }
-    if matches!(e.event_type, EventType::Write | EventType::Create | EventType::Rename | EventType::WriteRange) {
+    // CHANGED: Removed EventType::Rename from this check to prevent WAL races on source files
+    if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
-            let exists_check = if e.event_type == EventType::Rename {
-                 !dst_for_wal.exists()
-            } else { false };
-            if !exists_check {
-                let daemon_id = ctx.daemon_id.to_string();
-                let seq = e.seq_num;
-                let wal_path = dst_for_wal.clone();
-                let transition_success = tokio::task::spawn_blocking(move || {
-                    sidecar::atomic_wal_transition(&wal_path, WalState::None, WalState::IntentPending, &daemon_id, seq)
-                }).await.unwrap_or(Ok(false));
-                if let Ok(false) = transition_success {
-                    if dst_for_wal.exists() {
-                         warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
-                    }
+            // Removed the exists_check logic for Rename since Rename is no longer handled here
+            let daemon_id = ctx.daemon_id.to_string();
+            let seq = e.seq_num;
+            let wal_path = dst_for_wal.clone();
+            let transition_success = tokio::task::spawn_blocking(move || {
+                sidecar::atomic_wal_transition(&wal_path, WalState::None, WalState::IntentPending, &daemon_id, seq)
+            }).await.unwrap_or(Ok(false));
+            if let Ok(false) = transition_success {
+                if dst_for_wal.exists() {
+                     warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
                 }
             }
         }
@@ -487,7 +484,7 @@ async fn process_single_event_inner(
             let dst_clone = dst.clone();
             let e_offset = e.offset;
             let e_len = e.length;
-            let src_clone_for_metadata = src.clone();
+            let mut src_clone_for_metadata = src.clone(); // Mutable to allow update if moved
             let daemon_id = ctx.daemon_id.to_string();
             let e_seq = e.seq_num;
             let dst_for_phase2 = dst_clone.clone();
@@ -502,15 +499,34 @@ async fn process_single_event_inner(
                  error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
                  return Ok(None);
             }
-            let metadata_result = tokio::task::spawn_blocking(move || {
-                std::fs::metadata(&src_clone_for_metadata)
+            // Recover source path if missing (Race Condition: Rename happened on Source before we read)
+            let mut metadata_result = tokio::task::spawn_blocking({
+                let p = src_clone_for_metadata.clone();
+                move || std::fs::metadata(&p)
             }).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
+
+            if metadata_result.is_err() {
+                // Try to resolve inode again to find new path
+                let resolved_path = tokio::task::spawn_blocking({
+                    let source_clone = source.clone();
+                    let e_inode = e.inode;
+                    move || identity::resolve_and_update_path(&source_clone, e_inode, 0, 0, 0)
+                }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+
+                if let Ok(new_rel_path) = resolved_path {
+                    let new_src = source.mount.join(new_rel_path);
+                    debug!("Source Race: File moved from {:?} to {:?}. Retrying op.", src_clone_for_metadata, new_src);
+                    src_clone_for_metadata = new_src.clone();
+                    metadata_result = tokio::task::spawn_blocking(move || std::fs::metadata(&new_src)).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
+                }
+            }
+
             if let Ok(m) = metadata_result {
                 if m.is_file() {
                     let current_src_size = m.len();
                     let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
                     let copy_res = SmartCopier::copy(
-                        &src,
+                        &src_clone_for_metadata, // Use potentially updated path
                         &dst_clone,
                         ctx.ring,
                         buffer_pool,
@@ -534,7 +550,7 @@ async fn process_single_event_inner(
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
                             let apply_dst = dst_clone.clone();
-                            let apply_src = src.clone();
+                            let apply_src = src_clone_for_metadata.clone();
                             let _ = tokio::task::spawn_blocking(move || {
                                 security::sync_xattrs(&apply_src, &apply_dst);
                                 security::apply_metadata(&apply_src, &apply_dst)
@@ -547,6 +563,7 @@ async fn process_single_event_inner(
                     return Ok(None);
                 }
             } else {
+                warn!("Source Missing: Failed to locate source for inode {} even after retry.", e.inode);
                 return Ok(None);
             }
         },
@@ -602,29 +619,39 @@ async fn process_single_event_inner(
                 let old_dst_final_clone = old_dst_final.clone();
                 let new_dst_final_clone = new_dst_final.clone();
                 
+                // Adaptive timeout configuration based on system load and IO latency
+                let io_latency_ms = tuner.current_flush_ms.max(1);
+                let is_stressed = matches!(tuner.state, crate::tuner::TunerState::HighLoad | crate::tuner::TunerState::Muted | crate::tuner::TunerState::CriticalDrain);
+
                 // Retry logic handles race between Data Plane (Create) and Control Plane (Rename)
                 let res = tokio::task::spawn_blocking(move || {
-                    let mut attempts = 0;
-                    // Pre-check loop: Wait for source file to appear (up to 2 seconds)
-                    while !old_dst_final_clone.exists() && attempts < 20 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        attempts += 1;
-                    }
-                    // Reset attempts for the actual rename retry
-                    attempts = 0;
-                    loop {
-                        match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
-                            Ok(_) => return Ok(()),
-                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                                if attempts < 10 {
-                                    attempts += 1;
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    continue;
-                                }
-                                return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after retries: {}", e))));
-                            },
-                            Err(e) => return Err(FoxingError::Io(e)),
+                    let start = Instant::now();
+                    // Adaptive max wait: 
+                    // Normal: 10x measured latency (e.g., 5ms -> 50ms)
+                    // Stressed: 50x measured latency (e.g., 5ms -> 250ms)
+                    // Clamped between 50ms and 5s
+                    let multiplier = if is_stressed { 50 } else { 10 };
+                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_millis(50), Duration::from_secs(5));
+
+                    while !old_dst_final_clone.exists() {
+                        let elapsed = start.elapsed();
+                        if elapsed > max_wait {
+                            break;
                         }
+                        
+                        // Tiered backoff strategy for microsecond-scale responsiveness
+                        if elapsed < Duration::from_micros(500) {
+                            std::thread::yield_now(); // Ultra-fast spin for first 500us
+                        } else if elapsed < Duration::from_millis(10) {
+                            std::thread::sleep(Duration::from_micros(50)); // Fast polling for 10ms
+                        } else {
+                            std::thread::sleep(Duration::from_millis(1)); // Coarse polling thereafter
+                        }
+                    }
+                    
+                    match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(FoxingError::Io(e)),
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
                 
@@ -636,7 +663,6 @@ async fn process_single_event_inner(
                         let _ = tokio::task::spawn_blocking(move || {
                             sidecar::clear_wal_state(&cleanup_path);
                         });
-                        // Critical: Remove from dirty_stats on success to prevent WAL desync on future ops
                         ctx.dirty_stats.remove(&e.inode);
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
@@ -655,11 +681,10 @@ async fn process_single_event_inner(
                             active_repairs_clone.remove(&dst_clone_cleanup);
                             let _ = trigger_clone.0.try_send(parent_clone);
                         });
-                        // Critical: Remove from dirty_stats on failure to prevent phantom tracking
                         ctx.dirty_stats.remove(&e.inode);
                         return Ok(None);
                     },
-                    Err(io_err) => { // Renamed from 'e' to 'io_err' to fix shadowing
+                    Err(io_err) => {
                         ctx.failure_state.record_failure();
                         ctx.dirty_stats.remove(&e.inode);
                         return Err(io_err);
