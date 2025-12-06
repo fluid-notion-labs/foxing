@@ -628,9 +628,9 @@ async fn process_single_event_inner(
                     // Adaptive max wait: 
                     // Normal: 10x measured latency (e.g., 5ms -> 50ms)
                     // Stressed: 50x measured latency (e.g., 5ms -> 250ms)
-                    // Clamped between 2s and 10s to handle significant BPF/FS propagation delays
+                    // Clamped between 1s and 10s to handle significant BPF/FS propagation delays
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(2), Duration::from_secs(10));
+                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(1), Duration::from_secs(10));
 
                     while !old_dst_final_clone.exists() {
                         let elapsed = start.elapsed();
