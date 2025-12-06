@@ -346,7 +346,9 @@ pub async fn run_worker(
                 }
             }
         }
-        for e in &events_to_process_raw {
+        // Start of problematic loop:
+        for e_ref in &events_to_process_raw {
+            let e = e_ref.clone(); // FIX: Clone the Arc<Event> for the loop body scope
             let (initial_dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
                 let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
                 if let Some(pp) = parent_path_opt {
@@ -357,7 +359,7 @@ pub async fn run_worker(
                     (target_cfg.path.join(rel_path), true, false)
                 }
             } else {
-                match identity::resolve_target(&source.inode_map, e, &target_cfg.path) {
+                match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
                     ResolveResult::Success(p, s, n) => (p, s, n),
                     ResolveResult::NeedsRepair(synthetic_path) => {
                         warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
@@ -486,11 +488,12 @@ pub async fn run_worker(
 
                         // OPTIMIZATION: Only trigger the expensive walkdir lookup after repeated failures
                         if attempts >= 3 {
+                             let e_clone_for_spawn = e.clone(); // FIX: Clone the Arc for the spawned task
                              let lookup_res = tokio::task::spawn_blocking({
                                  // FIX E0425: Capture `source_clone` correctly
                                  let source_clone = source_clone.clone();
-                                 let inode = e.inode;
-                                 move || identity::resolve_and_update_path(&source_clone, inode, e.generation, e.timestamp_ns, e.seq_num) // Pass full metadata to ID resolver
+                                 // Pass full metadata to ID resolver from the cloned Arc
+                                 move || identity::resolve_and_update_path(&source_clone, e_clone_for_spawn.inode, e_clone_for_spawn.generation, e_clone_for_spawn.timestamp_ns, e_clone_for_spawn.seq_num) 
                              }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
                              if let Ok(new_rel_path) = lookup_res {
                                  let new_src = source.mount.join(&new_rel_path);
