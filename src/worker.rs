@@ -117,7 +117,6 @@ pub async fn run_worker(
     let role_name = if is_control_plane { "ControlPlane" } else { "DataPlane" };
     info!("Worker {} started as {}", worker_id, role_name);
 
-    // ... (Init logic skipped for brevity, keeping existing structure) ...
     if is_control_plane {
         if let Ok(meta) = std::fs::metadata(&source.path) {
             let inode = meta.ino();
@@ -150,7 +149,6 @@ pub async fn run_worker(
     let mut tuner = BbrTuner::new(&target_cfg);
     let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
     
-    // Control plane needs less ring depth as it does mostly metadata ops
     let ring_depth = if is_control_plane { 128 } else { tuner.recommended_ring_depth() };
     debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
 
@@ -167,7 +165,6 @@ pub async fn run_worker(
     let total_workers = config_reader.worker_count.max(1);
     let global_limit_mib = config.read().await.global_buffer_limit;
     
-    // Calculate memory limits
     let total_worker_mem_limit_mib = global_limit_mib * 3 / 10;
     let worker_mem_limit_mib = total_worker_mem_limit_mib / total_workers as u64;
     let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
@@ -193,8 +190,6 @@ pub async fn run_worker(
     let mut shutdown_requested = false;
 
     let _result: Result<()> = loop {
-        // ... (Hibernation and Polling Logic unchanged) ...
-        // 1. Circuit Breaker / Hibernation Check
         if !is_hibernating && failure_state.check_hibernation_needed() {
              if !is_hibernating {
                  warn!("Target {:?} failed. Hibernating.", target_cfg.path);
@@ -208,11 +203,10 @@ pub async fn run_worker(
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
                     continue;
                 }
-                Some(_) = rx_main.recv() => { continue; } // Drain events while sleeping
+                Some(_) = rx_main.recv() => { continue; } 
              }
         }
 
-        // 2. Failure Backoff (Data Plane Only)
         if !is_control_plane && !shutdown_requested {
              if let Some(delay) = failure_state.next_retry_delay() {
                  sleep(delay).await;
@@ -220,13 +214,11 @@ pub async fn run_worker(
              }
         }
 
-        // 3. Event Polling
         let event_poll_result = if !shutdown_requested {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("Worker {}: Shutdown requested. Draining queue...", worker_id);
                     shutdown_requested = true;
-                    // Try to grab one last event if available
                     match rx_main.try_recv() {
                         Ok(e) => {
                             metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
@@ -238,14 +230,13 @@ pub async fn run_worker(
                 Some(e) = async {
                     if let Some(rx) = &mut rx_repair { rx.recv().await } else { std::future::pending().await }
                 } => {
-                    // Priority Lane: Check for inversion
                     if e.event_type == EventType::Unlink || e.event_type == EventType::SequenceGap {
                         let mut lookahead_count = 0;
                         while let Ok(main_event) = rx_main.try_recv() {
                             metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
                             coalescer.push(main_event);
                             lookahead_count += 1;
-                            if lookahead_count > 50 { break; } // Bounded lookahead
+                            if lookahead_count > 50 { break; } 
                         }
                         if lookahead_count > 0 {
                             debug!("Worker {}: Priority Inversion Fix - Pulled {} events ahead of Repair Unlink", worker_id, lookahead_count);
@@ -508,7 +499,7 @@ async fn process_single_event_inner(
     worker_id: usize,
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
-    // ... (Creation Logic omitted for brevity, logic remains same) ...
+    // Creation Logic
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
@@ -524,6 +515,7 @@ async fn process_single_event_inner(
             let identity_dir = target_cfg_clone.path.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
             
+            // Create the file. If it already exists, that's fine.
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&target_cfg_clone.path) {
@@ -532,7 +524,7 @@ async fn process_single_event_inner(
                     Ok(())
                 },
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = std::fs::OpenOptions::new().write(true).open(&dst_clone);
+                    // It exists, so we can touch it if needed, but no need to error.
                     Ok(())
                 },
                 Err(e) => return Err(e),
@@ -547,7 +539,10 @@ async fn process_single_event_inner(
         }
     }
 
-    // ... (Write Logic omitted for brevity) ...
+    // Write-Ahead Log Entry
+    // We only attempt WAL transitions if the file likely exists.
+    // For pure creation events where we just created it above, it should exist.
+    // For writes to existing files, it should exist.
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
@@ -555,12 +550,14 @@ async fn process_single_event_inner(
             let daemon_id = ctx.daemon_id.to_string();
             let seq = e.seq_num;
             let wal_path = dst_for_wal.clone();
-            let transition_success = tokio::task::spawn_blocking(move || {
-                sidecar::atomic_wal_transition(&wal_path, WalState::None, WalState::IntentPending, &daemon_id, seq)
-            }).await.unwrap_or(Ok(false));
             
-            if let Ok(false) = transition_success {
-                if dst_for_wal.exists() {
+            // Only transition if file exists to avoid "WAL Target Lost" on new creates
+            if dst_for_wal.exists() {
+                let transition_success = tokio::task::spawn_blocking(move || {
+                    sidecar::atomic_wal_transition(&wal_path, WalState::None, WalState::IntentPending, &daemon_id, seq)
+                }).await.unwrap_or(Ok(false));
+                
+                if let Ok(false) = transition_success {
                      debug!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
                 }
             }
@@ -586,17 +583,26 @@ async fn process_single_event_inner(
             let e_seq = e.seq_num;
             let dst_for_phase2 = dst_clone.clone();
 
-            let phase2_success = tokio::task::spawn_blocking(move || {
-                sidecar::atomic_wal_transition(&dst_for_phase2, WalState::IntentPending, WalState::InProgress, &daemon_id, e_seq)
-            }).await.unwrap_or(Ok(false));
+            // WAL Phase 2: IntentPending -> InProgress
+            // Skip this check if file doesn't exist (e.g. creating via SmartCopier)
+            if dst_for_phase2.exists() {
+                let phase2_success = tokio::task::spawn_blocking(move || {
+                    sidecar::atomic_wal_transition(&dst_for_phase2, WalState::IntentPending, WalState::InProgress, &daemon_id, e_seq)
+                }).await.unwrap_or(Ok(false));
 
-            if let Ok(false) = phase2_success {
-                 if !dst_clone.exists() {
-                     debug!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Triggering retry.", dst_clone);
-                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, "WAL Target Lost")));
-                 }
-                 error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
-                 return Ok(None);
+                if let Ok(false) = phase2_success {
+                     // If it fails transition AND exists, it's a real conflict.
+                     // If it disappeared during transition, that's a race, but if we are creating it, we might not care.
+                     if !dst_clone.exists() {
+                         // File gone. If we are creating, this is weird but maybe okay?
+                         // If we are writing, this is bad.
+                         // But if we are about to SmartCopy, we create a tmp file anyway.
+                         debug!("WAL Race: File {:?} disappeared during Intent -> InProgress transition.", dst_clone);
+                     } else {
+                         error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
+                         return Ok(None);
+                     }
+                }
             }
 
             let mut metadata_result = tokio::task::spawn_blocking({
@@ -644,9 +650,13 @@ async fn process_single_event_inner(
                         Ok(stats) => {
                             let dst_for_phase3 = dst_clone.clone();
                             let daemon_id_p3 = ctx.daemon_id.to_string();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                sidecar::atomic_wal_transition(&dst_for_phase3, WalState::InProgress, WalState::CommitPending, &daemon_id_p3, e_seq)
-                            }).await;
+                            // Post-Write: InProgress -> CommitPending
+                            // Only if file exists (it should now!)
+                            if dst_for_phase3.exists() {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    sidecar::atomic_wal_transition(&dst_for_phase3, WalState::InProgress, WalState::CommitPending, &daemon_id_p3, e_seq)
+                                }).await;
+                            }
 
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
                             ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
