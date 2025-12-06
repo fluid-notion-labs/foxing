@@ -472,15 +472,9 @@ pub async fn run_worker(
                              break;
                         }
                         
-                        // Check if source really exists
-                        if !src.exists() {
-                            debug!("Worker {}: Source file {:?} disappeared. Aborting retry for event {}.", worker_id, src, e.seq_num);
-                            break;
-                        }
-
-                        let sleep_duration = Duration::from_millis(50 * (attempts as u64));
-                        sleep(sleep_duration).await;
-                        
+                        // RECOVERY ATTEMPT 1: Identity Resolution
+                        // The file likely moved on source (Race Condition).
+                        // We must resolve the NEW path before checking existence.
                         debug!("Worker {}: Event {} failed (NotFound). Retrying with fresh lookup (Attempt {}).", worker_id, e.seq_num, attempts);
                         
                         let lookup_res = tokio::task::spawn_blocking({
@@ -495,10 +489,20 @@ pub async fn run_worker(
                              debug!("Worker {}: Recovery found new path: {:?} -> {:?}", worker_id, dst, new_dst);
                              src = new_src;
                              dst = new_dst;
-                        } else {
-                             debug!("Worker {}: Fresh lookup failed for inode {}. Assuming deleted.", worker_id, e.inode);
-                             break;
+                             // Found it! Loop again immediately to try the op on the new path.
+                             continue; 
+                        } 
+                        
+                        // RECOVERY ATTEMPT 2: Fallback Existence Check
+                        // If lookup failed, AND the old path is missing, then it's really gone.
+                        if !src.exists() {
+                            debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Aborting retry for event {}.", worker_id, src, e.seq_num);
+                            break;
                         }
+
+                        // If src exists but we got NotFound, it might be a target/parent issue or transient lock.
+                        let sleep_duration = Duration::from_millis(50 * (attempts as u64));
+                        sleep(sleep_duration).await;
                     },
                     Err(e) => {
                         error!("Worker {}: Event failed with non-recoverable error: {:?}", worker_id, e);
