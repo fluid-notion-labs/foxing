@@ -652,10 +652,10 @@ async fn process_single_event_inner(
                         ctx.dirty_stats.remove(&e.inode);
                         return Ok(None);
                     },
-                    Err(e) => {
+                    Err(err) => { // CHANGED: Renamed 'e' to 'err' to avoid shadowing the Event 'e'
                         ctx.failure_state.record_failure();
-                        ctx.dirty_stats.remove(&e.inode);
-                        return Err(e);
+                        ctx.dirty_stats.remove(&e.inode); // Now refers to the outer Event 'e'
+                        return Err(err);
                     }
                 }
                 return Ok(None);
