@@ -271,12 +271,6 @@ impl Manager {
                     // Create Channels
                     let (fanout_tx, fanout_rxs_vec) = crate::event::create_fanout(config_reader.queue_max, target_workers);
                     let fanout_queue_arc = Arc::new(fanout_tx);
-                    // Priority Repair Channel
-                    let (repair_tx_raw, repair_rx_raw) = crate::event::create_fanout(10_000, 1);
-                    if let Some(tx) = repair_tx_raw.senders.first() {
-                        hydration_repair_txs.push(tx.clone());
-                    }
-                    let mut repair_rx_option = Some(repair_rx_raw.into_iter().next().unwrap());
                     // Register queues for all device aliases
                     for alt_dev_id in &src.dev_ids {
                         queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
@@ -287,8 +281,8 @@ impl Manager {
                     for (i, rx) in fanout_rxs_vec.into_iter().enumerate() {
                         let (sd_tx, sd_rx) = mpsc::channel(1);
                         shutdowns.push(sd_tx);
-                        let repair_channel = if i == 0 { repair_rx_option.take() } else { None };
                         let worker_daemon_id = self.daemon_id.clone();
+                        // NOTE: Removed `repair_channel` parameter as it's no longer necessary.
                         handles.push(tokio::spawn(worker::run_worker(
                             rx,
                             src.clone(),
@@ -300,7 +294,7 @@ impl Manager {
                             self.governor.clone(),
                             self.tuner_board.clone(),
                             i,
-                            repair_channel,
+                            None, // Pass None for the removed priority repair channel
                             serialization_engine.clone(),
                             worker_daemon_id,
                         )));

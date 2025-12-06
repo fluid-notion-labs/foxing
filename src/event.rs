@@ -5,12 +5,10 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use serde::{Serialize, Deserialize};
 use std::time::Instant;
-
 #[allow(dead_code)]
 const S_IFMT: u32 = 0o170000;
 #[allow(dead_code)]
 const S_IFDIR: u32 = 0o040000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EventType {
@@ -19,7 +17,6 @@ pub enum EventType {
     Barrier=15, Mknod=16, Symlink=17, Fallocate=18, Utimes=19,
     SequenceGap=255, Unknown=0
 }
-
 impl From<u8> for EventType {
     fn from(v: u8) -> Self {
         match v {
@@ -33,7 +30,6 @@ impl From<u8> for EventType {
         }
     }
 }
-
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -46,51 +42,38 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
-            Self::Mkdir | Self::Rmdir |
+            Self::Mkdir | Self::Rmdir | Self::Unlink |
             Self::Link | Self::Symlink | Self::Mknod
         )
     }
+    // New function to identify events that require strict global ordering
+    pub fn requires_global_ordering(&self) -> bool {
+        matches!(self, Self::Rename | Self::Rmdir | Self::Mkdir | Self::Unlink)
+    }
 }
-
 #[derive(Debug)]
 pub struct EventQueue {
     pub senders: Vec<mpsc::Sender<Arc<Event>>>
 }
-
 impl EventQueue {
     pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
         Self { senders }
     }
-
-    /// Inode-Centric Causal Lanes (ICCL) routing.
-    /// All events for a specific inode are routed to the same worker (Lane).
-    /// This guarantees that Create -> Write -> Rename -> Delete sequences
-    /// for a single file are always processed linearly, eliminating
-    /// race conditions between workers.
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
-        
         if self.senders.is_empty() { return; }
-        
         let pool_size = self.senders.len();
-        
-        // Simple modulo sharding ensures strict inode affinity.
-        // We use a hasher to ensure good distribution even if inodes are sequential.
         let mut hasher = DefaultHasher::new();
         e.inode.hash(&mut hasher);
         let hash = hasher.finish();
-        
         let target_idx = (hash as usize) % pool_size;
-
         if self.senders[target_idx].try_send(e).is_err() {
             metrics::EVENTS_DROPPED.inc();
         }
     }
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub event_type: EventType,
@@ -113,7 +96,6 @@ pub struct Event {
     #[serde(skip, default="Instant::now")]
     pub created_at: Instant
 }
-
 pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
     let actual_workers = workers.max(1);
     let (mut txs, mut rxs) = (Vec::new(), Vec::new());

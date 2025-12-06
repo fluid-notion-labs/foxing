@@ -4,7 +4,8 @@ use crate::event::{Event, EventType};
 use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
-
+use parking_lot::Mutex;
+#[derive(Debug)]
 pub struct ReorderBuffer {
     buffer: BTreeMap<u64, Arc<Event>>,
     pub next_seq: u64,
@@ -13,7 +14,6 @@ pub struct ReorderBuffer {
     stalled_since: Option<Instant>,
     base_stall_timeout: Duration,
 }
-
 impl ReorderBuffer {
     pub fn new(target_latency_ms: u64, max_pending_bytes: u64) -> Self {
         let timeout_ms = (target_latency_ms * 2).max(50).min(500);
@@ -26,7 +26,6 @@ impl ReorderBuffer {
             base_stall_timeout: Duration::from_millis(timeout_ms),
         }
     }
-
     pub fn push(&mut self, event: Arc<Event>) -> bool {
         let event_size = 256 + event.name.len() as u64;
         if self.current_pending_bytes + event_size > self.max_pending_bytes {
@@ -42,20 +41,16 @@ impl ReorderBuffer {
         metrics::ORDERING_BUF_SIZE.with_label_values(&["ingress"]).set((self.buffer.len() as i64) as f64);
         true
     }
-
     pub fn pop(&mut self) -> Option<Arc<Event>> {
         let (&seq, next_evt) = self.buffer.iter().next()?;
-
         if seq > self.next_seq {
             let pending_count = self.buffer.len();
             let utilization = self.current_pending_bytes as f64 / self.max_pending_bytes as f64;
-            
-            let has_structural_event = self.buffer.values().any(|evt| 
+            let has_structural_event = self.buffer.values().any(|evt|
                 evt.event_type.is_structural_metadata() || evt.event_type == EventType::Rename
             );
-
             let effective_timeout = if has_structural_event {
-                self.base_stall_timeout.max(Duration::from_millis(500)) 
+                self.base_stall_timeout.max(Duration::from_millis(500))
             } else if pending_count > 200 || utilization > 0.8 {
                 Duration::from_millis(0)
             } else if pending_count > 50 || utilization > 0.5 {
@@ -63,21 +58,18 @@ impl ReorderBuffer {
             } else {
                 self.base_stall_timeout
             };
-
             if let Some(time) = self.stalled_since {
                 if time.elapsed() > effective_timeout {
                     warn!("INGRESS STALL: Jumping gap {} -> {} (pending: {}, timeout: {:?}).",
                           self.next_seq, seq, pending_count, effective_timeout);
                     metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
-                    
-                    // ISSUE 4 FIX: Create Synthetic Event to Trigger Repairs
                     let gap_event = Arc::new(Event {
                         event_type: EventType::SequenceGap,
                         dev_id: next_evt.dev_id,
                         inode: 0,
                         parent_inode: 0,
                         new_parent_inode: 0,
-                        seq_num: self.next_seq, // Marker for gap start
+                        seq_num: self.next_seq,
                         timestamp_ns: 0,
                         offset: 0,
                         length: 0,
@@ -91,11 +83,8 @@ impl ReorderBuffer {
                         interactive: false,
                         created_at: Instant::now(),
                     });
-
-                    // Advance sequence past the gap
                     self.next_seq = seq;
                     self.stalled_since = None;
-                    
                     return Some(gap_event);
                 }
             } else {
@@ -114,18 +103,13 @@ impl ReorderBuffer {
             }
             return None;
         }
-
         self.stalled_since = None;
         if seq < self.next_seq {
             let evt = self.buffer.remove(&seq).unwrap();
             self.current_pending_bytes -= 256 + evt.name.len() as u64;
             metrics::LATE_EVENTS.inc();
-            // Issue 4: Return orphaned event to caller instead of dropping
-            // Although seq < next_seq implies we already processed passed this point,
-            // returning it ensures we don't drop data. The worker handles idempotency.
             return Some(evt);
         }
-
         let evt = self.buffer.remove(&seq).unwrap();
         self.current_pending_bytes -= 256 + evt.name.len() as u64;
         self.next_seq += 1;
@@ -133,12 +117,10 @@ impl ReorderBuffer {
         Some(evt)
     }
 }
-
 pub struct Coalescer {
     buffer: Vec<Arc<Event>>,
     scan_depth: usize,
 }
-
 impl Coalescer {
     pub fn new(scan_depth: usize) -> Self {
         Self { buffer: Vec::with_capacity(128), scan_depth }
@@ -152,6 +134,10 @@ impl Coalescer {
     pub fn pop_batch(&mut self, coalesce_bytes_limit: u64) -> Option<Arc<Event>> {
         if self.buffer.is_empty() { return None; }
         let head = self.buffer.remove(0);
+        // FIX: Structural events (Rename, Mkdir, Rmdir, Unlink) must be serialized immediately
+        if head.event_type.requires_global_ordering() {
+            return Some(head);
+        }
         if coalesce_bytes_limit > 0 &&
            (head.event_type == EventType::Write || head.event_type == EventType::WriteRange)
         {
@@ -179,7 +165,9 @@ impl Coalescer {
                 indices_to_remove.push(i);
                 merged_count += 1;
             } else {
-                if evt.inode == inode { break; }
+                // Optimization: If the next event is for the same inode but not contiguous,
+                // we stop checking further events for this specific coalescing chain.
+                if evt.inode == inode { break; } 
             }
         }
         if merged_count > 0 {
