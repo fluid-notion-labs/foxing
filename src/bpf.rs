@@ -57,8 +57,6 @@ pub fn run(
         let key: u32 = 0;
         let next_seq = initial_seq + 1;
         let val_bytes = next_seq.to_ne_bytes();
-        
-        // Correctly restore global sequence number in the ARRAY map
         if let Err(e) = skel.maps.local_seq_map.update(&key.to_ne_bytes(), &val_bytes, libbpf_rs::MapFlags::ANY) {
             warn!("BPF: Failed to restore global sequence number {}: {}", next_seq, e);
         } else {
@@ -213,15 +211,17 @@ pub fn run(
         }
         if let Ok(mut buffers) = reorder_buffers_in_closure.lock() {
             if let Some(buf) = buffers.get_mut(&raw.dev) {
-                if buf.push(evt) {
+                if buf.push(evt.clone()) { // Clone Arc for push
                     while let Some(ordered_evt) = buf.pop() {
-                        if let Some(src_info) = sources_in_closure.get(&ordered_evt.dev_id) {
+                        // FIX 6: Project identity BEFORE dispatching event to workers
+                        if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
                             if let Some(projector) = &src_info.projector {
-                                projector.project(&ordered_evt);
+                                projector.project(&ordered_evt); // Project FIRST
                             }
                         }
+                        
                         metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                        if let Some(qs) = queues_in_closure.get(&ordered_evt.dev_id) {
+                        if let Some(qs) = queues_in_loop.get(&ordered_evt.dev_id) {
                             for q in qs { q.push(ordered_evt.clone()); }
                         }
                     }
@@ -253,9 +253,10 @@ pub fn run(
                 if let Ok(mut buffers) = reorder_buffers.lock() {
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
+                             // FIX 6: Project identity BEFORE dispatching event to workers
                              if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id) {
                                 if let Some(projector) = &src_info.projector {
-                                    projector.project(&ordered_evt);
+                                    projector.project(&ordered_evt); // Project FIRST
                                 }
                             }
                             metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);

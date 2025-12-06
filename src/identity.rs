@@ -197,7 +197,7 @@ pub fn resolve_and_update_path(
     let start_time = std::time::Instant::now();
     let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
 
-    // FIX: Conditional Debounce Check
+    // FIX 3: Conditional Debounce Check
     if let Some(entry) = RECENT_LOOKUPS.get(&inode) {
         let (last_time, path, last_seq) = entry.value();
         
