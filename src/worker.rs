@@ -228,7 +228,26 @@ pub async fn run_worker(
                 },
                 Some(e) = async {
                     if let Some(rx) = &mut rx_repair { rx.recv().await } else { std::future::pending().await }
-                } => { Some(e) },
+                } => { 
+                    // CRITICAL FIX: Priority Inversion Handling
+                    // If we receive an Unlink from the repair lane, it implies hydration thinks a file is gone.
+                    // However, if there is a pending Rename in the Main queue, the Rename explains *why* it's gone.
+                    // If we process the Unlink first, we delete the source file, and Rename fails.
+                    // We must opportunistically drain the Main queue to let Rename win.
+                    if e.event_type == EventType::Unlink || e.event_type == EventType::SequenceGap {
+                        let mut lookahead_count = 0;
+                        while let Ok(main_event) = rx_main.try_recv() {
+                            metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+                            coalescer.push(main_event);
+                            lookahead_count += 1;
+                            if lookahead_count > 50 { break; } // Bounded lookahead
+                        }
+                        if lookahead_count > 0 {
+                            debug!("Worker {}: Priority Inversion Fix - Pulled {} events ahead of Repair Unlink", worker_id, lookahead_count);
+                        }
+                    }
+                    Some(e) 
+                },
                 Some(e) = rx_main.recv() => {
                     metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
                     Some(e)
@@ -254,10 +273,6 @@ pub async fn run_worker(
 
                     let next_interval_ms = tuner.current_flush_ms;
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(next_interval_ms));
-
-                    if !is_control_plane && recommended_depth != buffer_pool.capacity() {
-                        // Resizing logic omitted
-                    }
 
                     let path_clone = target_cfg.path.clone();
                     let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
@@ -380,15 +395,13 @@ pub async fn run_worker(
                 _ => OpKind::Write,
             };
 
-            // CRITICAL FIX: Inode Resolution for Synthetic Events
-            // If we receive a Synthetic Unlink (Inode 0), we must resolve the TARGET inode
-            // to ensure we lock against other operations (like Rename) on the same file.
+            // Resolution fix for Synthetic Unlinks (Inode 0) to ensure locking works
             let barrier_inode = if e.inode == 0 && e.event_type == EventType::Unlink {
                 let rough_target_path = target_cfg.path.join(e.name.trim_start_matches('/'));
                 if let Ok(meta) = std::fs::symlink_metadata(&rough_target_path) {
                     meta.ino()
                 } else {
-                    0 // File likely already gone, locking 0 is fine
+                    0 
                 }
             } else {
                 e.inode
@@ -494,8 +507,9 @@ async fn process_single_event_inner(
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
-            // OPTIMIZATION: Check existence before attempting WAL transition to avoid "WAL Race" warning
-            // on files that haven't been created yet (common in Rename flows)
+            
+            // Fix: Check existence before attempting WAL transition to prevent "WAL Race" warnings
+            // on files that are being renamed (and thus don't exist at the new path yet)
             let exists_check = if e.event_type == EventType::Rename {
                  !dst_for_wal.exists()
             } else { false };
@@ -508,9 +522,9 @@ async fn process_single_event_inner(
                 }).await.unwrap_or(Ok(false));
 
                 if let Ok(false) = transition_success {
-                    // Only warn if the file actually exists, otherwise it's just a new file
-                    if dst.exists() {
-                         warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst);
+                    // Only warn if the file actually exists, suppressing noise for new files
+                    if dst_for_wal.exists() {
+                         warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
                     }
                 }
             }
@@ -667,6 +681,7 @@ async fn process_single_event_inner(
                         metrics::RENAME_EVENTS.inc();
                         info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final, new_dst_final);
                         
+                        // Fix: Clean WAL state on destination to ensure "IntentPending" does not persist
                         let cleanup_path = new_dst_final.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             sidecar::clear_wal_state(&cleanup_path);
@@ -721,7 +736,6 @@ async fn process_single_event_inner(
             return res.map(|_| None);
         },
         EventType::Unlink => {
-             // Implementation of Unlink inside the barrier to prevent race conditions
              let src_inode = e.inode;
              let src_dev = e.dev_id;
              identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, src_inode);
