@@ -623,8 +623,9 @@ async fn process_single_event_inner(
                 let res = tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    // Increased clamp from 10s to 60s to handle heavy Data Plane backlog vs Control Plane race.
-                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(5), Duration::from_secs(60));
+                    // Fix: Increased lower bound from 5s to 30s to handle deep Data Plane backlogs.
+                    // Previous clamp(5s, 60s) allowed only 5s waits on low latency systems, causing race failures.
+                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(30), Duration::from_secs(120));
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
@@ -638,7 +639,7 @@ async fn process_single_event_inner(
                                 } else if elapsed < Duration::from_millis(10) {
                                     std::thread::sleep(Duration::from_micros(50));
                                 } else {
-                                    std::thread::sleep(Duration::from_millis(10));
+                                    std::thread::sleep(Duration::from_millis(1));
                                 }
                                 continue;
                             },
