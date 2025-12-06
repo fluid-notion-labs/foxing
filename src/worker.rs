@@ -464,7 +464,7 @@ async fn process_single_event_inner(
             }).await.unwrap_or(Ok(false));
             if let Ok(false) = transition_success {
                 if dst_for_wal.exists() {
-                     warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
+                     debug!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst_for_wal);
                 }
             }
         }
@@ -492,7 +492,8 @@ async fn process_single_event_inner(
             }).await.unwrap_or(Ok(false));
             if let Ok(false) = phase2_success {
                  if !dst_clone.exists() {
-                     warn!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Aborting write.", dst_clone);
+                     // CHANGED: Downgraded to debug to reduce noise for legitimate tmp file turnover
+                     debug!("WAL Race: File {:?} disappeared during Intent -> InProgress transition. Aborting write.", dst_clone);
                      return Ok(None);
                  }
                  error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
@@ -628,29 +629,33 @@ async fn process_single_event_inner(
                     // Adaptive max wait: 
                     // Normal: 10x measured latency (e.g., 5ms -> 50ms)
                     // Stressed: 50x measured latency (e.g., 5ms -> 250ms)
-                    // Clamped between 1s and 10s to handle significant BPF/FS propagation delays
+                    // Clamped between 2s and 10s to handle significant BPF/FS propagation delays
                     let multiplier = if is_stressed { 50 } else { 10 };
-                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(1), Duration::from_secs(10));
+                    let max_wait = Duration::from_millis(io_latency_ms * multiplier).clamp(Duration::from_secs(2), Duration::from_secs(10));
 
-                    while !old_dst_final_clone.exists() {
-                        let elapsed = start.elapsed();
-                        if elapsed > max_wait {
-                            break;
+                    loop {
+                        // Attempt rename directly inside loop to catch "file exists but rename failed" consistency gaps
+                        match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
+                            Ok(_) => return Ok(()),
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+                                let elapsed = start.elapsed();
+                                if elapsed > max_wait {
+                                    // Final timeout
+                                    return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
+                                }
+                                
+                                // Tiered backoff strategy for microsecond-scale responsiveness
+                                if elapsed < Duration::from_micros(500) {
+                                    std::thread::yield_now(); // Ultra-fast spin for first 500us
+                                } else if elapsed < Duration::from_millis(10) {
+                                    std::thread::sleep(Duration::from_micros(50)); // Fast polling for 10ms
+                                } else {
+                                    std::thread::sleep(Duration::from_millis(1)); // Coarse polling thereafter
+                                }
+                                continue;
+                            },
+                            Err(e) => return Err(FoxingError::Io(e)),
                         }
-                        
-                        // Tiered backoff strategy for microsecond-scale responsiveness
-                        if elapsed < Duration::from_micros(500) {
-                            std::thread::yield_now(); // Ultra-fast spin for first 500us
-                        } else if elapsed < Duration::from_millis(10) {
-                            std::thread::sleep(Duration::from_micros(50)); // Fast polling for 10ms
-                        } else {
-                            std::thread::sleep(Duration::from_millis(1)); // Coarse polling thereafter
-                        }
-                    }
-                    
-                    match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(FoxingError::Io(e)),
                     }
                 }).await.map_err(FoxingError::Join).and_then(|r| r);
                 
