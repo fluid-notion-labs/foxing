@@ -151,7 +151,31 @@ pub async fn run_worker(
     daemon_id: String,
 ) -> Result<()> {
     info!("Worker {} started (Causal Lane)", worker_id);
-    // REMOVED: Worker 0 Root identity seeding logic, as all workers are now equal.
+
+    // FIX (High Priority): Re-introduce Root Identity Seeding, coordinated by Worker 0.
+    if worker_id == 0 {
+        if let Ok(meta) = std::fs::metadata(&source.path) {
+            let inode = meta.ino();
+            let dev = source.dev;
+            if source.dir_map.get(inode).is_none() {
+                info!("Worker {}: Seeding Root Identity for {:?} -> Inode {} (Dev {})", worker_id, source.path, inode, dev);
+                identity::update_map(
+                    &source.inode_map,
+                    &source.dir_map,
+                    dev,
+                    inode,
+                    PathBuf::from(""),
+                    0,
+                    false,
+                    true,
+                    0,
+                    0
+                );
+            }
+        } else {
+            warn!("Worker {}: Failed to stat source root {:?}. Root identity will be missing!", worker_id, source.path);
+        }
+    }
     
     let queue_max_hint = config.read().await.queue_max;
     let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
@@ -315,7 +339,9 @@ pub async fn run_worker(
             if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
                 events_to_process_raw.push(e);
             }
-            if events_to_process_raw.len() > 0 && events_to_process_raw[0].event_type.requires_global_ordering() {
+            let is_structural = events_to_process_raw.len() > 0 && events_to_process_raw[0].event_type.requires_global_ordering();
+            
+            if is_structural {
                 // If the event is structural, process only this one event, regardless of batch size.
             } else {
                  // It's a non-structural event, try to fill the batch.
@@ -330,6 +356,17 @@ pub async fn run_worker(
         }
 
         for e in events_to_process_raw {
+            
+             // High Priority: Structural events like Rmdir/Unlink should ensure existence before deletion attempt.
+             if matches!(e.event_type, EventType::Rmdir | EventType::Unlink) {
+                 let target_exists = std::fs::symlink_metadata(&dst).is_ok();
+                 if !target_exists {
+                     debug!("Worker {}: Skipping {} for non-existent target {:?}", worker_id, e.event_type.as_str(), dst);
+                     if e.inode != 0 { wal_map.clear_wal_state(e.inode); }
+                     continue;
+                 }
+             }
+
              if e.event_type == EventType::SequenceGap {
                  warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
                  let path = target_cfg.path.clone();
@@ -525,7 +562,23 @@ async fn process_single_event_inner(
     let inode = e.inode;
     let wal_map = &source.wal_state_map;
     let source_clone = source.clone(); // Clone Arc<SourceInfo> here for spawn_blocking blocks
-    // ... [Creation Logic remains the same] ...
+    
+    // FIX (Critical): Use the main worker context for Identity map updates.
+    let identity_update_sync = |rel: PathBuf, is_dir: bool| {
+        identity::update_map(
+            &source.inode_map,
+            &source.dir_map,
+            e.dev_id,
+            inode,
+            rel,
+            e.generation,
+            false, // is_synthetic
+            is_dir,
+            e.timestamp_ns,
+            e.seq_num
+        );
+    };
+
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let _target_cfg_path_clone = target_cfg.path.clone();
@@ -541,18 +594,23 @@ async fn process_single_event_inner(
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
                 Ok(_f) => {
                     if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
-                        identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
+                        // FIX: Move map update out of spawn_blocking, rely on caller.
+                        // identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, false, e_ts, e_seq);
+                        return Ok(Some(rel.to_path_buf()));
                     }
-                    Ok(())
+                    Ok(None)
                 },
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    Ok(())
+                    Ok(None)
                 },
                 Err(e) => return Err(e),
             }
         }).await;
-        if let Ok(_f) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
+        if let Ok(path_opt) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
             metrics::SIDECAR_FILES_CREATED.inc();
+            if let Some(rel_path) = path_opt {
+                identity_update_sync(rel_path, false);
+            }
         } else {
             debug!("Worker {}: Creation failed (likely race): {:?}", worker_id, e.name);
             return Ok(None);
@@ -660,9 +718,8 @@ async fn process_single_event_inner(
                         Some(parent_rel) => parent_rel.join(new_name_str),
                         None => {
                             let source_clone = source_clone.clone();
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
-                            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+                            // FIX (Critical): Move Identity operations out of spawn_blocking
+                            let resolved = identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0).ok();
                             match resolved {
                                 Ok(parent_rel) => parent_rel.join(new_name_str),
                                 Err(_) => {
@@ -679,7 +736,7 @@ async fn process_single_event_inner(
                 PathBuf::new()
             };
             if let Some(_new_name_str) = &e.new_name {
-                // Update identity map immediately for subsequent events
+                // FIX (High Priority): Update map directly, but REMOVE the global map clear.
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,
@@ -691,10 +748,7 @@ async fn process_single_event_inner(
                     e.timestamp_ns,
                     e.seq_num
                 );
-                // Clear the directory map if a directory was renamed, forcing re-resolution of children
-                if is_dir {
-                    source.dir_map.clear();
-                }
+                
                 let old_dst_final_log = dst.clone();
                 let new_dst_final_log = target_cfg.path.join(&new_rel_path);
                 let old_dst_final_move = old_dst_final_log.clone();
@@ -802,25 +856,26 @@ async fn process_single_event_inner(
         EventType::Mkdir => {
             let dst_clone = dst.clone();
             let _target_cfg_path_clone = target_cfg.path.clone();
-            let e_dev = e.dev_id;
-            let e_generation = e.generation;
-            let e_seq = e.seq_num;
-            let e_ts = e.timestamp_ns;
-            let source_map_clone = source.inode_map.clone();
-            let source_dir_map_clone = source.dir_map.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let r = std::fs::create_dir_all(&dst_clone);
                 if r.is_ok() {
                     if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
-                        identity::update_map(&source_map_clone, &source_dir_map_clone, e_dev, inode, rel.to_path_buf(), e_generation, false, true, e_ts, e_seq);
+                        return Ok(Some(rel.to_path_buf()));
                     }
                 }
-                r
+                Ok(None)
             }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-            return res.map(|_| None);
+            
+            if let Ok(path_opt) = res {
+                if let Some(rel_path) = path_opt {
+                    identity_update_sync(rel_path, true);
+                }
+            }
+            Ok(None)
         },
         EventType::Unlink => {
              let src_dev = e.dev_id;
+             // Identity map updates handled outside spawn_blocking
              identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
              wal_map.clear_wal_state(inode);
              let dst_clone = dst.clone();
@@ -861,6 +916,7 @@ async fn process_single_event_inner(
         }
         EventType::Rmdir => {
             let src_dev = e.dev_id;
+             // Identity map updates handled outside spawn_blocking
             identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
             wal_map.clear_wal_state(inode);
             let dst_clone = dst.clone();

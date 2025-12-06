@@ -11,12 +11,12 @@ use crate::event::{Event, EventType};
 use crate::mirror::SourceInfo;
 use crate::governor::Governor;
 use crate::tuner::{TunerBoard, TunerState};
-use crate::{security, identity, metrics, Result}; // <-- FIX: Removed unused `sidecar`
+use crate::{security, identity, metrics, Result};
 use std::os::unix::io::AsRawFd;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use crate::consistency::SerializationEngine;
-use crate::wal::{WalState, get_wal_state}; // <-- FIX: Removed unused WalStateMap import
+use crate::wal::{WalState, get_wal_state};
 #[derive(Debug)]
 pub struct HydrationState {
     pub active: AtomicBool,
@@ -79,7 +79,7 @@ impl Hydrator {
         if !path.exists() {
              if let Ok(rel) = path.strip_prefix(&self.source.path) {
                  if !rel.as_os_str().is_empty() {
-                     self.queue_deletion(rel);
+                     self.queue_deletion(rel, path.is_dir()); // Pass type flag
                  }
              }
              return;
@@ -88,12 +88,13 @@ impl Hydrator {
             warn!("Hydration: Failed to repair specific path {:?}: {:?}", path, e);
         }
     }
-    fn queue_deletion(&self, rel: &Path) {
+    fn queue_deletion(&self, rel: &Path, is_dir: bool) {
         if self.repair_txs.is_empty() { return; }
         let path_str = rel.to_string_lossy();
         let idx = (path_str.len()) % self.repair_txs.len();
+        let event_type = if is_dir { EventType::Rmdir } else { EventType::Unlink };
         let evt = Event {
-            event_type: EventType::Unlink,
+            event_type, // Use determined event type
             dev_id: self.source.dev,
             inode: 0, parent_inode: 0, new_parent_inode: 0,
             seq_num: 0, offset: 0, length: 0,
@@ -152,7 +153,7 @@ impl Hydrator {
                                         let _ = fs::create_dir_all(&parent_path);
                                     }
                                 }
-                                self.queue_deletion(rel);
+                                self.queue_deletion(rel, target_path.is_dir()); // Pass type flag
                             }
                         }
                     }
@@ -303,12 +304,10 @@ impl Hydrator {
     }
     fn sync_file_needed(&self, src_path: &Path, rel: &Path, m: &fs::Metadata, ino: u64, target_cfg: &TargetConfig) -> Result<bool> {
         let dst_path = target_cfg.path.join(rel);
-        
-        // --- WAL Check (Inode-based) ---
-        if let Some(wal_entry) = get_wal_state(&self.source.wal_state_map, ino) { // <-- FIX: Use get_wal_state
+        if let Some(wal_entry) = get_wal_state(&self.source.wal_state_map, ino) {
             if wal_entry.daemon_id != self.daemon_id {
                 warn!("Hydration: Found WAL from previous daemon instance (ID mismatch). Forcing repair for {:?}.", dst_path);
-                self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                self.source.wal_state_map.clear_wal_state(ino);
                 return Ok(true);
             }
             let mut is_active_worker = false;
@@ -324,34 +323,32 @@ impl Hydrator {
             match wal_entry.state {
                 WalState::IntentPending => {
                     info!("Hydration: Clearing stale INTENT_PENDING flag for {:?}.", dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                    self.source.wal_state_map.clear_wal_state(ino);
                 },
                 WalState::InProgress => {
                     warn!("Hydration: Found STALE/CRASHED write ({:?}) for {:?}. Forcing repair.", wal_entry.state, dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                    self.source.wal_state_map.clear_wal_state(ino);
                     return Ok(true);
                 },
                 WalState::CommitPending => {
                     if let Ok(meta) = std::fs::metadata(&dst_path) {
                         if meta.len() == m.len() && meta.mtime() == m.mtime() {
                              info!("Hydration: WAL CommitPending but file matches source. Assuming valid: {:?}", dst_path);
-                             self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                             self.source.wal_state_map.clear_wal_state(ino);
                              return Ok(false);
                         }
                     }
                     warn!("Hydration: Found UNCOMMITTED write for {:?}. Forcing repair.", dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                    self.source.wal_state_map.clear_wal_state(ino);
                     return Ok(true);
                 },
                 _ => {
                     warn!("Hydration: Found Unknown WAL state for {:?}. Forcing repair.", dst_path);
-                    self.source.wal_state_map.clear_wal_state(ino); // <-- FIX: Clear using WalStateMap
+                    self.source.wal_state_map.clear_wal_state(ino);
                     return Ok(true);
                 }
             }
         }
-        // --- End WAL Check ---
-
         let needs_sync = {
             match std::fs::OpenOptions::new().read(true).write(true).open(&dst_path) {
                 Ok(df) => {
