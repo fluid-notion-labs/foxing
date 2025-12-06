@@ -44,18 +44,17 @@ impl ReorderBuffer {
     }
 
     pub fn pop(&mut self) -> Option<Arc<Event>> {
-        let (&seq, _) = self.buffer.iter().next()?;
+        let (&seq, next_evt) = self.buffer.iter().next()?;
+
         if seq > self.next_seq {
             let pending_count = self.buffer.len();
             let utilization = self.current_pending_bytes as f64 / self.max_pending_bytes as f64;
             
-            // PRIORITY CHECK: Ensure we don't skip gaps if critical metadata is waiting
             let has_structural_event = self.buffer.values().any(|evt| 
                 evt.event_type.is_structural_metadata() || evt.event_type == EventType::Rename
             );
 
             let effective_timeout = if has_structural_event {
-                // Force a minimum wait for structural operations, even under load
                 self.base_stall_timeout.max(Duration::from_millis(500)) 
             } else if pending_count > 200 || utilization > 0.8 {
                 Duration::from_millis(0)
@@ -67,32 +66,66 @@ impl ReorderBuffer {
 
             if let Some(time) = self.stalled_since {
                 if time.elapsed() > effective_timeout {
-                    if effective_timeout.as_millis() > 10 {
-                         warn!("INGRESS STALL: Jumping gap {} -> {} (pending: {}, timeout: {:?}).",
-                               self.next_seq, seq, pending_count, effective_timeout);
-                    }
+                    warn!("INGRESS STALL: Jumping gap {} -> {} (pending: {}, timeout: {:?}).",
+                          self.next_seq, seq, pending_count, effective_timeout);
                     metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
+                    
+                    // ISSUE 4 FIX: Create Synthetic Event to Trigger Repairs
+                    let gap_event = Arc::new(Event {
+                        event_type: EventType::SequenceGap,
+                        dev_id: next_evt.dev_id,
+                        inode: 0,
+                        parent_inode: 0,
+                        new_parent_inode: 0,
+                        seq_num: self.next_seq, // Marker for gap start
+                        timestamp_ns: 0,
+                        offset: 0,
+                        length: 0,
+                        name: format!("GAP-{}-{}", self.next_seq, seq),
+                        new_name: None,
+                        generation: 0,
+                        projid: 0,
+                        mode: 0,
+                        flags: 0,
+                        process_name: "GAP".into(),
+                        interactive: false,
+                        created_at: Instant::now(),
+                    });
+
+                    // Advance sequence past the gap
                     self.next_seq = seq;
                     self.stalled_since = None;
-                    return self.pop();
+                    
+                    return Some(gap_event);
                 }
             } else {
                 if effective_timeout.is_zero() {
                      metrics::SEQUENCE_GAPS.with_label_values(&["ingress"]).inc();
+                     let gap_event = Arc::new(Event {
+                        event_type: EventType::SequenceGap,
+                        dev_id: next_evt.dev_id,
+                        inode: 0, parent_inode: 0, new_parent_inode: 0, seq_num: self.next_seq, timestamp_ns: 0, offset: 0, length: 0,
+                        name: format!("GAP-{}-{}", self.next_seq, seq), new_name: None, generation: 0, projid: 0, mode: 0, flags: 0, process_name: "GAP".into(), interactive: false, created_at: Instant::now(),
+                    });
                      self.next_seq = seq;
-                     return self.pop();
+                     return Some(gap_event);
                 }
                 self.stalled_since = Some(Instant::now());
             }
             return None;
         }
+
         self.stalled_since = None;
         if seq < self.next_seq {
             let evt = self.buffer.remove(&seq).unwrap();
             self.current_pending_bytes -= 256 + evt.name.len() as u64;
             metrics::LATE_EVENTS.inc();
+            // Issue 4: Return orphaned event to caller instead of dropping
+            // Although seq < next_seq implies we already processed passed this point,
+            // returning it ensures we don't drop data. The worker handles idempotency.
             return Some(evt);
         }
+
         let evt = self.buffer.remove(&seq).unwrap();
         self.current_pending_bytes -= 256 + evt.name.len() as u64;
         self.next_seq += 1;
@@ -108,10 +141,7 @@ pub struct Coalescer {
 
 impl Coalescer {
     pub fn new(scan_depth: usize) -> Self {
-        Self {
-            buffer: Vec::with_capacity(128),
-            scan_depth,
-        }
+        Self { buffer: Vec::with_capacity(128), scan_depth }
     }
     pub fn push(&mut self, event: Arc<Event>) {
         self.buffer.push(event);

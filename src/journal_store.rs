@@ -16,7 +16,7 @@ struct RecoveryLayout {
     source_path: PathBuf,
     daemon_id: String,
     disks: Vec<DiskInfo>,
-    tuning_profile: String, 
+    tuning_profile: String,
 }
 
 #[derive(Serialize)]
@@ -42,9 +42,9 @@ pub struct JournalStore {
 
 impl JournalStore {
     pub fn new(
-        source_journal_path: &Path, 
-        target_root: &Path, 
-        source_mount: &Path, 
+        source_journal_path: &Path,
+        target_root: &Path,
+        source_mount: &Path,
         daemon_id: &str,
         buffer_size_bytes: usize,
         tuning_profile: &str,
@@ -54,25 +54,20 @@ impl JournalStore {
         if let Some(parent) = source_journal_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .write(true)
             .open(source_journal_path)?;
-            
         debug!("JOURNAL: Initializing with write buffer: {} KB", buffer_size_bytes / 1024);
         let writer = BufWriter::with_capacity(buffer_size_bytes, file);
-
         let target_meta_path = target_root.join(".mirror").join(format!("source_layout_{}.json", daemon_id));
         if let Err(e) = Self::write_recovery_layout(&target_meta_path, source_mount, daemon_id, tuning_profile) {
             warn!("JOURNAL: Could not write recovery layout: {}", e);
         } else {
             info!("JOURNAL: Wrote source recovery layout to {:?}", target_meta_path);
         }
-
         let current_size = std::fs::metadata(source_journal_path).map(|m| m.len()).unwrap_or(0);
-
         Ok(Self {
             event_writer: Arc::new(Mutex::new(writer)),
             bytes_written: Arc::new(Mutex::new(current_size)),
@@ -88,27 +83,32 @@ impl JournalStore {
         self.last_recovered_seq.load(Ordering::Relaxed)
     }
 
-    pub fn replay<F>(&self, mut callback: F) -> io::Result<usize> 
+    // ISSUE 7 FIX: Sorted Replay
+    pub fn replay<F>(&self, mut callback: F) -> io::Result<usize>
     where F: FnMut(Event) {
         if !self.journal_path.exists() { return Ok(0); }
-        
         let file = File::open(&self.journal_path)?;
         let reader = BufReader::new(file);
-        let mut count = 0;
-        let mut max_seq = 0;
-
+        let mut events = Vec::new();
+        
         for line in reader.lines() {
             if let Ok(l) = line {
                 if let Ok(evt) = serde_json::from_str::<Event>(&l) {
-                    if evt.seq_num > max_seq {
-                        max_seq = evt.seq_num;
-                    }
-                    callback(evt);
-                    count += 1;
+                    events.push(evt);
                 }
             }
         }
-        
+
+        // Sort by sequence number to ensure parent dirs created before children renamed into them
+        events.sort_by_key(|e| e.seq_num);
+
+        let count = events.len();
+        let max_seq = events.last().map(|e| e.seq_num).unwrap_or(0);
+
+        for evt in events {
+            callback(evt);
+        }
+
         self.last_recovered_seq.store(max_seq, Ordering::Relaxed);
         info!("JOURNAL: Replay Complete. Loaded {} events. Max Sequence: {}", count, max_seq);
         Ok(count)
@@ -130,23 +130,17 @@ impl JournalStore {
     pub fn append_batch(&self, events: &[Arc<Event>]) -> io::Result<u64> {
         let mut buffer = Vec::with_capacity(events.len() * 128);
         for evt in events {
-            // FIX: Explicitly dereference Arc (&**evt) to get &Event, which implements Serialize
             if let Ok(json) = serde_json::to_string(&**evt) {
                 buffer.extend_from_slice(json.as_bytes());
                 buffer.push(b'\n');
             }
         }
-
         let len = buffer.len();
         if len == 0 { return Ok(0); }
-
         self.check_rotation_needed();
-
         let mut w = self.event_writer.lock().unwrap();
         w.write_all(&buffer)?;
-        
         if let Ok(mut bw) = self.bytes_written.lock() { *bw += len as u64; }
-        
         Ok(len as u64)
     }
 
@@ -159,22 +153,17 @@ impl JournalStore {
         if let Ok(bw) = self.bytes_written.lock() {
             if *bw < self.size_limit_bytes { return; }
         }
-
         if let Ok(mut w) = self.event_writer.lock() {
             if let Ok(mut bw) = self.bytes_written.lock() {
                 if *bw < self.size_limit_bytes { return; }
-                
                 info!("JOURNAL: Rotating log file (Size: {} bytes)", *bw);
                 let _ = w.flush();
-                
                 let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
                 let archived_path = format!("{}.{}", self.journal_path.to_string_lossy(), timestamp);
-                
                 if let Err(e) = std::fs::rename(&self.journal_path, &archived_path) {
                     error!("JOURNAL: Failed to rotate (rename) log: {}", e);
                     return;
                 }
-
                 match OpenOptions::new().create(true).append(true).write(true).open(&self.journal_path) {
                     Ok(new_file) => {
                         *w = BufWriter::with_capacity(self.buffer_capacity, new_file);
@@ -188,7 +177,6 @@ impl JournalStore {
                 }
             }
         }
-        
         let pattern = format!("{}.*", self.journal_path.to_string_lossy());
         let retention = self.retention_count;
         std::thread::spawn(move || {
@@ -206,7 +194,6 @@ impl JournalStore {
             }
         }
         files.sort_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
-        
         let total_files = files.len();
         if total_files > retention {
             let to_delete = total_files - retention;
@@ -222,9 +209,7 @@ impl JournalStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
         let disks = Disks::new_with_refreshed_list();
-
         let disk_infos: Vec<DiskInfo> = disks.iter().map(|d| {
             DiskInfo {
                 name: d.name().to_string_lossy().to_string(),
@@ -235,7 +220,6 @@ impl JournalStore {
                 is_removable: d.is_removable(),
             }
         }).collect();
-
         let layout = RecoveryLayout {
             timestamp: Utc::now().to_rfc3339(),
             source_path: source_mount.to_path_buf(),
@@ -243,7 +227,6 @@ impl JournalStore {
             disks: disk_infos,
             tuning_profile: tuning_profile.to_string(),
         };
-
         let file = File::create(path)?;
         serde_json::to_writer_pretty(file, &layout)?;
         Ok(())

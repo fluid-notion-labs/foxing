@@ -5,7 +5,7 @@ use lru::LruCache;
 use crate::event::{Event};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use tracing::{warn, info, debug};
+use tracing::{warn, debug};
 use walkdir;
 use std::io;
 use crate::metrics;
@@ -23,6 +23,13 @@ impl IdentityEntry {
     pub fn new(path: PathBuf, generation: u32, timestamp_ns: u64, seq_num: u64) -> Self {
         Self { path, generation, timestamp_ns, seq_num }
     }
+}
+
+// ISSUE 2 FIX: Explicit Result Type for Repair Handling
+#[derive(Debug)]
+pub enum ResolveResult {
+    Success(PathBuf, bool, bool), // path, is_synthetic, needs_creation
+    NeedsRepair(PathBuf),         // synthetic_path_for_repair_queueing
 }
 
 const SHARD_COUNT: usize = 64;
@@ -49,7 +56,6 @@ impl ShardedInodeMap {
     pub fn put(&self, inode: u64, entry: IdentityEntry) {
         let mut shard = self.get_shard(inode).lock();
         if let Some(existing) = shard.get(&inode) {
-            // monotonic updates only: ensure we don't overwrite newer state with older events
             let is_hydration = existing.timestamp_ns == u64::MAX;
             if !is_hydration {
                 if existing.timestamp_ns > entry.timestamp_ns { return; }
@@ -140,54 +146,49 @@ pub fn resolve_target(
     inode_map: &ShardedInodeMap,
     event: &Event,
     target_root: &std::path::Path
-) -> (PathBuf, bool, bool) {
-    // 1. Check Memory Cache First (Fast Path)
-    // PATTERN: Strict Inode Map Trust.
-    // We assume the InodeMap is the "Shadow Namespace" Source of Truth.
+) -> ResolveResult {
+    // 1. Check Cache
     if let Some(entry) = inode_map.get_entry_clone(event.inode) {
         let match_gen = entry.generation == event.generation
                         || entry.generation == 0
                         || entry.generation == std::u32::MAX;
         
         if !match_gen {
-            // Generation Mismatch is the ONLY reason to invalidate.
-            // It means the Inode was recycled by the OS.
             warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. Invalidating.",
                   event.inode, entry.generation, event.generation);
             inode_map.remove(event.inode);
             metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
+            metrics::GENERATION_MISMATCHES.inc();
+            
+            let identity_dir = target_root.join(".mirror").join(".by-identity");
+            let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
+            return ResolveResult::NeedsRepair(identity_dir.join(filename));
         } else {
-             // CACHE HIT: Trust the path in the map explicitly.
-             // DO NOT verify existence on disk (fs::metadata). Doing so causes TOCTOU races
-             // where we "forget" a file just because it hasn't been flushed to disk yet,
-             // leading to "Source Missing" errors on subsequent renames.
              metrics::IDENTITY_CACHE_HIT_RATE.set(1.0);
-             return (target_root.join(&entry.path), false, false);
+             return ResolveResult::Success(target_root.join(&entry.path), false, false);
         }
     } else {
         metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
     }
 
-    // 2. Parent-Based Reconstruction (Heuristic - Only used on Cache Miss)
+    // 2. Resolve via Parent
     if event.parent_inode != 0 {
         if let Some(parent_path) = inode_map.get_path(event.parent_inode) {
             let full_path = parent_path.join(&event.name);
-            // Repair the map since we found the child via the parent
             inode_map.put(event.inode, IdentityEntry::new(
                 full_path.clone(),
                 event.generation,
                 event.timestamp_ns,
                 event.seq_num,
             ));
-            return (target_root.join(full_path), false, false);
+            return ResolveResult::Success(target_root.join(full_path), false, false);
         }
     }
 
-    // 3. Fallback: Path Name (Interactive/New Files)
-    // Used when BPF gives us a name but we haven't seen the inode before.
+    // 3. Simple Path Fallback
     let event_path = PathBuf::from(&event.name);
     if !event.name.is_empty() && !event.name.contains('/') {
-        // Relative path in root, or unknown context. 
+        // Name is a single component but we failed parent lookup (or root)
     } else if !event.name.is_empty() {
         inode_map.put(event.inode, IdentityEntry::new(
             event_path.clone(),
@@ -195,17 +196,15 @@ pub fn resolve_target(
             event.timestamp_ns,
             event.seq_num,
         ));
-        return (target_root.join(event_path), false, false);
+        return ResolveResult::Success(target_root.join(event_path), false, false);
     }
 
-    // 4. Synthetic Identity (Last Resort)
-    // If we have no clue where this file is, we operate on a synthetic handle
-    // to preserve the data content until the path is eventually resolved.
+    // 4. Synthetic Identity Fallback
     let identity_dir = target_root.join(".mirror").join(".by-identity");
     let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
     let synthetic_path = identity_dir.join(filename);
     
-    (synthetic_path, true, true)
+    ResolveResult::Success(synthetic_path, true, true)
 }
 
 pub fn resolve_directory(dir_map: &ShardedDirMap, inode_map: &ShardedInodeMap, _dev: u32, inode: u64) -> Option<PathBuf> {
@@ -226,8 +225,6 @@ pub fn resolve_and_update_path(
     ts_hint: u64,
     seq_hint: u64
 ) -> io::Result<PathBuf> {
-    // Aggressive Lookup - Disk Scan.
-    // This is the "Emergency Recovery" mechanism, not the standard resolution path.
     let start_time = std::time::Instant::now();
     let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
 
@@ -239,14 +236,12 @@ pub fn resolve_and_update_path(
         }
     }
 
-    info!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source.mount);
+    debug!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source.mount);
     let mut found_path = None;
     
-    // Depth limited walk to avoid massive stalls
     for entry in walkdir::WalkDir::new(&source.mount).min_depth(1) {
         if let Ok(entry) = entry {
             if entry.depth() > 20 { continue; }
-            
             if let Ok(metadata) = entry.metadata() {
                 if metadata.ino() == inode {
                     if let Ok(rel_path) = entry.path().strip_prefix(&source.mount) {

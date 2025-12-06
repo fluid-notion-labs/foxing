@@ -124,10 +124,10 @@ impl Manager {
             config_reader.governor_psi_io_threshold,
             config_reader.governor_psi_cpu_threshold,
         ));
-        
+
         let cache_size_raw = (config_reader.global_buffer_limit / 5) as usize;
         let lru_size_val = cache_size_raw.max(10000);
-
+        
         let journal_buf_size = (config_reader.io_buffer_size_mib * 1024 * 1024) as usize;
         let journal_buf_final = journal_buf_size.max(64 * 1024).min(16 * 1024 * 1024);
 
@@ -151,12 +151,10 @@ impl Manager {
             match resolve_all_device_ids(&sc.path) {
                 Ok((mount_path, mut dev_ids)) => {
                     dev_ids.retain(|id| !target_ids_to_exclude.contains(id));
-                    
                     if dev_ids.is_empty() {
                         error!("Source {:?} has NO device IDs left after excluding Targets!", sc.path);
                         continue;
                     }
-                    
                     let primary_dev = dev_ids[0];
                     info!("Source: {:?} (Mount: {:?})", sc.path, mount_path);
                     
@@ -169,10 +167,10 @@ impl Manager {
                     
                     info!("Initializing Inotify Reverse Index for {:?}", sc.path);
                     let identity_watcher = Some(InotifyIndex::new(sc.path.clone()));
-
+                    
                     let inode_map = ShardedInodeMap::new(lru_size_val);
                     let dir_map = ShardedDirMap::new(lru_size_val);
-
+                    
                     let projector = Arc::new(IdentityProjector::new(
                         inode_map.clone(),
                         dir_map.clone(),
@@ -186,9 +184,9 @@ impl Manager {
                         let tuning_profile_str = format!("{:?}", tgt.profile);
                         
                         match JournalStore::new(
-                            &journal_path, 
-                            &tgt.path, 
-                            &mount_path, 
+                            &journal_path,
+                            &tgt.path,
+                            &mount_path,
                             &daemon_id,
                             journal_buf_final,
                             &tuning_profile_str,
@@ -227,8 +225,14 @@ impl Manager {
             for t in &sc.targets {
                 let xattr_ok = security::probe_xattr_support(&t.path);
                 t.xattr_supported.store(xattr_ok, std::sync::atomic::Ordering::Relaxed);
+                
+                // RECOVERY: Scan for pending Directory Hash commits from previous crash (Issue 6)
+                if t.path.exists() {
+                    let _ = security::remove_metadata(&t.path, "user.foxing_dir_hash_pending");
+                }
             }
         }
+
         drop(config_reader);
 
         Self {
@@ -251,38 +255,49 @@ impl Manager {
         let (raw_hydration_tx, hydration_rx_moved) = mpsc::channel(32);
         let hydration_tx = Arc::new(HydrationSender(raw_hydration_tx));
         let (_, hydration_rx_dummy) = mpsc::channel(1);
+
         let config_reader = self.config.read().await;
 
         for (_primary_dev, src) in self.sources.iter_mut() {
+            // Start Version Indexer
             let v_index = src.version_index.clone();
             std::thread::spawn(move || {
                 v_index.index_directory();
             });
+
             if let Some(source_cfg) = config_reader.sources.iter().find(|s| s.path == src.path) {
                 let mut hydration_targets = Vec::new();
                 let mut hydration_repair_txs = Vec::new();
                 let mut queues_for_source: HashMap<u32, Vec<Arc<EventQueue>>> = HashMap::new();
                 let mut serialization_engines: HashMap<PathBuf, Arc<SerializationEngine>> = HashMap::new();
+
                 for tgt_cfg in &source_cfg.targets {
                     let serialization_engine = SerializationEngine::new();
                     serialization_engines.insert(tgt_cfg.path.clone(), serialization_engine.clone());
+                    
                     let target_workers = tgt_cfg.worker_count.max(2);
                     let (fanout_tx, fanout_rxs_vec) = crate::event::create_fanout(config_reader.queue_max, target_workers);
                     let fanout_queue_arc = Arc::new(fanout_tx);
+                    
                     let (repair_tx_raw, repair_rx_raw) = crate::event::create_fanout(10_000, 1);
                     if let Some(tx) = repair_tx_raw.senders.first() {
                         hydration_repair_txs.push(tx.clone());
                     }
                     let mut repair_rx_option = Some(repair_rx_raw.into_iter().next().unwrap());
+
                     for alt_dev_id in &src.dev_ids {
                         queues_for_source.entry(*alt_dev_id).or_insert_with(Vec::new).push(fanout_queue_arc.clone());
                     }
+
                     self.tuner_board.insert(tgt_cfg.path.clone(), TunerState::Startup);
+
                     for (i, rx) in fanout_rxs_vec.into_iter().enumerate() {
                         let (sd_tx, sd_rx) = mpsc::channel(1);
                         shutdowns.push(sd_tx);
+                        
                         let repair_channel = if i == 0 { repair_rx_option.take() } else { None };
                         let worker_daemon_id = self.daemon_id.clone();
+                        
                         handles.push(tokio::spawn(worker::run_worker(
                             rx,
                             src.clone(),
@@ -299,22 +314,25 @@ impl Manager {
                             worker_daemon_id,
                         )));
                     }
+
                     if tgt_cfg.initial_sync {
                         hydration_targets.push(tgt_cfg.clone());
                     }
                 }
-                
+
                 let mut q_write = src.queues.write().await;
                 *q_write = queues_for_source.clone();
                 drop(q_write);
-                
+
                 for (k, v) in &queues_for_source {
                     all_queues_map.entry(*k).or_insert_with(Vec::new).extend(v.iter().cloned());
                 }
 
+                // JOURNAL REPLAY
                 let queues_copy = queues_for_source.clone();
                 if let Some(journal) = &src.journal {
                     let projector = src.projector.clone();
+                    // Issue 7: Uses sorted replay internally
                     let replay_count = journal.replay(|evt| {
                         let evt_arc = Arc::new(evt);
                         if let Some(p) = &projector { p.project(&evt_arc); }
@@ -325,6 +343,17 @@ impl Manager {
                     
                     if replay_count > 0 {
                         info!("MANAGER: Replayed {} pending events from journal.", replay_count);
+                        
+                        // ISSUE 7 FIX: Post-Replay Consistency Check
+                        // Verify root identity integrity after journal rehydration
+                        use std::os::unix::fs::MetadataExt;
+                        if let Ok(meta) = fs::metadata(&src.path) {
+                            let inode = meta.ino();
+                            if src.dir_map.get(inode).is_none() {
+                                warn!("Journal Replay Gap: Root inode {} missing from DirMap. Injecting.", inode);
+                                src.dir_map.put(inode, PathBuf::from(""));
+                            }
+                        }
                     }
                 }
 
@@ -336,8 +365,10 @@ impl Manager {
                     self.tuner_board.clone(),
                     bulk_worker_count,
                 );
+                
                 *src.bulk_job_queue.lock() = Some(queue);
                 self.bulk_hydration_handles.extend(bulk_handles);
+
                 if !hydration_targets.is_empty() {
                     let hydrator = Arc::new(Hydrator::new(
                         src.clone(),
@@ -348,10 +379,12 @@ impl Manager {
                         serialization_engines,
                         self.daemon_id.clone(),
                     ));
+                    
                     if let Ok(watcher) = hydrator.clone().start_watcher() {
                         self.watchers.push(watcher);
                     }
                     self.hydrators.push(hydrator.clone());
+                    
                     let h_clone = hydrator.clone();
                     let thread_handle = std::thread::spawn(move || {
                         h_clone.full_scan();
@@ -361,10 +394,9 @@ impl Manager {
                 }
             }
         }
-        
+
         let hydrators_arc = Arc::new(self.hydrators.clone());
         let tuner_board_clone = self.tuner_board.clone();
-        
         let source_root_canonical = fs::canonicalize(
             self.sources.values().next().map(|s| s.path.as_path()).unwrap_or(Path::new("/"))
         ).unwrap_or_else(|_| PathBuf::from("/"));
@@ -372,9 +404,11 @@ impl Manager {
         let debounce_handle = tokio::spawn(async move {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut hydration_rx = hydration_rx_moved;
+            
             while let Some(path) = hydration_rx.recv().await {
                 let is_root_request = path == source_root_canonical;
                 let is_targeted_repair = path.exists() && !is_root_request;
+
                 if is_targeted_repair {
                     if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
                         if let Some(tgt_cfg) = hydrator.targets.iter().next() {
@@ -388,6 +422,7 @@ impl Manager {
                     }
                     continue;
                 }
+
                 if is_root_request {
                     let now = Instant::now();
                     let (_repair_debounce, full_scan_debounce) = calculate_adaptive_debounces(&tuner_board_clone);
@@ -406,7 +441,9 @@ impl Manager {
             }
             Ok(())
         });
+        
         handles.push(debounce_handle);
+
         (all_queues_map, handles, shutdowns, hydration_rx_dummy)
     }
 

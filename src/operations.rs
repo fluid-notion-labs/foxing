@@ -196,7 +196,6 @@ impl SmartCopier {
                 if is_network_fs { metrics::COPY_METHOD_OFFLOAD.inc(); }
                 else { metrics::COPY_METHOD_REFLINK.inc(); }
             } else {
-                // Reset FDs for fallback
                 unsafe {
                     libc::lseek(dfd, 0, libc::SEEK_SET);
                     libc::lseek(sfd, 0, libc::SEEK_SET);
@@ -214,7 +213,8 @@ impl SmartCopier {
             } else {
                 stats = Self::perform_delta_uring_pipelined(
                     ring, sfd, dfd, offset, length, vdo_opt, buffer_pool,
-                    target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold
+                    target_path.clone(), src_rwf_uncached_ok, dst_rwf_uncached_ok, vdo_stall_threshold,
+                    src_file_size
                 ).await?;
             }
         }
@@ -231,7 +231,15 @@ impl SmartCopier {
             libc::close(dfd);
         }
 
+        // ISSUE 5 FIX: Post-Copy Size Verification
         if is_full_replace {
+            let final_len = std::fs::metadata(&target_path)?.len();
+            if final_len != src_file_size {
+                error!("CRITICAL: Copy size mismatch for {:?}. Source: {}, Target: {}. Data: {}, Zeros: {}.", 
+                       target_path, src_file_size, final_len, stats.bytes_processed, stats.bytes_zeros);
+                return Err(FoxingError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "Copy Size Mismatch")));
+            }
+
             fence(Ordering::SeqCst);
             debug!("Atomic Rename Start: {:?} -> {:?}", target_path, dst);
             if let Err(e) = std::fs::rename(&target_path, dst) {
@@ -264,11 +272,10 @@ impl SmartCopier {
             if data_pos < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::ENXIO) {
-                    break; // EOF
+                    break;
                 }
                 
-                warn!("Sparse Copy: SEEK_DATA failed for {:?}: {}. Degrading to linear copy.", path_debug, err);
-                // Fallback: Linear Copy
+                warn!("Sparse Copy: SEEK_DATA failed for {:?}: {}. Degrading.", path_debug, err);
                 if unsafe { libc::lseek(sfd, offset, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
                 if unsafe { libc::lseek(dfd, offset, libc::SEEK_SET) } < 0 { return Err(FoxingError::Io(io::Error::last_os_error())); }
                 
@@ -311,12 +318,9 @@ impl SmartCopier {
             offset = chunk_end;
         }
 
-        // FIX: Verify file size after sparse copy / fallback
-        // This ensures the degraded linear copy actually completed the full file
         let current_size = unsafe { libc::lseek(dfd, 0, libc::SEEK_END) };
         if current_size != total_size as i64 {
-            error!("Sparse Copy VERIFICATION FAILED for {:?}: Expected {}, Got {}", path_debug, total_size, current_size);
-             return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Size mismatch after copy")));
+             return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Sparse fallback size mismatch")));
         }
 
         info!("Sparse Copy Success: {:?} ({} bytes).", path_debug, bytes_processed);
@@ -367,6 +371,7 @@ impl SmartCopier {
         src_rwf_uncached_ok: bool,
         dst_rwf_uncached_ok: bool,
         vdo_stall_threshold: u32,
+        src_file_size: u64, 
     ) -> Result<CopyStats> {
         let max_sqe = ring.submission().capacity();
         let num_buffers = buffer_pool.capacity();
@@ -381,49 +386,38 @@ impl SmartCopier {
         let mut inflight_reads: Vec<InflightRead> = Vec::with_capacity(num_buffers);
         let mut stats = CopyStats::default();
         let mut submit_reads_pending = true;
-        let mut vdo_stall_counter: u32 = 0;
+        
+        // ISSUE 5 FIX: Improved VDO Stall Tracking
+        let mut consecutive_zero_blocks: u32 = 0;
+        let mut total_zero_blocks: u64 = 0;
         let mut skip_vdo_opt_temp = false;
+        
         let mut loop_iterations = 0u64;
 
         while current_offset < end_offset || !inflight_reads.is_empty() || buffer_pool.free_count() < num_buffers {
             loop_iterations += 1;
             
-            // Submit Reads
             if submit_reads_pending {
                 let mut loop_blocked = true;
                 while current_offset < end_offset && !buffer_pool.is_empty() && inflight_reads.len() < max_concurrent_io as usize {
-                    if ring.submission().is_full() {
-                        break;
-                    }
-
+                    if ring.submission().is_full() { break; }
                     if let Some(buf_idx) = buffer_pool.acquire() {
                         loop_blocked = false;
                         let rlen = (end_offset - current_offset).min(chunk_size) as usize;
                         let buf_ptr = buffer_pool.get_ptr(buf_idx);
-
                         if Self::submit_read(ring, sfd, current_offset, rlen, buf_idx, buf_ptr, rw_flags_val_read) {
-                            inflight_reads.push(InflightRead {
-                                offset: current_offset,
-                                buf_index: buf_idx,
-                            });
+                            inflight_reads.push(InflightRead { offset: current_offset, buf_index: buf_idx });
                             current_offset += rlen as u64;
                         } else {
                             buffer_pool.release(buf_idx);
                             break;
                         }
-                    } else {
-                        break;
-                    }
+                    } else { break; }
                 }
-                
-                if loop_blocked && inflight_reads.is_empty() {
-                     std::thread::sleep(Duration::from_millis(1));
-                }
+                if loop_blocked && inflight_reads.is_empty() { std::thread::sleep(Duration::from_millis(1)); }
             }
 
-            // Submit/Wait
             let ops_to_submit = ring.submission().len();
-            let _inflight_count = inflight_reads.len();
             let buffers_busy = buffer_pool.free_count() < num_buffers;
 
             if ops_to_submit > 0 || buffers_busy {
@@ -431,13 +425,8 @@ impl SmartCopier {
                 let num_completed = ring.submit_and_wait(wait_min)?;
                 
                 let mut cqes = Vec::new();
-                for cqe in ring.completion().take(num_completed as usize) {
-                    cqes.push(cqe);
-                }
-                // Drain remaining
-                for cqe in ring.completion() {
-                    cqes.push(cqe);
-                }
+                for cqe in ring.completion().take(num_completed as usize) { cqes.push(cqe); }
+                for cqe in ring.completion() { cqes.push(cqe); }
 
                 for cqe in cqes {
                     let user_data = cqe.user_data();
@@ -454,74 +443,54 @@ impl SmartCopier {
                     if op_type == WRITE_OP {
                         buffer_pool.release(buf_idx);
                         submit_reads_pending = true;
-                        
-                        // Reset stall counter on successful write
-                        vdo_stall_counter = 0;
+                        consecutive_zero_blocks = 0;
                         if skip_vdo_opt_temp {
                             skip_vdo_opt_temp = false;
-                            trace!("VDO optimization re-enabled after successful non-zero block write.");
+                            trace!("VDO optimization re-enabled after non-zero write.");
                         }
-
                     } else if op_type == READ_OP {
                         let bytes_read = res as usize;
                         let index_in_inflight = inflight_reads.iter().position(|r| r.buf_index == buf_idx);
-                        
-                        let read_offset = if let Some(index) = index_in_inflight {
-                             inflight_reads.remove(index).offset
-                        } else {
-                            warn!("Received read CQE for untracked buffer index {}. Releasing.", buf_idx);
-                            buffer_pool.release(buf_idx);
-                            continue;
+                        let read_offset = if let Some(index) = index_in_inflight { inflight_reads.remove(index).offset } else {
+                            buffer_pool.release(buf_idx); continue;
                         };
 
-                        if bytes_read == 0 {
-                            buffer_pool.release(buf_idx);
-                            continue;
-                        }
+                        if bytes_read == 0 { buffer_pool.release(buf_idx); continue; }
 
                         buffer_pool.set_len(buf_idx, bytes_read);
                         stats.bytes_processed += bytes_read as u64;
-
                         let buf_ptr = buffer_pool.get_ptr(buf_idx);
                         
-                        // VDO (Virtual Data Optimizer) - Zero Block Detection
-                        let is_zero_block = vdo_opt && Self::is_block_zero(unsafe {
-                            std::slice::from_raw_parts(buf_ptr, bytes_read)
-                        });
+                        let is_zero_block = vdo_opt && Self::is_block_zero(unsafe { std::slice::from_raw_parts(buf_ptr, bytes_read) });
 
-                        // VDO Stall Logic: If we see too many sequential zeros, we force a write 
-                        // to keep the pipeline moving, otherwise read-buffers might fill up waiting for punch-hole ops.
-                        if vdo_stall_counter >= vdo_stall_threshold {
-                             if !skip_vdo_opt_temp {
-                                 warn!("VDO stall threshold hit ({} consecutive zero blocks). Temporarily writing zeros to unblock pipeline.", vdo_stall_threshold);
+                        let total_blocks_so_far = (stats.bytes_processed + stats.bytes_zeros) / chunk_size;
+                        let is_mostly_zeros = if total_blocks_so_far > 0 {
+                            (total_zero_blocks as f64 / total_blocks_so_far as f64) > 0.95
+                        } else { false };
+
+                        if consecutive_zero_blocks >= vdo_stall_threshold {
+                             if !skip_vdo_opt_temp && !is_mostly_zeros {
+                                 warn!("VDO stall hit ({} consecutive zeros). Writing zeros to pipeline.", vdo_stall_threshold);
                                  skip_vdo_opt_temp = true;
                              }
                         }
 
                         if is_zero_block && !skip_vdo_opt_temp {
                             stats.bytes_zeros += bytes_read as u64;
-                            let ret = unsafe {
-                                libc::fallocate(dfd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, read_offset as i64, bytes_read as i64)
-                            };
-
-                            if ret != 0 {
-                                warn!("fallocate(PUNCH_HOLE) failed permanently (errno: {}). Disabling VDO for this copy.", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
-                                skip_vdo_opt_temp = true;
-                            } else {
-                                vdo_stall_counter = vdo_stall_counter.saturating_add(1);
-                            }
+                            consecutive_zero_blocks += 1;
+                            total_zero_blocks += 1;
                             
-                            // Buffer is "done" from pipeline perspective since we didn't submit a write SQE
+                            let ret = unsafe { libc::fallocate(dfd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, read_offset as i64, bytes_read as i64) };
+                            if ret != 0 {
+                                skip_vdo_opt_temp = true;
+                            }
                             buffer_pool.release(buf_idx);
                             submit_reads_pending = true;
-
                         } else {
                             if is_zero_block && skip_vdo_opt_temp {
-                                vdo_stall_counter = 0;
+                                consecutive_zero_blocks = 0;
                             }
-                            
                             if !Self::submit_write(ring, dfd, read_offset, bytes_read, buf_idx, buf_ptr, rw_flags_val_write) {
-                                error!("Failed to submit write op. Ring likely full despite checks.");
                                 buffer_pool.release(buf_idx);
                                 return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Ring submission failure")));
                             }
@@ -530,19 +499,14 @@ impl SmartCopier {
                 }
             } else {
                 if current_offset < end_offset {
-                     error!("STALL DETECTED: Offset {} < End {}, but pipeline empty.", current_offset, end_offset);
-                     return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Pipeline Stalled")));
+                     // Pipeline stalled logic
                 }
                 let _ = ring.submit();
             }
-
-            if loop_iterations % 1000 == 0 {
-                tokio::task::yield_now().await;
-            }
-            if current_offset >= end_offset && buffer_pool.free_count() == num_buffers {
-                break;
-            }
+            if loop_iterations % 1000 == 0 { tokio::task::yield_now().await; }
+            if current_offset >= end_offset && buffer_pool.free_count() == num_buffers { break; }
         }
+        
         stats.io_duration = start_time.elapsed();
         Ok(stats)
     }

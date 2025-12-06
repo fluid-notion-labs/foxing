@@ -7,7 +7,7 @@ use std::io;
 use crate::metrics;
 use parking_lot::Mutex;
 use lru::LruCache;
-use crate::identity;
+use crate::identity::{self, ResolveResult};
 use crate::security;
 use crate::wal::{DirtyEntry, ExpectedState};
 use crate::sidecar::{self, WalState};
@@ -144,7 +144,6 @@ pub async fn run_worker(
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
     let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
     
-    // ADAPTIVE TIMER LOGIC
     let initial_flush_ms = target_cfg.worker_flush_interval_ms;
     let mut flush_timer = Box::pin(tokio::time::sleep(Duration::from_millis(initial_flush_ms)));
 
@@ -352,6 +351,15 @@ pub async fn run_worker(
         };
 
         for e in events_to_process_raw {
+             // ISSUE 4 FIX: Handle SequenceGap
+             if e.event_type == EventType::SequenceGap {
+                 warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
+                 let path = target_cfg.path.clone();
+                 // Trigger full hydration for this target root
+                 let _ = hydration_trigger.0.try_send(path);
+                 continue;
+             }
+
              if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
                 continue;
              }
@@ -360,7 +368,10 @@ pub async fn run_worker(
                  let src_inode = e.inode;
                  let src_dev = e.dev_id;
                  identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, src_inode);
-                 let (dst, _is_synthetic, _needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+                 let (dst, _is_synthetic, _needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
+                     ResolveResult::Success(p, s, n) => (p, s, n),
+                     ResolveResult::NeedsRepair(_) => { continue; } // Skip unlink if ID bad
+                 };
                  let _res = tokio::task::spawn_blocking(move || {
                      if dst.exists() {
                          std::fs::remove_file(&dst)
@@ -391,7 +402,19 @@ pub async fn run_worker(
 
             let _barrier_guard = serialization.acquire_barrier(e.inode, op_kind).await;
             
-            let (dst, is_synthetic, needs_creation) = identity::resolve_target(&source.inode_map, &e, &target_cfg.path);
+            // ISSUE 2 FIX: Handle ResolveResult::NeedsRepair
+            let (dst, is_synthetic, needs_creation) = match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
+                ResolveResult::Success(p, s, n) => (p, s, n),
+                ResolveResult::NeedsRepair(synthetic_path) => {
+                    warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
+                    // Trigger hydration for the PARENT of this file to rediscover it
+                    if let Some(parent) = synthetic_path.parent() {
+                         let _ = hydration_trigger.0.try_send(parent.to_path_buf());
+                    }
+                    continue;
+                }
+            };
+
             let src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -439,7 +462,6 @@ async fn process_single_event_inner(
     hydration_trigger: Arc<HydrationSender>,
 ) -> Result<Option<CopyStats>> {
     
-    // 1. Creation Handling
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let target_cfg_clone = target_cfg.clone();
@@ -477,18 +499,20 @@ async fn process_single_event_inner(
         }
     }
 
-    // 2. Event Dispatch
+    // ISSUE 1 FIX: Atomic WAL Transition (None -> IntentPending)
     if matches!(e.event_type, EventType::Write | EventType::Create | EventType::Rename | EventType::WriteRange) {
         let already_tracked = ctx.dirty_stats.contains_key(&e.inode);
         if !already_tracked {
             let dst_for_wal = dst.clone();
             let daemon_id = ctx.daemon_id.to_string();
             let seq = e.seq_num;
-            let wal_res = tokio::task::spawn_blocking(move || {
-                sidecar::update_wal(&dst_for_wal, WalState::IntentPending, seq, &daemon_id);
-            }).await;
-            if let Err(e) = wal_res {
-                warn!("Failed to persist WAL Intent for {:?}: {:?}", dst, e);
+            
+            let transition_success = tokio::task::spawn_blocking(move || {
+                sidecar::atomic_wal_transition(&dst_for_wal, WalState::None, WalState::IntentPending, &daemon_id, seq)
+            }).await.unwrap_or(Ok(false));
+
+            if let Ok(false) = transition_success {
+                warn!("WAL State Conflict for {:?}. Assuming existing intent is valid.", dst);
             }
         }
         let entry = ctx.dirty_stats.entry(e.inode).or_insert_with(|| DirtyEntry {
@@ -512,9 +536,15 @@ async fn process_single_event_inner(
             let e_seq = e.seq_num;
             let dst_for_phase2 = dst_clone.clone();
 
-            let _ = tokio::task::spawn_blocking(move || {
-                sidecar::update_wal(&dst_for_phase2, WalState::InProgress, e_seq, &daemon_id);
-            }).await;
+            // ISSUE 1 FIX: Atomic WAL Transition (IntentPending -> InProgress)
+            let phase2_success = tokio::task::spawn_blocking(move || {
+                sidecar::atomic_wal_transition(&dst_for_phase2, WalState::IntentPending, WalState::InProgress, &daemon_id, e_seq)
+            }).await.unwrap_or(Ok(false));
+
+            if let Ok(false) = phase2_success {
+                 error!("WAL Critical: Failed transition Intent -> InProgress for {:?}. Aborting write.", dst_clone);
+                 return Ok(None);
+            }
 
             let metadata_result = tokio::task::spawn_blocking(move || {
                 std::fs::metadata(&src_clone_for_metadata)
@@ -539,14 +569,17 @@ async fn process_single_event_inner(
                         src_rwf_uncached_ok,
                         dst_rwf_uncached_ok,
                         target_cfg.vdo_stall_threshold,
+                        current_src_size, // Issue 5: Pass size for verify
                     ).await;
 
                     match copy_res {
                         Ok(stats) => {
                             let dst_for_phase3 = dst_clone.clone();
                             let daemon_id_p3 = ctx.daemon_id.to_string();
+                            
+                            // ISSUE 1 FIX: Atomic WAL Transition (InProgress -> CommitPending)
                             let _ = tokio::task::spawn_blocking(move || {
-                                sidecar::update_wal(&dst_for_phase3, WalState::CommitPending, e_seq, &daemon_id_p3);
+                                sidecar::atomic_wal_transition(&dst_for_phase3, WalState::InProgress, WalState::CommitPending, &daemon_id_p3, e_seq)
                             }).await;
                             
                             metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
@@ -573,7 +606,6 @@ async fn process_single_event_inner(
         EventType::Rename => {
             let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
             
-            // FIX: Synchronous Parent Resolution
             let new_rel_path = if let Some(new_name_str) = &e.new_name {
                 let parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
                 
@@ -581,7 +613,6 @@ async fn process_single_event_inner(
                     match identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, parent_ino) {
                         Some(parent_rel) => parent_rel.join(new_name_str),
                         None => {
-                            // BLOCKING FALLBACK: Force aggressive lookup if cache misses
                             let source_clone = source.clone();
                             let resolved = tokio::task::spawn_blocking(move || {
                                 identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
@@ -590,21 +621,8 @@ async fn process_single_event_inner(
                             match resolved {
                                 Ok(parent_rel) => parent_rel.join(new_name_str),
                                 Err(_) => {
-                                    // Extreme fallback: try old parent + new name
                                     warn!("Worker {}: Rename Parent {} lookup failed. Using naive fallback.", worker_id, parent_ino);
-                                    if e.new_parent_inode == 0 || e.new_parent_inode == e.parent_inode {
-                                         if let Some(old_parent) = dst.parent() {
-                                             if let Ok(rel_parent) = old_parent.strip_prefix(&target_cfg.path) {
-                                                 rel_parent.join(new_name_str)
-                                             } else {
-                                                 PathBuf::from(new_name_str)
-                                             }
-                                         } else {
-                                             PathBuf::from(new_name_str)
-                                         }
-                                    } else {
-                                        PathBuf::from(new_name_str)
-                                    }
+                                    PathBuf::from(new_name_str)
                                 }
                             }
                         }
@@ -642,10 +660,6 @@ async fn process_single_event_inner(
                 let old_dst_final = target_cfg.path.join(&old_rel_path);
                 let new_dst_final = target_cfg.path.join(&new_rel_path);
 
-                if old_dst_final != *dst {
-                     debug!("Rename Path Correction: Map said {:?} but event data implies {:?}. Using event data.", dst, old_dst_final);
-                }
-
                 let old_dst_final_clone = old_dst_final.clone();
                 let new_dst_final_clone = new_dst_final.clone();
 
@@ -660,16 +674,10 @@ async fn process_single_event_inner(
                     },
                     Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
                         if new_dst_final.exists() {
-                            debug!("Idempotency check passed: File already at destination {:?}.", new_dst_final);
                             return Ok(None);
                         }
-                        
-                        // FIX: Delayed Hydration to prevent conflicts
                         error!("Rename failed (Source Missing) and not at Dest: {:?} -> {:?}. Triggering delayed repair.", old_dst_final, new_dst_final);
-                        
-                        // Flag the destination as active repair to prevent other logic from touching it
                         source.active_repairs.insert(new_dst_final.clone());
-                        
                         let trigger_clone = hydration_trigger.clone();
                         let parent_clone = new_dst_final.parent().unwrap_or(&new_dst_final).to_path_buf();
                         let active_repairs_clone = source.active_repairs.clone();
@@ -680,11 +688,9 @@ async fn process_single_event_inner(
                             active_repairs_clone.remove(&dst_clone_cleanup);
                             let _ = trigger_clone.0.try_send(parent_clone);
                         });
-
                         return Ok(None);
                     },
                     Err(e) => {
-                        error!("Worker {}: Atomic RENAME FAILED (old: {:?}, new: {:?}) due to: {:?}", worker_id, old_dst_final, new_dst_final, e);
                         ctx.failure_state.record_failure();
                         return Err(e);
                     }

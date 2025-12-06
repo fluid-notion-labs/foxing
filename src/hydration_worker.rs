@@ -11,12 +11,13 @@ use crate::security;
 use crate::governor::Governor;
 use tokio::task::spawn_blocking;
 use crate::metrics;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::io::ErrorKind;
 use crate::identity;
 use crate::buffer::BufferPool;
 use std::os::unix::fs::MetadataExt;
 use crate::sidecar;
+use dashmap::DashMap;
 
 #[derive(Debug)]
 pub struct HydrationJob {
@@ -27,6 +28,8 @@ pub struct HydrationJob {
 #[derive(Debug)]
 pub struct HydrationQueue {
     sender: mpsc::Sender<HydrationJob>,
+    // ISSUE 3: Rename Failure Tracker (Inode -> (Count, LastAttempt))
+    rename_failure_tracker: Arc<DashMap<u64, (u32, Instant)>>,
 }
 
 fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> Result<BufferPool> {
@@ -38,9 +41,8 @@ fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> 
     let worker_mem_limit_mib = total_hydration_mem_limit_mib / total_hydration_workers as u64;
     let num_io_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
-    
     let pool = BufferPool::new(num_io_buffers, buffer_chunk_size_bytes);
-    debug!("Hydration Worker: Initialized {} x {}MB buffers (Total {}MB).", 
+    debug!("Hydration Worker: Initialized {} x {}MB buffers (Total {}MB).",
            pool.capacity(), buffer_chunk_size_mib, pool.capacity() as u64 * buffer_chunk_size_mib);
     Ok(pool)
 }
@@ -55,6 +57,7 @@ impl HydrationQueue {
     ) -> (Self, Vec<tokio::task::JoinHandle<Result<()>>>) {
         let (tx, rx) = mpsc::channel(1000);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let tracker = Arc::new(DashMap::new());
         let mut handles = Vec::new();
         
         for id in 0..worker_count {
@@ -63,12 +66,13 @@ impl HydrationQueue {
             let config_clone = config.clone();
             let governor_clone = governor.clone();
             let tuner_clone = tuner_board.clone();
+            let tracker_clone = tracker.clone();
             
             handles.push(tokio::spawn(async move {
-                run_hydration_worker_loop(rx_clone, source_clone, config_clone, governor_clone, tuner_clone, worker_count, id).await
+                run_hydration_worker_loop(rx_clone, source_clone, config_clone, governor_clone, tuner_clone, worker_count, id, tracker_clone).await
             }));
         }
-        (Self { sender: tx }, handles)
+        (Self { sender: tx, rename_failure_tracker: tracker }, handles)
     }
 
     pub fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig) {
@@ -87,12 +91,12 @@ async fn run_hydration_worker_loop(
     tuner_board: TunerBoard,
     worker_count: usize,
     _worker_id: usize,
+    tracker: Arc<DashMap<u64, (u32, Instant)>>,
 ) -> Result<()> {
     let mut ring = match io_uring::IoUring::new(4) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create hydration io_uring: {}", e); return Err(e.into()); }
     };
-    
     let mut buffer_pool = initialize_hydration_buffer_pool(&config, worker_count)?;
     {
         let iovs = buffer_pool.as_io_vecs();
@@ -101,23 +105,21 @@ async fn run_hydration_worker_loop(
             return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Failed to register io_uring buffers")));
         }
     }
-
+    
     let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
-
+    
     loop {
         let job = {
             let mut lock = rx.lock().await;
             lock.recv().await
         };
-        
         match job {
             Some(job) => {
-                process_hydration_job(job, &source, &governor, &tuner_board, &mut ring, &mut buffer_pool, src_rwf_uncached_ok).await?;
+                process_hydration_job(job, &source, &governor, &tuner_board, &mut ring, &mut buffer_pool, src_rwf_uncached_ok, &tracker).await?;
             },
             None => break,
         }
     }
-    
     let _ = ring.submitter().unregister_buffers();
     Ok(())
 }
@@ -130,14 +132,42 @@ async fn process_hydration_job(
     ring: &mut io_uring::IoUring,
     buffer_pool: &mut BufferPool,
     src_rwf_uncached_ok: bool,
+    tracker: &Arc<DashMap<u64, (u32, Instant)>>,
 ) -> Result<()> {
     let HydrationJob { mut rel_path, target_cfg } = job;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
     let source_path_start = source.mount.join(&rel_path);
     let mut target_path = target_cfg.path.join(&rel_path);
-    
+
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
+        
+        // ISSUE 3 FIX: Check failure tracker before attempting resolution
+        let should_backoff = if let Some(mut entry) = tracker.get_mut(&inode) {
+            let (count, last_attempt) = *entry.value();
+            if count > 10 {
+                warn!("Hydration: Inode {} permanently failed {} attempts. Skipping.", inode, count);
+                return Ok(());
+            }
+            if count > 3 {
+                let backoff = Duration::from_millis(100 * 2u64.pow(count));
+                if last_attempt.elapsed() < backoff {
+                    true
+                } else {
+                    entry.value_mut().1 = Instant::now();
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_backoff {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
         match spawn_blocking({
             let source_clone = source.clone();
             move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
@@ -150,9 +180,14 @@ async fn process_hydration_job(
                         rel_path = new_rel.to_path_buf();
                     }
                 }
+                // Resolution successful, clear failure tracker
+                tracker.remove(&inode);
             },
             Err(FoxingError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                 warn!("Hydration Worker: Inode lookup failed for former path {:?}. Assuming deletion.", rel_path);
+                // Record failure
+                let mut entry = tracker.entry(inode).or_insert((0, Instant::now()));
+                entry.value_mut().0 += 1;
             },
             Err(e) => return Err(e),
         }
@@ -176,9 +211,9 @@ async fn process_hydration_job(
 
     let target_path_lossy = target_path.to_string_lossy().to_string();
     let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
-    
-    if governor.is_system_stressed() || 
-       matches!(current_state, TunerState::Muted | TunerState::CriticalDrain) 
+
+    if governor.is_system_stressed() ||
+       matches!(current_state, TunerState::Muted | TunerState::CriticalDrain)
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -205,7 +240,6 @@ async fn process_hydration_job(
                     }
                     return Ok(());
                 }
-                
                 let file_size = metadata.len();
                 let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
                 
@@ -265,9 +299,8 @@ async fn process_hydration_job(
                         }).await;
                     }
                 }
-                
                 if attempts < max_attempts {
-                    warn!("Hydration copy FAILED for {:?} (Attempt {}/{}) due to {:?}. Delaying {:?}.", 
+                    warn!("Hydration copy FAILED for {:?} (Attempt {}/{}) due to {:?}. Delaying {:?}.",
                           rel_path, attempts, max_attempts, e, delay);
                     tokio::time::sleep(delay).await;
                 } else {
@@ -277,9 +310,10 @@ async fn process_hydration_job(
             }
         }
     }
-    
+
     if !success {
         return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hydration job failed repeated attempts")));
     }
+    
     Ok(())
 }
