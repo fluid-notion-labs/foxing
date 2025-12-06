@@ -6,9 +6,11 @@ use std::collections::hash_map::DefaultHasher;
 use serde::{Serialize, Deserialize};
 use std::time::Instant;
 
+#[allow(dead_code)]
 const S_IFMT: u32 = 0o170000;
+#[allow(dead_code)]
 const S_IFDIR: u32 = 0o040000;
-const CONTROL_PLANE_POOL_SIZE: usize = 2; // Reserved workers for metadata
+const CONTROL_PLANE_POOL_SIZE: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -45,7 +47,7 @@ impl EventType {
             Self::Utimes => "utimes", Self::SequenceGap => "gap", Self::Unknown => "unknown"
         }
     }
-
+    
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir |
@@ -66,36 +68,35 @@ impl EventQueue {
 
     pub fn push(&self, e: Arc<Event>) {
         metrics::EVENTS_TOTAL.with_label_values(&[&e.dev_id.to_string(), e.event_type.as_str()]).inc();
+        
         if self.senders.is_empty() { return; }
-
+        
         let pool_size = self.senders.len();
         
-        // --- CONTROL PLANE / DATA PLANE SPLIT ---
-        // If we have enough workers, reserve 0..CONTROL_PLANE_POOL_SIZE for metadata
-        // Otherwise, Worker 0 takes all metadata.
+        // Hashing / Sharding Logic
         let target_idx = if pool_size > CONTROL_PLANE_POOL_SIZE {
+            // If we have dedicated data plane workers
             if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
-                // Control Plane Logic: Distribute based on Parent Inode to strictly serialize directory ops
+                // Metadata events go to Control Plane (Workers 0..CONTROL_PLANE_POOL_SIZE)
                 let mut hasher = DefaultHasher::new();
                 if e.parent_inode != 0 {
                     e.parent_inode.hash(&mut hasher);
                 } else {
-                    e.inode.hash(&mut hasher); // Fallback if no parent info (rare for mkdir/rename)
+                    e.inode.hash(&mut hasher);
                 }
                 let hash = hasher.finish();
                 hash as usize % CONTROL_PLANE_POOL_SIZE
             } else {
-                // Data Plane Logic: Distribute based on Inode to allow parallel file IO
+                // Data events go to Data Plane (Workers CONTROL_PLANE_POOL_SIZE..)
                 let mut hasher = DefaultHasher::new();
                 e.inode.hash(&mut hasher);
                 let hash = hasher.finish();
-                // Map to range [CONTROL_PLANE_POOL_SIZE .. pool_size]
                 CONTROL_PLANE_POOL_SIZE + (hash as usize % (pool_size - CONTROL_PLANE_POOL_SIZE))
             }
         } else {
-            // Low worker count fallback
+             // Fallback for low worker count
              if e.event_type == EventType::Rename || e.event_type.is_structural_metadata() {
-                 0 // All metadata serialized on Worker 0
+                 0
              } else {
                  let mut hasher = DefaultHasher::new();
                  e.inode.hash(&mut hasher);
