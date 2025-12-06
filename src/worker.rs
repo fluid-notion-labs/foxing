@@ -479,7 +479,6 @@ pub async fn run_worker(
                         // --- Deletion Check (Prioritized) ---
                         if !src.exists() {
                             // The file is gone from the source. No need for aggressive lookup.
-                            // We rely on the initial destination path (`dst`) for the corresponding unlink/rmdir event later.
                             debug!("Worker {}: Source file {:?} disappeared. Accepting deletion/missing status.", worker_id, src);
                             break;
                         }
@@ -949,11 +948,11 @@ async fn process_single_event_inner(
             let _res = tokio::task::spawn_blocking(move || {
                 if dst_clone.exists() {
                     std::fs::remove_dir(&dst_clone)
-                } else {
-                    Ok(())
-                }
-            }).await;
-            Ok(None)
+                 } else {
+                     Ok(())
+                 }
+             }).await;
+             Ok(None)
         }
         EventType::Link => {
              let src_dev = e.dev_id;

@@ -13,7 +13,8 @@ use std::num::NonZeroUsize;
 use dashmap::DashMap;
 use std::time::{Instant, Duration};
 lazy_static::lazy_static! {
-    static ref RECENT_LOOKUPS: DashMap<u64, (Instant, PathBuf)> = DashMap::new();
+    // FIX: Store (Timestamp, Path, Sequence Number) tuple to allow newer events to bypass the time-based debounce.
+    static ref RECENT_LOOKUPS: DashMap<u64, (Instant, PathBuf, u64)> = DashMap::new();
 }
 const LOOKUP_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
 #[derive(Clone, Debug)]
@@ -53,8 +54,6 @@ impl ShardedInodeMap {
     pub fn put(&self, inode: u64, entry: IdentityEntry) {
         let mut shard = self.get_shard(inode).lock();
         if let Some(existing) = shard.get(&inode) {
-            // CRITICAL FIX: Only allow update if the incoming sequence number is strictly newer.
-            // This prevents delayed, out-of-order events from overwriting the current, correct path.
             if existing.seq_num > 0 && existing.seq_num >= entry.seq_num {
                 return;
             }
@@ -197,19 +196,35 @@ pub fn resolve_and_update_path(
 ) -> io::Result<PathBuf> {
     let start_time = std::time::Instant::now();
     let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
+
+    // FIX: Conditional Debounce Check
     if let Some(entry) = RECENT_LOOKUPS.get(&inode) {
-        if entry.0.elapsed() < LOOKUP_DEBOUNCE_DURATION {
-            let path = entry.1.clone();
-            drop(entry);
+        let (last_time, path, last_seq) = entry.value();
+        
+        // Skip debounce if:
+        // 1. The incoming event sequence number is newer than the last recorded successful lookup sequence.
+        // 2. The last recorded sequence was a failure marker (u64::MAX), forcing a retry anyway.
+        let skip_debounce = seq_hint > *last_seq || *last_seq == u64::MAX;
+        
+        if !skip_debounce && last_time.elapsed() < LOOKUP_DEBOUNCE_DURATION {
             debug!("IDENTITY: Debounced aggressive lookup for Inode {} -> {:?}. Cached for {:?}.", inode, path, start_time.elapsed());
             source.inode_map.put(inode, IdentityEntry::new(path.clone(), generation_hint, ts_hint, seq_hint));
-            return Ok(path);
+            return Ok(path.clone());
+        }
+        
+        // If we skip the debounce, it means we must proceed with the expensive walk.
+        // We temporarily clear the aggressive lookup cache entry before the walk to avoid re-triggering.
+        if skip_debounce {
+             drop(entry); // Release read lock before remove
+             RECENT_LOOKUPS.remove(&inode);
         }
     }
+
     if let Some(watcher) = &source.identity_watcher {
         if let Some(path) = watcher.resolve(inode) {
              debug!("IDENTITY: Reverse Index HIT for Inode {} -> {:?}", inode, path);
              source.inode_map.put(inode, IdentityEntry::new(path.clone(), generation_hint, ts_hint, seq_hint));
+             RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone(), seq_hint)); // Update cache
              return Ok(path);
         }
     }
@@ -234,11 +249,14 @@ pub fn resolve_and_update_path(
         }
     }
     if let Some(path) = found_path {
-        RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone()));
+        RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone(), seq_hint)); // Update cache with successful path
         if fs::metadata(source.mount.join(&path)).is_ok() {
             return Ok(path);
         }
     }
+    // Record lookup failure time
+    RECENT_LOOKUPS.insert(inode, (Instant::now(), PathBuf::from(""), u64::MAX)); // Record failure, use u64::MAX for seq to ensure next event always forces a retry
+
     warn!("IDENTITY: Failed to resolve Inode {} after full walk. Duration: {:?}", inode, start_time.elapsed());
     Err(io::Error::new(io::ErrorKind::NotFound, "Inode not found after aggressive search."))
 }
