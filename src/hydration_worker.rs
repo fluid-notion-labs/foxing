@@ -37,11 +37,12 @@ fn initialize_hydration_buffer_pool(cfg: &SharedConfig, worker_count: usize) -> 
     let global_limit_mib = config_reader.global_buffer_limit;
     let total_hydration_workers = worker_count.max(1);
     
-    // Allocate 20% of global buffer to hydration
+    // Dedicated buffer memory for hydration (20% of global limit)
     let buffer_chunk_size_mib = config_reader.io_buffer_size_mib.max(1);
     let total_hydration_mem_limit_mib = global_limit_mib * 2 / 10;
     let worker_mem_limit_mib = total_hydration_mem_limit_mib / total_hydration_workers as u64;
     
+    // Calculate buffer count
     let num_io_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
     let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
 
@@ -59,11 +60,14 @@ impl HydrationQueue {
         tuner_board: TunerBoard,
         worker_count: usize
     ) -> (Self, Vec<tokio::task::JoinHandle<Result<()>>>) {
-        let (tx, rx) = mpsc::channel(1000);
+        // FOXING DEBUG: Increased queue size from 1,000 to 100,000 to handle Metadata Storms.
+        // During torture tests, ~5000 events can generate thousands of repair requests if dropped.
+        let (tx, rx) = mpsc::channel(100_000);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let tracker = Arc::new(DashMap::new());
-        
+
         let mut handles = Vec::new();
+
         for id in 0..worker_count {
             let rx_clone = rx.clone();
             let source_clone = source.clone();
@@ -71,7 +75,7 @@ impl HydrationQueue {
             let governor_clone = governor.clone();
             let tuner_clone = tuner_board.clone();
             let tracker_clone = tracker.clone();
-            
+
             handles.push(tokio::spawn(async move {
                 run_hydration_worker_loop(rx_clone, source_clone, config_clone, governor_clone, tuner_clone, worker_count, id, tracker_clone).await
             }));
@@ -98,6 +102,7 @@ async fn run_hydration_worker_loop(
     _worker_id: usize,
     tracker: Arc<DashMap<u64, (u32, Instant)>>,
 ) -> Result<()> {
+    // Each worker gets its own io_uring instance
     let mut ring = match io_uring::IoUring::new(4) {
         Ok(r) => r,
         Err(e) => { error!("Failed to create hydration io_uring: {}", e); return Err(e.into()); }
@@ -129,7 +134,7 @@ async fn run_hydration_worker_loop(
             None => break, // Channel closed
         }
     }
-    
+
     let _ = ring.submitter().unregister_buffers();
     Ok(())
 }
@@ -147,14 +152,14 @@ async fn process_hydration_job(
     let HydrationJob { mut rel_path, target_cfg } = job;
     let target_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
     
-    // Resolve potentially renamed path FIRST
     let source_path_start = source.mount.join(&rel_path);
     let mut target_path = target_cfg.path.join(&rel_path);
 
+    // 1. Resolve Identity / Handle Rename Correction
     if let Ok(metadata) = std::fs::metadata(&source_path_start) {
         let inode = metadata.ino();
-        
-        // --- Failure Tracking & Backoff Logic ---
+
+        // Check rename loop tracker
         let should_backoff = if let Some(mut entry) = tracker.get_mut(&inode) {
             let (count, last_attempt) = *entry.value();
             if count > 10 {
@@ -179,7 +184,6 @@ async fn process_hydration_job(
         if should_backoff {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        // -----------------------------------------
 
         match spawn_blocking({
             let source_clone = source.clone();
@@ -193,11 +197,9 @@ async fn process_hydration_job(
                         rel_path = new_rel.to_path_buf();
                     }
                 }
-                // Success - remove from failure tracker
                 tracker.remove(&inode);
             },
             Err(FoxingError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-                // It might have been deleted.
                 warn!("Hydration Worker: Inode lookup failed for former path {:?}. Assuming deletion.", rel_path);
                 let mut entry = tracker.entry(inode).or_insert((0, Instant::now()));
                 entry.value_mut().0 += 1;
@@ -208,7 +210,7 @@ async fn process_hydration_job(
 
     let source_path = source.mount.join(&rel_path);
     if !source_path.exists() {
-        // If source is gone, we should verify if we need to clean up target
+        // If source disappeared, cleanup target
         if target_path.exists() {
             warn!("Hydration Worker: Source path {:?} disappeared. Deleting target: {:?}", source_path, target_path);
             let target_path_clone = target_path.clone();
@@ -222,24 +224,24 @@ async fn process_hydration_job(
         }
         return Ok(());
     }
-
-    // Check Tuner State - Pause if System Stressed
     let target_path_lossy = target_path.to_string_lossy().to_string();
+
+    // 2. Tuner Pacing
     let current_state = tuner_board.get(&target_cfg.path).map(|r| *r.value()).unwrap_or(TunerState::Startup);
-    
     if governor.is_system_stressed() || 
        matches!(current_state, TunerState::Muted | TunerState::CriticalDrain) 
     {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Ensure parent dir exists
+    // 3. Ensure Parent Exists
     if let Some(parent) = target_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
 
+    // 4. Copy Loop
     let mut attempts = 0;
     let max_attempts = 5;
     let mut success = false;
@@ -254,21 +256,21 @@ async fn process_hydration_job(
                     if metadata.is_dir() && !target_path.exists() {
                         let _ = std::fs::create_dir_all(&target_path);
                     }
-                    return Ok(());
+                    return Ok(()); // Directories handled, done.
                 }
-                
+
                 let file_size = metadata.len();
                 let direct_io_ok = target_cfg.direct_io_ok.load(Ordering::Relaxed);
-
+                
                 SmartCopier::copy(
-                    &source_path, 
-                    &target_path, 
-                    ring, 
-                    buffer_pool, 
+                    &source_path,
+                    &target_path,
+                    ring,
+                    buffer_pool,
                     &target_cfg.supports_reflink,
                     target_cfg.vdo_optimization,
-                    0, 
-                    file_size, 
+                    0, // Offset 0 for full file
+                    file_size,
                     direct_io_ok,
                     file_size,
                     src_rwf_uncached_ok,
@@ -278,7 +280,7 @@ async fn process_hydration_job(
             },
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    return Ok(()); // File gone, nothing to do
+                    return Ok(()); // Disappeared during copy prep
                 }
                 Err(FoxingError::Io(e))
             }
@@ -288,10 +290,9 @@ async fn process_hydration_job(
             Ok(Some(stats)) => {
                 metrics::BYTES_REPLICATED.with_label_values(&[&target_path_lossy]).inc_by(stats.bytes_processed as f64);
                 
-                // Metadata Sync
+                // Metadata Sync in blocking thread
                 let src_path_clone = source_path.clone();
                 let dst_path_clone = target_path.clone();
-                
                 let apply_res = spawn_blocking(move || {
                     security::sync_xattrs(&src_path_clone, &dst_path_clone);
                     let _ = security::apply_metadata(&src_path_clone, &dst_path_clone);
@@ -311,10 +312,9 @@ async fn process_hydration_job(
             Err(e) => {
                 let delay = Duration::from_millis(100 * (attempts as u64).min(5));
                 
-                // If IO error is "Input/output error" or similar, maybe the file changed/moved?
+                // Check for identity change (rename race during copy)
                 if let FoxingError::Io(io_err) = &e {
-                    if io_err.kind() == ErrorKind::Other || io_err.raw_os_error() == Some(5) {
-                        // Attempt aggressive re-lookup
+                    if io_err.kind() == ErrorKind::Other || io_err.raw_os_error() == Some(5) { // EIO or similar
                         let _ = spawn_blocking({
                             let source_clone = source.clone();
                             move || identity::resolve_and_update_path(&source_clone, 0, 0, 0, 0)
