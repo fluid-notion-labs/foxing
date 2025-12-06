@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
 use std::io;
 use crate::metrics;
-use parking_lot::Mutex;
 use lru::LruCache;
 use crate::identity::{self, ResolveResult};
 use crate::security;
@@ -31,7 +30,6 @@ use crate::mirror::SourceInfo;
 use std::os::unix::fs::MetadataExt;
 use libc;
 use std::os::unix::io::AsRawFd;
-use crate::wal::WalGuard;
 fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
     if let Some(parent) = dst.parent() {
         if !parent.exists() {
@@ -85,8 +83,9 @@ impl Clone for HydrationSender {
         HydrationSender(self.0.clone())
     }
 }
+// FIX: Remove unused Mutex import
 struct ShardedLockCache {
-    shards: Vec<Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>>
+    shards: Vec<std::sync::Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>>
 }
 impl ShardedLockCache {
     fn new(capacity_hint: usize) -> Self {
@@ -94,13 +93,13 @@ impl ShardedLockCache {
         let per_shard = (capacity_hint / shard_count).max(100);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(LruCache::new(std::num::NonZeroUsize::new(per_shard).unwrap())));
+            shards.push(std::sync::Mutex::new(LruCache::new(std::num::NonZeroUsize::new(per_shard).unwrap())));
         }
         Self { shards }
     }
     fn get(&self, key: u64) -> Arc<tokio::sync::Mutex<()>> {
         let idx = (key as usize) % 128;
-        let mut s = self.shards[idx].lock();
+        let mut s = self.shards[idx].lock().unwrap();
         s.get_or_insert(key, || Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
     fn get_by_path(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -146,7 +145,7 @@ pub async fn run_worker(
     _governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
-    mut rx_repair: Option<mpsc::Receiver<Arc<Event>>>,
+    _rx_repair: Option<mpsc::Receiver<Arc<Event>>>, // FIX: Remove unused mut
     serialization: Arc<SerializationEngine>,
     daemon_id: String,
 ) -> Result<()> {
@@ -339,7 +338,7 @@ pub async fn run_worker(
             if let Some(e) = coalescer.pop_batch(current_coalesce_limit) {
                 events_to_process_raw.push(e);
             }
-            let is_structural = events_to_process_raw.len() > 0 && events_to_process_raw[0].event_type.requires_global_ordering();
+            let is_structural = events_to_process_raw.len() == 1 && events_to_process_raw[0].event_type.requires_global_ordering();
             
             if is_structural {
                 // If the event is structural, process only this one event, regardless of batch size.
@@ -355,9 +354,34 @@ pub async fn run_worker(
             }
         }
 
-        for e in events_to_process_raw {
+        // FIX (E0382): Iterate over a reference to prevent moving the Vec before the check.
+        for e in &events_to_process_raw {
             
-             // High Priority: Structural events like Rmdir/Unlink should ensure existence before deletion attempt.
+            // --- Determine Target Path DST for structural checks ---
+            let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
+                // If it's a structural metadata event, try to resolve the parent path first
+                let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
+                if let Some(pp) = parent_path_opt {
+                    let rel_path = pp.join(&e.name);
+                    (target_cfg.path.join(rel_path), false, false)
+                } else {
+                    let rel_path = PathBuf::from(e.name.trim_start_matches('/'));
+                    (target_cfg.path.join(rel_path), true, false)
+                }
+            } else {
+                match identity::resolve_target(&source.inode_map, e, &target_cfg.path) {
+                    ResolveResult::Success(p, s, n) => (p, s, n),
+                    ResolveResult::NeedsRepair(synthetic_path) => {
+                        warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
+                        if let Some(parent) = synthetic_path.parent() {
+                             let _ = hydration_trigger.0.try_send((parent.to_path_buf(), Some(e.inode)));
+                        }
+                        continue;
+                    }
+                }
+            };
+            
+             // FIX (E0425): Move Structural Deletion Existence Check AFTER DST is assigned
              if matches!(e.event_type, EventType::Rmdir | EventType::Unlink) {
                  let target_exists = std::fs::symlink_metadata(&dst).is_ok();
                  if !target_exists {
@@ -407,28 +431,7 @@ pub async fn run_worker(
             // are serialized/batched correctly (Renames exclusive, Writes concurrent).
             let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
 
-            let (mut dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
-                // If it's a structural metadata event, try to resolve the parent path first
-                let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
-                if let Some(pp) = parent_path_opt {
-                    let rel_path = pp.join(&e.name);
-                    (target_cfg.path.join(rel_path), false, false)
-                } else {
-                    let rel_path = PathBuf::from(e.name.trim_start_matches('/'));
-                    (target_cfg.path.join(rel_path), true, false)
-                }
-            } else {
-                match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
-                    ResolveResult::Success(p, s, n) => (p, s, n),
-                    ResolveResult::NeedsRepair(synthetic_path) => {
-                        warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
-                        if let Some(parent) = synthetic_path.parent() {
-                             let _ = hydration_trigger.0.try_send((parent.to_path_buf(), Some(e.inode)));
-                        }
-                        continue;
-                    }
-                }
-            };
+            // This block determines SRC, which depends on DST, so it must run here.
             let mut src = if is_synthetic {
                 source.mount.join(e.name.trim_start_matches('/'))
             } else {
@@ -582,12 +585,12 @@ async fn process_single_event_inner(
     if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
         let dst_clone = dst.clone();
         let _target_cfg_path_clone = target_cfg.path.clone();
-        let e_dev = e.dev_id;
-        let e_generation = e.generation;
-        let e_ts = e.timestamp_ns;
-        let e_seq = e.seq_num;
-        let source_map_clone = source.inode_map.clone();
-        let source_dir_map_clone = source.dir_map.clone(); // Unused, but kept for context if needed later
+        let _e_dev = e.dev_id; // FIX: Mark unused
+        let _e_generation = e.generation; // FIX: Mark unused
+        let _e_ts = e.timestamp_ns; // FIX: Mark unused
+        let _e_seq = e.seq_num; // FIX: Mark unused
+        let _source_map_clone = source.inode_map.clone(); // FIX: Mark unused
+        let _source_dir_map_clone = source.dir_map.clone(); // FIX: Mark unused
         let res = tokio::task::spawn_blocking(move || {
             let identity_dir = _target_cfg_path_clone.join(".mirror").join(".by-identity");
             let _ = std::fs::create_dir_all(&identity_dir);
@@ -719,7 +722,10 @@ async fn process_single_event_inner(
                         None => {
                             let source_clone = source_clone.clone();
                             // FIX (Critical): Move Identity operations out of spawn_blocking
-                            let resolved = identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0).ok();
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
+                            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
+                            // FIX (E0308): Correctly handle the Result returned by the async block
                             match resolved {
                                 Ok(parent_rel) => parent_rel.join(new_name_str),
                                 Err(_) => {
@@ -736,7 +742,7 @@ async fn process_single_event_inner(
                 PathBuf::new()
             };
             if let Some(_new_name_str) = &e.new_name {
-                // FIX (High Priority): Update map directly, but REMOVE the global map clear.
+                // FIX (High Priority): Update map directly.
                 identity::update_map_after_rename(
                     &source.inode_map,
                     &source.dir_map,

@@ -4,7 +4,7 @@ use crate::event::{Event, EventType};
 use crate::metrics;
 use tracing::warn;
 use std::time::{Instant, Duration};
-use parking_lot::Mutex;
+// use parking_lot::Mutex; // FIX: Removed unused import
 #[derive(Debug)]
 pub struct ReorderBuffer {
     buffer: BTreeMap<u64, Arc<Event>>,
