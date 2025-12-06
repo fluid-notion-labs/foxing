@@ -260,7 +260,8 @@ impl Manager {
         let mut handles = Vec::new();
         let mut shutdowns = Vec::new();
 
-        // 100k capacity to handle storms
+        // FOXING FIX: Increased capacity to 100k. 
+        // Channel type updated to handle Inode for precise tracking.
         let (raw_hydration_tx, hydration_rx_moved) = mpsc::channel(100_000);
         let hydration_tx = Arc::new(HydrationSender(raw_hydration_tx));
         
@@ -441,7 +442,7 @@ impl Manager {
                             if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
                                 if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
                                     info!("Hydration MANAGER: IMMEDIATE repair dispatch for file {:?} (Inode: {:?})", path, inode_opt);
-                                    // FOXING FIX: Pass the inode to the queue
+                                    // FOXING FIX: Pass the inode to the queue for robust tracking
                                     queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone(), inode_opt);
                                 }
                             }

@@ -59,7 +59,6 @@ impl HydrationQueue {
         tuner_board: TunerBoard,
         worker_count: usize
     ) -> (Self, Vec<tokio::task::JoinHandle<Result<()>>>) {
-        // FOXING FIX: Queue size set to 100,000 to match the Channel in Mirror Manager
         let (tx, rx) = mpsc::channel(100_000);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let tracker = Arc::new(DashMap::new());
