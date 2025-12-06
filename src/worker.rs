@@ -440,6 +440,22 @@ pub async fn run_worker(
 
             loop {
                 attempts += 1;
+                // Before starting I/O, check if the Identity Map has a newer path for this Inode.
+                // This is a fast, internal check that avoids expensive disk lookups or failed I/O.
+                if attempts > 1 && e.inode != 0 {
+                    if let Some(entry) = source.inode_map.get_entry_clone(e.inode) {
+                        if entry.seq_num > e.seq_num {
+                            let new_src = source.mount.join(&entry.path);
+                            let new_dst = target_cfg.path.join(&entry.path);
+                            if new_src.exists() && new_dst.exists() {
+                                debug!("Worker {}: Proactive Identity Update: Inode {} moved to {:?} (Seq {} > Event Seq {}).", worker_id, e.inode, entry.path, entry.seq_num, e.seq_num);
+                                src = new_src;
+                                dst = new_dst;
+                            }
+                        }
+                    }
+                }
+
                 let res = process_single_event_inner(
                     &mut ctx, e.clone(), &source, &target_cfg, &tuner,
                     capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,

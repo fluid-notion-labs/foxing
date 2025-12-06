@@ -53,22 +53,10 @@ impl ShardedInodeMap {
     pub fn put(&self, inode: u64, entry: IdentityEntry) {
         let mut shard = self.get_shard(inode).lock();
         if let Some(existing) = shard.get(&inode) {
-            let is_hydration = existing.timestamp_ns == u64::MAX;
-
-            // CRITICAL FIX: Check sequence number/timestamp before overwriting an existing entry.
-            // Only update if the new entry is strictly newer (higher sequence number OR newer timestamp).
-            // Hydration entries (ts=u64::MAX) always yield to real events.
-            if existing.timestamp_ns != u64::MAX {
-                // If timestamps are the same, check sequence number
-                if existing.timestamp_ns == entry.timestamp_ns {
-                    if existing.seq_num >= entry.seq_num {
-                        return;
-                    }
-                } 
-                // If the existing entry is newer, skip the update
-                else if existing.timestamp_ns > entry.timestamp_ns {
-                    return;
-                }
+            // CRITICAL FIX: Only allow update if the incoming sequence number is strictly newer.
+            // This prevents delayed, out-of-order events from overwriting the current, correct path.
+            if existing.seq_num > 0 && existing.seq_num >= entry.seq_num {
+                return;
             }
         }
         shard.put(inode, entry);
