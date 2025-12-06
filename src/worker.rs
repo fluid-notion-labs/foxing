@@ -605,6 +605,13 @@ async fn process_single_event_inner(
                 // Retry logic handles race between Data Plane (Create) and Control Plane (Rename)
                 let res = tokio::task::spawn_blocking(move || {
                     let mut attempts = 0;
+                    // Pre-check loop: Wait for source file to appear (up to 2 seconds)
+                    while !old_dst_final_clone.exists() && attempts < 20 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        attempts += 1;
+                    }
+                    // Reset attempts for the actual rename retry
+                    attempts = 0;
                     loop {
                         match atomic_rename(&old_dst_final_clone, &new_dst_final_clone) {
                             Ok(_) => return Ok(()),
@@ -652,10 +659,10 @@ async fn process_single_event_inner(
                         ctx.dirty_stats.remove(&e.inode);
                         return Ok(None);
                     },
-                    Err(err) => { // CHANGED: Renamed 'e' to 'err' to avoid shadowing the Event 'e'
+                    Err(io_err) => { // Renamed from 'e' to 'io_err' to fix shadowing
                         ctx.failure_state.record_failure();
-                        ctx.dirty_stats.remove(&e.inode); // Now refers to the outer Event 'e'
-                        return Err(err);
+                        ctx.dirty_stats.remove(&e.inode);
+                        return Err(io_err);
                     }
                 }
                 return Ok(None);
