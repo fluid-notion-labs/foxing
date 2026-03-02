@@ -2,7 +2,8 @@
 
 **Status:** Proposed
 **Date:** 2026-03-02
-**Authors:** Project maintainers
+**Authors:** Joel Wirāmu Pauling
+**Target Platform** RHEL10 (kernel 6.12>= with some backports), Fedora43 (6.19>=) other distros. (Modern kernels)
 
 ---
 
@@ -1160,9 +1161,125 @@ The BLAKE3 Merkle tree operates at the filesystem/plaintext level, above dm-cryp
 
 ---
 
-## 14. Consequences
+## 14. Adversarial Analysis and Security Considerations
 
-### 14.1 Benefits
+*This section incorporates findings from an independent adversarial review of the proposed architecture.*
+
+### 14.1 Cryptographic Trust and State Tampering (Merkle Engine)
+
+The BLAKE3 Merkle tree stored in `user.foxing.merkle` xattrs (Section 9) introduces a **trust boundary** at the target filesystem. Both `fxcp` and `foxingd` will rely on these xattrs to skip full-file content reads during delta transfers.
+
+**Risk: Target-Side "Lying Receipts"**
+
+A malicious actor with write access to the target filesystem could modify a file's contents and synchronously update the `user.foxing.merkle` xattr to match the original source tree. The replication engine would falsely trust the receipt, resulting in **silent data divergence**.
+
+**Trust Model:** The `user.foxing.merkle` xattr relies entirely on target-side OS permissions (SELinux, ACLs, DAC) for integrity. The architecture explicitly does **not** treat the target as a trusted store — it treats xattr signatures as a performance optimization, not a security guarantee.
+
+**Mitigations:**
+
+| Mitigation | Implementation |
+|-----------|----------------|
+| **`--enforce-strict-hash` flag** | Bypasses xattr receipts entirely. Forces full read + recomputation of target Merkle tree on every sync. Guarantees bit-for-bit verification at the cost of O(file_size) reads |
+| **`trusted.foxing.*` namespace** | Prefer `trusted.*` xattrs (require `CAP_SYS_ADMIN`) over `user.*` where available. Unprivileged users cannot tamper with `trusted.*` attributes |
+| **HMAC-signed signatures** | Optional mode where Merkle signatures are HMAC'd with a key derived from the source. Target-side tampering is detectable because the attacker lacks the signing key. Key stored in foxingd's config, never written to target |
+| **Periodic full verification** | foxingd can schedule periodic full-tree verification sweeps (e.g., daily) that ignore xattr receipts and recompute from disk. Catches any silent divergence |
+
+**Risk: Merkle Tree Parsing Vulnerabilities**
+
+A maliciously crafted or corrupted `user.foxing.merkle` xattr could trigger OOM or panics during deserialization. The `leaf_count` field controls memory allocation — a value of `u32::MAX` would attempt to allocate ~128GB.
+
+**Mitigations:**
+
+- `MerkleSignature::deserialize()` must enforce strict bounds: `leaf_count ≤ file_size / chunk_size + 1`
+- Maximum xattr payload size: reject any `user.foxing.merkle` value exceeding 64KB (xattr system limit on most filesystems)
+- Maximum sidecar file size: reject `.foxing_meta` JSON files exceeding 16MB
+- Use `bincode::Options::with_limit()` to cap deserialization buffer at a configured maximum
+- All deserialization returns `Option<T>` (never panics on malformed input — existing pattern in `sidecar.rs`)
+
+### 14.2 Unprivileged Execution Abuse (fxcp Standalone)
+
+A primary benefit of the split is allowing `fxcp` to run without `CAP_BPF` or root. However, `fxcp` exposes high-performance kernel features to standard users.
+
+**Risk: Resource Exhaustion via High-Performance APIs**
+
+A malicious local user could use `fxcp` to saturate the I/O queue via `io_uring`, exhaust file descriptors via `FICLONE` storms, or monopolize block device bandwidth via `copy_file_range` — causing localized Denial of Service for other users on a multi-tenant system.
+
+**Mitigations:**
+
+| Mitigation | Implementation |
+|-----------|----------------|
+| **Honor cgroups** | fxcp-core must respect cgroup v2 I/O limits (`io.max`, `io.latency`). The `Governor` already monitors PSI which reflects cgroup pressure |
+| **Honor ulimits** | Respect `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_AS`. BufferPool allocation already checks global memory limits |
+| **Governor in standalone mode** | The `Governor` (moved to fxcp-core) must be active by default in the fxcp binary, not just foxingd. Configurable via `--max-load` CLI flag |
+| **io_uring queue depth cap** | fxcp-core should cap io_uring SQE depth to a configurable maximum (default: 64 for fxcp standalone vs 256+ for foxingd). Prevents queue monopolization |
+| **Rate limiting** | fxcp standalone should default to a conservative `--bandwidth-limit` that can be raised explicitly, similar to `rsync --bwlimit` |
+
+**Risk: Symlink Traversal**
+
+`fxcp` performing recursive copies could follow malicious symlinks outside the intended target directory (symlink-to-`/etc/shadow` attack).
+
+**Mitigation:** `fxcp-core` must implement **path canonicalization with jail enforcement** — resolve all symlinks and verify the canonical path remains under the specified source/target root. The existing `security.rs` module should include a `path_within_root(path, root) -> bool` check called before every file operation. `O_NOFOLLOW` should be used for opens where symlink following is not explicitly intended.
+
+### 14.3 Asymmetric State Recovery (Crash Consistency)
+
+The crash consistency model uses `user.foxing.dirty` flags. foxingd sets the flag before writing and clears it after atomic commit. foxingd has continuous background workers that sweep and repair on restart.
+
+**Risk: Orphaned Temporary Files and Stale Flags**
+
+When using standalone `fxcp` (no daemon), a hard crash (`SIGKILL`, power loss, OOM kill) mid-transfer leaves `.tmp.<uuid>` files and `dirty` xattrs scattered across the target. Without foxingd's automatic sweep, the target accumulates garbage and locked files indefinitely.
+
+**Mitigations:**
+
+| Mitigation | Implementation |
+|-----------|----------------|
+| **`fxcp --cleanup` command** | Dedicated subcommand that scans a target directory for orphaned `.tmp.*` files and stale `user.foxing.dirty` xattrs, removing them with user confirmation |
+| **`CleanupGuard` RAII pattern** | Similar to existing `WalGuard` — registers `.tmp` file paths at creation, removes them on drop. Catches `SIGINT`/`SIGTERM` via signal handler. Cannot catch `SIGKILL` or power loss, hence the `--cleanup` command |
+| **Tmp file age limit** | `fxcp --cleanup` should only remove `.tmp.*` files older than a configurable threshold (default: 1 hour) to avoid removing files from a concurrent fxcp process |
+| **Startup sweep option** | `fxcp --repair-before-copy SOURCE DEST` scans the target for stale state before beginning a new sync |
+
+### 14.4 Adversarial Pacing and Governor Manipulation
+
+foxingd passes `Arc<Governor>` to fxcp-core for I/O pacing based on system load (PSI, Load Average).
+
+**Risk: Artificial Replication Stalling**
+
+An attacker or noisy neighbor could intentionally generate high CPU/IO pressure to manipulate the `Governor` into throttling fxcp-core. In foxingd context, sustained throttling causes the `ReorderBuffer` or `HydrationQueue` to overflow, forcing event drops and loss of real-time sync.
+
+**Mitigations:**
+
+| Mitigation | Implementation |
+|-----------|----------------|
+| **QoS Override / Minimum Guaranteed Throughput** | The `SmartCopier` constructor should accept an optional `min_throughput_bytes_sec: u64` parameter. When set, the Governor cannot throttle below this floor — ensuring critical replication paths (WAL, database journals) maintain forward progress |
+| **Governor bypass for control plane** | foxingd's Worker 0 (structural metadata: renames, creates, deletes) should bypass Governor throttling entirely. Structural operations are small, latency-sensitive, and must not be delayed |
+| **Backpressure signaling** | When the Governor throttles for >30 seconds continuously, foxingd should emit a `foxing_governor_sustained_throttle` metric and log a warning. This makes artificial stalling visible in monitoring |
+| **Bounded queue with drop policy** | The `ReorderBuffer` should have a configurable maximum size with an explicit drop policy (drop oldest events when full, trigger gap-based hydration to recover). This prevents unbounded memory growth from sustained throttling |
+| **PSI source validation** | Governor should cross-reference PSI pressure against its own I/O contribution (via `/proc/self/io`). If the system pressure is not caused by foxing's own I/O, throttling should be less aggressive |
+
+### 14.5 Supply Chain and Library Attack Surface
+
+Extracting `fxcp-core` into a standalone library crate makes it available to third-party consumers. Any vulnerability in fxcp-core is now exploitable by every application that imports it.
+
+**Risk: Broader Exploit Applicability**
+
+Memory safety bugs, path traversal vulnerabilities, or integer overflows in `fxcp-core/operations.rs` become exploitable vectors not just for foxingd but for any application importing the crate.
+
+**Mandatory Security Practices:**
+
+| Practice | Scope |
+|----------|-------|
+| **Continuous fuzz testing** | `cargo-fuzz` targets for: `SmartCopier` path resolution, `MerkleSignature::deserialize()`, `SyncSignature::deserialize()`, io_uring SQE construction, xattr value parsing |
+| **Unsafe encapsulation** | All `unsafe` blocks handling io_uring, native `ioctl`, and SIMD intrinsics must be encapsulated in minimal-surface `unsafe fn` wrappers with documented safety invariants. No raw pointer arithmetic in public API surface |
+| **Path sanitization** | Every path received from external input (CLI args, config, xattr values) must pass through `canonicalize()` + root jail check before use in any filesystem operation |
+| **Integer overflow protection** | All size calculations (`chunk_count = file_size / chunk_size`, buffer allocation sizes, offset arithmetic) must use checked arithmetic (`checked_mul`, `checked_add`) or `saturating_*` variants |
+| **Dependency auditing** | `cargo-audit` in CI. Minimize transitive dependency count for fxcp-core. Pin security-critical deps (blake3, io-uring, libc) |
+| **Symlink policy** | Default to `O_NOFOLLOW` for all opens. Symlink following requires explicit opt-in via `--follow-symlinks` flag |
+| **RUSTSEC advisory compliance** | Subscribe to RUSTSEC advisories for all fxcp-core dependencies. Automated PR generation for security updates |
+
+---
+
+## 15. Consequences
+
+### 15.1 Benefits
 
 | Benefit | Description |
 |---------|-------------|
@@ -1174,7 +1291,7 @@ The BLAKE3 Merkle tree operates at the filesystem/plaintext level, above dm-cryp
 | **Targeted testing** | Copy engine tests run without BPF infrastructure. Daemon tests can mock fxcp-core |
 | **Quick Fox realized** | fxcp embodies the "Quick Fox" as an independent tool — fast, nimble, no daemon baggage |
 
-### 14.2 Risks and Mitigations
+### 15.2 Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
@@ -1184,7 +1301,7 @@ The BLAKE3 Merkle tree operates at the filesystem/plaintext level, above dm-cryp
 | Migration breaks `foxing sync` users | Users must switch to `fxcp` | foxingd can retain `sync` subcommand as thin wrapper during deprecation period |
 | `ONE_SHOT_MODE` global state sharing | `AtomicBool` in constants used by both planes | Lives in fxcp-core. Both binaries set it at startup |
 
-### 14.3 Trade-offs
+### 15.3 Trade-offs
 
 1. **Workspace complexity vs modularity** — Three crates require coordinating versions and CI. This is the standard Rust workspace pattern, well-supported by Cargo.
 2. **Two metrics modules** — fxcp-core (~20 metrics) + foxingd (~80 additional). Acceptable given clean separation.
@@ -1192,7 +1309,7 @@ The BLAKE3 Merkle tree operates at the filesystem/plaintext level, above dm-cryp
 
 ---
 
-## 15. Validation Criteria
+## 16. Validation Criteria
 
 The split is successful when:
 
@@ -1206,7 +1323,7 @@ The split is successful when:
 
 ---
 
-## 16. References
+## 17. References
 
 ### Linux Kernel & VFS
 - Linux VFS Documentation: https://docs.kernel.org/filesystems/vfs.html
