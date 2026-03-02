@@ -92,27 +92,29 @@ def generate_mixed(root: Path, file_count: int = 5000) -> dict:
 
 
 def generate_deep_tree(root: Path, depth: int = 10, width: int = 5) -> dict:
-    """Deeply nested directory tree with files at each level."""
+    """Deeply nested directory tree with files at each level.
+
+    Creates a single deep spine (depth levels), with `width` sibling dirs
+    and a file in each at every level.  Total dirs = depth * width,
+    total files = depth * width.  NOT exponential.
+    """
     root.mkdir(parents=True, exist_ok=True)
     total_files = 0
     total_bytes = 0
     total_dirs = 0
 
-    def _recurse(path: Path, level: int):
-        nonlocal total_files, total_bytes, total_dirs
-        if level >= depth:
-            return
+    current = root
+    for level in range(depth):
         for w in range(width):
-            d = path / f"d{level}_{w}"
+            d = current / f"d{level}_{w}"
             d.mkdir(exist_ok=True)
             total_dirs += 1
-            # Put a file in each dir
             fp = d / f"leaf_{level}_{w}.dat"
             total_bytes += _write_random_file(fp, 4096)
             total_files += 1
-            _recurse(d, level + 1)
+        # Descend into the first child only (spine)
+        current = current / f"d{level}_0"
 
-    _recurse(root, 0)
     return {"files": total_files, "bytes": total_bytes, "dirs": total_dirs + 1}
 
 
