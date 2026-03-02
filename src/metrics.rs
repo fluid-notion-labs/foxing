@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
-    // --- Core Event Metrics ---
+    // --- [foxingd] Core Event Metrics (BPF/inotify pipeline) ---
     pub static ref EVENTS_TOTAL: CounterVec = register_counter_vec!(
         "foxing_events_total",
         "Total events received by type",
@@ -36,7 +36,7 @@ lazy_static! {
         "Events that arrived after their window passed (Reorder Buffer)"
     ).unwrap();
 
-    // --- BPF & Ring Diagnostics ---
+    // --- [foxingd] BPF & Ring Diagnostics ---
     pub static ref BPF_PANIC_CAUGHT: Counter = register_counter!(
         "foxing_bpf_panic_caught_total",
         "Number of panics caught within the BPF ring buffer callback"
@@ -57,7 +57,7 @@ lazy_static! {
 }
 
 lazy_static! {
-    // --- Latency & Performance ---
+    // --- [fxcp-core] Latency & Performance ---
     pub static ref REPLICATION_LATENCY: HistogramVec = register_histogram_vec!(
         "foxing_replication_latency_seconds",
         "End-to-end latency from source event to target write",
@@ -69,7 +69,7 @@ lazy_static! {
         vec![0.001, 0.01, 0.1, 1.0]
     ).unwrap();
     
-    // --- Data Movement ---
+    // --- [fxcp-core] Data Movement ---
     pub static ref BYTES_REPLICATED: CounterVec = register_counter_vec!(
         "foxing_bytes_replicated_total",
         "Bytes successfully written to target",
@@ -84,7 +84,7 @@ lazy_static! {
         "Number of write events merged into larger chunks"
     ).unwrap();
     
-    // --- IO Methods ---
+    // --- [fxcp-core] IO Methods ---
     pub static ref COPY_METHOD_REFLINK: CounterVec = register_counter_vec!(
         "foxing_copy_method_reflink_total",
         "Writes handled via CoW Reflink",
@@ -107,7 +107,7 @@ lazy_static! {
 }
 
 lazy_static! {
-    // --- Versioning ---
+    // --- [fxcp-core] Versioning (core) ---
     pub static ref VERSIONING_FAILURES: Counter = register_counter!(
         "foxing_versioning_failures_total",
         "Failed attempts to create version snapshots"
@@ -116,6 +116,7 @@ lazy_static! {
         "foxing_versioning_success_total",
         "Successfully created version snapshots"
     ).unwrap();
+    // --- [foxingd] Versioning (target-scoped) ---
     pub static ref TARGET_DYNAMIC_VERSION_LIMIT_COUNT: GaugeVec = register_gauge_vec!(
         "foxing_target_dynamic_version_limit_count",
         "Current adaptive limit for version count",
@@ -132,7 +133,7 @@ lazy_static! {
         &["target"]
     ).unwrap();
 
-    // --- Governor & System Health ---
+    // --- [foxingd] Governor & System Health ---
     pub static ref GOVERNOR_STRESSED: Gauge = register_gauge!(
         "foxing_governor_stressed",
         "Current system stress state (1=stressed, 0=normal)"
@@ -157,7 +158,7 @@ lazy_static! {
 }
 
 lazy_static! {
-    // --- BBR Tuner Metrics ---
+    // --- [foxingd] BBR Tuner Metrics ---
     pub static ref TARGET_BATCH_SIZE: GaugeVec = register_gauge_vec!(
         "foxing_target_batch_size",
         "Current dynamic batch size calculated by BBR tuner",
@@ -184,7 +185,7 @@ lazy_static! {
         &["target", "worker"]
     ).unwrap();
 
-    // --- Worker Internals ---
+    // --- [foxingd] Worker Internals ---
     pub static ref WORKER_BUFFER_UTILIZATION: GaugeVec = register_gauge_vec!(
         "foxing_worker_buffer_utilization",
         "Ratio of pending events to max queue depth (0.0 - 1.0)",
@@ -203,7 +204,7 @@ lazy_static! {
         &["type"] // type=ingress|structural|worker
     ).unwrap();
     
-    // --- Memory & Buffer Pool ---
+    // --- [fxcp-core] Memory & Buffer Pool ---
     pub static ref GLOBAL_BUFFER_LIMIT: Gauge = register_gauge!(
         "foxing_global_buffer_limit_bytes",
         "Maximum configured memory for buffers (Bytes)"
@@ -229,11 +230,12 @@ lazy_static! {
 }
 
 lazy_static! {
-    // --- Reliability ---
+    // --- [fxcp-core] Reliability (copy-plane) ---
     pub static ref JOURNAL_RECOVERIES: Counter = register_counter!(
         "foxing_journal_recoveries_total",
         "Number of atomic rename operations recovered from intent journal"
     ).unwrap();
+    // --- [foxingd] Reliability (daemon-plane) ---
     pub static ref POISON_CABINET_ACTIVE: Gauge = register_gauge!(
         "foxing_poison_cabinet_active_inodes",
         "Number of inodes currently in backoff state due to repeated failures"
@@ -252,7 +254,7 @@ lazy_static! {
         "Workers that failed to drain gracefully"
     ).unwrap();
 
-    // --- Identity & Hydration ---
+    // --- [foxingd] Identity & Hydration ---
     pub static ref IDENTITY_CACHE_HIT_RATE: Gauge = register_gauge!(
         "foxing_identity_cache_hit_rate",
         "Ratio of InodeMap hits vs misses"
@@ -287,7 +289,7 @@ lazy_static! {
         "Files skipped during hydration because size/mtime matched"
     ).unwrap();
     
-    // --- Integrity ---
+    // --- [fxcp-core] Integrity ---
     pub static ref HASH_VERIFICATIONS_TOTAL: Counter = register_counter!(
         "foxing_hash_verifications_total",
         "Number of BLAKE3 hash verifications performed"
@@ -301,7 +303,7 @@ lazy_static! {
         "Time spent computing BLAKE3 hashes"
     ).unwrap();
 
-    // --- Capacity ---
+    // --- [foxingd] Capacity ---
     pub static ref TARGET_CAPACITY_BYTES_TOTAL: GaugeVec = register_gauge_vec!(
         "foxing_target_capacity_bytes_total",
         "Total capacity of target filesystem",
@@ -314,6 +316,7 @@ lazy_static! {
     ).unwrap();
 }
 
+// --- [foxingd] Debug ---
 #[cfg(feature = "debug_metrics")]
 lazy_static! {
     pub static ref DEBUG_EVENTS_BY_DEV: CounterVec = register_counter_vec!(
@@ -323,13 +326,15 @@ lazy_static! {
     ).unwrap();
 }
 
+// [foxingd]
 pub static DISCOVERY_COMPLETE: AtomicBool = AtomicBool::new(false);
 
+// [fxcp-core]
 pub fn initialize_metrics(global_limit_mb: u64) {
     GLOBAL_BUFFER_LIMIT.set((global_limit_mb * 1024 * 1024) as f64);
 }
 
-// ... [BatchedCounter and BatchedAtomicCounter structs remain unchanged] ...
+// [fxcp-core] BatchedCounter and BatchedAtomicCounter — shared helpers
 pub struct BatchedCounter {
     counter: Counter,
     local_count: u64,

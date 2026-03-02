@@ -11,6 +11,7 @@ use lazy_static::lazy_static;
 use crate::constants;
 use clap::ValueEnum;
 
+// [fxcp-core] SysSpecs block — deps: sysinfo + std only, safe to extract
 #[derive(Debug)]
 pub struct SysSpecs {
     pub logical_cores: usize,

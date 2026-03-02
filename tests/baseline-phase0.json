@@ -1,0 +1,690 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-03-02T05:05:32.821175+00:00",
+  "env": {
+    "kernel": "6.17.7",
+    "fs": "btrfs",
+    "reflink": true,
+    "rust": "1.93.1",
+    "foxing": "0.3.2",
+    "cpus": 24,
+    "mem_gb": 92.2
+  },
+  "build": {
+    "status": "CACHED",
+    "duration_ms": 0,
+    "binary": "/var/home/aenertia/build/foxing/target/release/foxing",
+    "size_bytes": 228622288
+  },
+  "tests": [
+    {
+      "id": "small_files.rsync.cold",
+      "workload": "small_files",
+      "tool": "rsync",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 698,
+      "metrics": {
+        "files": 10000,
+        "bytes": 40960000,
+        "throughput_mbps": 55.96,
+        "files_per_sec": 14326.6
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10000,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "small_files.cp.cold",
+      "workload": "small_files",
+      "tool": "cp",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 423,
+      "metrics": {
+        "files": 10000,
+        "bytes": 40960000,
+        "throughput_mbps": 92.35,
+        "files_per_sec": 23640.7
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10000,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "small_files.foxing.cold",
+      "workload": "small_files",
+      "tool": "foxing",
+      "phase": "cold",
+      "status": "ERROR",
+      "duration_ms": 60000,
+      "metrics": {
+        "files": 10000,
+        "bytes": 40960000,
+        "throughput_mbps": 0.65,
+        "files_per_sec": 166.7
+      },
+      "error": "timeout (60s)"
+    },
+    {
+      "id": "small_files.rsync.delta",
+      "workload": "small_files",
+      "tool": "rsync",
+      "phase": "delta",
+      "status": "PASS",
+      "duration_ms": 199,
+      "metrics": {
+        "files": 9982,
+        "bytes": 41943286,
+        "throughput_mbps": 201.01,
+        "files_per_sec": 50160.8
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 9982,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "small_files.cp.delta",
+      "workload": "small_files",
+      "tool": "cp",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 473,
+      "metrics": {
+        "files": 9982,
+        "bytes": 41943286,
+        "throughput_mbps": 84.57,
+        "files_per_sec": 21103.6
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 9982,
+        "mismatches": 247
+      },
+      "error": "verify: 247 mismatches"
+    },
+    {
+      "id": "small_files.foxing.delta",
+      "workload": "small_files",
+      "tool": "foxing",
+      "phase": "delta",
+      "status": "ERROR",
+      "duration_ms": 60000,
+      "metrics": {
+        "files": 9982,
+        "bytes": 41943286,
+        "throughput_mbps": 0.67,
+        "files_per_sec": 166.4
+      },
+      "error": "timeout (60s)"
+    },
+    {
+      "id": "large_files.rsync.cold",
+      "workload": "large_files",
+      "tool": "rsync",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 1316,
+      "metrics": {
+        "files": 10,
+        "bytes": 1048576000,
+        "throughput_mbps": 759.88,
+        "files_per_sec": 7.6
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "large_files.cp.cold",
+      "workload": "large_files",
+      "tool": "cp",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 4,
+      "metrics": {
+        "files": 10,
+        "bytes": 1048576000,
+        "throughput_mbps": 250000.0,
+        "files_per_sec": 2500.0
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "large_files.foxing.cold",
+      "workload": "large_files",
+      "tool": "foxing",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 4711,
+      "metrics": {
+        "files": 10,
+        "bytes": 1048576000,
+        "throughput_mbps": 212.27,
+        "files_per_sec": 2.1
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "large_files.rsync.delta",
+      "workload": "large_files",
+      "tool": "rsync",
+      "phase": "delta",
+      "status": "PASS",
+      "duration_ms": 68,
+      "metrics": {
+        "files": 9,
+        "bytes": 943718400,
+        "throughput_mbps": 13235.29,
+        "files_per_sec": 132.4
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 9,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "large_files.cp.delta",
+      "workload": "large_files",
+      "tool": "cp",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 204,
+      "metrics": {
+        "files": 9,
+        "bytes": 943718400,
+        "throughput_mbps": 4411.76,
+        "files_per_sec": 44.1
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 9,
+        "mismatches": 1
+      },
+      "error": "verify: 1 mismatches"
+    },
+    {
+      "id": "large_files.foxing.delta",
+      "workload": "large_files",
+      "tool": "foxing",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 3284,
+      "metrics": {
+        "files": 9,
+        "bytes": 943718400,
+        "throughput_mbps": 274.06,
+        "files_per_sec": 2.7
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 9,
+        "mismatches": 1
+      },
+      "error": "verify: 1 mismatches"
+    },
+    {
+      "id": "mixed.rsync.cold",
+      "workload": "mixed",
+      "tool": "rsync",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 3775,
+      "metrics": {
+        "files": 5000,
+        "bytes": 2232111538,
+        "throughput_mbps": 563.9,
+        "files_per_sec": 1324.5
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 5000,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "mixed.cp.cold",
+      "workload": "mixed",
+      "tool": "cp",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 237,
+      "metrics": {
+        "files": 5000,
+        "bytes": 2232111538,
+        "throughput_mbps": 8981.89,
+        "files_per_sec": 21097.0
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 5000,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "mixed.foxing.cold",
+      "workload": "mixed",
+      "tool": "foxing",
+      "phase": "cold",
+      "status": "ERROR",
+      "duration_ms": 60000,
+      "metrics": {
+        "files": 5000,
+        "bytes": 2232111538,
+        "throughput_mbps": 35.48,
+        "files_per_sec": 83.3
+      },
+      "error": "timeout (60s)"
+    },
+    {
+      "id": "mixed.rsync.delta",
+      "workload": "mixed",
+      "tool": "rsync",
+      "phase": "delta",
+      "status": "PASS",
+      "duration_ms": 331,
+      "metrics": {
+        "files": 5017,
+        "bytes": 2191960824,
+        "throughput_mbps": 6315.46,
+        "files_per_sec": 15157.1
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 5017,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "mixed.cp.delta",
+      "workload": "mixed",
+      "tool": "cp",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 696,
+      "metrics": {
+        "files": 5017,
+        "bytes": 2191960824,
+        "throughput_mbps": 3003.47,
+        "files_per_sec": 7208.3
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 5017,
+        "mismatches": 116
+      },
+      "error": "verify: 116 mismatches"
+    },
+    {
+      "id": "mixed.foxing.delta",
+      "workload": "mixed",
+      "tool": "foxing",
+      "phase": "delta",
+      "status": "ERROR",
+      "duration_ms": 60000,
+      "metrics": {
+        "files": 5017,
+        "bytes": 2191960824,
+        "throughput_mbps": 34.84,
+        "files_per_sec": 83.6
+      },
+      "error": "timeout (60s)"
+    },
+    {
+      "id": "deep_tree.rsync.cold",
+      "workload": "deep_tree",
+      "tool": "rsync",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 53,
+      "metrics": {
+        "files": 50,
+        "bytes": 204800,
+        "throughput_mbps": 3.69,
+        "files_per_sec": 943.4
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 50,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "deep_tree.cp.cold",
+      "workload": "deep_tree",
+      "tool": "cp",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 10,
+      "metrics": {
+        "files": 50,
+        "bytes": 204800,
+        "throughput_mbps": 19.53,
+        "files_per_sec": 5000.0
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 50,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "deep_tree.foxing.cold",
+      "workload": "deep_tree",
+      "tool": "foxing",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 4724,
+      "metrics": {
+        "files": 50,
+        "bytes": 204800,
+        "throughput_mbps": 0.04,
+        "files_per_sec": 10.6
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 50,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "deep_tree.rsync.delta",
+      "workload": "deep_tree",
+      "tool": "rsync",
+      "phase": "delta",
+      "status": "PASS",
+      "duration_ms": 58,
+      "metrics": {
+        "files": 49,
+        "bytes": 209960,
+        "throughput_mbps": 3.45,
+        "files_per_sec": 844.8
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 49,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "deep_tree.cp.delta",
+      "workload": "deep_tree",
+      "tool": "cp",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 10,
+      "metrics": {
+        "files": 49,
+        "bytes": 209960,
+        "throughput_mbps": 20.02,
+        "files_per_sec": 4900.0
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 49,
+        "mismatches": 1
+      },
+      "error": "verify: 1 mismatches"
+    },
+    {
+      "id": "deep_tree.foxing.delta",
+      "workload": "deep_tree",
+      "tool": "foxing",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 2067,
+      "metrics": {
+        "files": 49,
+        "bytes": 209960,
+        "throughput_mbps": 0.1,
+        "files_per_sec": 23.7
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 49,
+        "mismatches": 5
+      },
+      "error": "verify: 5 mismatches"
+    },
+    {
+      "id": "sparse.rsync.cold",
+      "workload": "sparse",
+      "tool": "rsync",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 1016,
+      "metrics": {
+        "files": 10,
+        "bytes": 524288000,
+        "throughput_mbps": 492.13,
+        "files_per_sec": 9.8
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "sparse.cp.cold",
+      "workload": "sparse",
+      "tool": "cp",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 3,
+      "metrics": {
+        "files": 10,
+        "bytes": 524288000,
+        "throughput_mbps": 166666.67,
+        "files_per_sec": 3333.3
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "sparse.foxing.cold",
+      "workload": "sparse",
+      "tool": "foxing",
+      "phase": "cold",
+      "status": "PASS",
+      "duration_ms": 5034,
+      "metrics": {
+        "files": 10,
+        "bytes": 524288000,
+        "throughput_mbps": 99.32,
+        "files_per_sec": 2.0
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 10,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "sparse.rsync.delta",
+      "workload": "sparse",
+      "tool": "rsync",
+      "phase": "delta",
+      "status": "PASS",
+      "duration_ms": 56,
+      "metrics": {
+        "files": 9,
+        "bytes": 471859200,
+        "throughput_mbps": 8035.71,
+        "files_per_sec": 160.7
+      },
+      "verify": {
+        "status": "PASS",
+        "files_checked": 9,
+        "mismatches": 0
+      }
+    },
+    {
+      "id": "sparse.cp.delta",
+      "workload": "sparse",
+      "tool": "cp",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 86,
+      "metrics": {
+        "files": 9,
+        "bytes": 471859200,
+        "throughput_mbps": 5232.56,
+        "files_per_sec": 104.7
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 9,
+        "mismatches": 1
+      },
+      "error": "verify: 1 mismatches"
+    },
+    {
+      "id": "sparse.foxing.delta",
+      "workload": "sparse",
+      "tool": "foxing",
+      "phase": "delta",
+      "status": "FAIL",
+      "duration_ms": 3004,
+      "metrics": {
+        "files": 9,
+        "bytes": 471859200,
+        "throughput_mbps": 149.8,
+        "files_per_sec": 3.0
+      },
+      "verify": {
+        "status": "FAIL",
+        "files_checked": 9,
+        "mismatches": 1
+      },
+      "error": "verify: 1 mismatches"
+    }
+  ],
+  "comparisons": [
+    {
+      "workload": "small_files",
+      "phase": "cold",
+      "rsync_ms": 698,
+      "cp_ms": 423,
+      "foxing_ms": 60000,
+      "foxing_vs_rsync": 0.012,
+      "foxing_vs_cp": 0.007
+    },
+    {
+      "workload": "small_files",
+      "phase": "delta",
+      "rsync_ms": 199,
+      "cp_ms": 473,
+      "foxing_ms": 60000,
+      "foxing_vs_rsync": 0.003,
+      "foxing_vs_cp": 0.008
+    },
+    {
+      "workload": "large_files",
+      "phase": "cold",
+      "rsync_ms": 1316,
+      "cp_ms": 4,
+      "foxing_ms": 4711,
+      "foxing_vs_rsync": 0.279,
+      "foxing_vs_cp": 0.001
+    },
+    {
+      "workload": "large_files",
+      "phase": "delta",
+      "rsync_ms": 68,
+      "cp_ms": 204,
+      "foxing_ms": 3284,
+      "foxing_vs_rsync": 0.021,
+      "foxing_vs_cp": 0.062
+    },
+    {
+      "workload": "mixed",
+      "phase": "cold",
+      "rsync_ms": 3775,
+      "cp_ms": 237,
+      "foxing_ms": 60000,
+      "foxing_vs_rsync": 0.063,
+      "foxing_vs_cp": 0.004
+    },
+    {
+      "workload": "mixed",
+      "phase": "delta",
+      "rsync_ms": 331,
+      "cp_ms": 696,
+      "foxing_ms": 60000,
+      "foxing_vs_rsync": 0.006,
+      "foxing_vs_cp": 0.012
+    },
+    {
+      "workload": "deep_tree",
+      "phase": "cold",
+      "rsync_ms": 53,
+      "cp_ms": 10,
+      "foxing_ms": 4724,
+      "foxing_vs_rsync": 0.011,
+      "foxing_vs_cp": 0.002
+    },
+    {
+      "workload": "deep_tree",
+      "phase": "delta",
+      "rsync_ms": 58,
+      "cp_ms": 10,
+      "foxing_ms": 2067,
+      "foxing_vs_rsync": 0.028,
+      "foxing_vs_cp": 0.005
+    },
+    {
+      "workload": "sparse",
+      "phase": "cold",
+      "rsync_ms": 1016,
+      "cp_ms": 3,
+      "foxing_ms": 5034,
+      "foxing_vs_rsync": 0.202,
+      "foxing_vs_cp": 0.001
+    },
+    {
+      "workload": "sparse",
+      "phase": "delta",
+      "rsync_ms": 56,
+      "cp_ms": 86,
+      "foxing_ms": 3004,
+      "foxing_vs_rsync": 0.019,
+      "foxing_vs_cp": 0.029
+    }
+  ],
+  "summary": {
+    "total": 30,
+    "passed": 18,
+    "failed": 8,
+    "skipped": 0,
+    "errored": 4,
+    "regressions": [],
+    "fastest_tool": {
+      "small_files": "cp",
+      "large_files": "cp",
+      "mixed": "cp",
+      "deep_tree": "cp",
+      "sparse": "cp"
+    }
+  }
+}

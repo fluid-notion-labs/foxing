@@ -1,18 +1,23 @@
+// [fxcp-core] Security — metadata sync, capability checks, fallocate, xattr preservation
+// ⚠ [Phase 1 BLOCKER] Circular dep: security ↔ operations
+//   security.rs imports operations::Capabilities
+//   operations.rs imports security
+//   Fix: move Capabilities to a shared types module in fxcp-core.
 use std::path::Path;
-use crate::error::{FoxingError, Result};
+use crate::error::{FoxingError, Result};   // [fxcp-core]
 use std::os::unix::io::{BorrowedFd, AsRawFd};
 use nix::fcntl::{fallocate, FallocateFlags};
 use libc;
 use nix::sys::statvfs::statvfs;
 use std::fs::File;
-use crate::operations;
+use crate::operations;                     // ⚠ circular — needs Capabilities type
 use nix::unistd::{chown, Uid, Gid};
 use xattr;
 use tracing::{debug, warn};
 use std::fs::OpenOptions;
 use std::ffi::CString;
-use crate::buffer::AlignedBuffer;
-use crate::sidecar;
+use crate::buffer::AlignedBuffer;          // [fxcp-core]
+use crate::sidecar;                        // [fxcp-core]
 use std::io::{Read, Seek, SeekFrom};
 use walkdir::WalkDir;
 use std::os::unix::fs::MetadataExt;

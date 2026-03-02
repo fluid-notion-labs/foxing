@@ -1,3 +1,8 @@
+// [fxcp-core] Core copy engine — SmartCopier, Capabilities, io_uring I/O
+// Deps: buffer [fxcp-core], error [fxcp-core], security [fxcp-core], metrics [fxcp-core subset]
+// ⚠ BLOCKER: governor::Governor — used as Option<Arc<Governor>>, only call is
+//   gov.current_memory_usage_pct() > 0.90 in process_data_segment(). Extractable via trait in Phase 1.
+// ⚠ CIRCULAR: security.rs imports operations::Capabilities. Fix: move Capabilities to shared types.
 use std::path::{Path, PathBuf};
 use std::os::unix::io::{AsRawFd, RawFd, FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -10,15 +15,15 @@ use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
 use tracing::{warn, debug, error, trace, info};
-use crate::buffer::{BufferPool};
-use crate::error::{FoxingError, Result};
-use crate::security;
-use crate::metrics;
+use crate::buffer::{BufferPool};           // [fxcp-core]
+use crate::error::{FoxingError, Result};   // [fxcp-core]
+use crate::security;                       // [fxcp-core]
+use crate::metrics;                        // [fxcp-core] subset
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use dashmap::DashMap;
-use crate::governor::Governor;
+use crate::governor::Governor;             // ⚠ [foxingd] — extract via trait
 use tokio::fs::File;
 use tokio::io::unix::AsyncFd;
 use lazy_static::lazy_static;
