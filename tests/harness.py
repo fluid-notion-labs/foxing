@@ -44,7 +44,7 @@ FOXING_BINARY = PROJECT_ROOT / "target" / "release" / "foxing"
 DEFAULT_TEST_ROOT = PROJECT_ROOT / "test_harness"
 TMPFS_PREFIX = "foxing_test_"
 BUILD_TIMEOUT = 300  # 5 min cargo build timeout
-TOOL_TIMEOUT = 600   # 10 min per tool invocation
+DEFAULT_TOOL_TIMEOUT = 60  # per-tool timeout in seconds
 
 TOOLS = {
     "rsync":  lambda src, dst: ["rsync", "-a", "--delete", f"{src}/", f"{dst}/"],
@@ -185,7 +185,7 @@ def build_foxing(force: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Tool runner
 # ---------------------------------------------------------------------------
-def run_tool(tool_name: str, src: Path, dst: Path) -> dict:
+def run_tool(tool_name: str, src: Path, dst: Path, timeout: int = DEFAULT_TOOL_TIMEOUT) -> dict:
     """Run a copy tool and return timing + status."""
     cmd = TOOLS[tool_name](str(src), str(dst))
 
@@ -195,11 +195,11 @@ def run_tool(tool_name: str, src: Path, dst: Path) -> dict:
     start = time.monotonic()
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=TOOL_TIMEOUT
+            cmd, capture_output=True, text=True, timeout=timeout
         )
         elapsed_ms = int((time.monotonic() - start) * 1000)
     except subprocess.TimeoutExpired:
-        return {"status": "ERROR", "duration_ms": TOOL_TIMEOUT * 1000, "error": "timeout"}
+        return {"status": "ERROR", "duration_ms": timeout * 1000, "error": f"timeout ({timeout}s)"}
     except FileNotFoundError:
         return {"status": "SKIP", "duration_ms": 0, "error": f"{tool_name} not found"}
 
@@ -269,6 +269,8 @@ def parse_args() -> argparse.Namespace:
                    help="Workload scale preset")
     p.add_argument("--rebuild", action="store_true",
                    help="Force rebuild of foxing binary")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TOOL_TIMEOUT,
+                   help=f"Per-tool timeout in seconds (default: {DEFAULT_TOOL_TIMEOUT})")
     return p.parse_args()
 
 
@@ -288,6 +290,7 @@ def run_workload_suite(
     test_root: Path,
     scale: str,
     skip_verify: bool,
+    tool_timeout: int = DEFAULT_TOOL_TIMEOUT,
 ) -> tuple[list[dict], list[dict]]:
     """Run all tools on a single workload. Returns (tests, comparisons)."""
     tests = []
@@ -312,7 +315,7 @@ def run_workload_suite(
             shutil.rmtree(target_dir)
 
         log(f"  Running {tool} (cold)...", file=sys.stderr)
-        result = run_tool(tool, source_dir, target_dir)
+        result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
 
         # Compute metrics
         metrics = {
@@ -366,7 +369,7 @@ def run_workload_suite(
         target_dir = test_root / f"target_{tool}"
 
         log(f"  Running {tool} (delta)...", file=sys.stderr)
-        result = run_tool(tool, source_dir, target_dir)
+        result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
 
         # Re-scan source for updated stats
         updated_stats = workloads.get_workload_stats(source_dir)
@@ -629,7 +632,8 @@ def main():
         for wl_name in wl_names:
             log(f"\nWorkload: {wl_name}", file=sys.stderr)
             tests, comparisons = run_workload_suite(
-                wl_name, tool_names, test_root, args.scale, args.skip_verify
+                wl_name, tool_names, test_root, args.scale, args.skip_verify,
+                tool_timeout=args.timeout,
             )
             all_tests.extend(tests)
             all_comparisons.extend(comparisons)
