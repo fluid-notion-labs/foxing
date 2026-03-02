@@ -1,8 +1,4 @@
-// [fxcp-core] Core copy engine — SmartCopier, Capabilities, io_uring I/O
-// Deps: buffer [fxcp-core], error [fxcp-core], security [fxcp-core], metrics [fxcp-core subset]
-// ⚠ BLOCKER: governor::Governor — used as Option<Arc<Governor>>, only call is
-//   gov.current_memory_usage_pct() > 0.90 in process_data_segment(). Extractable via trait in Phase 1.
-// ⚠ CIRCULAR: security.rs imports operations::Capabilities. Fix: move Capabilities to shared types.
+// Core copy engine — SmartCopier, Capabilities, io_uring I/O
 use std::path::{Path, PathBuf};
 use std::os::unix::io::{AsRawFd, RawFd, FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -15,15 +11,15 @@ use libc;
 use nix::sys::statfs;
 use std::time::{Duration, Instant};
 use tracing::{warn, debug, error, trace, info};
-use crate::buffer::{BufferPool};           // [fxcp-core]
-use crate::error::{FoxingError, Result};   // [fxcp-core]
-use crate::security;                       // [fxcp-core]
-use crate::metrics;                        // [fxcp-core] subset
+use crate::buffer::{BufferPool};
+use crate::error::{FxcpError, Result};
+use crate::security;
+use crate::metrics;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use dashmap::DashMap;
-use crate::governor::Governor;             // ⚠ [foxingd] — extract via trait
+use crate::governor::Governor;
 use tokio::fs::File;
 use tokio::io::unix::AsyncFd;
 use lazy_static::lazy_static;
@@ -469,7 +465,7 @@ fn probe_btrfs_quotas(fd: RawFd) -> bool {
 pub fn btrfs_resolve_inode(fd: RawFd, inode: u64) -> Result<PathBuf> {
     let mut args = BtrfsIoctlInoLookupArgs { treeid: 0, objectid: inode, name: [0; 4080] };
     let ret = unsafe { libc::ioctl(fd, BTRFS_IOC_INO_LOOKUP, &mut args) };
-    if ret < 0 { return Err(FoxingError::Io(std::io::Error::last_os_error())); }
+    if ret < 0 { return Err(FxcpError::Io(std::io::Error::last_os_error())); }
     
     let name_slice = match args.name.iter().position(|&c| c == 0) {
         Some(pos) => &args.name[..pos],
@@ -480,11 +476,11 @@ pub fn btrfs_resolve_inode(fd: RawFd, inode: u64) -> Result<PathBuf> {
 }
 
 pub fn btrfs_create_snapshot(src_fd: RawFd, dest_dir: &Path, name: &str) -> Result<()> {
-    let dest_dir_file = std::fs::File::open(dest_dir).map_err(FoxingError::Io)?;
-    let cname = CString::new(name).map_err(|_| FoxingError::Config("Invalid snapshot name".into()))?;
+    let dest_dir_file = std::fs::File::open(dest_dir).map_err(FxcpError::Io)?;
+    let cname = CString::new(name).map_err(|_| FxcpError::Config("Invalid snapshot name".into()))?;
     
     if cname.as_bytes().len() > 4039 {
-        return Err(FoxingError::Config("Snapshot name too long".into()));
+        return Err(FxcpError::Config("Snapshot name too long".into()));
     }
 
     let mut args = BtrfsIoctlVolArgsV2 {
@@ -505,17 +501,17 @@ pub fn btrfs_create_snapshot(src_fd: RawFd, dest_dir: &Path, name: &str) -> Resu
 
     let ret = unsafe { libc::ioctl(dest_dir_file.as_raw_fd(), BTRFS_IOC_SNAP_CREATE_V2, &args) };
     if ret < 0 {
-        return Err(FoxingError::Io(std::io::Error::last_os_error()));
+        return Err(FxcpError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
 }
 
 pub fn btrfs_create_subvol(dest_dir: &Path, name: &str) -> Result<()> {
-    let dir_file = std::fs::File::open(dest_dir).map_err(FoxingError::Io)?;
-    let cname = CString::new(name).map_err(|_| FoxingError::Config("Invalid subvol name".into()))?;
+    let dir_file = std::fs::File::open(dest_dir).map_err(FxcpError::Io)?;
+    let cname = CString::new(name).map_err(|_| FxcpError::Config("Invalid subvol name".into()))?;
     
     if cname.as_bytes().len() > 4039 {
-        return Err(FoxingError::Config("Subvolume name too long".into()));
+        return Err(FxcpError::Config("Subvolume name too long".into()));
     }
 
     let mut args = BtrfsIoctlVolArgsV2 {
@@ -536,13 +532,13 @@ pub fn btrfs_create_subvol(dest_dir: &Path, name: &str) -> Result<()> {
 
     let ret = unsafe { libc::ioctl(dir_file.as_raw_fd(), BTRFS_IOC_SUBVOL_CREATE_V2, &args) };
     if ret < 0 {
-        return Err(FoxingError::Io(std::io::Error::last_os_error()));
+        return Err(FxcpError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
 }
 
 pub fn btrfs_scrub_start(mount_point: &Path) -> Result<()> {
-    let f = std::fs::File::open(mount_point).map_err(FoxingError::Io)?;
+    let f = std::fs::File::open(mount_point).map_err(FxcpError::Io)?;
     let mut args: BtrfsScrubArgs = unsafe { std::mem::zeroed() };
     args.devid = 0;
     
@@ -552,7 +548,7 @@ pub fn btrfs_scrub_start(mount_point: &Path) -> Result<()> {
         if err.raw_os_error() == Some(libc::EINPROGRESS) {
             return Ok(());
         }
-        return Err(FoxingError::Io(err));
+        return Err(FxcpError::Io(err));
     }
     Ok(())
 }
@@ -562,10 +558,10 @@ pub fn btrfs_send_stream(
     parent_root_id: u64, 
     clone_sources: &[u64]
 ) -> Result<std::fs::File> {
-    let (pipe_r, pipe_w) = nix::unistd::pipe().map_err(FoxingError::System)?;
+    let (pipe_r, pipe_w) = nix::unistd::pipe().map_err(FxcpError::System)?;
     let clone_sources_vec = clone_sources.to_vec();
     
-    let fd_dup = nix::unistd::dup(subvol_fd).map_err(FoxingError::System)?;
+    let fd_dup = nix::unistd::dup(subvol_fd).map_err(FxcpError::System)?;
     let pipe_w_fd = pipe_w.into_raw_fd();
 
     std::thread::spawn(move || {
@@ -609,7 +605,7 @@ pub fn open_by_handle_at(mount_fd: RawFd, handle: &FileHandle) -> Result<std::fs
         )
     };
     if fd < 0 {
-        return Err(FoxingError::Io(std::io::Error::last_os_error()));
+        return Err(FxcpError::Io(std::io::Error::last_os_error()));
     }
     Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
 }
@@ -679,10 +675,10 @@ impl SmartCopier {
             Err(e) => {
                 if let Some(raw) = e.raw_os_error() {
                     if raw == libc::EPERM || raw == libc::EACCES {
-                        return File::open(path).await.map_err(FoxingError::Io);
+                        return File::open(path).await.map_err(FxcpError::Io);
                     }
                 }
-                Err(FoxingError::Io(e))
+                Err(FxcpError::Io(e))
             }
         }
     }
@@ -800,17 +796,17 @@ impl SmartCopier {
             Operation::Truncate { dst, size } => {
                 spawn_blocking(move || {
                     security::truncate_file(&dst, size).map(|_| CopyStats::default())
-                }).await.map_err(FoxingError::Join)?
+                }).await.map_err(FxcpError::Join)?
             },
             Operation::Rename { src, dst, flags } => {
                 spawn_blocking(move || {
-                    crate::consistency::atomic_rename(&src, &dst, Some(flags)).map(|_| CopyStats::default()).map_err(FoxingError::Io)
-                }).await.map_err(FoxingError::Join)?.map_err(FoxingError::from)
+                    crate::consistency::atomic_rename(&src, &dst, Some(flags)).map(|_| CopyStats::default()).map_err(FxcpError::Io)
+                }).await.map_err(FxcpError::Join)?.map_err(FxcpError::from)
             },
             Operation::Fallocate { dst, mode, offset, length } => {
                 spawn_blocking(move || {
                     security::do_fallocate(&dst, offset, length, mode).map(|_| CopyStats::default())
-                }).await.map_err(FoxingError::Join)?
+                }).await.map_err(FxcpError::Join)?
             }
         }
     }
@@ -834,7 +830,7 @@ impl SmartCopier {
             Ok(f) => f,
             Err(e) => {
                 error!("prepare_destination_file: Failed to open {:?}: {}", path, e);
-                return Err(FoxingError::Io(e));
+                return Err(FxcpError::Io(e));
             }
         };
         let fd = file.as_raw_fd();
@@ -902,7 +898,7 @@ impl SmartCopier {
                     spawn_blocking(move || {
                         let f = std::fs::File::open(&tp1)?;
                         f.sync_all()
-                    }).await.map_err(FoxingError::Join)??;
+                    }).await.map_err(FxcpError::Join)??;
                 }
 
                 let src_owned = src.to_path_buf();
@@ -913,7 +909,7 @@ impl SmartCopier {
                         debug!("SmartCopier: Metadata apply failed for temp file {:?}: {:?}", tp_meta, e);
                     }
                     security::sync_xattrs(&src_owned, &tp_meta);
-                }).await.map_err(FoxingError::Join)?;
+                }).await.map_err(FxcpError::Join)?;
 
                 let tp2 = target_path.clone();
                 let dst_owned = dst.to_path_buf();
@@ -933,7 +929,7 @@ impl SmartCopier {
                         if is_btrfs {
                             crate::consistency::atomic_rename(&tp2, &dst_owned, Some(libc::RENAME_EXCHANGE as u32))
                                 .or_else(|_| crate::consistency::atomic_rename(&tp2, &dst_owned, None))
-                                .map_err(FoxingError::Io)
+                                .map_err(FxcpError::Io)
                         } else {
                             match crate::consistency::exchange::atomic_exchange(&tp2, &dst_owned) {
                                 Ok(_) => Ok(()),
@@ -945,14 +941,14 @@ impl SmartCopier {
                                     } else {
                                         warn!("Atomic Exchange failed: {}. Falling back to rename.", e);
                                     }
-                                    crate::consistency::atomic_rename(&tp2, &dst_owned, None).map_err(FoxingError::Io)
+                                    crate::consistency::atomic_rename(&tp2, &dst_owned, None).map_err(FxcpError::Io)
                                 }
                             }
                         }
                     } else {
-                        crate::consistency::atomic_rename(&tp2, &dst_owned, None).map_err(FoxingError::Io)
+                        crate::consistency::atomic_rename(&tp2, &dst_owned, None).map_err(FxcpError::Io)
                     }
-                }).await.map_err(FoxingError::Join)??;
+                }).await.map_err(FxcpError::Join)??;
 
                 if let Some(cb) = barrier_callback {
                     if let Ok(meta) = std::fs::metadata(dst) { cb(meta.ino()); }
@@ -991,7 +987,7 @@ impl SmartCopier {
         buffer_limit: Option<usize>,
         skip_fsync: bool,
     ) -> Result<CopyStats> {
-        let src_meta = std::fs::metadata(src).map_err(FoxingError::Io)?;
+        let src_meta = std::fs::metadata(src).map_err(FxcpError::Io)?;
         let strategy = determine_copy_strategy(src, dst, &src_meta, target_caps);
         
         let sf = Self::open_source_noatime(src).await?;
@@ -1006,7 +1002,7 @@ impl SmartCopier {
         }
         if use_direct_io { open_opts.custom_flags(libc::O_DIRECT); }
 
-        let df = open_opts.open(dst).await.map_err(FoxingError::Io)?;
+        let df = open_opts.open(dst).await.map_err(FxcpError::Io)?;
         let dfd = df.as_raw_fd();
 
         let mut reflink_done = false;
@@ -1051,7 +1047,7 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
-    ) -> Result<std::result::Result<CopyStats, FoxingError>> {
+    ) -> Result<std::result::Result<CopyStats, FxcpError>> {
         debug!("execute_full_copy_logic: Start {:?} -> {:?}", src, target_path);
         
         let sf = Self::open_source_noatime(src).await?;
@@ -1068,11 +1064,11 @@ impl SmartCopier {
         debug!("execute_full_copy_logic: Preparing destination...");
         let (_file_handle, dfd) = spawn_blocking(move || {
             Self::prepare_destination_file(path_clone, use_direct_io, use_f2fs, src_file_size)
-        }).await.map_err(FoxingError::Join)??;
+        }).await.map_err(FxcpError::Join)??;
 
         let mut transfer_done = false;
         let mut stats = CopyStats::default();
-        let src_meta = std::fs::metadata(src).map_err(FoxingError::Io)?;
+        let src_meta = std::fs::metadata(src).map_err(FxcpError::Io)?;
         let strategy = determine_copy_strategy(src, target_path, &src_meta, target_caps);
 
         if !use_atomic && !use_f2fs && strategy == CopyStrategy::Reflink {
@@ -1109,7 +1105,7 @@ impl SmartCopier {
                 let res = if should_commit {
                     if unsafe { libc::ioctl(dfd, F2FS_IOC_COMMIT_ATOMIC_WRITE) } < 0 {
                         error!("F2FS: Atomic Commit Failed!");
-                        Err(FoxingError::Io(std::io::Error::last_os_error()))
+                        Err(FxcpError::Io(std::io::Error::last_os_error()))
                     } else {
                         Ok(())
                     }
@@ -1119,7 +1115,7 @@ impl SmartCopier {
                 };
                 Self::set_f2fs_pinning(dfd, false);
                 res
-            }).await.map_err(FoxingError::Join)?;
+            }).await.map_err(FxcpError::Join)?;
             
             if let Err(e) = commit_res {
                 if result_val.is_ok() { result_val = Err(e); }
@@ -1159,7 +1155,7 @@ impl SmartCopier {
                     let chunk = std::cmp::min(remaining, 1024 * 1024 * 1024);
                     let ret = unsafe { libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, chunk, 0) };
                     if ret < 0 {
-                        return Err(FoxingError::Io(std::io::Error::last_os_error()));
+                        return Err(FxcpError::Io(std::io::Error::last_os_error()));
                     } else if ret == 0 {
                         break;
                     }
@@ -1176,9 +1172,9 @@ impl SmartCopier {
                 if is_network_fs { metrics::COPY_METHOD_OFFLOAD.with_label_values(&[&target_label]).inc(); } else { metrics::COPY_METHOD_REFLINK.with_label_values(&[&target_label]).inc(); }
                 Ok(CopyStats { bytes_processed: src_file_size, bytes_zeros: 0, io_duration: start.elapsed(), ops_count: ops })
             } else {
-                Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Reflink partial copy or EOF")))
+                Err(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "Reflink partial copy or EOF")))
             }
-        }).await.map_err(FoxingError::Join)?
+        }).await.map_err(FxcpError::Join)?
     }
 
     async fn try_reflink_range(sfd: i32, dfd: i32, src_offset: u64, len: u64, dst_offset: u64, target_label: String) -> Result<CopyStats> {
@@ -1194,9 +1190,9 @@ impl SmartCopier {
                  if err.raw_os_error() != Some(libc::EOPNOTSUPP) && err.raw_os_error() != Some(libc::EXDEV) {
                      warn!("Reflink range failed on supported target ({}). Fallback copy active.", err);
                  }
-                 Err(FoxingError::Io(err))
+                 Err(FxcpError::Io(err))
             }
-        }).await.map_err(FoxingError::Join)?
+        }).await.map_err(FxcpError::Join)?
     }
 
     fn check_atomic_invariants(caps: &Arc<Capabilities>, offset: u64, length: u32, buffer_addr: usize) -> Result<()> {
@@ -1204,24 +1200,24 @@ impl SmartCopier {
         let max = caps.atomic_max_bytes.load(Ordering::Relaxed) as u64;
         
         if min == 0 || max == 0 {
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Unsupported, "Atomic writes not supported by hardware")));
+            return Err(FxcpError::Io(io::Error::new(io::ErrorKind::Unsupported, "Atomic writes not supported by hardware")));
         }
         
         let len_u64 = length as u64;
         if !len_u64.is_power_of_two() {
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write length {} is not power of 2", len_u64))));
+            return Err(FxcpError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write length {} is not power of 2", len_u64))));
         }
         
         if len_u64 < min || len_u64 > max {
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write length {} out of bounds ({}-{})", len_u64, min, max))));
+            return Err(FxcpError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write length {} out of bounds ({}-{})", len_u64, min, max))));
         }
         
         if offset % len_u64 != 0 {
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write offset {} not aligned to length {}", offset, len_u64))));
+            return Err(FxcpError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("Atomic write offset {} not aligned to length {}", offset, len_u64))));
         }
         
         if (buffer_addr as u64) % len_u64 != 0 {
-            return Err(FoxingError::Io(io::Error::new(io::ErrorKind::InvalidInput, "Buffer memory not aligned for atomic write")));
+            return Err(FxcpError::Io(io::Error::new(io::ErrorKind::InvalidInput, "Buffer memory not aligned for atomic write")));
         }
         
         Ok(())
@@ -1250,7 +1246,7 @@ impl SmartCopier {
                         }
                         break;
                     },
-                    _ => return Err(FoxingError::Io(err)),
+                    _ => return Err(FxcpError::Io(err)),
                 }
             }
             let data_offset = data_offset_res as u64;
@@ -1326,7 +1322,7 @@ impl SmartCopier {
             debug!("perform_delta_uring_pipelined: Mapping sparse segments...");
             let segments = spawn_blocking(move || {
                 Self::map_sparse_segments(sfd, offset, length)
-            }).await.map_err(FoxingError::Join)??;
+            }).await.map_err(FxcpError::Join)??;
             debug!("perform_delta_uring_pipelined: Mapped {} segments", segments.len());
 
             for segment in segments {
@@ -1354,7 +1350,7 @@ impl SmartCopier {
                                             let _ = unsafe { libc::read(async_fd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
                                             guard.clear_ready();
                                         },
-                                        Ok(Err(e)) => return Err(FoxingError::Io(e)),
+                                        Ok(Err(e)) => return Err(FxcpError::Io(e)),
                                         Err(_) => {
                                             if let Some(_) = ring.completion().next() {
                                                 // drain
@@ -1364,7 +1360,7 @@ impl SmartCopier {
                                 }
                             }
                             if !pushed {
-                                 return Err(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full (fallocate)")));
+                                 return Err(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full (fallocate)")));
                             }
                         }
                     },
@@ -1413,7 +1409,7 @@ impl SmartCopier {
                             let _ = unsafe { libc::read(async_fd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
                             guard.clear_ready();
                         },
-                        Ok(Err(e)) => return Err(FoxingError::Io(e)),
+                        Ok(Err(e)) => return Err(FxcpError::Io(e)),
                         Err(_) => {
                             if let Some(_) = ring.completion().next() {
                                 // drain
@@ -1425,7 +1421,7 @@ impl SmartCopier {
             
             if !pushed {
                  let _ = ring.submit();
-                 unsafe { ring.submission().push(&fsync_op) }.map_err(|e| FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                 unsafe { ring.submission().push(&fsync_op) }.map_err(|e| FxcpError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
             }
 
             ring.submit()?;
@@ -1440,7 +1436,7 @@ impl SmartCopier {
                  if let Some(c) = ring.completion().next() {
                      if c.user_data() == 0 {
                          if c.result() < 0 {
-                             return Err(FoxingError::Io(io::Error::from_raw_os_error(-c.result())));
+                             return Err(FxcpError::Io(io::Error::from_raw_os_error(-c.result())));
                          }
                          fsync_found = true;
                      }
@@ -1460,7 +1456,7 @@ impl SmartCopier {
                         let _ = unsafe { libc::read(async_fd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
                         guard.clear_ready();
                     },
-                    Ok(Err(e)) => return Err(FoxingError::Io(e)),
+                    Ok(Err(e)) => return Err(FxcpError::Io(e)),
                     Err(_) => {
                         let _ = ring.submit();
                         if let Some(_) = ring.completion().next() {
@@ -1530,7 +1526,7 @@ impl SmartCopier {
         let mut length = total_len;
         let mut atomic_intent = vec![false; capacity];
         let mut context_map = vec![0u64; capacity];
-        let mut encountered_error: Option<FoxingError> = None;
+        let mut encountered_error: Option<FxcpError> = None;
         let atomic_max = target_caps.atomic_max_bytes.load(Ordering::Relaxed) as u64;
         let mut pending_submissions = 0;
         
@@ -1551,7 +1547,7 @@ impl SmartCopier {
                  if ring.submission().is_full() {
                      if pending_submissions > 0 {
                          if let Err(e) = ring.submit() {
-                             encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())));
+                             encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())));
                              break;
                          }
                          pending_submissions = 0;
@@ -1567,7 +1563,7 @@ impl SmartCopier {
                  
                  if index as usize >= active_pool.capacity() {
                      error!("BufferPool Index Out of Bounds: {} (Capacity: {})", index, active_pool.capacity());
-                     return Err(FoxingError::MemoryExhausted("BufferPool index corrupted".into()));
+                     return Err(FxcpError::MemoryExhausted("BufferPool index corrupted".into()));
                  }
 
                  let mut current_len = (length as usize).min(chunk_size as usize) as u32;
@@ -1590,7 +1586,7 @@ impl SmartCopier {
                     } else {
                         active_pool.release(index);
                         error!("BufferPool returned null pointer for index {}", index);
-                        return Err(FoxingError::MemoryExhausted("BufferPool null pointer".into()));
+                        return Err(FxcpError::MemoryExhausted("BufferPool null pointer".into()));
                     }
                     atomic_intent[index as usize] = true;
                  } else {
@@ -1606,7 +1602,7 @@ impl SmartCopier {
                      None => {
                          active_pool.release(index);
                          error!("BufferPool returned null pointer for index {}", index);
-                         return Err(FoxingError::MemoryExhausted("BufferPool null pointer".into()));
+                         return Err(FxcpError::MemoryExhausted("BufferPool null pointer".into()));
                      }
                  };
 
@@ -1673,7 +1669,7 @@ impl SmartCopier {
             if pending_submissions > 0 {
                 if let Err(e) = ring.submit() {
                     if encountered_error.is_none() {
-                        encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())));
+                        encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())));
                     }
                 }
                 pending_submissions = 0;
@@ -1701,7 +1697,7 @@ impl SmartCopier {
                                 guard.clear_ready();
                                 if let Some(c) = ring.completion().next() { c } else { continue; }
                             },
-                            Ok(Err(e)) => return Err(FoxingError::Io(e)),
+                            Ok(Err(e)) => return Err(FxcpError::Io(e)),
                             Err(_) => {
                                 // Timeout, force submit
                                 ring.submit()?;
@@ -1773,7 +1769,7 @@ impl SmartCopier {
                             if unsafe { ring.submission().push(&write_op) }.is_ok() {
                                 continue; // Successfully requeued
                             } else {
-                                encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "SQ full during atomic retry")));
+                                encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "SQ full during atomic retry")));
                             }
                         }
                     }
@@ -1788,7 +1784,7 @@ impl SmartCopier {
                     if encountered_error.is_none() {
                         let err = io::Error::from_raw_os_error(-cqe.result());
                         if err.kind() != io::ErrorKind::Interrupted {
-                             encountered_error = Some(FoxingError::Io(err));
+                             encountered_error = Some(FxcpError::Io(err));
                         }
                     }
                     inflight_ops -= 1;
@@ -1842,7 +1838,7 @@ impl SmartCopier {
                                      bytes_processed += bytes_transferred;
                                      inflight_ops += 1;
                                  } else {
-                                     encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during zero-block fallocate")));
+                                     encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during zero-block fallocate")));
                                      active_pool.release(index);
                                  }
                              } else {
@@ -1864,7 +1860,7 @@ impl SmartCopier {
                                     pending_submissions += 1;
                                     inflight_ops += 1;
                                 } else {
-                                    encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during write")));
+                                    encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during write")));
                                     active_pool.release(index);
                                 }
                              }
@@ -1887,7 +1883,7 @@ impl SmartCopier {
                                  pending_submissions += 1;
                                  inflight_ops += 1;
                              } else {
-                                 encountered_error = Some(FoxingError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during write")));
+                                 encountered_error = Some(FxcpError::Io(io::Error::new(io::ErrorKind::Other, "Submission queue full during write")));
                                  active_pool.release(index);
                              }
                         }
@@ -1995,7 +1991,7 @@ pub fn apply_lock(path: &Path, lock_type: u32, lock_map: &DashMap<u64, std::fs::
          return Ok(());
     }
     
-    let file = std::fs::File::open(path).map_err(FoxingError::Io)?;
+    let file = std::fs::File::open(path).map_err(FxcpError::Io)?;
     let fd = file.as_raw_fd();
     
     let ret = unsafe { libc::flock(fd, (lock_type as i32) | libc::LOCK_NB) };

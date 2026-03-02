@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use crate::error::{Result, FoxingError as MirrorError};
+use crate::error::{Result, FxcpError as MirrorError};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, copy};
 use crate::sidecar;

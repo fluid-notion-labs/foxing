@@ -3,20 +3,20 @@ use tracing::{info, error, debug, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use foxing::config::{Config, SourceConfig, TargetConfig, TargetProfile};
-use foxing::mirror::Manager;
-use foxing::tuner::{TunerBoard, GLOBAL_TUNER_REGISTRY};
-use foxing::metrics;
+use foxingd::config::{Config, SourceConfig, TargetConfig, TargetProfile};
+use foxingd::mirror::Manager;
+use foxingd::tuner::{TunerBoard, GLOBAL_TUNER_REGISTRY};
+use foxingd::metrics;
 use tokio::signal::unix::{signal, SignalKind};
 use axum::{routing::get, Router, Json, extract::State};
 use tower_http::trace::TraceLayer;
 use std::net::SocketAddr;
 use tokio::sync::{RwLock, mpsc};
-use foxing::tui;
-use foxing::versioning;
+use foxingd::tui;
+use fxcp_core::versioning;
 use std::time::Duration;
-use foxing::hydration_worker::HydrationMode;
-use foxing::constants;
+use foxingd::hydration_worker::HydrationMode;
+use fxcp_core::constants;
 
 const CONFIG_HELP: &str = r#"
 FOXING CONFIGURATION CHEATSHEET & USAGE GUIDE
@@ -129,21 +129,21 @@ struct AppState {
 
 #[derive(Clone)]
 struct TuiLogWriter {
-    tx: mpsc::UnboundedSender<foxing::tui::UiEvent>,
+    tx: mpsc::UnboundedSender<foxingd::tui::UiEvent>,
 }
 
 impl std::io::Write for TuiLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let s = String::from_utf8_lossy(buf).to_string();
-        let _ = self.tx.send(foxing::tui::UiEvent::Log(s));
+        let _ = self.tx.send(foxingd::tui::UiEvent::Log(s));
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus {
-    use foxing::api::{BpfDeviceStat, TargetStatus};
-    let mut status = foxing::api::SystemStatus::default();
+fn collect_system_status(tuner_board: &TunerBoard) -> foxingd::api::SystemStatus {
+    use foxingd::api::{BpfDeviceStat, TargetStatus};
+    let mut status = foxingd::api::SystemStatus::default();
     
     status.load_avg_1m = metrics::GOVERNOR_LOAD_AVERAGE.with_label_values(&["1m"]).get();
     status.governor_stressed = metrics::GOVERNOR_STRESSED.get() == 1.0;
@@ -156,7 +156,7 @@ fn collect_system_status(tuner_board: &TunerBoard) -> foxing::api::SystemStatus 
     status.debug.sidecars_created = metrics::SIDECAR_FILES_CREATED.get() as u64;
     status.debug.generation_mismatches = metrics::GENERATION_MISMATCHES.get() as u64;
 
-    let dev_stats = foxing::bpf::get_device_stats();
+    let dev_stats = foxingd::bpf::get_device_stats();
     for (dev_id, (seq, count)) in dev_stats {
         let hex_id = format!("0x{:08x}", dev_id);
         status.debug.bpf_device_stats.insert(hex_id, BpfDeviceStat {
@@ -229,7 +229,7 @@ async fn run_monitor(base_url: String) -> anyhow::Result<()> {
     let (ui_tx, rx) = tokio::sync::mpsc::channel(32);
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(32);
     
-    let _ = ui_tx.send(foxing::tui::UiEvent::Log("Connected to remote daemon. Real-time logs not available in monitor mode.".to_string())).await;
+    let _ = ui_tx.send(foxingd::tui::UiEvent::Log("Connected to remote daemon. Real-time logs not available in monitor mode.".to_string())).await;
     
     let url_clone = base_url.clone();
     let ui_tx_clone = ui_tx.clone();
@@ -243,8 +243,8 @@ async fn run_monitor(base_url: String) -> anyhow::Result<()> {
             interval.tick().await;
             match client.get(&status_url).send().await {
                 Ok(resp) => {
-                    if let Ok(status) = resp.json::<foxing::api::SystemStatus>().await {
-                        if ui_tx_clone.send(foxing::tui::UiEvent::SystemUpdate(Box::new(status))).await.is_err() {
+                    if let Ok(status) = resp.json::<foxingd::api::SystemStatus>().await {
+                        if ui_tx_clone.send(foxingd::tui::UiEvent::SystemUpdate(Box::new(status))).await.is_err() {
                             break;
                         }
                     }
@@ -261,7 +261,7 @@ async fn run_monitor(base_url: String) -> anyhow::Result<()> {
         }
     });
     
-    let mut app = foxing::tui::TuiApp::new(foxing::tui::DataMode::Remote(base_url), cmd_tx, ui_tx, CONFIG_HELP.to_string())?;
+    let mut app = foxingd::tui::TuiApp::new(foxingd::tui::DataMode::Remote(base_url), cmd_tx, ui_tx, CONFIG_HELP.to_string())?;
     app.run(rx).await?;
     Ok(())
 }
@@ -397,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
                 max_versions_size_mb: 1024,
                 force_retention_files: vec![],
                 force_retention_count: 0,
-                worker_count: foxing::config::SYS.logical_cores.min(8),
+                worker_count: foxingd::config::SYS.logical_cores.min(8),
                 batch_size: 64,
                 worker_flush_interval_us: 100_000,
                 io_buffer_size_mib: 4,
@@ -430,10 +430,10 @@ async fn main() -> anyhow::Result<()> {
             
             // Pre-compile config to validate paths
             for sc in &mut config.sources {
-                sc.rwf_uncached_ok.store(foxing::security::probe_rwf_uncached(&sc.path), Ordering::Relaxed);
+                sc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&sc.path), Ordering::Relaxed);
                 for tc in &mut sc.targets {
-                    tc.rwf_uncached_ok.store(foxing::security::probe_rwf_uncached(&tc.path), Ordering::Relaxed);
-                    tc.direct_io_ok.store(foxing::security::probe_direct_io(&tc.path), Ordering::Relaxed);
+                    tc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&tc.path), Ordering::Relaxed);
+                    tc.direct_io_ok.store(fxcp_core::security::probe_direct_io(&tc.path), Ordering::Relaxed);
                     tc.compile(config.worker_count, config.io_buffer_size_mib)?;
                 }
             }
@@ -517,7 +517,7 @@ async fn run_runtime(
     config: Config,
     start_tui: bool,
     one_shot_mode: bool,
-    log_receiver: Option<mpsc::UnboundedReceiver<foxing::tui::UiEvent>>,
+    log_receiver: Option<mpsc::UnboundedReceiver<foxingd::tui::UiEvent>>,
     verbosity: u8
 ) -> anyhow::Result<()> {
     if one_shot_mode {
@@ -580,7 +580,7 @@ async fn run_runtime(
     let bpf_shutdown_clone = bpf_shutdown.clone();
     
     let bpf_handle = std::thread::spawn(move || {
-        if let Err(e) = foxing::bpf::run(queues, bpf_shutdown_clone, sources_map, initial_seq) {
+        if let Err(e) = foxingd::bpf::run(queues, bpf_shutdown_clone, sources_map, initial_seq) {
             error!("BPF Thread crashed: {}", e);
         }
     });
@@ -755,7 +755,7 @@ async fn run_runtime(
             loop {
                 interval.tick().await;
                 let status = collect_system_status(&t_board);
-                if ui_tx_clone.send(foxing::tui::UiEvent::SystemUpdate(Box::new(status))).await.is_err() {
+                if ui_tx_clone.send(foxingd::tui::UiEvent::SystemUpdate(Box::new(status))).await.is_err() {
                     break;
                 }
             }
@@ -776,7 +776,7 @@ async fn run_runtime(
             }
         });
 
-        let mut app = foxing::tui::TuiApp::new(foxing::tui::DataMode::Local, cmd_tx, ui_tx, CONFIG_HELP.to_string()).expect("Failed to init TUI");
+        let mut app = foxingd::tui::TuiApp::new(foxingd::tui::DataMode::Local, cmd_tx, ui_tx, CONFIG_HELP.to_string()).expect("Failed to init TUI");
         let _ = app.run(rx).await;
         
         poller_handle.abort();

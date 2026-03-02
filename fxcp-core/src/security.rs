@@ -1,23 +1,19 @@
-// [fxcp-core] Security — metadata sync, capability checks, fallocate, xattr preservation
-// ⚠ [Phase 1 BLOCKER] Circular dep: security ↔ operations
-//   security.rs imports operations::Capabilities
-//   operations.rs imports security
-//   Fix: move Capabilities to a shared types module in fxcp-core.
+// Security — metadata sync, capability checks, fallocate, xattr preservation
 use std::path::Path;
-use crate::error::{FoxingError, Result};   // [fxcp-core]
+use crate::error::{FxcpError, Result};
 use std::os::unix::io::{BorrowedFd, AsRawFd};
 use nix::fcntl::{fallocate, FallocateFlags};
 use libc;
 use nix::sys::statvfs::statvfs;
 use std::fs::File;
-use crate::operations;                     // ⚠ circular — needs Capabilities type
+use crate::operations;
 use nix::unistd::{chown, Uid, Gid};
 use xattr;
 use tracing::{debug, warn};
 use std::fs::OpenOptions;
 use std::ffi::CString;
-use crate::buffer::AlignedBuffer;          // [fxcp-core]
-use crate::sidecar;                        // [fxcp-core]
+use crate::buffer::AlignedBuffer;
+use crate::sidecar;
 use std::io::{Read, Seek, SeekFrom};
 use walkdir::WalkDir;
 use std::os::unix::fs::MetadataExt;
@@ -37,7 +33,7 @@ lazy_static! {
 }
 
 pub fn ioctl_ficlone(src_fd: i32, dst_path: &Path) -> Result<()> {
-    let dst_file = File::create(dst_path).map_err(FoxingError::Io)?;
+    let dst_file = File::create(dst_path).map_err(FxcpError::Io)?;
     let dst_fd = dst_file.as_raw_fd();
     let ret = unsafe {
         libc::ioctl(dst_fd, FICLONE, src_fd)
@@ -45,12 +41,12 @@ pub fn ioctl_ficlone(src_fd: i32, dst_path: &Path) -> Result<()> {
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINVAL) {
-            return Err(FoxingError::Io(std::io::Error::new(
+            return Err(FxcpError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 format!("FICLONE (CoW) not supported by filesystem: {}", dst_path.to_string_lossy())
             )));
         }
-        return Err(FoxingError::System(nix::Error::last()));
+        return Err(FxcpError::System(nix::Error::last()));
     }
     Ok(())
 }
@@ -85,14 +81,14 @@ pub fn preallocate(fd: i32, size: u64) {
 pub fn enable_compression(fd: i32) -> Result<()> {
     let flags: u32 = FS_COMPR_FL;
     let ret = unsafe { libc::ioctl(fd, 0x40086602, &flags) };
-    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FxcpError::System(nix::Error::last())); }
     Ok(())
 }
 
 pub fn enable_f2fs_pinning(fd: i32) -> Result<()> {
     let pin: u32 = 1;
     let ret = unsafe { libc::ioctl(fd, 0xF50D, &pin) };
-    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FxcpError::System(nix::Error::last())); }
     Ok(())
 }
 
@@ -114,14 +110,14 @@ pub fn set_project_id(fd: i32, projid: u32) -> Result<()> {
     attr.fsx_projid = projid;
     
     let ret = unsafe { libc::ioctl(fd, 0x40205820, &attr) };
-    if ret != 0 { return Err(FoxingError::System(nix::Error::last())); }
+    if ret != 0 { return Err(FxcpError::System(nix::Error::last())); }
     Ok(())
 }
 
 pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
     let lock = libc::flock { l_type: libc::F_WRLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
     if unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &lock) } < 0 {
-        return Err(FoxingError::System(nix::Error::last()));
+        return Err(FxcpError::System(nix::Error::last()));
     }
     Ok(())
 }
@@ -129,7 +125,7 @@ pub fn acquire_mandatory_lock(fd: i32) -> Result<()> {
 pub fn acquire_read_lock(fd: i32) -> Result<()> {
     let lock = libc::flock { l_type: libc::F_RDLCK as i16, l_whence: libc::SEEK_SET as i16, l_start: 0, l_len: 0, l_pid: 0 };
     if unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &lock) } < 0 {
-        return Err(FoxingError::System(nix::Error::last()));
+        return Err(FxcpError::System(nix::Error::last()));
     }
     Ok(())
 }
@@ -141,24 +137,24 @@ pub fn set_ownership(path: &Path, uid: u32, gid: u32) -> Result<()> {
         Some(Gid::from_raw(gid)),
     ) {
         Ok(_) => Ok(()),
-        Err(e) => Err(FoxingError::System(e))
+        Err(e) => Err(FxcpError::System(e))
     }
 }
 
 pub fn copy_timestamps(src: &Path, dst: &Path) -> Result<()> {
-    let meta = std::fs::metadata(src).map_err(FoxingError::Io)?;
+    let meta = std::fs::metadata(src).map_err(FxcpError::Io)?;
     let atime = libc::timespec { tv_sec: meta.atime(), tv_nsec: meta.atime_nsec() };
     let mtime = libc::timespec { tv_sec: meta.mtime(), tv_nsec: meta.mtime_nsec() };
     let times = [atime, mtime];
     
-    let c_path = CString::new(dst.to_string_lossy().as_bytes()).map_err(|_| FoxingError::Config("Invalid path".into()))?;
+    let c_path = CString::new(dst.to_string_lossy().as_bytes()).map_err(|_| FxcpError::Config("Invalid path".into()))?;
     
     let ret = unsafe {
         libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0)
     };
     
     if ret != 0 {
-        return Err(FoxingError::Io(std::io::Error::last_os_error()));
+        return Err(FxcpError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -200,14 +196,14 @@ pub fn check_sync_marker(dst: &Path, src_len: u64, src_mtime: i64, src_mtime_nse
 }
 
 pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
-    let meta = std::fs::metadata(src).map_err(FoxingError::Io)?;
+    let meta = std::fs::metadata(src).map_err(FxcpError::Io)?;
     use std::os::unix::fs::MetadataExt;
     
     set_ownership(dst, meta.uid(), meta.gid())?;
     
     let permissions = meta.permissions();
     if let Err(e) = std::fs::set_permissions(dst, permissions) {
-         return Err(FoxingError::Io(e));
+         return Err(FxcpError::Io(e));
     }
     
     copy_timestamps(src, dst)?;
@@ -305,7 +301,7 @@ pub fn check_and_lock_dir_integrity(dir_path: &Path, lock_file: &File) -> Result
     if let Err(e) = acquire_mandatory_lock(lock_file.as_raw_fd()) {
         return Err(e);
     }
-    let _meta = lock_file.metadata().map_err(FoxingError::Io)?;
+    let _meta = lock_file.metadata().map_err(FxcpError::Io)?;
     let hash_bytes = match sidecar::get_metadata(dir_path, "dir_hash") {
         Some(b) if b.len() == 8 => b,
         _ => return Ok(0),
@@ -408,16 +404,16 @@ pub fn probe_rwf_uncached(target_root: &Path) -> bool {
 }
 
 fn calculate_partial_hash(path: &Path) -> Result<u64> {
-    let mut file = File::open(path).map_err(FoxingError::Io)?;
-    let len = file.metadata().map_err(FoxingError::Io)?.len();
+    let mut file = File::open(path).map_err(FxcpError::Io)?;
+    let len = file.metadata().map_err(FxcpError::Io)?.len();
     let mut hasher = FxHasher::default();
     hasher.write_u64(len);
     let mut buf = [0u8; 65536];
-    let n = file.read(&mut buf).map_err(FoxingError::Io)?;
+    let n = file.read(&mut buf).map_err(FxcpError::Io)?;
     hasher.write(&buf[..n]);
     if len > 131072 {
-        file.seek(SeekFrom::End(-65536)).map_err(FoxingError::Io)?;
-        let n = file.read(&mut buf).map_err(FoxingError::Io)?;
+        file.seek(SeekFrom::End(-65536)).map_err(FxcpError::Io)?;
+        let n = file.read(&mut buf).map_err(FxcpError::Io)?;
         hasher.write(&buf[..n]);
     }
     Ok(hasher.finish())
@@ -482,7 +478,7 @@ pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, in
                 content_hash,
             }))
         }
-        Err(FoxingError::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+        Err(FxcpError::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
             warn!("Versioning: FICLONE (CoW) failed on {:?}: {}. Snapshot skipped.", path, e);
             crate::metrics::VERSIONING_FAILURES.inc();
             Ok(None)
@@ -504,35 +500,35 @@ pub fn commit_epoch(_path: &Path, _seq: u64, _projid: u32) -> Result<()> {
 }
 
 pub fn truncate_file(dst: &Path, size: u64) -> Result<()> {
-    let f = OpenOptions::new().write(true).open(dst).map_err(FoxingError::Io)?;
-    f.set_len(size).map_err(FoxingError::Io)
+    let f = OpenOptions::new().write(true).open(dst).map_err(FxcpError::Io)?;
+    f.set_len(size).map_err(FxcpError::Io)
 }
 
 pub fn do_fallocate(dst: &Path, offset: u64, len: u64, mode: i32) -> Result<()> {
-    let f = OpenOptions::new().write(true).open(dst).map_err(FoxingError::Io)?;
+    let f = OpenOptions::new().write(true).open(dst).map_err(FxcpError::Io)?;
     let fd = f.as_raw_fd();
     let ret = unsafe { libc::fallocate(fd, mode, offset as i64, len as i64) };
-    if ret < 0 { return Err(FoxingError::Io(std::io::Error::last_os_error())); }
+    if ret < 0 { return Err(FxcpError::Io(std::io::Error::last_os_error())); }
     Ok(())
 }
 
 pub fn create_symlink(target: &str, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).map_err(FoxingError::Io)
+    std::os::unix::fs::symlink(target, link).map_err(FxcpError::Io)
 }
 
 pub fn create_hard_link(original: &Path, link: &Path) -> Result<()> {
-    std::fs::hard_link(original, link).map_err(FoxingError::Io)
+    std::fs::hard_link(original, link).map_err(FxcpError::Io)
 }
 
 pub fn create_mknod(dst: &Path, mode: u32, dev: u64) -> Result<()> {
-    let cpath = CString::new(dst.to_string_lossy().as_bytes()).map_err(|_| FoxingError::Config("Invalid path".into()))?;
+    let cpath = CString::new(dst.to_string_lossy().as_bytes()).map_err(|_| FxcpError::Config("Invalid path".into()))?;
     let ret = unsafe { libc::mknod(cpath.as_ptr(), mode, dev) };
-    if ret < 0 { return Err(FoxingError::Io(std::io::Error::last_os_error())); }
+    if ret < 0 { return Err(FxcpError::Io(std::io::Error::last_os_error())); }
     Ok(())
 }
 
 pub fn set_file_attr(path: &Path, flags: u32) -> Result<()> {
-    let file = File::open(path).map_err(FoxingError::Io)?;
+    let file = File::open(path).map_err(FxcpError::Io)?;
     let fd = file.as_raw_fd();
     let flags_long = flags as libc::c_long;
     let ret = unsafe {
@@ -545,7 +541,7 @@ pub fn set_file_attr(path: &Path, flags: u32) -> Result<()> {
                 debug!("Security: FS_IOC_SETFLAGS not supported or invalid on {:?} (Error: {})", path, err);
                 Ok(())
             },
-            _ => Err(FoxingError::Io(err))
+            _ => Err(FxcpError::Io(err))
         }
     } else {
         Ok(())

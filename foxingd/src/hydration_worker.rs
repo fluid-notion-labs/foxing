@@ -7,21 +7,22 @@ use tracing::{warn, debug, info, error};
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, EventKind};
 use crate::config::{TargetConfig, Config};
 use crate::mirror::{SourceInfo, SharedConfig};
-use crate::governor::Governor;
+use fxcp_core::governor::Governor;
 use crate::tuner::{TunerBoard, TunerState, GLOBAL_TUNER_REGISTRY};
-use crate::{security, Result};
+use fxcp_core::security;
+use crate::Result;
 use crate::error::FoxingError;
 use crate::identity::{self};
 use std::os::unix::io::AsRawFd;
 use tokio::sync::{mpsc};
 use std::collections::{HashMap};
-use crate::consistency::SerializationEngine;
-use crate::sidecar;
+use fxcp_core::consistency::SerializationEngine;
+use fxcp_core::sidecar;
 use std::fs::OpenOptions;
 use crate::event::{Event};
-use crate::operations::{CopyStats, probe_capabilities};
-use crate::buffer::BufferPool;
-use crate::constants;
+use fxcp_core::operations::{CopyStats, probe_capabilities};
+use fxcp_core::buffer::BufferPool;
+use fxcp_core::constants;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use tokio::io::unix::AsyncFd;
@@ -30,8 +31,8 @@ use tokio::sync::mpsc::{Receiver, UnboundedSender};
 use io_uring::IoUring;
 use libc;
 use std::io::ErrorKind;
-use crate::sidecar::{SyncSignature, get_sync_signature, set_sync_signature};
-use crate::hashing;
+use fxcp_core::sidecar::{SyncSignature, get_sync_signature, set_sync_signature};
+use fxcp_core::hashing;
 use rand::seq::IndexedRandom;
 
 #[derive(Debug)]
@@ -614,7 +615,7 @@ pub async fn run_hydration_worker_loop(
     stats_senders: Arc<HashMap<PathBuf, Vec<UnboundedSender<CopyStats>>>>,
 ) -> Result<()> {
     
-    use crate::operations::FsyncLatencyTracker;
+    use fxcp_core::operations::FsyncLatencyTracker;
 
     let mut current_alloc = {
         let cfg = config.read().await;
@@ -645,7 +646,7 @@ pub async fn run_hydration_worker_loop(
                 },
                 Err(critical) => {
                     error!("Hydration Worker {}: CRITICAL MEMORY FAILURE. Exiting worker thread. Error: {:?}", worker_id, critical);
-                    return Err(critical);
+                    return Err(critical.into());
                 }
             }
         }
@@ -806,17 +807,17 @@ pub async fn process_hydration_job(
     ring: &mut io_uring::IoUring,
     buffer_pool: &mut BufferPool,
     async_fd: Arc<AsyncFd<std::os::unix::io::RawFd>>,
-    source_caps: &Arc<crate::operations::Capabilities>,
-    target_caps_ref: &Arc<crate::operations::Capabilities>,
+    source_caps: &Arc<fxcp_core::operations::Capabilities>,
+    target_caps_ref: &Arc<fxcp_core::operations::Capabilities>,
     tracker: &Arc<DashMap<u64, (u32, std::time::Instant)>>,
-    fsync_tracker: &mut crate::operations::FsyncLatencyTracker,
+    fsync_tracker: &mut fxcp_core::operations::FsyncLatencyTracker,
     buffer_limit: Option<usize>,
     skip_fsync: bool,
 ) -> Result<Option<CopyStats>> {
     use tokio::task::spawn_blocking;
-    use crate::operations::{SmartCopier};
+    use fxcp_core::operations::{SmartCopier};
     use std::time::Duration;
-    use crate::constants;
+    use fxcp_core::constants;
     use std::io::ErrorKind;
     use crate::identity;
     
@@ -937,7 +938,7 @@ pub async fn process_hydration_job(
                     security::apply_metadata(&src_path_clone, &dst_path_clone)
                 }).await
                 .map_err(FoxingError::Join)
-                .and_then(|inner| inner);
+                .and_then(|inner| inner.map_err(Into::into));
 
                 if metadata_result.is_err() {
                     warn!("Hydration: Failed to apply metadata/clear state for {:?}. Retrying.", current_target_path);

@@ -12,7 +12,7 @@ use tracing::{info, warn, debug, error};
 use crate::ordering::ReorderBuffer;
 use std::sync::Mutex;
 use crate::mirror::SourceInfo;
-use crate::constants;
+use fxcp_core::constants;
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;

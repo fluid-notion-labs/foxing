@@ -4,9 +4,9 @@ use std::ops::Sub;
 use parking_lot::Mutex;
 use lru::LruCache;
 use tracing::debug;
-use crate::security;
+use fxcp_core::security;
 // FIX: Import constant from the new location (constants.rs)
-use crate::constants::ERROR_LIMITER_SECS;
+use fxcp_core::constants::ERROR_LIMITER_SECS;
 struct PoisonEntry {
     failure_count: u32,
     next_attempt: Instant,

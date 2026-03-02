@@ -6,14 +6,14 @@ use crate::error::Result;
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
 use crate::tuner::TunerBoard;
-use crate::governor::Governor;
+use fxcp_core::governor::Governor;
 use tokio::task::JoinSet;
 use dashmap::DashMap;
-use crate::constants;
+use fxcp_core::constants;
 use std::sync::atomic::{AtomicUsize, Ordering, AtomicBool};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
-use crate::operations::CopyStats;
+use fxcp_core::operations::CopyStats;
 
 #[derive(Debug, Clone)]
 pub struct HydrationJob {

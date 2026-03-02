@@ -17,10 +17,10 @@ use dashmap::{DashMap, DashSet};
 use std::ops::Sub;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::governor::Governor;
-use crate::security;
+use fxcp_core::governor::Governor;
+use fxcp_core::security;
 use uuid::Uuid;
-use crate::versioning::VersionIndex;
+use fxcp_core::versioning::VersionIndex;
 use crate::identity_watch::ProactiveIndex;
 use crate::projector::IdentityProjector;
 use std::os::unix::fs::MetadataExt;
@@ -29,7 +29,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use rand::Rng;
 use notify::RecommendedWatcher;
 use std::os::unix::io::AsRawFd;
-use crate::operations::CopyStats;
+use fxcp_core::operations::CopyStats;
 
 pub type SharedConfig = Arc<RwLock<Config>>;
 pub type HydrationTx = mpsc::UnboundedSender<(PathBuf, Option<u64>)>;
@@ -136,7 +136,7 @@ impl Manager {
                     
                     let fs_root_relative_path = if let Ok(f) = fs::File::open(&mount_path) {
                         if let Ok(meta) = f.metadata() {
-                            crate::operations::btrfs_resolve_inode(f.as_raw_fd(), meta.ino()).ok()
+                            fxcp_core::operations::btrfs_resolve_inode(f.as_raw_fd(), meta.ino()).ok()
                         } else { None }
                     } else { None };
 
@@ -150,7 +150,7 @@ impl Manager {
                         sc.path.clone()
                     };
 
-                    let version_index = Arc::new(crate::versioning::VersionIndex::new(version_root));
+                    let version_index = Arc::new(fxcp_core::versioning::VersionIndex::new(version_root));
                     let identity_index = Some(ProactiveIndex::new(sc.path.clone()));
                     
                     let inode_map = Arc::new(DashMap::new());
@@ -194,7 +194,7 @@ impl Manager {
                 t.xattr_supported.store(xattr_ok, std::sync::atomic::Ordering::Relaxed);
                 
                 if t.path.exists() {
-                    let _ = crate::sidecar::remove_metadata(&t.path, "user.foxing_dir_hash_pending");
+                    let _ = fxcp_core::sidecar::remove_metadata(&t.path, "user.foxing_dir_hash_pending");
                 }
             }
         }

@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use crate::config::{TargetConfig, TargetProfile};
 use tracing::{debug, warn};
-use crate::constants;
+use fxcp_core::constants;
 use std::sync::atomic::Ordering;
 use lazy_static::lazy_static;
 

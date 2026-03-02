@@ -40,7 +40,7 @@ import verify
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FOXING_BINARY = PROJECT_ROOT / "target" / "release" / "foxing"
+FOXING_BINARY = PROJECT_ROOT / "target" / "release" / "foxingd"
 DEFAULT_TEST_ROOT = PROJECT_ROOT / "test_harness"
 TMPFS_PREFIX = "foxing_test_"
 BUILD_TIMEOUT = 300  # 5 min cargo build timeout
@@ -153,11 +153,11 @@ def build_foxing(force: bool = False) -> dict:
                 "size_bytes": FOXING_BINARY.stat().st_size,
             }
 
-    log("Building foxing (cargo build --release)...", file=sys.stderr)
+    log("Building foxingd (cargo build --release -p foxingd)...", file=sys.stderr)
     start = time.monotonic()
     try:
         result = subprocess.run(
-            ["cargo", "build", "--release"],
+            ["cargo", "build", "--release", "-p", "foxingd"],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,

@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use regex::Regex;
 use crate::error::{Result, FoxingError};
 use tracing::{info, warn, debug, error};
-use crate::security;
+use fxcp_core::security;
 use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
 use lazy_static::lazy_static;
-use crate::constants;
+use fxcp_core::constants;
 use clap::ValueEnum;
 
-// [fxcp-core] SysSpecs block — deps: sysinfo + std only, safe to extract
 #[derive(Debug)]
 pub struct SysSpecs {
     pub logical_cores: usize,
@@ -223,8 +222,8 @@ impl Config {
             debug!("Using custom capacity_threshold_mb: {} (Default: {} MB)", config.capacity_threshold_mb, constants::CAPACITY_THRESHOLD_MB);
         }
 
-        crate::hashing::set_hashing_enabled(config.enable_content_hashing);
-        crate::hashing::set_lite_threshold_kb(config.hash_lite_threshold_kb);
+        fxcp_core::hashing::set_hashing_enabled(config.enable_content_hashing);
+        fxcp_core::hashing::set_lite_threshold_kb(config.hash_lite_threshold_kb);
 
         if !config.enable_content_hashing {
             warn!("Content hashing DISABLED. Falling back to mtime-based verification. Risk of silent data corruption on timestamp clamping filesystems.");

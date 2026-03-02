@@ -5,7 +5,7 @@ use crate::metrics;
 use tracing::{warn, debug, info};
 use std::time::{Instant, Duration};
 use crate::columnar::EventBatch;
-use crate::constants;
+use fxcp_core::constants;
 
 #[derive(Debug)]
 pub struct ReorderBuffer {

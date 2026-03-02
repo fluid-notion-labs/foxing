@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::cell::UnsafeCell;
 use crossbeam::queue::ArrayQueue;
-use crate::error::{FoxingError, Result};
+use crate::error::{FxcpError, Result};
 use crate::constants;
 use std::ptr;
 
@@ -36,7 +36,7 @@ impl AlignedBuffer {
                     Some(current + actual_capacity as u64)
                 }
             }
-        ).map_err(|_| FoxingError::MemoryExhausted(format!(
+        ).map_err(|_| FxcpError::MemoryExhausted(format!(
             "Global memory limit exceeded. Refusing allocation of {} bytes.", capacity
         )))?;
 
@@ -47,14 +47,14 @@ impl AlignedBuffer {
             .map_err(|_e| {
                 GLOBAL_BUFFER_COUNT.fetch_sub(actual_capacity as u64, Ordering::SeqCst);
                 GLOBAL_MEMORY_USAGE_BYTES.sub(actual_capacity as f64);
-                FoxingError::System(nix::Error::from(nix::errno::Errno::EINVAL))
+                FxcpError::System(nix::Error::from(nix::errno::Errno::EINVAL))
             })?;
             
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             GLOBAL_BUFFER_COUNT.fetch_sub(actual_capacity as u64, Ordering::SeqCst);
             GLOBAL_MEMORY_USAGE_BYTES.sub(actual_capacity as f64);
-            return Err(FoxingError::MemoryExhausted("Physical memory allocation failed".to_string()));
+            return Err(FxcpError::MemoryExhausted("Physical memory allocation failed".to_string()));
         }
         unsafe { ptr::write_bytes(ptr, 0, actual_capacity); }
         trace!("AlignedBuffer: Allocated {} bytes.", actual_capacity);
@@ -144,7 +144,7 @@ impl BufferPool {
     }
     fn create_pool(requested_buffers: usize, requested_chunk_size: usize, alignment: usize, local_mode: bool) -> Result<Self> {
         if requested_buffers > 65535 {
-            return Err(FoxingError::Config("BufferPool: max 65535 buffers allowed".to_string()));
+            return Err(FxcpError::Config("BufferPool: max 65535 buffers allowed".to_string()));
         }
         let align = alignment.max(constants::MINIMUM_ALIGNMENT_BYTES);
         let min_chunk_size = 4096;
@@ -205,7 +205,7 @@ impl BufferPool {
                 })
             });
         }
-        Err(FoxingError::MemoryExhausted("BufferPool: All allocation strategies failed.".to_string()))
+        Err(FxcpError::MemoryExhausted("BufferPool: All allocation strategies failed.".to_string()))
     }
     
     #[inline(always)]

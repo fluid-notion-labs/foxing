@@ -2,28 +2,29 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast, Mutex};
 use tracing::{error, info, debug, warn};
 use crate::error::{Result, FoxingError};
+use fxcp_core::FxcpError;
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::{TargetConfig};
-use crate::operations::{SmartCopier, CopyStats, probe_capabilities, OptimizedFs, FsyncLatencyTracker};
+use fxcp_core::operations::{SmartCopier, CopyStats, probe_capabilities, OptimizedFs, FsyncLatencyTracker};
 use std::sync::atomic::Ordering;
 use crate::tuner::{BbrTuner, TunerBoard, TunerOutput, GLOBAL_TUNER_REGISTRY, check_global_consistency};
-use crate::governor::Governor;
+use fxcp_core::governor::Governor;
 use std::time::{Duration, Instant};
 use crate::identity::{self, ResolveResult};
-use crate::buffer::BufferPool;
+use fxcp_core::buffer::BufferPool;
 use crate::event::{Event, EventType};
 use crate::ordering::{Coalescer};
-use crate::consistency::{InMemoryWal, WalOpKind};
+use fxcp_core::consistency::{InMemoryWal, WalOpKind};
 use crate::resilience::{PoisonCabinet, CircuitBreaker};
 use io_uring::IoUring;
 use std::path::{Path, PathBuf};
 use libc;
-use crate::sidecar::{AsyncSidecar, SyncSignature, set_sync_signature};
+use fxcp_core::sidecar::{AsyncSidecar, SyncSignature, set_sync_signature};
 use std::collections::{HashSet, VecDeque};
-use crate::constants;
+use fxcp_core::constants;
 use tokio::io::unix::AsyncFd;
 use tokio::task::spawn_blocking;
-use crate::security;
+use fxcp_core::security;
 use std::os::unix::fs::MetadataExt;
 use crate::metrics;
 
@@ -530,7 +531,7 @@ async fn process_single_event_with_wal(
                 let target_path_clone = target_path.clone();
                 let event_clone = event.clone();
                 let snapshot_result = spawn_blocking(move || {
-                    crate::security::create_version_snapshot(
+                    fxcp_core::security::create_version_snapshot(
                         &target_path_clone,
                         event_clone.seq_num,
                         &root_path,
@@ -566,7 +567,7 @@ async fn process_single_event_with_wal(
                 target_label.clone(),
                 None, // Pass None for worker buffer limit (default tuning)
                 false, // Daemon workers always fsync
-            ).await;
+            ).await.map_err(Into::into);
         },
         EventType::Write | EventType::WriteRange => {
             let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
@@ -583,7 +584,7 @@ async fn process_single_event_with_wal(
                 let event_clone = event.clone();
                 
                 let snapshot_result = spawn_blocking(move || {
-                    crate::security::create_version_snapshot(
+                    fxcp_core::security::create_version_snapshot(
                         &target_path_clone,
                         event_clone.seq_num,
                         &root_path,
@@ -599,7 +600,7 @@ async fn process_single_event_with_wal(
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            let is_unsupported = if let FoxingError::Io(io_err) = &e {
+                            let is_unsupported = if let FxcpError::Io(io_err) = &e {
                                 io_err.kind() == std::io::ErrorKind::Unsupported
                             } else {
                                 false
@@ -630,7 +631,7 @@ async fn process_single_event_with_wal(
                 target_label.clone(),
                 None, // Pass None for worker buffer limit (default tuning)
                 false, // Daemon workers always fsync
-            ).await;
+            ).await.map_err(Into::into);
         },
         EventType::Rename => {
             let old_rel_res = resolve_event_path(&source, event.parent_inode, &event.name).await;
@@ -642,7 +643,7 @@ async fn process_single_event_with_wal(
                         if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
                     }
                     
-                    op_result = smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags).await;
+                    op_result = smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags).await.map_err(Into::into);
                     
                     // Update identity map if directory
                     if event.mode & libc::S_IFDIR as u32 != 0 {
@@ -684,7 +685,7 @@ async fn process_single_event_with_wal(
                     }
                     
                     info!("Worker: Executing recovered rename: {:?} -> {:?}", old_path, new_target_path);
-                    op_result = smart_copier.optimized_rename(old_path, new_target_path, 0).await;
+                    op_result = smart_copier.optimized_rename(old_path, new_target_path, 0).await.map_err(Into::into);
                 } else {
                     op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to strip prefix from recovered path")));
                 }
@@ -697,7 +698,7 @@ async fn process_single_event_with_wal(
                 sidecar.set_dirty_blind(target_path.clone());
                 dirty_tracker.insert(event.inode);
             }
-            op_result = smart_copier.optimized_truncate(target_path.clone(), event.length).await;
+            op_result = smart_copier.optimized_truncate(target_path.clone(), event.length).await.map_err(Into::into);
         },
         EventType::Unlink | EventType::Rmdir => {
              let event_clone = event.clone();
@@ -805,7 +806,7 @@ async fn process_single_event_with_wal(
                              );
                          }
                      },
-                     Ok(Err(e)) => op_result = Err(e),
+                     Ok(Err(e)) => op_result = Err(e.into()),
                      Err(e) => op_result = Err(e.into()),
                  }
              } else {
@@ -820,15 +821,15 @@ async fn process_single_event_with_wal(
              let p = target_path.clone();
              let flags = event.flags;
              let res = spawn_blocking(move || security::set_file_attr(&p, flags)).await.map_err(FoxingError::Join);
-             if let Ok(Err(e)) = res { op_result = Err(e); }
+             if let Ok(Err(e)) = res { op_result = Err(e.into()); }
              else if let Err(e) = res { op_result = Err(e.into()); }
         },
         EventType::Lock | EventType::Flock => {
              let p = target_path.clone();
              let flags = event.flags;
              let map = source.lock_map.clone();
-             let res = spawn_blocking(move || crate::operations::apply_lock(&p, flags, &map)).await.map_err(FoxingError::Join);
-             if let Ok(Err(e)) = res { op_result = Err(e); }
+             let res = spawn_blocking(move || fxcp_core::operations::apply_lock(&p, flags, &map)).await.map_err(FoxingError::Join);
+             if let Ok(Err(e)) = res { op_result = Err(e.into()); }
              else if let Err(e) = res { op_result = Err(e.into()); }
         },
         EventType::Fallocate => {
@@ -837,7 +838,7 @@ async fn process_single_event_with_wal(
                 dirty_tracker.insert(event.inode);
             }
             let mode = event.flags as i32;
-            op_result = smart_copier.optimized_fallocate(target_path.clone(), mode, event.offset, event.length).await;
+            op_result = smart_copier.optimized_fallocate(target_path.clone(), mode, event.offset, event.length).await.map_err(Into::into);
         },
         _ => {}
     }
@@ -856,7 +857,7 @@ async fn process_single_event_with_wal(
     if dirty_tracker.contains(&event.inode) {
         let p = target_path.clone();
         let _ = spawn_blocking(move || {
-            crate::sidecar::remove_metadata(&p, "user.foxing.dirty")
+            fxcp_core::sidecar::remove_metadata(&p, "user.foxing.dirty")
         }).await;
         dirty_tracker.remove(&event.inode);
     }

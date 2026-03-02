@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use futures::{StreamExt, FutureExt};
 use crossterm::event::EventStream;
 use std::collections::{HashMap, VecDeque};
-use crate::versioning::{FileVersion, VersionIndex};
+use fxcp_core::versioning::{FileVersion, VersionIndex};
 use crate::config::SourceConfig;
 use chrono::{DateTime, Utc};
 use std::os::unix::fs::MetadataExt;

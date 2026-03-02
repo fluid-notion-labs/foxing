@@ -1,5 +1,4 @@
-// [fxcp-core] Sidecar — metadata/dirty-flag management via xattr
-// Only crate dep: crate::hashing. Cleanest extraction candidate.
+// Sidecar — metadata/dirty-flag management via xattr
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use std::collections::HashMap;
@@ -12,7 +11,7 @@ use tracing::{error, debug, warn};
 use tokio::sync::{mpsc, oneshot};
 use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::hashing; // [fxcp-core]
+use crate::hashing;
 use std::os::unix::fs::MetadataExt;
 
 const NS_USER_PREFIX: &str = "user.foxing.";

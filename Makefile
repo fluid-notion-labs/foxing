@@ -8,10 +8,10 @@ check:
 	cargo check --workspace --all-targets
 
 build:
-	cargo build
+	cargo build --workspace
 
 release:
-	cargo build --release
+	cargo build --release --workspace
 
 install-deps:
 	sudo dnf install -y clang llvm libbpf-devel bpftool cargo

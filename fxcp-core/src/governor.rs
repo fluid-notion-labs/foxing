@@ -1,6 +1,4 @@
-// [foxingd] Governor — system stress management
-// Deps: crate::metrics (GOVERNOR_* subset), crate::constants, sysinfo, parking_lot
-// Phase 1: stays in foxingd. fxcp-core gets a trait interface for Optional<Arc<Governor>>.
+// Governor — system stress management
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::sync::Arc;

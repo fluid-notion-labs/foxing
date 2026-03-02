@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use crate::event::Event;
 use crate::metrics;
-use crate::constants;
+use fxcp_core::constants;
 
 #[allow(dead_code)]
 fn current_time_sec() -> u64 {
@@ -308,7 +308,7 @@ pub fn resolve_live_path(source: &Arc<crate::mirror::SourceInfo>, inode: u64, ge
     use std::os::unix::io::AsRawFd;
     if let Ok(root_file) = File::open(&source.mount) {
         let fd = root_file.as_raw_fd();
-        match crate::operations::btrfs_resolve_inode(fd, inode) {
+        match fxcp_core::operations::btrfs_resolve_inode(fd, inode) {
             Ok(path) => {
                 if let Some(ref root_offset) = source.fs_root_relative_path {
                     if let Ok(stripped) = path.strip_prefix(root_offset) {
