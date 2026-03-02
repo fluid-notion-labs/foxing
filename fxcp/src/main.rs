@@ -43,21 +43,31 @@ struct Cli {
     debug: bool,
 }
 
+// Auto-adaptive thresholds
+const SMALL_FILE_THRESHOLD: u64 = 64 * 1024; // Files below 64KB use std::fs::copy (no io_uring)
+const FICLONE: u64 = 0x40049409;              // btrfs/xfs reflink ioctl
+
 struct SyncStats {
     files_copied: u64,
+    files_reflinked: u64,
+    files_small: u64,
     files_skipped: u64,
     files_delta: u64,
     files_deleted: u64,
     dirs_created: u64,
     bytes_copied: u64,
+    bytes_reflinked: u64,
+    bytes_small: u64,
     bytes_delta: u64,
     errors: u64,
 }
 
 impl Default for SyncStats {
     fn default() -> Self {
-        Self { files_copied: 0, files_skipped: 0, files_delta: 0, files_deleted: 0,
-               dirs_created: 0, bytes_copied: 0, bytes_delta: 0, errors: 0 }
+        Self { files_copied: 0, files_reflinked: 0, files_small: 0,
+               files_skipped: 0, files_delta: 0, files_deleted: 0,
+               dirs_created: 0, bytes_copied: 0, bytes_reflinked: 0,
+               bytes_small: 0, bytes_delta: 0, errors: 0 }
     }
 }
 
@@ -257,9 +267,44 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
             }
         }
 
-        // Full copy
+        // --- Auto-adaptive copy strategy selection ---
+        let file_size = src_meta.len();
+        let same_device = src_meta.dev() == std::fs::metadata(&destination)
+            .map(|m| m.dev()).unwrap_or(0);
+
+        // Tier 1: Reflink fast path (instant CoW, same-device btrfs/xfs only)
+        if same_device && file_size > 0 {
+            if try_reflink_copy(src_path, &dst_path) {
+                stats.files_reflinked += 1;
+                stats.bytes_reflinked += file_size;
+                if cli.archive {
+                    let _ = preserve_metadata(src_path, &dst_path);
+                }
+                continue;
+            }
+            // Reflink failed (NOCOW, cross-subvol, etc) — fall through
+        }
+
+        // Tier 2: Small file fast path (std::fs::copy, no io_uring overhead)
+        if file_size <= SMALL_FILE_THRESHOLD {
+            match copy_small_file(src_path, &dst_path) {
+                Ok(bytes) => {
+                    stats.files_small += 1;
+                    stats.bytes_small += bytes;
+                    if cli.archive {
+                        let _ = preserve_metadata(src_path, &dst_path);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    debug!("small file copy failed for {:?}: {}, falling back to io_uring", src_path, e);
+                }
+            }
+        }
+
+        // Tier 3: io_uring copy (large files, cross-device, or fallback)
         match copier.optimized_copy(
-            src_path.to_path_buf(), dst_path.clone(), src_meta.len(),
+            src_path.to_path_buf(), dst_path.clone(), file_size,
             "default".into(), None, true,
         ).await {
             Ok(copy_stats) => {
@@ -282,6 +327,29 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     }
 
     Ok(stats)
+}
+
+/// Reflink fast path: FICLONE ioctl for instant CoW copy.
+/// Returns true if reflink succeeded, false if not supported/failed.
+fn try_reflink_copy(src: &Path, dst: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let src_file = match std::fs::File::open(src) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Create or truncate destination
+    let dst_file = match std::fs::File::create(dst) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    ret == 0
+}
+
+/// Small file fast path: use std::fs::copy (kernel sendfile/splice internally).
+/// Avoids io_uring ring submission overhead for tiny files.
+fn copy_small_file(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    std::fs::copy(src, dst)
 }
 
 async fn try_delta_copy(
@@ -430,19 +498,32 @@ fn run_cleanup(path: &Path) {
 }
 
 fn print_summary(stats: &SyncStats) {
-    let total_bytes = stats.bytes_copied + stats.bytes_delta;
+    let total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_small + stats.bytes_delta;
+    let total_files = stats.files_copied + stats.files_reflinked + stats.files_small + stats.files_delta;
     println!("fxcp sync complete:");
-    println!("  Files copied:  {}", stats.files_copied);
-    println!("  Files delta:   {}", stats.files_delta);
+    println!("  Files total:   {}", total_files);
+    if stats.files_reflinked > 0 {
+        println!("  - reflinked:   {} ({:.1} MB, instant CoW)", stats.files_reflinked,
+                 stats.bytes_reflinked as f64 / 1024.0 / 1024.0);
+    }
+    if stats.files_small > 0 {
+        println!("  - small copy:  {} ({:.1} MB, sendfile)", stats.files_small,
+                 stats.bytes_small as f64 / 1024.0 / 1024.0);
+    }
+    if stats.files_copied > 0 {
+        println!("  - io_uring:    {} ({:.1} MB)", stats.files_copied,
+                 stats.bytes_copied as f64 / 1024.0 / 1024.0);
+    }
+    if stats.files_delta > 0 {
+        println!("  - delta:       {} ({:.1} MB)", stats.files_delta,
+                 stats.bytes_delta as f64 / 1024.0 / 1024.0);
+    }
     println!("  Files skipped: {}", stats.files_skipped);
     if stats.files_deleted > 0 {
         println!("  Files deleted: {}", stats.files_deleted);
     }
     println!("  Dirs created:  {}", stats.dirs_created);
     println!("  Bytes total:   {} ({:.1} MB)", total_bytes, total_bytes as f64 / 1024.0 / 1024.0);
-    if stats.bytes_delta > 0 {
-        println!("  Bytes delta:   {} ({:.1} MB)", stats.bytes_delta, stats.bytes_delta as f64 / 1024.0 / 1024.0);
-    }
     if stats.errors > 0 {
         println!("  Errors:        {}", stats.errors);
     }
