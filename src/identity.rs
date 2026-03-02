@@ -1,262 +1,333 @@
-use std::path::{PathBuf};
-use std::sync::Arc;
-use parking_lot::Mutex;
-use lru::LruCache;
-use crate::event::{Event};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use tracing::{warn, debug};
-use walkdir;
-use std::io;
-use crate::metrics;
-use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf, Component};
+use crate::error::{FoxingError, Result};
+use std::sync::atomic::{Ordering, AtomicU64};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use parking_lot::RwLock;
+use tracing::{debug, warn};
 use dashmap::DashMap;
-use std::time::{Instant, Duration};
-lazy_static::lazy_static! {
-    // FIX: Store (Timestamp, Path, Sequence Number) tuple to allow newer events to bypass the time-based debounce.
-    static ref RECENT_LOOKUPS: DashMap<u64, (Instant, PathBuf, u64)> = DashMap::new();
+use std::sync::Arc;
+use crate::event::Event;
+use crate::metrics;
+use crate::constants;
+
+#[allow(dead_code)]
+fn current_time_sec() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
-const LOOKUP_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
-#[derive(Clone, Debug)]
+
+#[derive(Debug)]
 pub struct IdentityEntry {
-    pub path: PathBuf,
-    pub generation: u32,
-    pub timestamp_ns: u64,
-    pub seq_num: u64,
+    pub paths: RwLock<Vec<PathBuf>>,
+    pub generation: RwLock<u32>,
+    pub timestamp_ns: RwLock<u64>,
+    pub seq_num: RwLock<u64>,
+    pub last_accessed_seq: AtomicU64,
+    pub unlinked_at: RwLock<Option<Instant>>,
 }
+
 impl IdentityEntry {
     pub fn new(path: PathBuf, generation: u32, timestamp_ns: u64, seq_num: u64) -> Self {
-        Self { path, generation, timestamp_ns, seq_num }
+        Self {
+            paths: RwLock::new(vec![path]),
+            generation: RwLock::new(generation),
+            timestamp_ns: RwLock::new(timestamp_ns),
+            seq_num: RwLock::new(seq_num),
+            last_accessed_seq: AtomicU64::new(seq_num),
+            unlinked_at: RwLock::new(None),
+        }
+    }
+
+    pub fn primary_path(&self) -> PathBuf {
+        let paths = self.paths.read();
+        paths[0].clone()
+    }
+
+    pub fn add_path(&self, path: PathBuf) {
+        let mut paths = self.paths.write();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        *self.unlinked_at.write() = None;
+    }
+
+    pub fn record_access(&self, seq: u64) {
+        let _ = self.last_accessed_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    pub fn record_use(&self) {
+        let mut unlinked = self.unlinked_at.write();
+        if unlinked.is_some() {
+             *unlinked = None;
+        }
+    }
+
+    pub fn record_unlinked(&self) {
+        let mut unlinked = self.unlinked_at.write();
+        if unlinked.is_none() {
+             *unlinked = Some(Instant::now());
+        }
+    }
+
+    pub fn should_evict(&self, current_global_seq: u64) -> bool {
+        if self.unlinked_at.read().is_some() {
+             return true;
+        }
+        let last = self.last_accessed_seq.load(Ordering::Relaxed);
+        if current_global_seq > last && (current_global_seq - last) > constants::CACHE_TTL_EVENTS {
+            return true;
+        }
+        false
+    }
+
+    pub fn remove_path(&self, path: &Path) {
+        let mut paths = self.paths.write();
+        paths.retain(|p| p != path);
+        if paths.is_empty() {
+             drop(paths);
+             self.record_unlinked();
+        }
     }
 }
-#[derive(Debug)]
+
+pub type ShardedInodeMap = Arc<DashMap<u64, IdentityEntry>>;
+pub type ShardedDirMap = Arc<DashMap<u64, PathBuf>>;
+
+#[derive(Debug, PartialEq)]
 pub enum ResolveResult {
     Success(PathBuf, bool, bool),
     NeedsRepair(PathBuf),
+    SecurityBlock,
 }
-const SHARD_COUNT: usize = 64;
-#[derive(Debug)]
-pub struct ShardedInodeMap {
-    shards: Vec<Mutex<LruCache<u64, IdentityEntry>>>,
-}
-impl ShardedInodeMap {
-    pub fn new(capacity: usize) -> Arc<Self> {
-        let per_shard = NonZeroUsize::new((capacity / SHARD_COUNT).max(100)).unwrap();
-        let mut shards = Vec::with_capacity(SHARD_COUNT);
-        for _ in 0..SHARD_COUNT {
-            shards.push(Mutex::new(LruCache::new(per_shard)));
-        }
-        Arc::new(Self { shards })
-    }
-    fn get_shard(&self, inode: u64) -> &Mutex<LruCache<u64, IdentityEntry>> {
-        &self.shards[(inode as usize) % SHARD_COUNT]
-    }
-    pub fn put(&self, inode: u64, entry: IdentityEntry) {
-        let mut shard = self.get_shard(inode).lock();
-        if let Some(existing) = shard.get(&inode) {
-            if existing.seq_num > 0 && existing.seq_num >= entry.seq_num {
-                return;
+
+fn validate_target_root_containment(target_root: &Path, rel_path: &Path) -> bool {
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(_) => {},
+            Component::CurDir => {},
+            _ => {
+                warn!("Security: Path Traversal attempt detected in relative path: {:?}", rel_path);
+                return false;
             }
         }
-        shard.put(inode, entry);
     }
-    pub fn get_path(&self, inode: u64) -> Option<PathBuf> {
-        let mut shard = self.get_shard(inode).lock();
-        shard.get(&inode).map(|e| e.path.clone())
-    }
-    pub fn get_entry_clone(&self, inode: u64) -> Option<IdentityEntry> {
-        let mut shard = self.get_shard(inode).lock();
-        shard.get(&inode).cloned()
-    }
-    pub fn remove(&self, inode: u64) {
-        let mut shard = self.get_shard(inode).lock();
-        if shard.pop(&inode).is_some() {
-            debug!("IDENTITY: Removed inode {} from ShardedMap", inode);
-        }
-    }
+    let full_path = target_root.join(rel_path);
+    if full_path.starts_with(target_root) { true } else { false }
 }
-#[derive(Debug)]
-pub struct ShardedDirMap {
-    shards: Vec<Mutex<LruCache<u64, PathBuf>>>,
-}
-impl ShardedDirMap {
-    pub fn new(capacity: usize) -> Arc<Self> {
-        let per_shard = NonZeroUsize::new((capacity / SHARD_COUNT).max(100)).unwrap();
-        let mut shards = Vec::with_capacity(SHARD_COUNT);
-        for _ in 0..SHARD_COUNT {
-            shards.push(Mutex::new(LruCache::new(per_shard)));
-        }
-        Arc::new(Self { shards })
-    }
-    fn get_shard(&self, inode: u64) -> &Mutex<LruCache<u64, PathBuf>> {
-        &self.shards[(inode as usize) % SHARD_COUNT]
-    }
-    pub fn put(&self, inode: u64, path: PathBuf) {
-        self.get_shard(inode).lock().put(inode, path);
-    }
-    pub fn get(&self, inode: u64) -> Option<PathBuf> {
-        self.get_shard(inode).lock().get(&inode).cloned()
-    }
-    pub fn remove(&self, inode: u64) {
-        self.get_shard(inode).lock().pop(&inode);
-    }
-    pub fn clear(&self) {
-        for shard in &self.shards {
-            shard.lock().clear();
-        }
-    }
-}
-pub fn update_map(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64, path: PathBuf, generation: u32, is_synthetic: bool, is_dir: bool, ts: u64, seq: u64) {
-    if !is_synthetic {
-        map.put(inode, IdentityEntry::new(path.clone(), generation, ts, seq));
-    }
-    if is_dir {
-        dir_map.put(inode, path);
-    }
-}
-pub fn update_map_after_rename(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64, new_path: PathBuf, generation: u32, is_dir: bool, ts: u64, seq: u64) {
-    map.put(inode, IdentityEntry::new(new_path.clone(), generation, ts, seq));
-    if is_dir {
-        dir_map.put(inode, new_path);
-    }
-}
-pub fn remove_entry(map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64) {
-    map.remove(inode);
-    dir_map.remove(inode);
-}
+
 pub fn resolve_target(
     inode_map: &ShardedInodeMap,
+    dir_map: &ShardedDirMap,
     event: &Event,
-    target_root: &std::path::Path
+    target_root: &Path
 ) -> ResolveResult {
-    if let Some(entry) = inode_map.get_entry_clone(event.inode) {
-        let match_gen = entry.generation == event.generation
-                        || entry.generation == 0
-                        || entry.generation == std::u32::MAX;
-        if !match_gen {
-            warn!("Identity Mismatch: Inode {} cached gen {} != event gen {}. Invalidating.",
-                  event.inode, entry.generation, event.generation);
-            inode_map.remove(event.inode);
-            metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
-            metrics::GENERATION_MISMATCHES.inc();
-            let identity_dir = target_root.join(".mirror").join(".by-identity");
-            let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
-            return ResolveResult::NeedsRepair(identity_dir.join(filename));
+    std::sync::atomic::fence(Ordering::Acquire);
+    
+    // Optimistic read first
+    let (result, rel_path_check) = if let Some(entry) = inode_map.get(&event.inode) {
+        entry.record_access(event.seq_num);
+        
+        let specific_rel_path = if event.parent_inode != 0 && !event.name.is_empty() {
+             if let Some(parent_path) = dir_map.get(&event.parent_inode) {
+                 Some(parent_path.join(&event.name))
+             } else {
+                 None
+             }
         } else {
-             metrics::IDENTITY_CACHE_HIT_RATE.set(1.0);
-             return ResolveResult::Success(target_root.join(&entry.path), false, false);
+            None
+        };
+
+        let entry_gen = *entry.generation.read();
+        
+        if entry_gen != std::u32::MAX && entry_gen != event.generation {
+            metrics::GENERATION_MISMATCHES.inc();
+            let fallback = if let Some(p) = specific_rel_path {
+                target_root.join(p)
+            } else {
+                target_root.join(&event.name)
+            };
+            (ResolveResult::NeedsRepair(fallback), None)
+        } else if let Some(rel_path) = specific_rel_path {
+            let paths_guard = entry.paths.read();
+            let known = paths_guard.contains(&rel_path);
+            drop(paths_guard);
+            
+            if !known {
+                debug!("Identity: Lazy tree repair for inode {}. Updating path to {:?}", event.inode, rel_path);
+                if event.nlink <= 1 {
+                    entry.paths.write().clear();
+                }
+                entry.add_path(rel_path.clone());
+            }
+            let full_target_path = target_root.join(&rel_path);
+            (ResolveResult::Success(full_target_path, false, false), Some(rel_path))
+        } else {
+            let primary = target_root.join(entry.primary_path());
+            (ResolveResult::Success(primary, false, false), Some(entry.primary_path()))
         }
     } else {
-        metrics::IDENTITY_CACHE_HIT_RATE.set(0.0);
-    }
-    if event.parent_inode != 0 {
-        if let Some(parent_path) = inode_map.get_path(event.parent_inode) {
-            let full_path = parent_path.join(&event.name);
-            inode_map.put(event.inode, IdentityEntry::new(
-                full_path.clone(),
-                event.generation,
-                event.timestamp_ns,
-                event.seq_num,
-            ));
-            return ResolveResult::Success(target_root.join(full_path), false, false);
+        let fallback_path = target_root.join(&event.name);
+        let r = if !event.name.is_empty() {
+            ResolveResult::Success(fallback_path.clone(), true, true)
+        } else {
+            ResolveResult::NeedsRepair(fallback_path.clone())
+        };
+        (r, Some(PathBuf::from(&event.name)))
+    };
+
+    if let Some(rel) = rel_path_check {
+        if !validate_target_root_containment(target_root, &rel) {
+            return ResolveResult::SecurityBlock;
         }
     }
-    let event_path = PathBuf::from(&event.name);
-    if !event.name.is_empty() && !event.name.contains('/') {
-    } else if !event.name.is_empty() {
-        inode_map.put(event.inode, IdentityEntry::new(
-            event_path.clone(),
-            event.generation,
-            event.timestamp_ns,
-            event.seq_num,
-        ));
-        return ResolveResult::Success(target_root.join(event_path), false, false);
-    }
-    let identity_dir = target_root.join(".mirror").join(".by-identity");
-    let filename = format!("{}_{}_{}", event.dev_id, event.inode, event.generation);
-    let synthetic_path = identity_dir.join(filename);
-    ResolveResult::Success(synthetic_path, true, true)
+    result
 }
-pub fn resolve_directory(dir_map: &ShardedDirMap, inode_map: &ShardedInodeMap, _dev: u32, inode: u64) -> Option<PathBuf> {
-    if let Some(p) = dir_map.get(inode) {
-        return Some(p);
+
+pub fn prune_expired_entries(inode_map: &ShardedInodeMap, limit: usize, current_global_seq: u64) {
+    if inode_map.len() > limit {
+        debug!("Identity Map exceeded high water mark ({}). Starting intelligent eviction (Epoch: {}).", limit, current_global_seq);
+        let target_len = limit * 9 / 10;
+        let excess_count = inode_map.len().saturating_sub(target_len);
+        
+        if excess_count == 0 { return; }
+
+        let mut candidates: Vec<(u64, bool, u64)> = inode_map.iter()
+            .map(|r| {
+                let unlinked = r.value().unlinked_at.read().is_some();
+                let last = r.value().last_accessed_seq.load(Ordering::Relaxed);
+                (*r.key(), unlinked, last)
+            })
+            .collect();
+
+        candidates.sort_unstable_by(|a, b| {
+            if a.1 && !b.1 {
+                std::cmp::Ordering::Less
+            } else if !a.1 && b.1 {
+                std::cmp::Ordering::Greater
+            } else {
+                a.2.cmp(&b.2)
+            }
+        });
+
+        let removed_count = candidates.iter().take(excess_count).filter(|(inode, _, _)| {
+            inode_map.remove(inode).is_some()
+        }).count();
+
+        debug!("Identity Map eviction complete. Removed {} entries (Target: {}).", removed_count, excess_count);
+    } else {
+        inode_map.retain(|_, v| !v.should_evict(current_global_seq));
     }
-    if let Some(entry) = inode_map.get_entry_clone(inode) {
-        dir_map.put(inode, entry.path.clone());
-        return Some(entry.path);
+}
+
+pub fn update_map(
+    inode_map: &ShardedInodeMap,
+    dir_map: &ShardedDirMap,
+    _dev: u32,
+    inode: u64,
+    rel_path: PathBuf,
+    generation: u32,
+    is_synthetic: bool,
+    is_dir: bool,
+    timestamp_ns: u64,
+    seq_num: u64,
+) {
+    if inode == 0 { return; }
+    
+    if is_dir {
+        dir_map.insert(inode, rel_path.clone());
+    }
+
+    match inode_map.entry(inode) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            let e = entry.get();
+            e.add_path(rel_path);
+            e.record_access(seq_num);
+        },
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(IdentityEntry::new(rel_path, generation, timestamp_ns, seq_num));
+        }
+    }
+
+    if is_synthetic {
+        metrics::SYNTHETIC_IDENTITY_FILES.inc();
+    }
+}
+
+pub fn update_map_after_rename(
+    inode_map: &ShardedInodeMap,
+    dir_map: &ShardedDirMap,
+    _dev: u32,
+    inode: u64,
+    new_rel_path: PathBuf,
+    generation: u32,
+    is_dir: bool,
+    timestamp_ns: u64,
+    seq_num: u64,
+) {
+    if inode == 0 { return; }
+
+    match inode_map.entry(inode) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            let e = entry.get();
+            e.add_path(new_rel_path.clone());
+            *e.generation.write() = generation;
+            *e.timestamp_ns.write() = timestamp_ns;
+            *e.seq_num.write() = seq_num;
+            e.record_access(seq_num);
+        },
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(IdentityEntry::new(new_rel_path.clone(), generation, timestamp_ns, seq_num));
+        }
+    }
+
+    if is_dir {
+        dir_map.insert(inode, new_rel_path);
+    }
+}
+
+pub fn remove_entry(inode_map: &ShardedInodeMap, dir_map: &ShardedDirMap, _dev: u32, inode: u64) {
+    if inode == 0 { return; }
+    if let Some(entry) = inode_map.get(&inode) {
+        entry.record_unlinked();
+    }
+    dir_map.remove(&inode);
+}
+
+pub fn resolve_live_path(source: &Arc<crate::mirror::SourceInfo>, inode: u64, generation: u32) -> Option<PathBuf> {
+    if let Some(index) = &source.identity_index {
+        if let Some(rel_path) = index.resolve(inode) {
+            return Some(rel_path);
+        }
+    }
+    if let Some(entry) = source.inode_map.get(&inode) {
+        let entry_gen = *entry.generation.read();
+        if entry_gen == std::u32::MAX || entry_gen == generation {
+            return Some(entry.primary_path());
+        }
+    }
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    if let Ok(root_file) = File::open(&source.mount) {
+        let fd = root_file.as_raw_fd();
+        match crate::operations::btrfs_resolve_inode(fd, inode) {
+            Ok(path) => {
+                if let Some(ref root_offset) = source.fs_root_relative_path {
+                    if let Ok(stripped) = path.strip_prefix(root_offset) {
+                        return Some(stripped.to_path_buf());
+                    }
+                }
+                return Some(path);
+            },
+            Err(_) => {}
+        }
     }
     None
 }
-pub fn resolve_and_update_path(
-    source: &crate::mirror::SourceInfo,
-    inode: u64,
-    generation_hint: u32,
-    ts_hint: u64,
-    seq_hint: u64
-) -> io::Result<PathBuf> {
-    let start_time = std::time::Instant::now();
-    let _timer = metrics::INODE_LOOKUP_DURATION.start_timer();
 
-    // FIX 3: Conditional Debounce Check
-    if let Some(entry) = RECENT_LOOKUPS.get(&inode) {
-        let (last_time, path, last_seq) = entry.value();
-        
-        // Skip debounce if:
-        // 1. The incoming event sequence number is newer than the last recorded successful lookup sequence.
-        // 2. The last recorded sequence was a failure marker (u64::MAX), forcing a retry anyway.
-        let skip_debounce = seq_hint > *last_seq || *last_seq == u64::MAX;
-        
-        if !skip_debounce && last_time.elapsed() < LOOKUP_DEBOUNCE_DURATION {
-            debug!("IDENTITY: Debounced aggressive lookup for Inode {} -> {:?}. Cached for {:?}.", inode, path, start_time.elapsed());
-            source.inode_map.put(inode, IdentityEntry::new(path.clone(), generation_hint, ts_hint, seq_hint));
-            return Ok(path.clone());
-        }
-        
-        // If we skip the debounce, it means we must proceed with the expensive walk.
-        // We temporarily clear the aggressive lookup cache entry before the walk to avoid re-triggering.
-        if skip_debounce {
-             drop(entry); // Release read lock before remove
-             RECENT_LOOKUPS.remove(&inode);
-        }
+pub fn resolve_and_update_path(source: &Arc<crate::mirror::SourceInfo>, inode: u64, generation: u32, timestamp_ns: u64, seq_num: u64) -> Result<PathBuf> {
+    if let Some(live_path) = resolve_live_path(source, inode, generation) {
+        let is_dir = std::fs::metadata(&source.mount.join(&live_path)).map(|m| m.is_dir()).unwrap_or(false);
+        update_map(&source.inode_map, &source.dir_map, source.dev, inode, live_path.clone(), generation, false, is_dir, timestamp_ns, seq_num);
+        return Ok(live_path);
     }
-
-    if let Some(watcher) = &source.identity_watcher {
-        if let Some(path) = watcher.resolve(inode) {
-             debug!("IDENTITY: Reverse Index HIT for Inode {} -> {:?}", inode, path);
-             source.inode_map.put(inode, IdentityEntry::new(path.clone(), generation_hint, ts_hint, seq_hint));
-             RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone(), seq_hint)); // Update cache
-             return Ok(path);
-        }
-    }
-    debug!("IDENTITY: Starting aggressive lookup for Inode {} in {:?}", inode, source.mount);
-    let mut found_path = None;
-    for entry in walkdir::WalkDir::new(&source.mount).min_depth(1) {
-        if let Ok(entry) = entry {
-            if entry.depth() > 20 { continue; }
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.ino() == inode {
-                    if let Ok(rel_path) = entry.path().strip_prefix(&source.mount) {
-                        found_path = Some(rel_path.to_path_buf());
-                        let rel_path_buf = rel_path.to_path_buf();
-                        source.inode_map.put(inode, IdentityEntry::new(rel_path_buf.clone(), generation_hint, ts_hint, seq_hint));
-                        if metadata.is_dir() {
-                             source.dir_map.put(inode, rel_path_buf.clone());
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(path) = found_path {
-        RECENT_LOOKUPS.insert(inode, (Instant::now(), path.clone(), seq_hint)); // Update cache with successful path
-        if fs::metadata(source.mount.join(&path)).is_ok() {
-            return Ok(path);
-        }
-    }
-    // Record lookup failure time
-    RECENT_LOOKUPS.insert(inode, (Instant::now(), PathBuf::from(""), u64::MAX)); // Record failure, use u64::MAX for seq to ensure next event always forces a retry
-
-    warn!("IDENTITY: Failed to resolve Inode {} after full walk. Duration: {:?}", inode, start_time.elapsed());
-    Err(io::Error::new(io::ErrorKind::NotFound, "Inode not found after aggressive search."))
+    Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Failed to resolve or update path for inode {}", inode))))
 }

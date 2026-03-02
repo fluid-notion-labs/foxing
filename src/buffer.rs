@@ -1,117 +1,282 @@
-use std::alloc::{alloc, dealloc, Layout, handle_alloc_error};
+use std::alloc::{alloc, dealloc, Layout};
 use std::{ops::{Deref, DerefMut}, slice};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, Ordering};
-use tracing::{debug, error};
+use tracing::{debug, error, trace, info};
+use crate::metrics::{GLOBAL_BUFFER_COUNT, GLOBAL_BUFFER_LIMIT, GLOBAL_MEMORY_USAGE_BYTES};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::cell::UnsafeCell;
+use crossbeam::queue::ArrayQueue;
+use crate::error::{FoxingError, Result};
+use crate::constants;
+use std::ptr;
+
 pub struct AlignedBuffer {
     ptr: *mut u8,
     layout: Layout,
     capacity: usize,
-    len: usize
+    len: AtomicUsize
 }
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
+
 impl AlignedBuffer {
-    pub fn new(capacity: usize) -> Self {
-        let layout = Layout::from_size_align(capacity, 4096).unwrap();
+    pub fn try_new(capacity: usize, alignment: usize) -> Result<Self> {
+        // Fix: Limit is already in bytes, don't multiply by 1024*1024 again
+        let limit_bytes = GLOBAL_BUFFER_LIMIT.get() as u64;
+        let align = alignment.max(constants::MINIMUM_ALIGNMENT_BYTES);
+        let actual_capacity = capacity.max(align);
+        
+        let _prev = GLOBAL_BUFFER_COUNT.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current| {
+                if current + actual_capacity as u64 > limit_bytes {
+                    None
+                } else {
+                    Some(current + actual_capacity as u64)
+                }
+            }
+        ).map_err(|_| FoxingError::MemoryExhausted(format!(
+            "Global memory limit exceeded. Refusing allocation of {} bytes.", capacity
+        )))?;
+
+        // Update Prometheus Gauge
+        GLOBAL_MEMORY_USAGE_BYTES.add(actual_capacity as f64);
+
+        let layout = Layout::from_size_align(actual_capacity, align)
+            .map_err(|_e| {
+                GLOBAL_BUFFER_COUNT.fetch_sub(actual_capacity as u64, Ordering::SeqCst);
+                GLOBAL_MEMORY_USAGE_BYTES.sub(actual_capacity as f64);
+                FoxingError::System(nix::Error::from(nix::errno::Errno::EINVAL))
+            })?;
+            
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
-            handle_alloc_error(layout);
+            GLOBAL_BUFFER_COUNT.fetch_sub(actual_capacity as u64, Ordering::SeqCst);
+            GLOBAL_MEMORY_USAGE_BYTES.sub(actual_capacity as f64);
+            return Err(FoxingError::MemoryExhausted("Physical memory allocation failed".to_string()));
         }
-        Self { ptr, layout, capacity, len: 0 }
+        unsafe { ptr::write_bytes(ptr, 0, actual_capacity); }
+        trace!("AlignedBuffer: Allocated {} bytes.", actual_capacity);
+        Ok(Self {
+            ptr,
+            layout,
+            capacity: actual_capacity,
+            len: AtomicUsize::new(0)
+        })
     }
+    #[inline(always)]
+    pub fn clear(&self) {
+        self.len.store(0, Ordering::Release);
+    }
+    #[inline(always)]
     pub fn capacity(&self) -> usize { self.capacity }
-    pub fn set_full_len(&mut self) { self.len = self.capacity; }
-    pub fn clear(&mut self) { self.len = 0; }
-    pub fn ptr(&self) -> *mut u8 { self.ptr }
-    pub unsafe fn capacity_slice_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            slice::from_raw_parts_mut(self.ptr, self.capacity)
+    #[inline(always)]
+    pub fn set_full_len(&self) {
+        self.len.store(self.capacity, Ordering::Release);
+    }
+    #[inline(always)]
+    pub fn set_len(&self, len: usize) {
+        if len > self.capacity {
+            panic!("AlignedBuffer::set_len: {} exceeds capacity {}", len, self.capacity);
         }
+        self.len.store(len, Ordering::Release);
+    }
+    #[inline(always)]
+    pub fn get_len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    pub fn ptr(&self) -> *mut u8 { self.ptr }
+    #[inline(always)]
+    pub fn alignment(&self) -> usize { self.layout.align() }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        let _prev = GLOBAL_BUFFER_COUNT.fetch_sub(self.capacity as u64, Ordering::SeqCst);
+        GLOBAL_MEMORY_USAGE_BYTES.sub(self.capacity as f64);
+        unsafe { dealloc(self.ptr, self.layout); }
     }
 }
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) { unsafe { dealloc(self.ptr, self.layout); } }
-}
+
 impl Deref for AlignedBuffer {
     type Target = [u8];
-    fn deref(&self) -> &Self::Target { unsafe { slice::from_raw_parts(self.ptr, self.len) } }
+    fn deref(&self) -> &Self::Target {
+        unsafe { slice::from_raw_parts(self.ptr, self.get_len()) }
+    }
 }
+
 impl DerefMut for AlignedBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target { unsafe { slice::from_raw_parts_mut(self.ptr, self.len) } }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.get_len()) }
+    }
 }
-pub struct BufferPool {
-    // The actual memory buffers, held in a Box to ensure they are pinned/stable.
-    // The Box<Vec<..>> ensures that the Vec itself doesn't move, which is critical
-    // once the addresses are registered with io_uring.
-    buffers: Box<Vec<AlignedBuffer>>,
-    // A list of indices (u16) representing available buffers.
-    free_list: VecDeque<u16>,
-    // The current number of in-flight buffers (used in metrics, mostly).
-    in_flight_count: AtomicU16,
-    // The size of each chunk.
+
+enum QueueStrategy {
+    Shared(ArrayQueue<u16>),
+    Local(UnsafeCell<Vec<u16>>),
+}
+unsafe impl Send for QueueStrategy {}
+unsafe impl Sync for QueueStrategy {}
+
+struct BufferPoolInner {
+    buffers: Vec<UnsafeCell<AlignedBuffer>>,
+    free_indices: QueueStrategy,
+    capacity: usize,
     chunk_size: usize,
+    alignment: usize,
 }
+unsafe impl Sync for BufferPoolInner {}
+unsafe impl Send for BufferPoolInner {}
+
+#[derive(Clone)]
+pub struct BufferPool {
+    inner: Arc<BufferPoolInner>,
+}
+
 impl BufferPool {
-    pub fn new(num_buffers: usize, chunk_size: usize) -> Self {
-        let mut buffers = Vec::with_capacity(num_buffers);
-        for _ in 0..num_buffers {
-            buffers.push(AlignedBuffer::new(chunk_size));
-        }
-        let mut free_list = VecDeque::with_capacity(num_buffers);
-        for i in 0..num_buffers {
-            // io_uring 0.7.x uses u16 for buffer IDs
-            free_list.push_back(i as u16);
-        }
-        debug!("BufferPool initialized with {} buffers of {} bytes each.", num_buffers, chunk_size);
-        Self {
-            buffers: Box::new(buffers),
-            free_list,
-            in_flight_count: AtomicU16::new(0),
-            chunk_size,
-        }
+    pub fn new(requested_buffers: usize, requested_chunk_size: usize, alignment: usize) -> Result<Self> {
+        Self::create_pool(requested_buffers, requested_chunk_size, alignment, false)
     }
-    pub fn capacity(&self) -> usize { self.buffers.len() }
-    pub fn chunk_size(&self) -> usize { self.chunk_size }
-    // Get the raw pointer for the buffer at the given index.
-    pub fn get_ptr(&self, index: u16) -> *mut u8 {
-        self.buffers[index as usize].ptr()
+    pub fn new_local(requested_buffers: usize, requested_chunk_size: usize, alignment: usize) -> Result<Self> {
+        Self::create_pool(requested_buffers, requested_chunk_size, alignment, true)
     }
-    // Get the size of the memory block
+    fn create_pool(requested_buffers: usize, requested_chunk_size: usize, alignment: usize, local_mode: bool) -> Result<Self> {
+        if requested_buffers > 65535 {
+            return Err(FoxingError::Config("BufferPool: max 65535 buffers allowed".to_string()));
+        }
+        let align = alignment.max(constants::MINIMUM_ALIGNMENT_BYTES);
+        let min_chunk_size = 4096;
+        let strategies = [
+            (requested_buffers, requested_chunk_size),
+            (requested_buffers / 2, requested_chunk_size),
+            (requested_buffers / 4, requested_chunk_size),
+            (requested_buffers, requested_chunk_size / 2),
+            (requested_buffers / 2, requested_chunk_size / 2),
+            (8, min_chunk_size),
+        ];
+        
+        for (count, size) in strategies {
+            if count < 2 || size < min_chunk_size { continue; }
+            let mut buffers = Vec::with_capacity(count);
+            let mut allocated_successfully = true;
+            for i in 0..count {
+                match AlignedBuffer::try_new(size, align) {
+                    Ok(buf) => buffers.push(UnsafeCell::new(buf)),
+                    Err(e) => {
+                        debug!("BufferPool: Allocation failed at buffer {} of {}: {:?}", i, count, e);
+                        allocated_successfully = false;
+                        break;
+                    }
+                }
+            }
+            if !allocated_successfully { continue; }
+            
+            let actual_capacity = buffers.len();
+            let queue = if local_mode {
+                let mut v = Vec::with_capacity(actual_capacity);
+                for i in 0..actual_capacity {
+                    v.push(i as u16);
+                }
+                QueueStrategy::Local(UnsafeCell::new(v))
+            } else {
+                let q = ArrayQueue::new(actual_capacity);
+                for i in 0..actual_capacity {
+                    let _ = q.push(i as u16);
+                }
+                QueueStrategy::Shared(q)
+            };
+            
+            let total_mb = (actual_capacity as u64 * size as u64) / 1024 / 1024;
+            info!("BufferPool: Allocated {} x {}KB buffers ({}MB total, Mode: {})",
+                  actual_capacity, size / 1024, total_mb, if local_mode { "Thread-Local" } else { "Shared" });
+            crate::metrics::BUFFER_POOL_CAPACITY.set(actual_capacity as f64);
+            crate::metrics::BUFFER_POOL_CHUNK_SIZE.set(size as f64);
+            crate::metrics::BUFFER_POOL_TOTAL_BYTES.set((actual_capacity as u64 * size as u64) as f64);
+            
+            return Ok(Self {
+                inner: Arc::new(BufferPoolInner {
+                    buffers,
+                    free_indices: queue,
+                    capacity: actual_capacity,
+                    chunk_size: size,
+                    alignment: align,
+                })
+            });
+        }
+        Err(FoxingError::MemoryExhausted("BufferPool: All allocation strategies failed.".to_string()))
+    }
+    
+    #[inline(always)]
+    pub fn capacity(&self) -> usize { self.inner.capacity }
+    #[inline(always)]
+    pub fn chunk_size(&self) -> usize { self.inner.chunk_size }
+    #[inline(always)]
+    pub fn alignment(&self) -> usize { self.inner.alignment }
+    #[inline(always)]
+    pub fn get_ptr(&self, index: u16) -> Option<*mut u8> {
+        self.inner.buffers.get(index as usize).map(|cell| {
+            unsafe { (*cell.get()).ptr() }
+        })
+    }
+    #[inline(always)]
     pub fn get_len(&self, index: u16) -> usize {
-        self.buffers[index as usize].len
+        if let Some(cell) = self.inner.buffers.get(index as usize) {
+            unsafe { (*cell.get()).get_len() }
+        } else {
+            0
+        }
     }
-    pub fn set_len(&mut self, index: u16, len: usize) {
-        self.buffers[index as usize].len = len;
+    #[inline(always)]
+    pub fn set_len(&self, index: u16, len: usize) {
+        if let Some(cell) = self.inner.buffers.get(index as usize) {
+            unsafe {
+                let buf = &*cell.get();
+                buf.set_len(len);
+            }
+        }
     }
-    // Get the address of the underlying buffer data for io_uring registration (iovec array)
     pub fn as_io_vecs(&mut self) -> Vec<libc::iovec> {
-        self.buffers.iter_mut().map(|buf| {
-            libc::iovec { iov_base: buf.ptr() as _, iov_len: buf.capacity() }
+        self.inner.buffers.iter().map(|cell| {
+            unsafe {
+                let buf = &*cell.get();
+                libc::iovec { iov_base: buf.ptr() as _, iov_len: buf.capacity() }
+            }
         }).collect()
     }
-    // Attempts to acquire a free buffer index (u16).
-    pub fn acquire(&mut self) -> Option<u16> {
-        let index = self.free_list.pop_front();
-        if index.is_some() {
-            self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+    #[inline]
+    pub fn acquire(&self) -> Option<u16> {
+        match &self.inner.free_indices {
+            QueueStrategy::Shared(q) => q.pop(),
+            QueueStrategy::Local(cell) => {
+                let vec = unsafe { &mut *cell.get() };
+                vec.pop()
+            }
         }
-        index
     }
-    // Releases a buffer index back to the pool.
-    pub fn release(&mut self, index: u16) {
-        if index as usize >= self.buffers.len() {
-            error!("Attempted to release invalid buffer index: {}", index);
-            return;
+    #[inline]
+    pub fn release(&self, index: u16) {
+        if let Some(cell) = self.inner.buffers.get(index as usize) {
+            unsafe { (*cell.get()).clear(); }
+            match &self.inner.free_indices {
+                QueueStrategy::Shared(q) => {
+                    let _ = q.push(index);
+                },
+                QueueStrategy::Local(c) => {
+                    let vec = unsafe { &mut *c.get() };
+                    vec.push(index);
+                }
+            }
+        } else {
+            error!("BufferPool: Attempted to release invalid index {}", index);
         }
-        self.buffers[index as usize].clear();
-        self.free_list.push_back(index);
-        self.in_flight_count.fetch_sub(1, Ordering::Relaxed);
     }
-    pub fn is_empty(&self) -> bool {
-        self.free_list.is_empty()
-    }
+    #[inline]
     pub fn free_count(&self) -> usize {
-        self.free_list.len()
+        match &self.inner.free_indices {
+            QueueStrategy::Shared(q) => q.len(),
+            QueueStrategy::Local(c) => unsafe { (*c.get()).len() },
+        }
     }
 }

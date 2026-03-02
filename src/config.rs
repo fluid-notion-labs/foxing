@@ -1,489 +1,463 @@
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, fs, sync::{Arc, atomic::AtomicBool}, collections::HashSet};
-use crate::error::{Result, FoxingError as MirrorError};
-use regex::RegexSet;
-use sysinfo::{System};
-use nix::sys::statfs::statfs;
+use std::path::{PathBuf, Path};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use regex::Regex;
+use crate::error::{Result, FoxingError};
+use tracing::{info, warn, debug, error};
+use crate::security;
+use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
+use lazy_static::lazy_static;
+use crate::constants;
+use clap::ValueEnum;
 
-pub const MAX_FAILURE_BACKOFF: u64 = 600;
-pub const ERROR_LIMITER_SECS: u64 = 60;
-const BASE_AUTOTUNE_VDO_THRESHOLD: u32 = 128;
-
-// Magic numbers for filesystem types (from linux/magic.h)
-const TMPFS_MAGIC: i64 = 0x01021994;
-const RAMFS_MAGIC: i64 = 0x858458f6;
-
-fn d_bool_false() -> bool { false }
-fn d_bool_true() -> bool { true }
-fn d_zero_usize() -> usize { 0 }
-fn d_zero_u64() -> u64 { 0 }
-fn d_zero_f64() -> f64 { 0.0 }
-fn d_mp() -> u16 { 9100 }
-fn d_st() -> u64 { 30 }
-fn def_abool() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
-fn d_zero_u32() -> u32 { 0 }
-
-fn d_journal_dir() -> PathBuf { PathBuf::new() } // Empty signals autotune
-fn d_journal_size_mb() -> u64 { 0 }
-fn d_journal_retention() -> usize { 0 }
-
-fn default_worker_count(sys: &System) -> usize {
-    sys.cpus().len().max(2)
-}
-fn default_global_buffer_limit_mb(sys: &System) -> u64 {
-    let total_mem = sys.total_memory() / 1024 / 1024;
-    (total_mem as f64 * 0.70) as u64
+#[derive(Debug)]
+pub struct SysSpecs {
+    pub logical_cores: usize,
+    pub total_memory_mb: u64,
+    pub available_memory_mb: u64,
 }
 
-#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemClass {
+    Constrained,
+    Standard,
+    Server,
+}
+
+impl SysSpecs {
+    fn detect() -> Self {
+        let mut s = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything())
+        );
+        s.refresh_memory();
+        Self {
+            logical_cores: s.cpus().len().max(1),
+            total_memory_mb: s.total_memory() / 1024 / 1024,
+            available_memory_mb: s.available_memory() / 1024 / 1024,
+        }
+    }
+    pub fn system_class(&self) -> SystemClass {
+        if self.total_memory_mb < 2048 {
+            SystemClass::Constrained
+        } else if self.total_memory_mb < 16384 {
+            SystemClass::Standard
+        } else {
+            SystemClass::Server
+        }
+    }
+}
+
+lazy_static! {
+    pub static ref SYS: SysSpecs = SysSpecs::detect();
+}
+
+fn default_worker_count() -> usize {
+    SYS.logical_cores.max(4).min(constants::MAX_WORKER_CORES)
+}
+fn default_queue_max() -> usize {
+    constants::DEFAULT_QUEUE_MAX
+}
+fn default_global_buffer_limit() -> u64 {
+    let total_mb = SYS.total_memory_mb;
+    let available_mb = SYS.available_memory_mb;
+    if total_mb < 2048 {
+        warn!("Running in Constrained Memory Mode (Total RAM: {} MB). Adjusting buffer limits aggressively.", total_mb);
+    }
+    let heuristic = (available_mb as f64 * 0.5) as u64;
+    heuristic.max(128)
+}
+fn default_metrics_port() -> u16 { 9100 }
+fn default_max_load_avg() -> f64 { (SYS.logical_cores as f64 * 2.5).max(4.0) }
+fn default_hydration_delay() -> u64 { 10 }
+fn default_psi_io() -> f64 { 10.0 }
+fn default_psi_cpu() -> f64 { 10.0 }
+fn default_capacity_check_interval() -> u64 { 5000 }
+fn default_capacity_threshold() -> u64 { constants::CAPACITY_THRESHOLD_MB }
+fn default_io_buffer_size() -> u64 { constants::DEFAULT_IO_BUFFER_SIZE_MIB }
+fn default_enable_hashing() -> bool { true }
+fn default_hash_threshold() -> u64 { 128 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum TargetProfile {
-    Auto,
     NVMe,
     SSD,
     HDD,
-    NFS,
     Network,
-}
-fn d_profile() -> TargetProfile { TargetProfile::Auto }
-
-pub fn autotune_buffer_chunk_size(profile: &TargetProfile, global_limit_mib: u64) -> u64 {
-    let base_mib = if global_limit_mib > 16384 { 8 } else { 2 };
-    match profile {
-        TargetProfile::NVMe => base_mib * 2,
-        TargetProfile::SSD => base_mib,
-        TargetProfile::Network | TargetProfile::NFS => base_mib,
-        TargetProfile::HDD | TargetProfile::Auto => base_mib.max(1),
-    }
-}
-pub fn autotune_vdo_stall_threshold(profile: &TargetProfile) -> u32 {
-    match profile {
-        TargetProfile::NVMe => 1024,
-        TargetProfile::SSD => 512,
-        TargetProfile::HDD => 128,
-        TargetProfile::Network | TargetProfile::NFS => 256,
-        TargetProfile::Auto => BASE_AUTOTUNE_VDO_THRESHOLD,
-    }
+    NFS,
+    SdCard,
+    Auto,
 }
 
 pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
     match profile {
-        TargetProfile::NVMe => (1, 4),
-        TargetProfile::SSD => (2, 8),
-        TargetProfile::HDD => (4, 32),
-        TargetProfile::NFS => (2, 16),
-        TargetProfile::Network => (2, 16),
+        TargetProfile::NVMe => (1, 2),
+        TargetProfile::SSD => (2, 4),
+        TargetProfile::HDD => (4, 8),
+        TargetProfile::Network | TargetProfile::NFS => (8, 16),
+        TargetProfile::SdCard => (5, 10),
         TargetProfile::Auto => (2, 8),
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default="d_zero_usize")] pub worker_count: usize,
-    #[serde(default="d_zero_usize")] pub queue_max: usize,
-    #[serde(default="d_mp")] pub metrics_port: u16,
-    #[serde(default="d_st")] pub shutdown_timeout_secs: u64,
-    #[serde(default="d_zero_u64")] pub coalesce_max_bytes: u64,
-    #[serde(default="d_zero_u64")] pub capacity_threshold_mb: u64,
-    #[serde(default="d_zero_u64")] pub breaker_interval_secs: u64,
-    #[serde(default="d_bool_false")] pub fatal_metrics_bind: bool,
-    #[serde(default="d_zero_u64")] pub force_flush_interval_secs: u64,
-    #[serde(default="d_zero_u64")] pub global_buffer_limit: u64,
-    #[serde(default="d_bool_false")] pub quiesce_mode: bool,
-    #[serde(default="d_zero_f64")] pub max_system_load_avg: f64,
-    #[serde(default="d_zero_u64")] pub hydration_delay_ms: u64,
-    #[serde(default="String::new")] pub io_priority: String,
-    #[serde(default="d_zero_u64")] pub io_buffer_size_mib: u64,
-    #[serde(default="d_zero_f64")] pub governor_psi_io_threshold: f64,
-    #[serde(default="d_zero_f64")] pub governor_psi_cpu_threshold: f64,
-    
-    // [NEW] Journal Config
-    #[serde(default="d_journal_dir")] pub journal_dir: PathBuf,
-    #[serde(default="d_journal_size_mb")] pub journal_size_limit_mb: u64,
-    #[serde(default="d_journal_retention")] pub journal_retention_count: usize,
-    
-    #[serde(default="d_zero_usize", skip)] pub max_workers_sys: usize,
-    #[serde(default)] pub sources: Vec<SourceConfig>
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+    #[serde(default = "default_queue_max")]
+    pub queue_max: usize,
+    #[serde(default = "default_global_buffer_limit")]
+    pub global_buffer_limit: u64,
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    #[serde(default = "default_max_load_avg")]
+    pub max_system_load_avg: f64,
+    #[serde(default = "default_hydration_delay")]
+    pub hydration_delay_ms: u64,
+    #[serde(default = "default_psi_io")]
+    pub governor_psi_io_threshold: f64,
+    #[serde(default = "default_psi_cpu")]
+    pub governor_psi_cpu_threshold: f64,
+    #[serde(default = "default_capacity_check_interval")]
+    pub worker_capacity_check_interval_ms: u64,
+    #[serde(default = "default_capacity_threshold")]
+    pub capacity_threshold_mb: u64,
+    #[serde(default = "default_io_buffer_size")]
+    pub io_buffer_size_mib: u64,
+    #[serde(default = "default_enable_hashing")]
+    pub enable_content_hashing: bool,
+    #[serde(default = "default_hash_threshold")]
+    pub hash_lite_threshold_kb: u64,
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            worker_count: default_worker_count(),
+            queue_max: default_queue_max(),
+            global_buffer_limit: default_global_buffer_limit(),
+            metrics_port: default_metrics_port(),
+            max_system_load_avg: default_max_load_avg(),
+            hydration_delay_ms: default_hydration_delay(),
+            governor_psi_io_threshold: default_psi_io(),
+            governor_psi_cpu_threshold: default_psi_cpu(),
+            worker_capacity_check_interval_ms: default_capacity_check_interval(),
+            capacity_threshold_mb: default_capacity_threshold(),
+            io_buffer_size_mib: default_io_buffer_size(),
+            enable_content_hashing: default_enable_hashing(),
+            hash_lite_threshold_kb: default_hash_threshold(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    fn validate(&mut self) -> Result<()> {
+        let global_limit = self.global_buffer_limit;
+        let total_workers = self.worker_count;
+        let io_buffer_mib = self.io_buffer_size_mib;
+        
+        let required_mem_mib = (total_workers as u64) * io_buffer_mib;
+        if required_mem_mib > global_limit {
+            let recommended_mib = global_limit / total_workers as u64;
+            self.io_buffer_size_mib = recommended_mib.max(1);
+            warn!(
+                "Config Validation Warning: Total IO Buffer size ({} MB) required by {} workers ({} MB each) exceeds global_buffer_limit ({} MB).",
+                required_mem_mib, total_workers, io_buffer_mib, global_limit
+            );
+            warn!("Automatically reducing io_buffer_size_mib to {} MB.", self.io_buffer_size_mib);
+        }
+
+        let max_events_by_mem = (global_limit * 1024) / constants::EVENT_QUEUE_OVERHEAD_BYTES;
+        if (self.queue_max as u64) > max_events_by_mem {
+            self.queue_max = max_events_by_mem.min(constants::DEFAULT_QUEUE_MAX as u64) as usize;
+            warn!(
+                "Config Validation Warning: Configured queue_max is too high for global_buffer_limit. Clamping to {} events based on memory budget.",
+                self.queue_max
+            );
+        }
+
+        let system_available_mb = SYS.available_memory_mb;
+        let minimum_required_available = (global_limit as f64 * 1.2) as u64;
+        
+        if system_available_mb < minimum_required_available {
+            error!(
+                "Config Validation Failure: System resource warning! Available physical memory ({} MB) is less than the required safe buffer target ({} MB, 1.2x global limit).", 
+                system_available_mb, minimum_required_available
+            );
+            return Err(FoxingError::Config(format!(
+                "System OOM risk detected: Available RAM ({} MB) < Safe Buffer Target ({} MB). Reduce global_buffer_limit.", 
+                system_available_mb, minimum_required_available
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn load(path: &str) -> Result<Self> {
+        let content = std::fs::read_to_string(path).map_err(FoxingError::Io)?;
+        let mut config: Config = toml::from_str(&content)
+            .map_err(|e| FoxingError::Config(format!("Failed to parse TOML: {}", e)))?;
+        
+        config.validate()?;
+
+        let physical_ram_mb = SYS.total_memory_mb;
+        let absolute_max_mb = (physical_ram_mb as f64 * 0.7) as u64;
+        
+        if config.global_buffer_limit > absolute_max_mb {
+            warn!(
+                "Config Warning: global_buffer_limit ({} MB) exceeds recommended safe limit (70% RAM: {} MB). \
+                Daemon will attempt startup but may encounter memory pressure. Auto-clamping to this limit.", 
+                config.global_buffer_limit, absolute_max_mb
+            );
+            config.global_buffer_limit = absolute_max_mb;
+            warn!("Auto-clamped global_buffer_limit to {} MB.", config.global_buffer_limit);
+        }
+
+        if config.capacity_threshold_mb != constants::CAPACITY_THRESHOLD_MB {
+            debug!("Using custom capacity_threshold_mb: {} (Default: {} MB)", config.capacity_threshold_mb, constants::CAPACITY_THRESHOLD_MB);
+        }
+
+        crate::hashing::set_hashing_enabled(config.enable_content_hashing);
+        crate::hashing::set_lite_threshold_kb(config.hash_lite_threshold_kb);
+
+        if !config.enable_content_hashing {
+            warn!("Content hashing DISABLED. Falling back to mtime-based verification. Risk of silent data corruption on timestamp clamping filesystems.");
+        } else {
+            info!("Content hashing ENABLED. Lite hash threshold: {} KB", config.hash_lite_threshold_kb);
+        }
+
+        for sc in config.sources.iter_mut() {
+            sc.rwf_uncached_ok.store(security::probe_rwf_uncached(&sc.path), Ordering::Relaxed);
+            for tc in sc.targets.iter_mut() {
+                if let Ok(rel_target) = tc.path.strip_prefix(&sc.path) {
+                    let rel_str = rel_target.to_string_lossy().to_string();
+                    if !rel_str.is_empty() {
+                        let already_excluded = tc.exclude.contains(&rel_str);
+                        if !already_excluded {
+                            info!("Config: Detected Target {:?} is inside Source {:?}. Auto-adding exclusion.", tc.path, sc.path);
+                            tc.exclude.push(rel_str);
+                        }
+                    }
+                }
+                tc.rwf_uncached_ok.store(security::probe_rwf_uncached(&tc.path), Ordering::Relaxed);
+                tc.direct_io_ok.store(security::probe_direct_io(&tc.path), Ordering::Relaxed);
+                tc.compile(config.worker_count, config.io_buffer_size_mib)?;
+            }
+        }
+
+        info!("Configuration loaded successfully.");
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub path: PathBuf,
+    #[serde(default)]
     pub targets: Vec<TargetConfig>,
-    #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
-}
-#[derive(Clone, Deserialize, Serialize, Debug)]
-pub struct TargetConfig {
-    pub path: PathBuf,
-    #[serde(default="d_profile")] pub profile: TargetProfile,
-    #[serde(default="d_bool_true")] pub initial_sync: bool,
-    #[serde(default="d_bool_false")] pub vdo_optimization: bool,
-    #[serde(default="d_bool_false")] pub btrfs_compression: bool,
-    #[serde(default="d_bool_false")] pub f2fs_compression: bool,
-    #[serde(default="d_bool_false")] pub f2fs_pinning: bool,
-    #[serde(default="d_bool_false")] pub enable_versioning: bool,
-    #[serde(default="d_bool_true")] pub paranoid_deduplication: bool,
-    #[serde(default="d_zero_usize")] pub max_versions: usize,
-    #[serde(default="d_zero_u64")] pub max_versions_size_mb: u64,
-    #[serde(default)] pub version_excludes: Vec<String>,
-    #[serde(default)] pub version_includes: Vec<String>,
-    #[serde(default="d_bool_false")] pub force_versioning: bool,
-    #[serde(default)] pub force_version_includes: Vec<String>,
-    pub force_retention_count: Option<usize>,
-    #[serde(default="d_zero_usize")] pub worker_count: usize,
-    #[serde(default="d_zero_usize")] pub queue_max: usize,
-    #[serde(default="d_zero_usize")] pub batch_size: usize,
-    #[serde(default="d_zero_u64")] pub io_buffer_size_mib: u64,
-    #[serde(default="d_zero_u64")] pub autotune_target_latency_ms: u64,
-    #[serde(default)] pub excludes: Vec<String>,
-    #[serde(default)] pub includes: Vec<String>,
-    #[serde(skip)] regex_ex: Option<RegexSet>,
-    #[serde(skip)] regex_in: Option<RegexSet>,
-    #[serde(skip)] regex_vex: Option<RegexSet>,
-    #[serde(skip)] regex_vin: Option<RegexSet>,
-    #[serde(skip)] regex_force_vin: Option<RegexSet>,
-    #[serde(skip, default="def_abool")] pub supports_reflink: Arc<AtomicBool>,
-    #[serde(skip, default="def_abool")] pub direct_io_ok: Arc<AtomicBool>,
-    #[serde(skip, default="def_abool")] pub rwf_uncached_ok: Arc<AtomicBool>,
-    #[serde(skip, default="def_abool")] pub xattr_supported: Arc<AtomicBool>,
-    #[serde(default = "d_zero_u32")] pub vdo_stall_threshold: u32,
-    #[serde(default="d_zero_u64")] pub ordering_max_pending_bytes: u64,
-    #[serde(default="d_zero_usize")] pub ordering_scan_depth: usize,
-    #[serde(default="d_zero_u64")] pub worker_hibernation_secs: u64,
-    #[serde(default="d_zero_u64")] pub worker_flush_interval_ms: u64,
-    #[serde(default="d_zero_u64")] pub worker_gap_recovery_secs: u64,
-    #[serde(default="d_zero_usize")] pub worker_critical_drain_threshold: usize,
-    #[serde(default="d_zero_u64")] pub worker_capacity_check_interval_ms: u64,
-    #[serde(default="d_zero_u64")] pub worker_gap_recovery_batch: u64,
-    #[serde(default="d_zero_u64")] pub worker_gap_recovery_max_backoff: u64,
-    #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_startup_mb: u64,
-    #[serde(default="d_zero_u64")] pub hydration_large_file_threshold_drain_mb: u64,
+    #[serde(skip, default)]
+    pub rwf_uncached_ok: Arc<AtomicBool>,
+    #[serde(default)]
+    pub cross_subvolumes: bool,
 }
 
-// Manually implement Default for TargetConfig because Arc<AtomicBool> and RegexSet are tricky
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetConfig {
+    pub path: PathBuf,
+    pub profile: TargetProfile,
+    #[serde(default = "TargetConfig::default_autotune_latency")]
+    pub autotune_target_latency_ms: u64,
+    #[serde(default)]
+    pub target_bandwidth_mbps: Option<u64>,
+    #[serde(default)]
+    pub target_iops: Option<u64>,
+    #[serde(default)]
+    pub initial_sync: bool,
+    #[serde(skip, default)]
+    pub supports_reflink: Arc<AtomicBool>,
+    #[serde(default)]
+    pub vdo_optimization: bool,
+    #[serde(default = "TargetConfig::default_vdo_stall_threshold")]
+    pub vdo_stall_threshold: u32,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub enable_versioning: bool,
+    #[serde(default = "TargetConfig::default_max_versions")]
+    pub max_versions: usize,
+    #[serde(default = "TargetConfig::default_max_versions_size_mb")]
+    pub max_versions_size_mb: u64,
+    #[serde(default)]
+    pub force_retention_files: Vec<String>,
+    #[serde(default = "TargetConfig::default_force_retention_count")]
+    pub force_retention_count: usize,
+    #[serde(default = "TargetConfig::default_worker_count")]
+    pub worker_count: usize,
+    #[serde(default = "TargetConfig::default_batch_size")]
+    pub batch_size: usize,
+    
+    // CHANGED: MS -> US
+    #[serde(default = "TargetConfig::default_flush_interval")]
+    pub worker_flush_interval_us: u64,
+    
+    #[serde(default = "TargetConfig::default_io_buffer_size_mib")]
+    pub io_buffer_size_mib: u64,
+    #[serde(default = "TargetConfig::default_ordering_scan_depth")]
+    pub ordering_scan_depth: usize,
+    #[serde(default = "TargetConfig::default_hibernation_secs")]
+    pub worker_hibernation_secs: u64,
+    #[serde(default = "TargetConfig::default_retry_initial_ms")]
+    pub worker_retry_initial_ms: u64,
+    #[serde(default = "TargetConfig::default_retry_max_ms")]
+    pub worker_retry_max_ms: u64,
+    #[serde(default = "TargetConfig::default_atomic_writes")]
+    pub atomic_writes: bool,
+    #[serde(default = "TargetConfig::default_source_uncached")]
+    pub source_uncached: bool,
+    #[serde(default = "TargetConfig::default_target_uncached")]
+    pub target_uncached: bool,
+    #[serde(skip, default)]
+    pub xattr_supported: Arc<AtomicBool>,
+    #[serde(skip, default)]
+    pub direct_io_ok: Arc<AtomicBool>,
+    #[serde(skip, default)]
+    pub rwf_uncached_ok: Arc<AtomicBool>,
+    #[serde(skip, default)]
+    pub rwf_atomic_ok: Arc<AtomicBool>,
+    #[serde(skip)]
+    pub include_regexes: Vec<Regex>,
+    #[serde(skip)]
+    pub exclude_regexes: Vec<Regex>,
+    #[serde(skip)]
+    pub force_retention_regexes: Vec<Regex>,
+    #[serde(skip, default)]
+    pub label: Arc<str>,
+}
+
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::new(),
-            profile: d_profile(),
-            initial_sync: d_bool_true(),
-            vdo_optimization: d_bool_false(),
-            btrfs_compression: d_bool_false(),
-            f2fs_compression: d_bool_false(),
-            f2fs_pinning: d_bool_false(),
-            enable_versioning: d_bool_false(),
-            paranoid_deduplication: d_bool_true(),
-            max_versions: d_zero_usize(),
-            max_versions_size_mb: d_zero_u64(),
-            version_excludes: Vec::new(),
-            version_includes: Vec::new(),
-            force_versioning: d_bool_false(),
-            force_version_includes: Vec::new(),
-            force_retention_count: None,
-            worker_count: d_zero_usize(),
-            queue_max: d_zero_usize(),
-            batch_size: d_zero_usize(),
-            io_buffer_size_mib: d_zero_u64(),
-            autotune_target_latency_ms: d_zero_u64(),
-            excludes: Vec::new(),
-            includes: Vec::new(),
-            regex_ex: None,
-            regex_in: None,
-            regex_vex: None,
-            regex_vin: None,
-            regex_force_vin: None,
-            supports_reflink: def_abool(),
-            direct_io_ok: def_abool(),
-            rwf_uncached_ok: def_abool(),
-            xattr_supported: def_abool(),
-            vdo_stall_threshold: d_zero_u32(),
-            ordering_max_pending_bytes: d_zero_u64(),
-            ordering_scan_depth: d_zero_usize(),
-            worker_hibernation_secs: d_zero_u64(),
-            worker_flush_interval_ms: d_zero_u64(),
-            worker_gap_recovery_secs: d_zero_u64(),
-            worker_critical_drain_threshold: d_zero_usize(),
-            worker_capacity_check_interval_ms: d_zero_u64(),
-            worker_gap_recovery_batch: d_zero_u64(),
-            worker_gap_recovery_max_backoff: d_zero_u64(),
-            hydration_large_file_threshold_startup_mb: d_zero_u64(),
-            hydration_large_file_threshold_drain_mb: d_zero_u64(),
+            profile: TargetProfile::Auto,
+            autotune_target_latency_ms: TargetConfig::default_autotune_latency(),
+            target_bandwidth_mbps: None,
+            target_iops: None,
+            initial_sync: false,
+            supports_reflink: Arc::new(AtomicBool::new(false)),
+            vdo_optimization: false,
+            vdo_stall_threshold: TargetConfig::default_vdo_stall_threshold(),
+            include: vec![],
+            exclude: vec![],
+            enable_versioning: false,
+            max_versions: TargetConfig::default_max_versions(),
+            max_versions_size_mb: TargetConfig::default_max_versions_size_mb(),
+            force_retention_files: vec![],
+            force_retention_count: TargetConfig::default_force_retention_count(),
+            worker_count: TargetConfig::default_worker_count(),
+            batch_size: TargetConfig::default_batch_size(),
+            worker_flush_interval_us: TargetConfig::default_flush_interval(),
+            io_buffer_size_mib: TargetConfig::default_io_buffer_size_mib(),
+            ordering_scan_depth: TargetConfig::default_ordering_scan_depth(),
+            worker_hibernation_secs: TargetConfig::default_hibernation_secs(),
+            worker_retry_initial_ms: TargetConfig::default_retry_initial_ms(),
+            worker_retry_max_ms: TargetConfig::default_retry_max_ms(),
+            atomic_writes: TargetConfig::default_atomic_writes(),
+            source_uncached: TargetConfig::default_source_uncached(),
+            target_uncached: TargetConfig::default_target_uncached(),
+            xattr_supported: Arc::new(AtomicBool::new(false)),
+            direct_io_ok: Arc::new(AtomicBool::new(false)),
+            rwf_uncached_ok: Arc::new(AtomicBool::new(false)),
+            rwf_atomic_ok: Arc::new(AtomicBool::new(false)),
+            include_regexes: vec![],
+            exclude_regexes: vec![],
+            force_retention_regexes: vec![],
+            label: "".into(),
         }
     }
 }
 
 impl TargetConfig {
-    pub fn compile(&mut self, max_workers_sys: usize, global_mem_limit_mb: u64) -> Result<()> {
-        if self.worker_count == 0 {
-            self.worker_count = (max_workers_sys / 2).max(2);
+    fn default_worker_count() -> usize { 4 }
+    fn default_batch_size() -> usize { 64 }
+    
+    // CHANGED: Default is now 100,000us (100ms)
+    fn default_flush_interval() -> u64 { 100_000 }
+    
+    fn default_io_buffer_size_mib() -> u64 { 2 }
+    fn default_ordering_scan_depth() -> usize { 16 }
+    fn default_hibernation_secs() -> u64 { constants::DEFAULT_HIBERNATION_SECS }
+    fn default_retry_initial_ms() -> u64 { 5 }
+    fn default_retry_max_ms() -> u64 { 1000 }
+    fn default_vdo_stall_threshold() -> u32 { 1000 }
+    fn default_autotune_latency() -> u64 { 50 }
+    fn default_max_versions() -> usize { 24 }
+    fn default_max_versions_size_mb() -> u64 { 1024 }
+    fn default_force_retention_count() -> usize { 100 }
+    fn default_atomic_writes() -> bool { false }
+    fn default_source_uncached() -> bool { false }
+    fn default_target_uncached() -> bool { false }
+
+    fn compile_filters(patterns: &[String]) -> Result<Vec<Regex>> {
+        patterns.iter().map(|p| {
+            let re_str = regex::escape(p).replace("\\*", ".*").replace("\\?", ".");
+            Regex::new(&re_str).map_err(|e| FoxingError::Config(format!("Invalid filter regex: {}: {}", p, e)))
+        }).collect()
+    }
+
+    pub fn compile(&mut self, default_workers: usize, default_io_buffer_mib: u64) -> Result<()> {
+        self.worker_count = self.worker_count.min(default_workers).max(1);
+        self.io_buffer_size_mib = self.io_buffer_size_mib.min(default_io_buffer_mib).max(1);
+        self.label = self.path.to_string_lossy().into();
+
+        let internal_excludes = vec![
+            ".foxing_reflink_probe*".to_string(),
+            ".foxing_latency_probe*".to_string(),
+            "*.tmp.*".to_string(),
+            "*.swap_tmp".to_string(),
+        ];
+        
+        for p in internal_excludes {
+            if !self.exclude.iter().any(|e| e == &p) {
+                self.exclude.push(p);
+            }
         }
-        if self.batch_size == 0 {
-            self.batch_size = match self.profile {
-                TargetProfile::NVMe => 256,
-                TargetProfile::SSD => 128,
-                TargetProfile::Network => 64,
-                _ => 32,
-            };
+
+        self.include_regexes = Self::compile_filters(&self.include)?;
+        self.exclude_regexes = Self::compile_filters(&self.exclude)?;
+        self.force_retention_regexes = Self::compile_filters(&self.force_retention_files)?;
+
+        // Ensure microsecond alignment if defaults were used
+        if self.worker_flush_interval_us == TargetConfig::default_flush_interval() {
+            let (min, _) = get_flush_multiplier_bounds(&self.profile);
+            // 50ms * multiplier -> microseconds
+            self.worker_flush_interval_us = (min as u64) * 50_000;
         }
-        if self.queue_max == 0 {
-            self.queue_max = match self.profile {
-                TargetProfile::NVMe => 1_000_000,
-                _ => 200_000,
-            };
-        }
-        if self.autotune_target_latency_ms == 0 {
-            self.autotune_target_latency_ms = match self.profile {
-                TargetProfile::NVMe => 10,
-                TargetProfile::SSD => 50,
-                _ => 200,
-            };
-        }
-        if self.ordering_max_pending_bytes == 0 {
-            let share = (global_mem_limit_mb * 1024 * 1024) / 5;
-            self.ordering_max_pending_bytes = share.max(128 * 1024 * 1024).min(2 * 1024 * 1024 * 1024);
-        }
-        if self.ordering_scan_depth == 0 {
-            self.ordering_scan_depth = 5000;
-        }
-        if self.worker_flush_interval_ms == 0 {
-            self.worker_flush_interval_ms = 10;
-        }
-        if self.worker_hibernation_secs == 0 {
-            self.worker_hibernation_secs = 300;
-        }
-        if self.worker_gap_recovery_secs == 0 { self.worker_gap_recovery_secs = 5; }
-        if self.worker_gap_recovery_batch == 0 { self.worker_gap_recovery_batch = 100; }
-        if self.worker_gap_recovery_max_backoff == 0 { self.worker_gap_recovery_max_backoff = 30; }
-        if self.worker_critical_drain_threshold == 0 { self.worker_critical_drain_threshold = 100; }
-        if self.worker_capacity_check_interval_ms == 0 { self.worker_capacity_check_interval_ms = 1000; }
-        if self.vdo_stall_threshold == 0 {
-            self.vdo_stall_threshold = autotune_vdo_stall_threshold(&self.profile);
-        }
-        if self.hydration_large_file_threshold_startup_mb == 0 {
-            self.hydration_large_file_threshold_startup_mb = match self.profile {
-                TargetProfile::HDD => 16,
-                _ => 128,
-            };
-        }
-        if self.hydration_large_file_threshold_drain_mb == 0 {
-            self.hydration_large_file_threshold_drain_mb = 5;
-        }
-        if self.max_versions == 0 { self.max_versions = 5; }
-        if self.max_versions_size_mb == 0 { self.max_versions_size_mb = 10240; }
-        if !self.excludes.is_empty() {
-            self.regex_ex = Some(RegexSet::new(&self.excludes).map_err(|e| MirrorError::Config(format!("Invalid exclude regex: {}", e)))?);
-        }
-        if !self.includes.is_empty() {
-            self.regex_in = Some(RegexSet::new(&self.includes).map_err(|e| MirrorError::Config(format!("Invalid include regex: {}", e)))?);
-        }
-        if !self.version_excludes.is_empty() {
-            self.regex_vex = Some(RegexSet::new(&self.version_excludes).map_err(|e| MirrorError::Config(format!("Invalid version exclude regex: {}", e)))?);
-        }
-        if !self.version_includes.is_empty() {
-            self.regex_vin = Some(RegexSet::new(&self.version_includes).map_err(|e| MirrorError::Config(format!("Invalid version include regex: {}", e)))?);
-        }
-        if !self.force_version_includes.is_empty() {
-            self.regex_force_vin = Some(RegexSet::new(&self.force_version_includes).map_err(|e| MirrorError::Config(format!("Invalid force version include regex: {}", e)))?);
-        }
+
         Ok(())
     }
-    pub fn allow(&self, p: &std::path::Path) -> bool {
-        let s = p.to_str().unwrap_or("");
-        if let Some(r) = &self.regex_in {
-            if !r.is_match(s) { return false; }
-        }
-        self.regex_ex.as_ref().map_or(true, |r| !r.is_match(s))
-    }
-    pub fn allow_versioning(&self, p: &std::path::Path) -> bool {
-        let s = p.to_str().unwrap_or("");
-        if let Some(r) = &self.regex_vin {
-            if !r.is_match(s) { return false; }
-        }
-        self.regex_vex.as_ref().map_or(true, |r| !r.is_match(s))
-    }
-    pub fn is_forced_version(&self, p: &std::path::Path) -> bool {
-        if self.force_versioning { return true; }
-        let s = p.to_str().unwrap_or("");
-        if let Some(r) = &self.regex_force_vin {
-            return r.is_match(s);
-        }
-        false
-    }
-}
 
-impl Config {
-    pub fn calculate_defaults(mut self) -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_memory();
-
-        if self.worker_count == 0 {
-            self.worker_count = default_worker_count(&sys);
-            tracing::info!("Auto-Config: Worker Count set to {} (All Cores)", self.worker_count);
-        }
-        self.max_workers_sys = self.worker_count;
-        if self.global_buffer_limit == 0 {
-            self.global_buffer_limit = default_global_buffer_limit_mb(&sys);
-            tracing::info!("Auto-Config: Global Buffer Limit set to {} MB (70% RAM)", self.global_buffer_limit);
-        }
-        if self.queue_max == 0 { self.queue_max = 500_000; }
-        if self.max_system_load_avg == 0.0 {
-            let cores = sys.cpus().len() as f64;
-            self.max_system_load_avg = cores * 4.0;
-        }
-        if self.governor_psi_io_threshold == 0.0 { self.governor_psi_io_threshold = 60.0; }
-        if self.governor_psi_cpu_threshold == 0.0 { self.governor_psi_cpu_threshold = 80.0; }
-        if self.capacity_threshold_mb == 0 { self.capacity_threshold_mb = 500; }
-        if self.breaker_interval_secs == 0 { self.breaker_interval_secs = 60; }
-        if self.force_flush_interval_secs == 0 { self.force_flush_interval_secs = 5; }
-        if self.hydration_delay_ms == 0 { self.hydration_delay_ms = 1; }
-        if self.io_priority.is_empty() { self.io_priority = "Realtime".to_string(); }
-        
-        if self.journal_dir.as_os_str().is_empty() {
-            self.journal_dir = Self::probe_ephemeral_storage();
-
-            let is_rescue = Self::is_likely_rescue_env();
-
-            let total_mem_mb = sys.total_memory() / 1024 / 1024;
-            
-            let target_total_mb = if is_rescue {
-                let avail_mem_mb = sys.available_memory() / 1024 / 1024;
-                tracing::info!("Config: Rescue Mode Detected! Scaling journal based on AVAILABLE memory ({} MB) instead of TOTAL.", avail_mem_mb);
-                (avail_mem_mb as f64 * 0.01) as u64
-            } else {
-                (total_mem_mb as f64 * 0.05) as u64
-            };
-            
-            let (min_cap, max_cap) = if is_rescue { (32, 512) } else { (64, 4096) };
-            let effective_total_mb = target_total_mb.max(min_cap).min(max_cap);
-            
-            self.journal_retention_count = 10;
-            self.journal_size_limit_mb = effective_total_mb / self.journal_retention_count as u64;
-            
-            if self.journal_size_limit_mb < 8 { self.journal_size_limit_mb = 8; }
-
-            tracing::info!(
-                "Config: Journal autotuned to Ephemeral (RAM/Tmp). Path: {:?}. Total Buffer: ~{} MB ({} segs x {} MB). RescueMode: {}", 
-                self.journal_dir,
-                self.journal_size_limit_mb * self.journal_retention_count as u64,
-                self.journal_retention_count,
-                self.journal_size_limit_mb,
-                is_rescue
-            );
-        } else {
-            if self.journal_size_limit_mb == 0 { self.journal_size_limit_mb = 100; }
-            if self.journal_retention_count == 0 { self.journal_retention_count = 10; }
-        }
-
-        self.ensure_journal_safety();
-        
-        self
-    }
-
-    fn is_likely_rescue_env() -> bool {
-        if Path::new("/run/ostree-booted").exists() {
-            return false;
-        }
-
-        if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-            let s = cmdline.to_lowercase();
-            if s.contains("rd.live.image") || s.contains("boot=live") || s.contains("casper") || s.contains("archisobasedir") {
+    pub fn is_path_excluded(&self, rel_path: &Path) -> bool {
+        let path_str = rel_path.to_string_lossy();
+        for re in &self.exclude_regexes {
+            if re.is_match(&path_str) {
                 return true;
             }
         }
-
-        let root = Path::new("/");
-        if let Ok(stat) = statfs(root) {
-            let magic = stat.filesystem_type().0 as i64;
-            if magic == TMPFS_MAGIC || magic == RAMFS_MAGIC {
-                return true;
+        if !self.include_regexes.is_empty() {
+            for re in &self.include_regexes {
+                if re.is_match(&path_str) {
+                    return false;
+                }
             }
+            return true;
         }
         false
-    }
-
-    fn probe_ephemeral_storage() -> PathBuf {
-        let candidates = ["/dev/shm", "/run/shm", "/tmp", "/run"];
-        for &path_str in &candidates {
-            let path = Path::new(path_str);
-            if !path.exists() { continue; }
-            
-            if let Ok(stat) = statfs(path) {
-                let magic = stat.filesystem_type().0 as i64;
-                if magic == TMPFS_MAGIC || magic == RAMFS_MAGIC {
-                    let mut p = path.to_path_buf();
-                    p.push("foxing_ephemeral_data");
-                    return p;
-                }
-            }
-        }
-        
-        let mut temp = std::env::temp_dir();
-        temp.push("foxing_ephemeral_data");
-        tracing::warn!("Config: Could not find explicit RAM disk. Falling back to system temp: {:?}", temp);
-        temp
-    }
-
-    fn ensure_journal_safety(&mut self) {
-        if !self.journal_dir.exists() {
-            let _ = std::fs::create_dir_all(&self.journal_dir);
-        }
-        
-        let abs_journal = self.journal_dir.canonicalize().unwrap_or(self.journal_dir.clone());
-        
-        for source in &mut self.sources {
-            let abs_source = source.path.canonicalize().unwrap_or(source.path.clone());
-            
-            if abs_journal.starts_with(&abs_source) {
-                let rel_journal = if abs_journal == abs_source {
-                    PathBuf::from("") 
-                } else {
-                    abs_journal.strip_prefix(&abs_source).unwrap_or(Path::new("")).to_path_buf()
-                };
-                
-                let pattern_base = if rel_journal.as_os_str().is_empty() {
-                    "source_.*\\.wal$".to_string()
-                } else {
-                    let s = rel_journal.to_string_lossy();
-                    format!("^{}.*", regex::escape(&s))
-                };
-                
-                for target in &mut source.targets {
-                    if !target.excludes.iter().any(|e| e == &pattern_base) {
-                        tracing::warn!("SAFETY: Journal {:?} is inside Source {:?}. Auto-excluding '{}' to prevent loops.", abs_journal, abs_source, pattern_base);
-                        target.excludes.push(pattern_base.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn load(p: &str) -> Result<Self> {
-        let s = fs::read_to_string(p)?;
-        let mut c: Config = toml::from_str(&s).map_err(|e| MirrorError::Config(e.to_string()))?;
-        c = c.calculate_defaults();
-        if c.shutdown_timeout_secs == 0 { return Err(MirrorError::Config("shutdown_timeout_secs must be > 0".into())); }
-        let global_limit_mib = c.global_buffer_limit;
-        let system_max_workers = c.max_workers_sys;
-        let mut target_paths = HashSet::new();
-        for s in &mut c.sources {
-            let src_uncached_ok = crate::security::probe_rwf_uncached(&s.path);
-            s.rwf_uncached_ok.store(src_uncached_ok, std::sync::atomic::Ordering::Relaxed);
-            for t in &mut s.targets {
-                t.compile(system_max_workers, global_limit_mib)?;
-                if t.io_buffer_size_mib == 0 {
-                    let tuned_mib = autotune_buffer_chunk_size(&t.profile, global_limit_mib);
-                    t.io_buffer_size_mib = tuned_mib;
-                    tracing::info!("Target {:?}: Autotuning buffer chunk size to {} MiB", t.path, tuned_mib);
-                }
-                let dio_ok = crate::security::probe_direct_io(&t.path);
-                t.direct_io_ok.store(dio_ok, std::sync::atomic::Ordering::Relaxed);
-                let tgt_uncached_ok = crate::security::probe_rwf_uncached(&t.path);
-                t.rwf_uncached_ok.store(tgt_uncached_ok, std::sync::atomic::Ordering::Relaxed);
-                let abs = t.path.canonicalize().map_err(|e| MirrorError::Config(format!("Invalid path {:?}: {}", t.path, e)))?;
-                if !target_paths.insert(abs.clone()) {
-                    return Err(MirrorError::Config(format!("Duplicate target path detected: {:?}.", abs)));
-                }
-            }
-        }
-        Ok(c)
     }
 }

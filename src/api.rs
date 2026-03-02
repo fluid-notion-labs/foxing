@@ -17,16 +17,15 @@ pub struct TargetStatus {
     pub latency_ms: f64,
     pub pending_events: usize,
     pub tuner_state: TunerState,
-    
-    // New BBR Metrics
     pub batch_size: usize,
     pub coalesce_window_kb: u64,
-    
     pub buffer_utilization: f64,
     pub ops_reflink: u64,
     pub ops_offload: u64,
     pub ops_standard: u64,
-    pub wal_failures: u64,
+    // Task 1: Bandwidth/Latency History (Bandwidth MB/s, Latency ms)
+    #[serde(default)]
+    pub history: Vec<(f64, f64)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

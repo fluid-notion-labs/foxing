@@ -1,30 +1,25 @@
 use std::time::{Instant, Duration};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::ops::Sub;
-use std::path::Path;
 use parking_lot::Mutex;
 use lru::LruCache;
 use tracing::debug;
 use crate::security;
-use crate::config::{MAX_FAILURE_BACKOFF, ERROR_LIMITER_SECS};
-
+// FIX: Import constant from the new location (constants.rs)
+use crate::constants::ERROR_LIMITER_SECS;
 struct PoisonEntry {
     failure_count: u32,
     next_attempt: Instant,
 }
-
 pub struct PoisonCabinet {
     cache: LruCache<u64, PoisonEntry>,
 }
-
 impl PoisonCabinet {
     pub fn new() -> Self {
         Self {
-            cache: LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()),
+            cache: LruCache::new(std::num::NonZeroUsize::new(65536).unwrap()),
         }
     }
-
     pub fn check_allowed(&mut self, inode: u64) -> bool {
         if let Some(entry) = self.cache.get(&inode) {
             if Instant::now() < entry.next_attempt {
@@ -33,7 +28,6 @@ impl PoisonCabinet {
         }
         true
     }
-
     pub fn record_failure(&mut self, inode: u64) {
         if let Some(entry) = self.cache.get_mut(&inode) {
             entry.failure_count += 1;
@@ -47,59 +41,60 @@ impl PoisonCabinet {
             });
         }
     }
-
     pub fn record_success(&mut self, inode: u64) {
         if self.cache.contains(&inode) {
             self.cache.pop(&inode);
         }
     }
 }
-
-pub struct ErrorLimiter { last: Mutex<HashMap<&'static str, Instant>> }
+pub struct ErrorLimiter {
+    last: Mutex<HashMap<&'static str, Instant>>
+}
 impl ErrorLimiter {
     pub fn new() -> Self { Self { last: Mutex::new(HashMap::new()) } }
     pub fn check(&self, key: &'static str) -> bool {
         let mut map = self.last.lock();
         let now = Instant::now();
+        // FIX: Use ERROR_LIMITER_SECS constant from constants module
         let entry = map.entry(key).or_insert(now.sub(Duration::from_secs(ERROR_LIMITER_SECS + 1)));
-        if now.duration_since(*entry) < Duration::from_secs(ERROR_LIMITER_SECS) { return false; }
+        if now.duration_since(*entry) < Duration::from_secs(ERROR_LIMITER_SECS) {
+            return false;
+        }
         *entry = now;
         true
     }
 }
-
 pub struct CircuitBreaker {
-    tripped: AtomicBool,
+    tripped: std::sync::atomic::AtomicBool,
     last_check: Mutex<Instant>,
     interval: Duration
 }
-
 impl Clone for CircuitBreaker {
     fn clone(&self) -> Self {
         Self {
-            tripped: AtomicBool::new(self.tripped.load(Ordering::Relaxed)),
+            tripped: std::sync::atomic::AtomicBool::new(self.tripped.load(std::sync::atomic::Ordering::Relaxed)),
             last_check: Mutex::new(*self.last_check.lock()),
             interval: self.interval
         }
     }
 }
-
 impl CircuitBreaker {
     pub fn new(interval_secs: u64) -> Self {
         Self {
-            tripped: AtomicBool::new(false),
+            tripped: std::sync::atomic::AtomicBool::new(false),
             last_check: Mutex::new(Instant::now()),
             interval: Duration::from_secs(interval_secs)
         }
     }
-
-    pub fn can_proceed(&self, path: &Path, threshold: u64) -> bool {
+    pub fn can_proceed(&self, path: &std::path::Path, threshold: u64) -> bool {
         let mut last = self.last_check.lock();
         let now = Instant::now();
-        if self.tripped.load(Ordering::Relaxed) {
-            if now.duration_since(*last) < self.interval { return false; }
+        if self.tripped.load(std::sync::atomic::Ordering::Relaxed) {
+            if now.duration_since(*last) < self.interval {
+                return false;
+            }
             if security::check_capacity(path, threshold) {
-                self.tripped.store(false, Ordering::Relaxed);
+                self.tripped.store(false, std::sync::atomic::Ordering::Relaxed);
                 *last = now;
                 return true;
             }
@@ -107,82 +102,56 @@ impl CircuitBreaker {
             return false;
         }
         if !security::check_capacity(path, threshold) {
-            self.tripped.store(true, Ordering::Relaxed);
+            self.tripped.store(true, std::sync::atomic::Ordering::Relaxed);
             *last = now;
             return false;
         }
         true
     }
-
-    pub fn trip(&self) { self.tripped.store(true, Ordering::Relaxed); }
+    pub fn trip(&self) { self.tripped.store(true, std::sync::atomic::Ordering::Relaxed); }
 }
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FailureState {
-    is_failed: AtomicBool,
-    last_failure: Instant,
-    retry_interval: Duration,
-    pub hibernation_threshold: Duration,
-    max_backoff: Duration
+    pub streak_start: Option<Instant>,
+    current_backoff: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    hibernation_threshold: Duration,
 }
-
-impl Clone for FailureState {
-    fn clone(&self) -> Self {
-        Self {
-            is_failed: AtomicBool::new(self.is_failed.load(Ordering::Relaxed)),
-            last_failure: self.last_failure,
-            retry_interval: self.retry_interval,
-            hibernation_threshold: self.hibernation_threshold,
-            max_backoff: self.max_backoff
-        }
-    }
-}
-
 impl FailureState {
-    pub fn new(interval_secs: u64) -> Self {
-        let max_backoff_duration = Duration::from_secs(MAX_FAILURE_BACKOFF);
+    pub fn new(
+        hibernation_secs: u64,
+        initial_retry_ms: u64,
+        max_retry_ms: u64
+    ) -> Self {
         Self {
-            is_failed: AtomicBool::new(false),
-            last_failure: Instant::now().sub(max_backoff_duration),
-            retry_interval: Duration::from_secs(5),
-            hibernation_threshold: Duration::from_secs(interval_secs),
-            max_backoff: max_backoff_duration
+            streak_start: None,
+            current_backoff: Duration::from_millis(initial_retry_ms),
+            initial_backoff: Duration::from_millis(initial_retry_ms),
+            max_backoff: Duration::from_millis(max_retry_ms),
+            hibernation_threshold: Duration::from_secs(hibernation_secs),
         }
     }
-
     pub fn record_failure(&mut self) {
-        self.is_failed.store(true, Ordering::Relaxed);
         let now = Instant::now();
-        if now.duration_since(self.last_failure) > self.max_backoff {
-            self.retry_interval = Duration::from_secs(5);
-        } else {
-            self.retry_interval = (self.retry_interval * 2).min(self.max_backoff);
+        if self.streak_start.is_none() {
+            self.streak_start = Some(now);
         }
-        self.last_failure = now;
+        // Ramp up backoff (hysteresis)
+        self.current_backoff = (self.current_backoff * 2).min(self.max_backoff);
     }
-
     pub fn record_success(&mut self) {
-        self.is_failed.store(false, Ordering::Relaxed);
-        self.retry_interval = Duration::from_secs(5);
+        self.streak_start = None;
+        self.current_backoff = self.initial_backoff;
     }
-
-    pub fn can_execute_io(&self) -> bool {
-        if !self.is_failed.load(Ordering::Relaxed) { return true; }
-        self.last_failure.elapsed() >= self.retry_interval
-    }
-
-    /// Calculates time until next retry allowed. Returns None if healthy.
-    pub fn next_retry_delay(&self) -> Option<Duration> {
-        if !self.is_failed.load(Ordering::Relaxed) { return None; }
-        let elapsed = self.last_failure.elapsed();
-        if elapsed < self.retry_interval {
-            Some(self.retry_interval - elapsed)
+    pub fn should_hibernate(&self) -> bool {
+        if let Some(start) = self.streak_start {
+            start.elapsed() > self.hibernation_threshold
         } else {
-            None
+            false
         }
     }
-
-    pub fn check_hibernation_needed(&self) -> bool {
-        self.is_failed.load(Ordering::Relaxed) && self.last_failure.elapsed() > self.hibernation_threshold
+    pub fn get_backoff(&self) -> Duration {
+        self.current_backoff
     }
 }

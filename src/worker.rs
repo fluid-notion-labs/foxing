@@ -1,1091 +1,866 @@
-use io_uring::IoUring;
-use tokio::sync::mpsc;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::Ordering};
-use std::io;
-use crate::metrics;
-use lru::LruCache;
-use crate::identity::{self, ResolveResult};
-use crate::security;
-use crate::wal::{WalState};
-use nix::sys::statvfs::statvfs;
-use crate::config::{Config, TargetConfig};
-use crate::error::{FoxingError, Result};
-use crate::buffer::BufferPool;
-use crate::tuner::{TunerBoard, BbrTuner, VdoTuner};
-use crate::resilience::{PoisonCabinet, CircuitBreaker, FailureState, ErrorLimiter};
-use crate::event::{Event, EventType};
-use crate::operations::{SmartCopier, CopyStats};
+use std::sync::Arc;
+use tokio::sync::{mpsc, broadcast, Mutex};
+use tracing::{error, info, debug, warn};
+use crate::error::{Result, FoxingError};
+use crate::mirror::{SourceInfo, SharedConfig};
+use crate::config::{TargetConfig};
+use crate::operations::{SmartCopier, CopyStats, probe_capabilities, OptimizedFs, FsyncLatencyTracker};
+use std::sync::atomic::Ordering;
+use crate::tuner::{BbrTuner, TunerBoard, TunerOutput, GLOBAL_TUNER_REGISTRY, check_global_consistency};
 use crate::governor::Governor;
-use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use tokio::time::sleep;
-use std::time::{Instant, Duration};
-use crate::ordering::Coalescer;
-use crate::consistency::{SerializationEngine, OpKind, atomic_rename};
-use crate::versioning;
-use crate::mirror::SourceInfo;
-use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, Instant};
+use crate::identity::{self, ResolveResult};
+use crate::buffer::BufferPool;
+use crate::event::{Event, EventType};
+use crate::ordering::{Coalescer};
+use crate::consistency::{InMemoryWal, WalOpKind};
+use crate::resilience::{PoisonCabinet, CircuitBreaker};
+use io_uring::IoUring;
+use std::path::{Path, PathBuf};
 use libc;
-use std::os::unix::io::AsRawFd;
-use std::collections::HashMap;
+use crate::sidecar::{AsyncSidecar, SyncSignature, set_sync_signature};
+use std::collections::{HashSet, VecDeque};
+use crate::constants;
+use tokio::io::unix::AsyncFd;
+use tokio::task::spawn_blocking;
+use crate::security;
+use std::os::unix::fs::MetadataExt;
+use crate::metrics;
 
-fn copy_with_reflink_sync(src: &Path, dst: &Path) -> io::Result<u64> {
-    if let Some(parent) = dst.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!("Copy Reflink: Failed to create parent {:?}: {}", parent, e);
+const STATIC_RING_DEPTH: u32 = 4096;
+
+#[derive(Debug, Clone)]
+pub struct HydrationSender(pub mpsc::UnboundedSender<(PathBuf, Option<u64>)>);
+
+impl HydrationSender {
+    pub async fn send_repair_job(&self, path: PathBuf, inode: Option<u64>) {
+        let _ = self.0.send((path, inode));
+    }
+}
+
+pub struct BarrierCoordinator {
+    pub worker_id: usize,
+    pub total_workers: usize,
+    pub cmd_tx: broadcast::Sender<BarrierCommand>,
+    pub cmd_rx: broadcast::Receiver<BarrierCommand>,
+    pub ack_tx: mpsc::Sender<usize>,
+    pub ack_rx: Option<Arc<Mutex<mpsc::Receiver<usize>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BarrierCommand { PauseAndFlush, Resume }
+
+struct RetryQueue {
+    queue: VecDeque<(Arc<Event>, Instant, u32)>,
+    max_retries: u32,
+    base_backoff_ms: u64,
+    capacity: usize,
+}
+
+impl RetryQueue {
+    fn new(max_retries: u32, base_backoff_ms: u64, capacity: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            max_retries,
+            base_backoff_ms,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, event: Arc<Event>, attempts: u32) {
+        if attempts >= self.max_retries {
+            error!("RetryQueue: Dropping event after {} attempts: {:?} (Inode: {})", attempts, event.event_type, event.inode);
+            return;
+        }
+        if self.queue.len() >= self.capacity {
+            warn!("RetryQueue Overflow: Refusing retry for inode {} (Queue Full)", event.inode);
+            crate::metrics::EVENTS_DROPPED.inc();
+            return;
+        }
+        let backoff_ms = (self.base_backoff_ms * 2u64.pow(attempts)).min(5000);
+        let backoff = Duration::from_millis(backoff_ms);
+        let next_attempt = Instant::now() + backoff;
+        
+        debug!("RetryQueue: Scheduling retry #{} for inode {} in {:?}", attempts + 1, event.inode, backoff);
+        self.queue.push_back((event, next_attempt, attempts + 1));
+    }
+
+    fn pop_ready(&mut self) -> Option<(Arc<Event>, u32)> {
+        if let Some((_, time, _)) = self.queue.front() {
+            if Instant::now() >= *time {
+                if let Some((evt, _, attempts)) = self.queue.pop_front() {
+                    return Some((evt, attempts));
+                }
             }
         }
+        None
     }
-    let src_file = std::fs::File::open(src).map_err(|e| {
-        debug!("Copy Reflink: Source {:?} not accessible: {}", src, e);
-        e
-    })?;
-    let dst_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(dst)
-        .map_err(|e| {
-            warn!("Copy Reflink: Failed to open destination {:?}: {}", dst, e);
-            e
-        })?;
-    let src_fd = src_file.as_raw_fd();
-    let dst_fd = dst_file.as_raw_fd();
-    let len = src_file.metadata()?.len();
-    let ret = unsafe {
-        let req = 0x4020940D;
-        #[repr(C)]
-        struct FileCloneRange {
-            src_fd: i64,
-            src_offset: u64,
-            src_length: u64,
-            dest_offset: u64,
-        }
-        let args = FileCloneRange {
-            src_fd: src_fd as i64,
-            src_offset: 0,
-            src_length: len,
-            dest_offset: 0,
-        };
-        libc::ioctl(dst_fd, req, &args)
-    };
-    if ret == 0 {
-        return Ok(len);
-    }
-    std::fs::copy(src, dst)
-}
-#[derive(Debug)]
-pub struct HydrationSender(pub mpsc::Sender<(PathBuf, Option<u64>)>);
-impl Clone for HydrationSender {
-    fn clone(&self) -> Self {
-        HydrationSender(self.0.clone())
-    }
-}
-struct ShardedLockCache {
-    shards: Vec<std::sync::Mutex<LruCache<u64, Arc<tokio::sync::Mutex<()>>>>>
-}
-impl ShardedLockCache {
-    fn new(capacity_hint: usize) -> Self {
-        let shard_count = 128;
-        let per_shard = (capacity_hint / shard_count).max(100);
-        let mut shards = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            shards.push(std::sync::Mutex::new(LruCache::new(std::num::NonZeroUsize::new(per_shard).unwrap())));
-        }
-        Self { shards }
-    }
-    fn get(&self, key: u64) -> Arc<tokio::sync::Mutex<()>> {
-        let idx = (key as usize) % 128;
-        let mut s = self.shards[idx].lock().unwrap();
-        s.get_or_insert(key, || Arc::new(tokio::sync::Mutex::new(()))).clone()
-    }
-    fn get_by_path(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        self.get(hasher.finish())
-    }
-}
-struct WorkerContext<'a> {
-    ring: &'a mut IoUring,
-    vdo_tuner: &'a mut VdoTuner,
-    failure_state: &'a mut FailureState,
-    capacity_breaker: &'a CircuitBreaker,
-    _limiter: &'a ErrorLimiter,
-    _cur_cap_avail: u64,
-    _cur_cap_total: u64,
-    daemon_id: &'a str,
-}
-fn initialize_buffer_pool(ring: &mut IoUring, num_buffers: usize, chunk_size_bytes: usize) -> Result<BufferPool> {
-    let mut pool = BufferPool::new(num_buffers, chunk_size_bytes);
-    let iovs = pool.as_io_vecs();
-    if unsafe { ring.submitter().register_buffers(&iovs) }.is_err() {
-        error!("Failed to register {} io_uring buffers.", num_buffers);
-        return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::Other, "Failed to register buffers")));
-    }
-    Ok(pool)
-}
-fn unregister_buffers(ring: &mut IoUring) -> Result<()> {
-    if ring.submitter().unregister_buffers().is_err() {
-        error!("Failed to unregister io_uring buffers.");
-        return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::Other, "Failed to unregister buffers")));
-    }
-    Ok(())
-}
 
-fn determine_batch_op_kind(events: &[Arc<Event>]) -> OpKind {
-    for event in events {
-        if matches!(event.event_type, EventType::Rename | EventType::Mkdir | EventType::Rmdir |
-                                    EventType::Link | EventType::Symlink | EventType::Unlink)
-        {
-            return OpKind::Rename;
-        }
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.queue.len()
     }
-    OpKind::Write
 }
 
 pub async fn run_worker(
-    mut rx_main: mpsc::Receiver<Arc<Event>>,
+    mut event_rx: mpsc::Receiver<Arc<Event>>,
     source: Arc<SourceInfo>,
     target_cfg: TargetConfig,
-    config: Arc<RwLock<Config>>,
-    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-    hydration_trigger: Arc<HydrationSender>,
+    config: SharedConfig,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    hydration_tx: Arc<HydrationSender>,
     _repair_txs: Arc<Vec<mpsc::Sender<Arc<Event>>>>,
     governor: Arc<Governor>,
     tuner_board: TunerBoard,
     worker_id: usize,
-    _rx_repair: Option<mpsc::Receiver<Arc<Event>>>,
-    serialization: Arc<SerializationEngine>,
+    _resume_state: Option<()>,
+    mut barrier: BarrierCoordinator,
     daemon_id: String,
+    initial_latency: Duration,
+    mut external_stats_rx: mpsc::UnboundedReceiver<CopyStats>,
 ) -> Result<()> {
-    info!("Worker {} started (Causal Lane)", worker_id);
-    // FIX (High Priority): Re-introduce Root Identity Seeding, coordinated by Worker 0.
-    if worker_id == 0 {
-        if let Ok(meta) = std::fs::metadata(&source.path) {
-            let inode = meta.ino();
-            let dev = source.dev;
-            if source.dir_map.get(inode).is_none() {
-                info!("Worker {}: Seeding Root Identity for {:?} -> Inode {} (Dev {})", worker_id, source.path, inode, dev);
-                identity::update_map(
-                    &source.inode_map,
-                    &source.dir_map,
-                    dev,
-                    inode,
-                    PathBuf::from(""),
-                    0,
-                    false,
-                    true,
-                    0,
-                    0
-                );
-            }
-        } else {
-            warn!("Worker {}: Failed to stat source root {:?}. Root identity will be missing!", worker_id, source.path);
-        }
-    }
-    let queue_max_hint = config.read().await.queue_max;
-    let locks = Arc::new(ShardedLockCache::new(queue_max_hint));
-    let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
-    // Removed: let mut dirty_stats: HashMap<u64, DirtyEntry> = HashMap::new();
-    let initial_flush_ms = target_cfg.worker_flush_interval_ms;
-    let mut flush_timer = Box::pin(tokio::time::sleep(Duration::from_millis(initial_flush_ms)));
-    let mut last_capacity_check = Instant::now();
-    // Initialize Tuners
-    let mut tuner = BbrTuner::new(&target_cfg);
-    let mut vdo_tuner = VdoTuner::new(target_cfg.vdo_optimization);
-    // Initialize IoUring
-    let ring_depth = tuner.recommended_ring_depth().max(32);
-    debug!("Worker {}: IoUring depth set to {}", worker_id, ring_depth);
-    let mut ring = match IoUring::new(ring_depth) {
-        Ok(r) => r,
-        Err(e) => { error!("Failed to create io_uring: {}", e); return Err(FoxingError::Io(e)); }
-    };
-    // Buffer Pool Setup
-    let config_reader = config.read().await;
-    let buffer_chunk_size_mib = target_cfg.io_buffer_size_mib.max(1);
-    let buffer_chunk_size_bytes = (buffer_chunk_size_mib * 1024 * 1024) as usize;
-    let capacity_threshold_mb = config_reader.capacity_threshold_mb;
-    let _force_flush_base_secs = config_reader.force_flush_interval_secs;
-    let total_workers = config_reader.worker_count.max(1);
-    let global_limit_mib = config.read().await.global_buffer_limit;
-    // Dynamic memory partitioning
-    let total_worker_mem_limit_mib = global_limit_mib * 3 / 10; // 30% of global limit for workers
-    let worker_mem_limit_mib = total_worker_mem_limit_mib / total_workers as u64;
-    let current_max_buffers = (worker_mem_limit_mib / buffer_chunk_size_mib).max(2) as usize;
-    let initial_num_buffers = current_max_buffers.min(target_cfg.batch_size).max(4);
-    drop(config_reader);
-    let mut buffer_pool = match initialize_buffer_pool(&mut ring, initial_num_buffers, buffer_chunk_size_bytes) {
-        Ok(pool) => pool,
-        Err(e) => return Err(e),
-    };
-    let src_rwf_uncached_ok = source.rwf_uncached_ok.load(Ordering::Relaxed);
-    let dst_rwf_uncached_ok = target_cfg.rwf_uncached_ok.load(Ordering::Relaxed);
-    // Resilience
-    let limiter = ErrorLimiter::new();
-    let capacity_breaker = CircuitBreaker::new(target_cfg.worker_hibernation_secs);
-    let mut failure_state = FailureState::new(target_cfg.worker_hibernation_secs);
-    let mut poison_cabinet = PoisonCabinet::new();
-    let mut cur_cap_avail = 0u64;
-    let mut cur_cap_total = 0u64;
-    let mut is_hibernating = false;
-    let mut shutdown_requested = false;
-    let mut recent_bytes_processed = 0u64;
-    // Alias wal_map outside the loop
-    let wal_map = &source.wal_state_map;
-    // --- Main Event Loop ---
-    let _result: Result<()> = loop {
-        // 1. Hibernation Check
-        if !is_hibernating && failure_state.check_hibernation_needed() {
-             if !is_hibernating {
-                 warn!("Target {:?} failed. Hibernating.", target_cfg.path);
-                 is_hibernating = true;
-             }
-        }
-        if is_hibernating {
-             tokio::select! {
-                _ = shutdown_rx.recv() => break Ok(()),
-                _ = &mut flush_timer => {
-                    flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
-                    continue;
-                }
-                Some(_) = rx_main.recv() => { continue; } // Drain events while down
-             }
-        }
-        // 2. Retry Backoff
-        if !shutdown_requested {
-             if let Some(delay) = failure_state.next_retry_delay() {
-                 sleep(delay).await;
-                 continue;
-             }
-        }
-        // 3. Event Poll (Single-Lane)
-        let event_poll_result = if !shutdown_requested {
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    info!("Worker {}: Shutdown requested. Draining queue...", worker_id);
-                    shutdown_requested = true;
-                    // Attempt to grab one event from main queue to continue the draining process
-                    match rx_main.try_recv() {
-                        Ok(e) => {
-                            metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
-                            Some(e)
-                        }
-                        Err(_) => None
-                    }
-                },
-                // REMOVED: Priority Repair Lane (rx_repair). Repair logic now routes to HydrationQueue directly.
-                Some(e) = rx_main.recv() => {
-                    metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
-                    Some(e)
-                },
-                _ = &mut flush_timer => {
-                    let tuner_tick_start = Instant::now();
-                    let is_stressed = governor.is_system_stressed(); // Use passed governor
-                    let pending_len = coalescer.len();
-                    let max_pending = target_cfg.queue_max;
-                    let target_label = target_cfg.path.to_string_lossy().to_string();
-                    let _recommended_depth = tuner.tune(
-                        tuner_tick_start.elapsed().as_secs_f64(),
-                        recent_bytes_processed,
-                        is_stressed,
-                        pending_len,
-                        max_pending,
-                        &tuner_board,
-                        &target_label,
-                        buffer_pool.chunk_size() as u64
-                    );
-                    recent_bytes_processed = 0;
-                    let next_interval_ms = tuner.current_flush_ms;
-                    flush_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(next_interval_ms));
-                    let path_clone = target_cfg.path.clone();
-                    let cap_check_interval = Duration::from_millis(target_cfg.worker_capacity_check_interval_ms);
-                    if last_capacity_check.elapsed() >= cap_check_interval {
-                         last_capacity_check = Instant::now();
-                         if let Ok(s) = statvfs(&path_clone) {
-                            cur_cap_total = s.blocks() * s.block_size();
-                            cur_cap_avail = s.blocks_available() * s.block_size();
-                            let label = target_cfg.path.to_string_lossy();
-                            metrics::TARGET_CAPACITY_BYTES_TOTAL.with_label_values(&[&label]).set(cur_cap_total as f64);
-                            metrics::TARGET_CAPACITY_BYTES_AVAILABLE.with_label_values(&[&label]).set(cur_cap_avail as f64);
-                        }
-                    }
-                    None
-                }
-            }
-        } else {
-            // Drain queue aggressively during shutdown
-            match rx_main.try_recv() {
-                Ok(e) => {
-                    metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
-                    Some(e)
-                },
-                Err(_) => None
-            }
-        };
-        if let Some(event_ptr) = event_poll_result {
-            coalescer.push(event_ptr.clone());
-        } else if shutdown_requested {
-            if coalescer.is_empty() {
-                break Ok(())
-            }
-        }
-        let current_coalesce_limit = tuner.current_coalesce_bytes;
-        let _effective_batch_size = if shutdown_requested {
-            256
-        } else {
-            tuner.current_batch_size
-        };
-        
-        // FIX 4: Batch Barrier Acquisition
-        let mut inode_batches: HashMap<u64, Vec<Arc<Event>>> = HashMap::new();
-
-        if coalescer.len() > 0 {
-            while let Some(evt) = coalescer.pop_batch(current_coalesce_limit) {
-                // Use inode 0 as a global marker for events like SequenceGap
-                let batch_inode = if evt.inode == 0 { evt.seq_num } else { evt.inode }; 
-                inode_batches.entry(batch_inode).or_default().push(evt);
-            }
-        }
-        
-        let mut needs_yield = false;
-
-        for (_inode, events) in inode_batches { // Fix warning: rename inode to _inode
-            let initial_event = events.first().unwrap();
-            let op_kind = determine_batch_op_kind(&events);
-            let barrier_inode = if initial_event.inode == 0 { initial_event.seq_num } else { initial_event.inode };
-
-            let _barrier_guard = serialization.acquire_barrier(barrier_inode, op_kind).await;
-
-            // Process all events in this batch under the single barrier
-            for e_inner in events {
-                let e = e_inner.clone();
-                
-                // Set flag for yielding later if structural event occurred
-                if e.event_type.requires_global_ordering() {
-                    needs_yield = true;
-                }
-                
-                // Re-calculate paths for each event inside the batch, as renames might have occurred
-                let (initial_dst, is_synthetic, needs_creation) = if matches!(e.event_type, EventType::Rename | EventType::Unlink | EventType::Rmdir) {
-                    let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, e.parent_inode);
-                    if let Some(pp) = parent_path_opt {
-                        let rel_path = pp.join(&e.name);
-                        (target_cfg.path.join(rel_path), false, false)
-                    } else {
-                        let rel_path = PathBuf::from(e.name.trim_start_matches('/'));
-                        (target_cfg.path.join(rel_path), true, false)
-                    }
-                } else {
-                    match identity::resolve_target(&source.inode_map, &e, &target_cfg.path) {
-                        ResolveResult::Success(p, s, n) => (p, s, n),
-                        ResolveResult::NeedsRepair(synthetic_path) => {
-                            warn!("Worker {}: Generation mismatch for inode {}. Queueing repair.", worker_id, e.inode);
-                            if let Some(parent) = synthetic_path.parent() {
-                                 let _ = hydration_trigger.0.try_send((parent.to_path_buf(), Some(e.inode)));
-                            }
-                            continue;
-                        }
-                    }
-                };
-                
-                let mut dst = initial_dst;
-                
-                if matches!(e.event_type, EventType::Rmdir | EventType::Unlink) {
-                     let target_exists = std::fs::symlink_metadata(&dst).is_ok();
-                     if !target_exists {
-                         debug!("Worker {}: Skipping {} for non-existent target {:?}", worker_id, e.event_type.as_str(), dst);
-                         if e.inode != 0 { wal_map.clear_wal_state(e.inode); }
-                         continue;
-                     }
-                }
-                
-                if e.event_type == EventType::SequenceGap {
-                    warn!("Worker {}: Processing SequenceGap {} -> {}. Triggering repair.", worker_id, e.seq_num, e.name);
-                    let path = target_cfg.path.clone();
-                    if let Err(_) = hydration_trigger.0.try_send((path.clone(), None)) {
-                         warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for gap at {:?}", worker_id, path);
-                    }
-                    continue;
-                }
-                
-                if !poison_cabinet.check_allowed(e.inode) && e.event_type != EventType::Mkdir {
-                    continue;
-                }
-
-                // FIX 2: Rename operation debouncing / proactive identity update
-                if e.event_type == EventType::Rename {
-                    if let Some(new_name) = &e.new_name {
-                        let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
-                        let new_parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
-                        if let Some(parent_path) = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, new_parent_ino) {
-                            let new_rel = parent_path.join(new_name);
-                            // Update identity BEFORE attempting operation (pre-warming cache)
-                            identity::update_map_after_rename(
-                                &source.inode_map, &source.dir_map, e.dev_id, e.inode,
-                                new_rel.clone(), e.generation, is_dir, e.timestamp_ns, e.seq_num
-                            );
-                        }
-                    }
-                }
-                
-                let mut ctx = WorkerContext {
-                    ring: &mut ring,
-                    vdo_tuner: &mut vdo_tuner,
-                    failure_state: &mut failure_state,
-                    capacity_breaker: &capacity_breaker,
-                    _limiter: &limiter,
-                    _cur_cap_avail: cur_cap_avail,
-                    _cur_cap_total: cur_cap_total,
-                    daemon_id: &daemon_id,
-                };
-                
-                let initial_rel_path = if let Ok(rel) = dst.strip_prefix(&target_cfg.path) {
-                    rel.to_path_buf()
-                } else {
-                    PathBuf::from(e.name.trim_start_matches('/'))
-                };
-                let mut src = source.mount.join(&initial_rel_path);
-                
-                let lock = locks.get_by_path(&e.name);
-                let _g = lock.lock().await;
-
-                let mut attempts = 0;
-                let max_retries = 5;
-                let source_clone = source.clone();
-                
-                loop {
-                    attempts += 1;
-                    let is_stressed = governor.is_system_stressed(); 
+    info!("Worker {}: Started for target {:?}", worker_id, target_cfg.path);
+    let worker_id_str = worker_id.to_string();
+    let wal = InMemoryWal::new();
+    let poison_cabinet = Arc::new(Mutex::new(PoisonCabinet::new()));
+    let circuit_breaker = Arc::new(Mutex::new(CircuitBreaker::new(30)));
+    let sidecar = AsyncSidecar::new();
     
-                    // Proactive Identity Update (Fast Check)
-                    if attempts > 1 && e.inode != 0 {
-                        if let Some(entry) = source.inode_map.get_entry_clone(e.inode) {
-                            if entry.seq_num > e.seq_num {
-                                let new_src = source.mount.join(&entry.path);
-                                let new_dst = target_cfg.path.join(&entry.path);
-                                if new_src.exists() && new_dst.exists() {
-                                    debug!("Worker {}: Proactive Identity Update: Inode {} moved to {:?} (Seq {} > Event Seq {}).", worker_id, e.inode, entry.path, entry.seq_num, e.seq_num);
-                                    src = new_src;
-                                    dst = new_dst;
-                                }
+    let source_caps = probe_capabilities(&source.path);
+    let target_caps = probe_capabilities(&target_cfg.path);
+
+    let mut tuner = BbrTuner::new(
+        &target_cfg,
+        initial_latency,
+        config.read().await.global_buffer_limit * 1024 * 1024,
+        target_caps.btrfs_quotas.load(Ordering::Relaxed)
+    );
+
+    let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
+    let mut retry_queue = RetryQueue::new(
+        constants::WORKER_RETRY_QUEUE_MAX_RETRIES,
+        constants::WORKER_RETRY_QUEUE_BASE_BACKOFF_MS,
+        1000
+    );
+
+    let ring_depth = STATIC_RING_DEPTH;
+    let ring = IoUring::new(ring_depth).map_err(FoxingError::Io)?;
+    let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    ring.submitter().register_eventfd(eventfd).map_err(FoxingError::Io)?;
+    let async_fd = Arc::new(AsyncFd::new(eventfd).map_err(FoxingError::Io)?);
+
+    let io_buffer_size = target_cfg.io_buffer_size_mib * 1024 * 1024;
+    let num_buffers = (io_buffer_size / 4096).max(ring_depth as u64) as usize;
+    let mut buffer_pool = BufferPool::new(num_buffers, 4096, constants::MINIMUM_ALIGNMENT_BYTES)?;
+    
+    {
+        let iovs = buffer_pool.as_io_vecs();
+        unsafe { ring.submitter().register_buffers(&iovs) }.map_err(|e| FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    }
+
+    let skip_fsync = constants::ONE_SHOT_MODE.load(Ordering::Relaxed);
+
+    let mut smart_copier = SmartCopier {
+        ring,
+        buffer_pool,
+        atomic_buffer_pool: None,
+        async_fd,
+        vdo_opt: target_cfg.vdo_optimization,
+        direct_io_ok: target_cfg.direct_io_ok.load(Ordering::Relaxed),
+        source_caps: source_caps.clone(),
+        target_caps: target_caps.clone(),
+        vdo_stall_threshold: target_cfg.vdo_stall_threshold,
+        barrier_callback: None,
+        source_uncached: target_cfg.source_uncached,
+        target_uncached: target_cfg.target_uncached,
+        governor: Some(governor.clone()),
+        fsync_tracker: FsyncLatencyTracker::default(),
+        skip_fsync,
+    };
+
+    let mut dirty_tracker: HashSet<u64> = HashSet::new();
+    
+    let mut flush_interval = tokio::time::interval(Duration::from_micros(tuner.current_flush_us));
+    let mut tune_interval = tokio::time::interval(Duration::from_micros(constants::WORKER_TUNE_INTERVAL_US));
+    tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut last_tune = Instant::now();
+    let mut bytes_since_tune = 0u64;
+    let mut ops_since_tune = 0u64;
+    let mut _events_since_tune = 0;
+    
+    let mut accumulated_latency = Duration::ZERO;
+    let mut max_latency_in_window = Duration::ZERO;
+    let mut latency_samples_count = 0;
+    let mut peak_coalescer_len = 0;
+
+    let path_label = &target_cfg.label;
+    
+    let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<TunerOutput>();
+    let board_clone = tuner_board.clone();
+    let path_label_clone = path_label.to_string();
+    let worker_id_label = worker_id_str.clone();
+    let worker_id_idx = worker_id;
+
+    tokio::spawn(async move {
+        let mut last_update = Instant::now();
+        let mut sanity_check_interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                Some(output) = telemetry_rx.recv() => {
+                    if last_update.elapsed() > Duration::from_millis(250) {
+                        board_clone.insert(PathBuf::from(&path_label_clone), output.state);
+                        
+                        // FIXED: Wrap TunerOutput in Arc to prevent type mismatch with DashMap<..., Arc<TunerOutput>>
+                        GLOBAL_TUNER_REGISTRY.insert((path_label_clone.clone(), worker_id_idx), Arc::new(output.clone()));
+                        
+                        metrics::TARGET_BATCH_SIZE.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.batch_size as f64);
+                        metrics::TARGET_COALESCE_BYTES.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.coalesce_bytes as f64);
+                        metrics::TUNER_STATE.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.state as i64 as f64);
+                        metrics::TARGET_FLUSH_INTERVAL_MS.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.flush_us as f64 / 1000.0);
+                        metrics::TARGET_STORAGE_CLASS.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.storage_class as i64 as f64);
+                        
+                        last_update = Instant::now();
+                    }
+                }
+                _ = sanity_check_interval.tick() => {
+                    if worker_id_idx == 0 {
+                        check_global_consistency();
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+
+    loop {
+        if last_tune.elapsed().as_micros() > constants::WORKER_TUNE_INTERVAL_US as u128 {
+            let elapsed = last_tune.elapsed().as_secs_f64();
+            let current_usage = crate::metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);
+            
+            let sample_latency = if latency_samples_count > 0 {
+                accumulated_latency / latency_samples_count
+            } else {
+                Duration::ZERO
+            };
+
+            let output = tuner.tune(
+                elapsed,
+                bytes_since_tune,
+                ops_since_tune,
+                governor.current_stress_score(),
+                coalescer.len(),
+                10_000,
+                4096,
+                governor.current_memory_usage_pct(),
+                sample_latency,
+                max_latency_in_window,
+                current_usage,
+                constants::AVG_EVENT_OVERHEAD_BYTES,
+                target_caps.btrfs_quotas.load(Ordering::Relaxed)
+            );
+            
+            let _ = telemetry_tx.send(output.clone());
+            
+            let flush_micros = output.flush_us;
+            flush_interval = tokio::time::interval(Duration::from_micros(flush_micros));
+            
+            let util_pct = (peak_coalescer_len as f64 / 10_000.0).clamp(0.0, 1.0);
+            metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[path_label, &worker_id_str]).set(util_pct);
+            metrics::WORKER_RETRY_QUEUE_SIZE.with_label_values(&[path_label, &worker_id_str]).set(retry_queue.len() as f64);
+
+            last_tune = Instant::now();
+            bytes_since_tune = 0;
+            ops_since_tune = 0;
+            _events_since_tune = 0;
+            accumulated_latency = Duration::ZERO;
+            max_latency_in_window = Duration::ZERO;
+            latency_samples_count = 0;
+            peak_coalescer_len = 0;
+        }
+
+        tokio::select! {
+            biased;
+            
+            _ = shutdown_rx.recv() => {
+                info!("Worker {}: Shutdown signal received.", worker_id);
+                break;
+            }
+            
+            Some(stats) = external_stats_rx.recv() => {
+                if !stats.io_duration.is_zero() && stats.ops_count > 0 {
+                    let avg_op_latency = stats.io_duration.div_f64(stats.ops_count as f64);
+                    accumulated_latency += avg_op_latency;
+                    if avg_op_latency > max_latency_in_window { max_latency_in_window = avg_op_latency; }
+                    latency_samples_count += 1;
+                }
+                bytes_since_tune += stats.bytes_processed;
+                ops_since_tune += stats.ops_count;
+            }
+
+            Ok(cmd) = barrier.cmd_rx.recv() => {
+                match cmd {
+                    BarrierCommand::PauseAndFlush => {
+                        debug!("Worker {}: Pausing for barrier...", worker_id);
+                        // Drain pending events
+                        while let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
+                             let start_time = Instant::now();
+                             let (res, sc, dt) = process_single_event_with_wal(
+                                evt, source.clone(), target_cfg.clone(), wal.clone(), 
+                                poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                                smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
+                            ).await;
+                            
+                            smart_copier = sc;
+                            dirty_tracker = dt;
+                            let duration = start_time.elapsed();
+                            
+                            if let Ok(stats) = res {
+                                bytes_since_tune += stats.bytes_processed;
+                                ops_since_tune += stats.ops_count.max(1);
+                                accumulated_latency += duration;
+                                if duration > max_latency_in_window { max_latency_in_window = duration; }
+                                latency_samples_count += 1;
                             }
                         }
-                    }
+                        
+                        let _ = barrier.ack_tx.send(worker_id).await;
+                        
+                        // Wait for resume
+                        loop {
+                            match barrier.cmd_rx.recv().await {
+                                Ok(BarrierCommand::Resume) => {
+                                    debug!("Worker {}: Resuming...", worker_id);
+                                    break;
+                                },
+                                Ok(_) => {},
+                                Err(_) => break,
+                            }
+                        }
+                    },
+                    BarrierCommand::Resume => {}
+                }
+            }
 
-                    // --- Process Event ---
-                    let res = process_single_event_inner(
-                        &mut ctx, e.clone(), &source, &target_cfg, &tuner,
-                        capacity_threshold_mb, &dst, is_synthetic, needs_creation, &src, &mut buffer_pool,
-                        src_rwf_uncached_ok, dst_rwf_uncached_ok, worker_id, hydration_trigger.clone(),
+            Some((evt, attempts)) = std::future::ready(retry_queue.pop_ready()) => {
+                let start_time = Instant::now();
+                let (res, sc, dt) = process_single_event_with_wal(
+                    evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
+                    poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                    smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), attempts
+                ).await;
+                
+                smart_copier = sc;
+                dirty_tracker = dt;
+                let duration = start_time.elapsed();
+
+                match res {
+                    Ok(stats) => {
+                        bytes_since_tune += stats.bytes_processed;
+                        ops_since_tune += stats.ops_count.max(1);
+                        accumulated_latency += duration;
+                        if duration > max_latency_in_window { max_latency_in_window = duration; }
+                        latency_samples_count += 1;
+                        let e2e = evt.created_at.elapsed().as_secs_f64();
+                        metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
+                    },
+                    Err(e) => {
+                        warn!("Worker {}: Retry #{} failed for inode {}: {:?}", worker_id, attempts, evt.inode, e);
+                        retry_queue.push(evt, attempts);
+                    }
+                }
+            }
+
+            _ = flush_interval.tick() => {
+                if let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
+                    let start_time = Instant::now();
+                    let (res, sc, dt) = process_single_event_with_wal(
+                        evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
+                        poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                        smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
                     ).await;
+                    
+                    smart_copier = sc;
+                    dirty_tracker = dt;
+                    let duration = start_time.elapsed();
+
+                    if let Ok(stats) = res {
+                        bytes_since_tune += stats.bytes_processed;
+                        ops_since_tune += stats.ops_count.max(1);
+                        accumulated_latency += duration;
+                        if duration > max_latency_in_window { max_latency_in_window = duration; }
+                        latency_samples_count += 1;
+                        let e2e = evt.created_at.elapsed().as_secs_f64();
+                        metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
+                    } else if let Err(e) = res {
+                        warn!("Worker {}: Event failed (queued for retry): {:?}", worker_id, e);
+                        retry_queue.push(evt, 0);
+                    }
+                }
+            }
+            
+            _ = tune_interval.tick() => {
+                // Just wakes up to check tuning if no events
+            }
+
+            Some(evt) = event_rx.recv(), if coalescer.len() < 10000 => {
+                coalescer.push(evt);
+                if coalescer.len() > peak_coalescer_len { peak_coalescer_len = coalescer.len(); }
+                
+                if let Some(batch_evt) = coalescer.pop_batch(tuner.current_coalesce_bytes, Duration::from_micros(tuner.current_flush_us), true) {
+                    let start_time = Instant::now();
+                    let (res, sc, dt) = process_single_event_with_wal(
+                        batch_evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
+                        poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                        smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
+                    ).await;
+                    
+                    smart_copier = sc;
+                    dirty_tracker = dt;
+                    let duration = start_time.elapsed();
 
                     match res {
-                        Ok(Some(stats)) => {
-                            recent_bytes_processed += stats.bytes_processed;
-                            // Fix 1: WAL Commit (Handled inside inner function if successful)
-                            break;
-                        },
-                        Ok(None) => {
-                            // Fix 1: WAL Clear (Handled inside inner function if successful or skipped)
-                            break;
-                        },
-                        Err(FoxingError::Io(io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                            if !src.exists() {
-                                debug!("Worker {}: Source file {:?} disappeared. Accepting deletion/missing status.", worker_id, src);
-                                break;
-                            }
-                            
-                            if attempts >= max_retries {
-                                 warn!("Worker {}: Event {}/Inode {} failed after {} retries (NotFound). Dropping & Repairing.", worker_id, e.seq_num, e.inode, max_retries);
-                                 if let Err(_) = hydration_trigger.0.try_send((src.clone(), Some(e.inode))) {
-                                     warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for {:?}", worker_id, src);
-                                 }
-                                 break;
-                            }
-                            debug!("Worker {}: Event {} failed (NotFound). Retrying with fresh lookup (Attempt {}).", worker_id, e.seq_num, attempts);
-                            let mut resolved_via_agressive_lookup = false;
-    
-                            if attempts >= 3 {
-                                 let e_clone_for_spawn = e.clone(); 
-                                 let lookup_res = tokio::task::spawn_blocking({
-                                     let source_clone = source_clone.clone();
-                                     move || identity::resolve_and_update_path(&source_clone, e_clone_for_spawn.inode, e_clone_for_spawn.generation, e_clone_for_spawn.timestamp_ns, e_clone_for_spawn.seq_num) 
-                                 }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-                                 
-                                 if let Ok(new_rel_path) = lookup_res {
-                                     let new_src = source.mount.join(&new_rel_path);
-                                     let new_dst = target_cfg.path.join(&new_rel_path);
-                                     debug!("Worker {}: Recovery found new path: {:?} -> {:?}", worker_id, dst, new_dst);
-                                     src = new_src;
-                                     dst = new_dst;
-                                     resolved_via_agressive_lookup = true;
-                                 }
-                            }
-    
-                            if resolved_via_agressive_lookup { continue; }
-
-                            if !src.exists() {
-                                if let Some(new_name) = &e.new_name {
-                                    let new_parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
-                                    let parent_path_opt = identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, new_parent_ino);
-                                    if let Some(pp) = parent_path_opt {
-                                        let expected_rel = pp.join(new_name);
-                                        let expected_src = source.mount.join(&expected_rel);
-                                        if let Ok(meta) = std::fs::metadata(&expected_src) {
-                                            if meta.ino() == e.inode {
-                                                debug!("Worker {}: Source Race: File moved from {:?} to {:?}. Retrying op.", worker_id, src, expected_src);
-                                                src = expected_src;
-                                                dst = target_cfg.path.join(expected_rel); 
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                debug!("Worker {}: Source file {:?} disappeared and identity lookup failed. Accepting deletion.", worker_id, src);
-                                break;
-                            }
-                            
-                            let stress_multiplier = if is_stressed { 2 } else { 1 };
-                            let sleep_duration = Duration::from_millis(50 * (attempts as u64) * stress_multiplier);
-                            sleep(sleep_duration).await;
-                            continue;
-                        },
-                        Err(FoxingError::Io(io_err)) if io_err.to_string().contains("WAL Entry Missing") => {
-                            if attempts >= max_retries {
-                                 error!("Worker {}: Event {}/Inode {} failed after {} retries (WAL Missing). Dropping.", worker_id, e.seq_num, e.inode, max_retries);
-                                 break;
-                            }
-                            warn!("Worker {}: Event {} failed (WAL Rollback Race). Retrying (Attempt {}).", worker_id, e.seq_num, attempts);
-                            let sleep_duration = Duration::from_millis(100 * (attempts as u64));
-                            sleep(sleep_duration).await;
-                            continue;
-                        }
-                        Err(err) => {
-                            error!("Worker {}: Event failed with non-recoverable error: {:?}", worker_id, err);
-                            if e.inode != 0 {
-                                wal_map.clear_wal_state(e.inode);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // --- Yielding for Batch Processing ---
-        if needs_yield {
-             tokio::task::yield_now().await;
-        }
-    };
-    let _ = unregister_buffers(&mut ring);
-    Ok(())
-}
-async fn process_single_event_inner(
-    ctx: &mut WorkerContext<'_>,
-    e: Arc<Event>,
-    source: &Arc<SourceInfo>,
-    target_cfg: &TargetConfig,
-    _tuner: &BbrTuner,
-    _capacity_threshold_mb: u64,
-    dst: &PathBuf,
-    _is_synthetic: bool,
-    needs_creation: bool,
-    src: &PathBuf,
-    buffer_pool: &mut BufferPool,
-    src_rwf_uncached_ok: bool,
-    dst_rwf_uncached_ok: bool,
-    worker_id: usize,
-    hydration_trigger: Arc<HydrationSender>,
-) -> Result<Option<CopyStats>> {
-    let inode = e.inode;
-    let wal_map = &source.wal_state_map;
-    let source_clone = source.clone();
-    let identity_update_sync = |rel: PathBuf, is_dir: bool| {
-        identity::update_map(
-            &source.inode_map,
-            &source.dir_map,
-            e.dev_id,
-            inode,
-            rel,
-            e.generation,
-            false, // is_synthetic
-            is_dir,
-            e.timestamp_ns,
-            e.seq_num
-        );
-    };
-    if needs_creation && !matches!(e.event_type, EventType::Mkdir | EventType::Symlink | EventType::Link | EventType::Mknod) {
-        let dst_clone = dst.clone();
-        let _target_cfg_path_clone = target_cfg.path.clone();
-        let _e_dev = e.dev_id;
-        let _e_generation = e.generation;
-        let _e_ts = e.timestamp_ns;
-        let _e_seq = e.seq_num;
-        let _source_map_clone = source.inode_map.clone();
-        let _source_dir_map_clone = source.dir_map.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            let identity_dir = _target_cfg_path_clone.join(".mirror").join(".by-identity");
-            let _ = std::fs::create_dir_all(&identity_dir);
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst_clone) {
-                Ok(_f) => {
-                    if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
-                        return Ok(Some(rel.to_path_buf()));
-                    }
-                    Ok(None)
-                },
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    Ok(None)
-                },
-                Err(e) => return Err(e),
-            }
-        }).await;
-        if let Ok(path_opt) = res.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io)) {
-            metrics::SIDECAR_FILES_CREATED.inc();
-            if let Some(rel_path) = path_opt {
-                identity_update_sync(rel_path, false);
-            }
-        } else {
-            debug!("Worker {}: Creation failed (likely race): {:?}", worker_id, e.name);
-            return Ok(None);
-        }
-    }
-    let mut wal_guard = None;
-    if matches!(e.event_type, EventType::Write | EventType::Create | EventType::WriteRange) {
-        // Fix 1: Explicitly manage WAL guard lifecycle inside worker operations
-        match wal_map.begin_write(inode, dst.clone(), e.seq_num, ctx.daemon_id.to_string(), e.projid) {
-            Ok(guard) => wal_guard = Some(guard),
-            Err(e) => {
-                if let FoxingError::Io(io_err) = &e {
-                    if io_err.kind() == io::ErrorKind::Other && io_err.to_string().starts_with("WAL Conflict") {
-                        debug!("WAL Conflict: Skipping write for Inode {} due to active/stale state.", inode);
-                        return Ok(None);
-                    }
-                }
-                return Err(e);
-            }
-        }
-    }
-    let res = match e.event_type {
-        EventType::Write | EventType::Create | EventType::WriteRange => {
-            let mut wal_guard_val = wal_guard.ok_or_else(|| {
-                FoxingError::Io(io::Error::new(io::ErrorKind::Other, "WAL guard missing for write operation"))
-            })?;
-            let dst_clone = dst.clone();
-            let e_offset = e.offset;
-            let e_len = e.length;
-            let mut src_clone_for_metadata = src.clone();
-            wal_map.advance(&mut wal_guard_val, WalState::InProgress)?;
-            let mut metadata_result = tokio::task::spawn_blocking({
-                let p = src_clone_for_metadata.clone();
-                move || std::fs::metadata(&p)
-            }).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
-            if metadata_result.is_err() {
-                let resolved_path = tokio::task::spawn_blocking({
-                    let source_clone = source_clone.clone();
-                    move || identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0)
-                }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-                if let Ok(new_rel_path) = resolved_path {
-                    let new_src = source.mount.join(new_rel_path);
-                    debug!("Source Race: File moved from {:?} to {:?}. Retrying op.", src_clone_for_metadata, new_src);
-                    src_clone_for_metadata = new_src.clone();
-                    metadata_result = tokio::task::spawn_blocking(move || std::fs::metadata(&new_src)).await.unwrap_or(Err(io::ErrorKind::NotFound.into()));
-                }
-            }
-            if let Ok(m) = metadata_result {
-                if m.is_file() {
-                    let current_src_size = m.len();
-                    let dynamic_vdo_opt = ctx.vdo_tuner.should_check_zeros(m.len());
-                    let copy_res = SmartCopier::copy(
-                        &src_clone_for_metadata,
-                        &dst_clone,
-                        ctx.ring,
-                        buffer_pool,
-                        &target_cfg.supports_reflink,
-                        dynamic_vdo_opt,
-                        e_offset,
-                        e_len,
-                        target_cfg.direct_io_ok.load(Ordering::Relaxed),
-                        current_src_size,
-                        src_rwf_uncached_ok,
-                        dst_rwf_uncached_ok,
-                        target_cfg.vdo_stall_threshold,
-                    ).await;
-                    match copy_res {
                         Ok(stats) => {
-                            wal_map.advance(&mut wal_guard_val, WalState::CommitPending)?;
-                            metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
-                            ctx.vdo_tuner.update(stats.bytes_processed, stats.bytes_zeros);
-                            let apply_dst = dst_clone.clone();
-                            let apply_src = src_clone_for_metadata.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                security::sync_xattrs(&apply_src, &apply_dst);
-                                security::apply_metadata(&apply_src, &apply_dst)
-                            }).await;
-                            // Fix 1: Commit explicitly to avoid dropping the guard
-                            wal_map.mark_committed(&mut wal_guard_val); 
-                            Ok(Some(stats))
-                        },
-                        Err(e) => Err(e)
-                    }
-                } else {
-                    wal_map.clear_wal_state(inode);
-                    Ok(None)
-                }
-            } else {
-                warn!("Source Missing: Failed to locate source for inode {} even after retry. ", inode);
-                wal_map.clear_wal_state(inode);
-                Ok(None)
-            }
-        },
-        EventType::Rename => {
-            let is_dir = (e.mode & libc::S_IFMT) == libc::S_IFDIR;
-            let new_rel_path = if let Some(new_name_str) = &e.new_name {
-                let parent_ino = if e.new_parent_inode != 0 { e.new_parent_inode } else { e.parent_inode };
-                if parent_ino != 0 {
-                    match identity::resolve_directory(&source.dir_map, &source.inode_map, e.dev_id, parent_ino) {
-                        Some(parent_rel) => parent_rel.join(new_name_str),
-                        None => {
-                            let source_clone = source_clone.clone();
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                identity::resolve_and_update_path(&source_clone, parent_ino, 0, 0, 0)
-                            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-                            match resolved {
-                                Ok(parent_rel) => parent_rel.join(new_name_str),
-                                Err(_) => {
-                                    warn!("Worker {}: Rename Parent {} lookup failed. Using naive fallback.", worker_id, parent_ino);
-                                    PathBuf::from(new_name_str)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    PathBuf::new()
-                }
-            } else {
-                PathBuf::new()
-            };
-            if let Some(_new_name_str) = &e.new_name {
-                // Fix 2 is applied in the outer loop of run_worker.
-                identity::update_map_after_rename(
-                    &source.inode_map, &source.dir_map, e.dev_id, inode, new_rel_path.clone(),
-                    e.generation, is_dir, e.timestamp_ns, e.seq_num
-                );
-                let old_dst_final_log = dst.clone();
-                let new_dst_final_log = target_cfg.path.join(&new_rel_path);
-                let old_dst_final_move = old_dst_final_log.clone();
-                let new_dst_final_move = new_dst_final_log.clone();
-                let source_mount = source.mount.clone();
-                let source_clone_rename = source_clone.clone();
-                let wal_map_clone = wal_map.clone();
-                let new_rel_path_clone = new_rel_path.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    let start = Instant::now();
-                    let max_wait = Duration::from_secs(5);
-                    loop {
-                        match atomic_rename(&old_dst_final_move, &new_dst_final_move) {
-                            Ok(_) => {
-                                wal_map_clone.clear_wal_state(inode);
-                                return Ok(());
-                            },
-                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                                let elapsed = start.elapsed();
-                                if let Some(parent) = new_dst_final_move.parent() {
-                                    if !parent.exists() {
-                                        debug!("Worker: Rename target dir {:?} missing. Creating.", parent);
-                                        let _ = std::fs::create_dir_all(parent);
-                                        continue;
-                                    }
-                                }
-                                if !old_dst_final_move.exists() {
-                                    if new_dst_final_move.exists() {
-                                         debug!("Worker: Rename target {:?} already exists. Assuming previous success (Stale event).", new_dst_final_move);
-                                         wal_map_clone.clear_wal_state(inode);
-                                         return Ok(());
-                                    }
-                                    let resolved_path = identity::resolve_and_update_path(&source_clone_rename, inode, 0, 0, 0).ok();
-                                    if let Some(rel) = resolved_path {
-                                        let current_src_abs = source_mount.join(&rel);
-                                        if current_src_abs.exists() {
-                                            debug!("Worker: Rename Source {:?} missing on target. Attempting SELF-HEAL copy from {:?} -> {:?}",
-                                                    old_dst_final_move, current_src_abs, new_dst_final_move);
-                                            match copy_with_reflink_sync(&current_src_abs, &new_dst_final_move) {
-                                                Ok(_) => {
-                                                    let _ = std::fs::remove_file(&old_dst_final_move);
-                                                    info!("Worker: SELF-HEAL Success.");
-                                                    wal_map_clone.clear_wal_state(inode);
-                                                    return Ok(());
-                                                }
-                                                Err(e) => {
-                                                    warn!("Worker: SELF-HEAL Failed: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, "Source disappeared")));
-                                }
-                                if elapsed > max_wait {
-                                    return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::NotFound, format!("Source missing after {}s retry: {}", elapsed.as_secs_f64(), e))));
-                                }
-                                std::thread::sleep(Duration::from_millis(10));
-                                continue;
-                            },
-                            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::ETXTBSY) => {
-                                let elapsed = start.elapsed();
-                                if elapsed > max_wait {
-                                     return Err(FoxingError::Io(std::io::Error::new(io::ErrorKind::TimedOut, format!("Timeout on BUSY file: {}", e))));
-                                }
-                                std::thread::sleep(Duration::from_millis(50));
-                                continue;
-                            },
-                            Err(e) => {
-                                wal_map_clone.clear_wal_state(inode);
-                                return Err(FoxingError::Io(e));
-                            },
-                        }
-                    }
-                }).await.map_err(FoxingError::Join).and_then(|r| r);
-                match res {
-                    Ok(_) => {
-                        metrics::RENAME_EVENTS.inc();
-                        info!("Worker {}: Atomic Rename SUCCESS: {:?} -> {:?}", worker_id, old_dst_final_log, new_dst_final_log);
-                    },
-                    Err(FoxingError::Io(ref io_err)) if io_err.kind() == io::ErrorKind::NotFound => {
-                        if new_dst_final_log.exists() {
-                            wal_map.clear_wal_state(inode);
-                            return Ok(None);
-                        }
-                        warn!("Worker {}: Source disappeared during rename. Triggering repair for NEW path: {:?}.", worker_id, new_rel_path_clone);
-                        let new_src = source.mount.join(&new_rel_path_clone);
-                        if let Err(_) = hydration_trigger.0.try_send((new_src, Some(inode))) {
-                            warn!("Worker {}: Hydration Trigger FULL. Failed to queue repair for Rename Target", worker_id);
-                        }
-                        wal_map.clear_wal_state(inode);
-                        return Ok(None);
-                    },
-                    Err(io_err) => {
-                        ctx.failure_state.record_failure();
-                        wal_map.clear_wal_state(inode);
-                        return Err(io_err);
-                    }
-                }
-                return Ok(None);
-            } else { return Ok(None); }
-        },
-        EventType::Mkdir => {
-            let dst_clone = dst.clone();
-            let _target_cfg_path_clone = target_cfg.path.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                let r = std::fs::create_dir_all(&dst_clone);
-                if r.is_ok() {
-                    if let Ok(rel) = dst_clone.strip_prefix(&_target_cfg_path_clone) {
-                        return Ok(Some(rel.to_path_buf()));
-                    }
-                }
-                Ok(None)
-            }).await.map_err(FoxingError::Join).and_then(|r| r.map_err(FoxingError::Io));
-            if let Ok(path_opt) = res {
-                if let Some(rel_path) = path_opt {
-                    identity_update_sync(rel_path, true);
-                }
-            }
-            Ok(None)
-        },
-        EventType::Unlink => {
-             let src_dev = e.dev_id;
-             identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
-             wal_map.clear_wal_state(inode);
-             let dst_clone = dst.clone();
-             let _res = tokio::task::spawn_blocking(move || {
-                 if dst_clone.exists() {
-                     std::fs::remove_file(&dst_clone)
-                 } else {
-                     Ok(())
-                 }
-             }).await;
-             Ok(None)
-        },
-        EventType::Fsync => {
-            if let Some(wal_guard_entry) = wal_map.get_entry_for_inode(inode) {
-                if wal_guard_entry.state == WalState::CommitPending {
-                    debug!("Fsync: Committing epoch for Inode {} (Seq {})", inode, wal_guard_entry.seq);
-                    let dst_clone = wal_guard_entry.path.clone();
-                    let seq = wal_guard_entry.seq;
-                    let projid = wal_guard_entry.projid;
-                    let commit_res = tokio::task::spawn_blocking(move || {
-                        security::commit_epoch(&dst_clone, seq, projid)
-                    }).await.map_err(FoxingError::Join).and_then(|r| r);
-                    match commit_res {
-                        Ok(_) => {
-                            wal_map.clear_wal_state(inode);
-                            info!("Fsync: Inode {} Commit & WAL Clear OK.", inode);
+                            bytes_since_tune += stats.bytes_processed;
+                            ops_since_tune += stats.ops_count.max(1);
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+                            let e2e = batch_evt.created_at.elapsed().as_secs_f64();
+                            metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
                         },
                         Err(e) => {
-                            error!("Fsync: Failed to commit epoch for Inode {}: {:?}. Clearing WAL state for next attempt.", inode, e);
-                            wal_map.clear_wal_state(inode);
+                            warn!("Worker {}: Batch failed: {:?}", worker_id, e);
+                            retry_queue.push(batch_evt, 0);
                         }
                     }
-                } else if wal_guard_entry.state == WalState::InProgress {
-                    debug!("Fsync: Inode {} ignored, still InProgress.", inode);
                 }
             }
-            Ok(None)
-        }
-        EventType::Rmdir => {
-            let src_dev = e.dev_id;
-            identity::remove_entry(&source.inode_map, &source.dir_map, src_dev, inode);
-            wal_map.clear_wal_state(inode);
-            let dst_clone = dst.clone();
-            let _res = tokio::task::spawn_blocking(move || {
-                if dst_clone.exists() {
-                    std::fs::remove_dir(&dst_clone)
-                 } else {
-                     Ok(())
-                 }
-             }).await;
-             Ok(None)
-        }
-        EventType::Link => {
-             let src_dev = e.dev_id;
-             let new_path = src.to_path_buf();
-             identity::update_map_after_rename(
-                &source.inode_map,
-                &source.dir_map,
-                src_dev,
-                inode,
-                new_path.clone(),
-                e.generation,
-                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
-                e.timestamp_ns,
-                e.seq_num
-            );
-            let new_dst = dst.clone();
-            let new_dst_clone_for_log = new_dst.clone();
-            let src_clone = source.mount.join(src);
-            let res = tokio::task::spawn_blocking(move || {
-                security::create_hard_link(&src_clone, &new_dst)
-            }).await.map_err(FoxingError::Join).and_then(|r| r);
-            if res.is_err() {
-                 error!("Link failed for {:?} -> {:?}: {:?}", src, new_dst_clone_for_log, res);
-                 return Err(res.unwrap_err());
-            }
-            Ok(None)
-        }
-        EventType::Symlink => {
-            let src_dev = e.dev_id;
-            let target_content = e.name.clone();
-            let link_path = dst.clone();
-            let link_path_rel = link_path.strip_prefix(&target_cfg.path).unwrap_or(link_path.as_path()).to_path_buf();
-            identity::update_map_after_rename(
-                &source.inode_map,
-                &source.dir_map,
-                src_dev,
-                inode,
-                link_path_rel,
-                e.generation,
-                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
-                e.timestamp_ns,
-                e.seq_num
-            );
-            let target_content_clone = target_content.clone();
-            let link_path_clone_for_log = link_path.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                security::create_symlink(&target_content, &link_path)
-            }).await.map_err(FoxingError::Join).and_then(|r| r);
-            if res.is_err() {
-                error!("Symlink failed for {} -> {:?}: {:?}", target_content_clone, link_path_clone_for_log, res);
-                return Err(res.unwrap_err());
-            }
-            Ok(None)
-        }
-        EventType::Mknod => {
-             let src_dev = e.dev_id;
-             let new_path_rel = dst.strip_prefix(&target_cfg.path).unwrap_or(dst.as_path()).to_path_buf();
-             let dev = e.length;
-             identity::update_map_after_rename(
-                &source.inode_map,
-                &source.dir_map,
-                src_dev,
-                inode,
-                new_path_rel,
-                e.generation,
-                (e.mode & libc::S_IFMT) == libc::S_IFDIR,
-                e.timestamp_ns,
-                e.seq_num
-            );
-            let new_dst = dst.clone();
-            let new_dst_clone_for_log = new_dst.clone();
-            let mode = e.mode;
-            let res = tokio::task::spawn_blocking(move || {
-                security::create_mknod(&new_dst, mode, dev)
-            }).await.map_err(FoxingError::Join).and_then(|r| r);
-            if res.is_err() {
-                error!("Mknod failed for {:?}: {:?}", new_dst_clone_for_log, res);
-                return Err(res.unwrap_err());
-            }
-            Ok(None)
-        }
-        EventType::Truncate | EventType::Fallocate => {
-            let dst_clone = dst.clone();
-            let new_size = e.length;
-            let offset = e.offset;
-            let flags = e.flags as i32;
-            let e_clone_for_log = e.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                if e.event_type == EventType::Truncate {
-                    security::truncate_file(&dst_clone, new_size)
-                } else {
-                    security::do_fallocate(&dst_clone, offset, new_size, flags)
-                }
-            }).await.map_err(FoxingError::Join).and_then(|r| r);
-            if res.is_err() {
-                error!("{} failed for {:?}: {:?}", e_clone_for_log.event_type.as_str(), dst, res);
-                return Err(res.unwrap_err());
-            }
-            Ok(None)
-        }
-        EventType::SetXattr | EventType::RemoveXattr => {
-            let dst_clone = dst.clone();
-            let apply_src = src.clone();
-            let _res = tokio::task::spawn_blocking(move || {
-                security::sync_xattrs(&apply_src, &dst_clone)
-            }).await;
-            Ok(None)
-        }
-        EventType::Chmod | EventType::Chown | EventType::Utimes => {
-            let dst_clone = dst.clone();
-            let apply_src = src.clone();
-            let _res = tokio::task::spawn_blocking(move || {
-                security::apply_metadata(&apply_src, &dst_clone)
-            }).await;
-            Ok(None)
-        }
-        _ => {
-            wal_map.clear_wal_state(inode);
-            Ok(None)
-        }
-    };
-    match res {
-        Ok(stats_opt) => {
-            Ok(stats_opt)
-        },
-        Err(err) => {
-            wal_map.clear_wal_state(inode);
-            if let FoxingError::Io(io_err) = &err {
-                if let Some(28) = io_err.raw_os_error() {
-                     error!("TARGET FULL (ENOSPC).");
-                     ctx.capacity_breaker.trip();
-                     ctx.failure_state.record_failure();
-                     let target_root_path = target_cfg.path.parent().unwrap_or(&target_cfg.path).to_path_buf();
-                     let _ = tokio::task::spawn_blocking(move || {
-                        versioning::prune_global_history(&target_root_path, 512 * 1024 * 1024)
-                    }).await;
-                }
-            }
-            return Err(err);
         }
     }
+
+    info!("Worker {}: Shutdown complete.", worker_id);
+    Ok(())
+}
+
+async fn resolve_event_path(source: &Arc<SourceInfo>, parent_inode: u64, name: &str) -> Result<PathBuf> {
+    if parent_inode == 0 { return Ok(PathBuf::from(name)); }
+    if let Some(dir_entry) = source.dir_map.get(&parent_inode) {
+        return Ok(dir_entry.value().join(name));
+    }
+    Ok(PathBuf::from(name))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_single_event_with_wal(
+    event: Arc<Event>,
+    source: Arc<SourceInfo>,
+    target_cfg: TargetConfig,
+    wal: Arc<InMemoryWal>,
+    _poison_cabinet: Arc<Mutex<PoisonCabinet>>,
+    _circuit_breaker: Arc<Mutex<CircuitBreaker>>,
+    _daemon_id: String,
+    mut smart_copier: SmartCopier,
+    sidecar: AsyncSidecar,
+    mut dirty_tracker: HashSet<u64>,
+    worker_id: usize,
+    hydration_tx: Arc<HydrationSender>,
+    _attempts: u32,
+) -> (Result<CopyStats>, SmartCopier, HashSet<u64>) {
+    let target_label = target_cfg.label.to_string();
+    
+    // Validate generation to prevent recycled inode corruption
+    if event.generation != std::u32::MAX {
+        if let Some(entry) = source.inode_map.get(&event.inode) {
+            let stored_gen = *entry.generation.read();
+            if stored_gen != std::u32::MAX && stored_gen != event.generation {
+                return (
+                    Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Generation mismatch - retry"))),
+                    smart_copier,
+                    dirty_tracker
+                );
+            }
+        }
+    }
+
+    let op_kind = match event.event_type {
+        EventType::Rename | EventType::RenameIncomplete => WalOpKind::Rename,
+        EventType::Truncate => WalOpKind::Truncate,
+        EventType::Write | EventType::WriteRange => WalOpKind::Write,
+        EventType::Barrier => WalOpKind::Barrier,
+        _ => WalOpKind::Barrier,
+    };
+
+    // WAL Barrier - Ensures ordering correctness for dependent operations
+    let op_guard = wal.acquire_barrier(event.inode, op_kind).await;
+
+    let target_path_res = identity::resolve_target(&source.inode_map, &source.dir_map, &event, &target_cfg.path);
+    let target_path = match target_path_res {
+        ResolveResult::Success(p, _, _) => p,
+        ResolveResult::NeedsRepair(p) => p,
+        ResolveResult::SecurityBlock => {
+            error!("Worker: Security Policy Violation - Access denied for inode {} (Path Traversal/Symlink Race)", event.inode);
+            return (Err(FoxingError::Security("Path traversal or symlink race detected".into())), smart_copier, dirty_tracker);
+        }
+    };
+
+    if let Ok(rel_path) = target_path.strip_prefix(&target_cfg.path) {
+        if target_cfg.is_path_excluded(rel_path) {
+            debug!("Worker: Dropping event for excluded path: {:?}", rel_path);
+            crate::metrics::EVENTS_FILTERED.with_label_values(&[&target_label]).inc();
+            return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+        }
+    }
+
+    let op_stats = CopyStats::default();
+    let mut op_result: Result<CopyStats> = Ok(op_stats);
+
+    match event.event_type {
+        EventType::Clone => {
+            let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+            let source_path = source.mount.join(rel);
+            
+            let size = match std::fs::metadata(&source_path) {
+                Ok(m) => m.len(),
+                Err(_) => event.length
+            };
+
+            if target_cfg.enable_versioning {
+                let root_path = target_cfg.path.clone();
+                let target_path_clone = target_path.clone();
+                let event_clone = event.clone();
+                let snapshot_result = spawn_blocking(move || {
+                    crate::security::create_version_snapshot(
+                        &target_path_clone,
+                        event_clone.seq_num,
+                        &root_path,
+                        event_clone.inode,
+                    )
+                }).await.map_err(FoxingError::Join);
+
+                if let Ok(res) = snapshot_result {
+                    match res {
+                        Ok(Some(version)) => {
+                            source.version_index.register(version);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!("Worker {}: Versioning failed for clone op on {:?}: {}", worker_id, target_path, e);
+                            crate::metrics::VERSIONING_FAILURES.inc();
+                        }
+                    }
+                }
+            }
+
+            if !dirty_tracker.contains(&event.inode) {
+                sidecar.set_dirty_blind(target_path.clone());
+                dirty_tracker.insert(event.inode);
+            }
+
+            op_result = smart_copier.optimized_copy_range(
+                source_path,
+                target_path.clone(),
+                event.offset,
+                event.length,
+                size,
+                target_label.clone(),
+                None, // Pass None for worker buffer limit (default tuning)
+                false, // Daemon workers always fsync
+            ).await;
+        },
+        EventType::Write | EventType::WriteRange => {
+            let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+            let source_path = source.mount.join(rel);
+            
+            let size = match std::fs::metadata(&source_path) {
+                Ok(m) => m.len(),
+                Err(_) => event.length
+            };
+
+            if target_cfg.enable_versioning {
+                let root_path = target_cfg.path.clone();
+                let target_path_clone = target_path.clone();
+                let event_clone = event.clone();
+                
+                let snapshot_result = spawn_blocking(move || {
+                    crate::security::create_version_snapshot(
+                        &target_path_clone,
+                        event_clone.seq_num,
+                        &root_path,
+                        event_clone.inode,
+                    )
+                }).await.map_err(FoxingError::Join);
+
+                if let Ok(res) = snapshot_result {
+                    match res {
+                        Ok(Some(version)) => {
+                            source.version_index.register(version);
+                            debug!("Worker {}: Snapshot registered for inode {}", worker_id, event.inode);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let is_unsupported = if let FoxingError::Io(io_err) = &e {
+                                io_err.kind() == std::io::ErrorKind::Unsupported
+                            } else {
+                                false
+                            };
+                            
+                            if is_unsupported {
+                                 warn!("Worker {}: Versioning skipped for {:?}: Filesystem does not support required features (Reflink/CoW).", worker_id, target_path);
+                            } else {
+                                 error!("Worker {}: Versioning CRITICAL FAILURE for {:?}: {}. Data loss risk.", worker_id, target_path, e);
+                            }
+                            crate::metrics::VERSIONING_FAILURES.inc();
+                        }
+                    }
+                }
+            }
+
+            if !dirty_tracker.contains(&event.inode) {
+                sidecar.set_dirty_blind(target_path.clone());
+                dirty_tracker.insert(event.inode);
+            }
+
+            op_result = smart_copier.optimized_copy_range(
+                source_path,
+                target_path.clone(),
+                event.offset,
+                event.length,
+                size,
+                target_label.clone(),
+                None, // Pass None for worker buffer limit (default tuning)
+                false, // Daemon workers always fsync
+            ).await;
+        },
+        EventType::Rename => {
+            let old_rel_res = resolve_event_path(&source, event.parent_inode, &event.name).await;
+            match old_rel_res {
+                Ok(old_rel) => {
+                    let old_path = target_cfg.path.join(old_rel);
+                    
+                    if let Some(parent) = target_path.parent() {
+                        if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
+                    }
+                    
+                    op_result = smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags).await;
+                    
+                    // Update identity map if directory
+                    if event.mode & libc::S_IFDIR as u32 != 0 {
+                        if let Some(new_name) = &event.new_name {
+                            if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                                identity::update_map_after_rename(
+                                    &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                    new_rel.clone(), event.generation, true, event.timestamp_ns, event.seq_num
+                                );
+                            }
+                        }
+                    }
+                },
+                Err(e) => op_result = Err(e),
+            }
+        },
+        EventType::RenameIncomplete => {
+            // Best effort recovery for partial rename events
+            let old_rel = if let Some(entry) = source.inode_map.get(&event.inode) {
+                entry.primary_path()
+            } else {
+                PathBuf::from(&event.name)
+            };
+            let old_path = target_cfg.path.join(&old_rel);
+            
+            let new_path_res = spawn_blocking({
+                let src_clone = source.clone();
+                let inode = event.inode;
+                let generation = event.generation;
+                move || identity::resolve_and_update_path(&src_clone, inode, generation, 0, 0)
+            }).await.map_err(FoxingError::Join);
+
+            if let Ok(Ok(new_path_full)) = new_path_res {
+                if let Ok(new_rel) = new_path_full.strip_prefix(&source.mount) {
+                    let new_target_path = target_cfg.path.join(new_rel);
+                    
+                    if let Some(parent) = new_target_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    
+                    info!("Worker: Executing recovered rename: {:?} -> {:?}", old_path, new_target_path);
+                    op_result = smart_copier.optimized_rename(old_path, new_target_path, 0).await;
+                } else {
+                    op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to strip prefix from recovered path")));
+                }
+            } else {
+                 op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to recover path for incomplete rename")));
+            }
+        },
+        EventType::Truncate => {
+            if !dirty_tracker.contains(&event.inode) {
+                sidecar.set_dirty_blind(target_path.clone());
+                dirty_tracker.insert(event.inode);
+            }
+            op_result = smart_copier.optimized_truncate(target_path.clone(), event.length).await;
+        },
+        EventType::Unlink | EventType::Rmdir => {
+             let event_clone = event.clone();
+             dirty_tracker.remove(&event.inode);
+             let path_to_remove = target_path.clone();
+             
+             let res = spawn_blocking(move || {
+                if event_clone.event_type == EventType::Rmdir {
+                    std::fs::remove_dir(path_to_remove)
+                } else {
+                    std::fs::remove_file(path_to_remove)
+                }
+            }).await.map_err(FoxingError::Join);
+
+            match res {
+                Ok(Ok(_)) => {
+                    identity::remove_entry(&source.inode_map, &source.dir_map, event.dev_id, event.inode);
+                },
+                Ok(Err(e)) => op_result = Err(FoxingError::Io(e)),
+                Err(e) => op_result = Err(e.into()),
+            }
+        },
+        EventType::Mkdir | EventType::Create | EventType::Mknod => {
+             let target_path_clone = target_path.clone();
+             let event_clone = event.clone();
+             
+             let fs_res = spawn_blocking(move || {
+                 if let Some(parent) = target_path_clone.parent() {
+                     let _ = std::fs::create_dir_all(parent);
+                 }
+                 
+                 if event_clone.event_type == EventType::Mkdir {
+                     let _ = std::fs::create_dir_all(&target_path_clone);
+                 } else if event_clone.event_type == EventType::Mknod {
+                     security::create_mknod(&target_path_clone, event_clone.mode, event_clone.dev_id as u64)?;
+                 } else {
+                     let _ = std::fs::File::create(&target_path_clone);
+                 }
+                 
+                 security::set_ownership(&target_path_clone, event_clone.uid, event_clone.gid)?;
+                 Ok::<(), FoxingError>(())
+             }).await.map_err(FoxingError::Join);
+
+             if let Ok(Ok(_)) = fs_res {
+                 let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                 let source_path = source.mount.join(rel);
+                 let target_path_meta = target_path.clone();
+                 
+                 let _ = spawn_blocking(move || {
+                     security::apply_metadata(&source_path, &target_path_meta)?;
+                     security::sync_xattrs(&source_path, &target_path_meta);
+                     
+                     if let Ok(sig) = SyncSignature::compute(&target_path_meta) {
+                        let _ = set_sync_signature(&target_path_meta, &sig);
+                     }
+                     Ok::<(), FoxingError>(())
+                 }).await;
+
+                 if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                      identity::update_map(
+                        &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                        rel.to_path_buf(), event.generation, false, event.event_type == EventType::Mkdir,
+                        event.timestamp_ns, event.seq_num
+                      );
+                 }
+             } else if let Ok(Err(e)) = fs_res {
+                 op_result = Err(e);
+             } else {
+                 op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Thread join error")));
+             }
+        },
+        EventType::Link => {
+             if let Some(entry) = source.inode_map.get(&event.inode) {
+                 let existing_rel = entry.primary_path();
+                 let existing_path = target_cfg.path.join(existing_rel);
+                 let new_path = target_path.clone();
+                 let new_path_link = new_path.clone();
+                 
+                 let link_res = spawn_blocking(move || {
+                     security::create_hard_link(&existing_path, &new_path_link)
+                 }).await.map_err(FoxingError::Join);
+
+                 match link_res {
+                     Ok(Ok(_)) => {
+                         let meta = spawn_blocking(move || {
+                             std::fs::metadata(&new_path)
+                         }).await.map_err(FoxingError::Join);
+                         
+                         if let Ok(Ok(meta)) = meta {
+                             if meta.nlink() as u32 != event.nlink {
+                                 warn!("Worker {}: Hardlink count mismatch for inode {}. Event: {}, Target: {}. Triggering repair.",
+                                       worker_id, event.inode, event.nlink, meta.nlink());
+                                 let rel_path = target_path.strip_prefix(&target_cfg.path)
+                                    .unwrap_or(Path::new(""))
+                                    .to_path_buf();
+                                 hydration_tx.send_repair_job(rel_path, Some(event.inode)).await;
+                             }
+                         }
+                         
+                         if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                             identity::update_map(
+                                &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                rel.to_path_buf(), event.generation, false, false,
+                                event.timestamp_ns, event.seq_num
+                             );
+                         }
+                     },
+                     Ok(Err(e)) => op_result = Err(e),
+                     Err(e) => op_result = Err(e.into()),
+                 }
+             } else {
+                 warn!("Worker {}: Cannot link inode {}. Source path not found in map. Triggering repair.", worker_id, event.inode);
+                 let rel_path = target_path.strip_prefix(&target_cfg.path)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
+                 hydration_tx.send_repair_job(rel_path, Some(event.inode)).await;
+             }
+        },
+        EventType::SetFlags => {
+             let p = target_path.clone();
+             let flags = event.flags;
+             let res = spawn_blocking(move || security::set_file_attr(&p, flags)).await.map_err(FoxingError::Join);
+             if let Ok(Err(e)) = res { op_result = Err(e); }
+             else if let Err(e) = res { op_result = Err(e.into()); }
+        },
+        EventType::Lock | EventType::Flock => {
+             let p = target_path.clone();
+             let flags = event.flags;
+             let map = source.lock_map.clone();
+             let res = spawn_blocking(move || crate::operations::apply_lock(&p, flags, &map)).await.map_err(FoxingError::Join);
+             if let Ok(Err(e)) = res { op_result = Err(e); }
+             else if let Err(e) = res { op_result = Err(e.into()); }
+        },
+        EventType::Fallocate => {
+            if !dirty_tracker.contains(&event.inode) {
+                sidecar.set_dirty_blind(target_path.clone());
+                dirty_tracker.insert(event.inode);
+            }
+            let mode = event.flags as i32;
+            op_result = smart_copier.optimized_fallocate(target_path.clone(), mode, event.offset, event.length).await;
+        },
+        _ => {}
+    }
+
+    if op_result.is_ok() && matches!(event.event_type, EventType::Write | EventType::WriteRange | EventType::Clone | EventType::Truncate | EventType::Fallocate) {
+        let target_path_clone = target_path.clone();
+        let _ = spawn_blocking(move || {
+            if let Ok(sig) = SyncSignature::compute(&target_path_clone) {
+                if let Err(e) = set_sync_signature(&target_path_clone, &sig) {
+                    debug!("Failed to persist signature for {:?}: {}", target_path_clone, e);
+                }
+            }
+        }).await;
+    }
+
+    if dirty_tracker.contains(&event.inode) {
+        let p = target_path.clone();
+        let _ = spawn_blocking(move || {
+            crate::sidecar::remove_metadata(&p, "user.foxing.dirty")
+        }).await;
+        dirty_tracker.remove(&event.inode);
+    }
+
+    drop(op_guard);
+    (op_result, smart_copier, dirty_tracker)
 }

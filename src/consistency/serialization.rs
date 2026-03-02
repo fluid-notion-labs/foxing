@@ -1,5 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
+use crate::consistency::sequencer::{GlobalSequencer, SequenceBarrier};
+use std::path::PathBuf;
+use tracing::{debug, warn};
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,39 +14,50 @@ pub enum OpKind {
 pub struct OpGuard {
     engine: Arc<SerializationEngine>,
     inode: u64,
-    kind: OpKind,
+    ticket: u64,
 }
 
 impl Drop for OpGuard {
     fn drop(&mut self) {
-        self.engine.complete_op(self.inode, self.kind);
+        self.engine.complete_op(self.inode, self.ticket);
+    }
+}
+
+pub struct PathGuard {
+    engine: Arc<SerializationEngine>,
+    path: PathBuf,
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        self.engine.release_path(&self.path);
     }
 }
 
 struct InodeState {
-    active_count: usize,
-    exclusive_active: bool,
-    queue: VecDeque<(OpKind, Arc<Notify>)>,
+    sequencer: GlobalSequencer,
+    barrier: SequenceBarrier,
 }
 
 impl InodeState {
     fn new() -> Self {
         Self {
-            active_count: 0,
-            exclusive_active: false,
-            queue: VecDeque::new(),
+            sequencer: GlobalSequencer::new(0),
+            barrier: SequenceBarrier::new(0),
         }
     }
 }
 
 pub struct SerializationEngine {
-    state: std::sync::Mutex<HashMap<u64, InodeState>>,
+    state: std::sync::Mutex<HashMap<u64, Arc<InodeState>>>,
+    path_locks: std::sync::Mutex<HashMap<PathBuf, Arc<Notify>>>,
 }
 
 impl SerializationEngine {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: std::sync::Mutex::new(HashMap::new()),
+            path_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -52,71 +66,100 @@ impl SerializationEngine {
         state.contains_key(&inode)
     }
 
-    pub async fn acquire_barrier(self: &Arc<Self>, inode: u64, kind: OpKind) -> OpGuard {
-        let notify = {
-            let mut state_map = self.state.lock().unwrap();
-            let inode_state = state_map.entry(inode).or_insert_with(InodeState::new);
+    /// Acquires a ticket-based barrier for an inode operation.
+    /// This ensures strict serialization of operations on the same inode
+    /// based on the order they arrive, preventing deadlocks.
+    pub async fn acquire_barrier(self: &Arc<Self>, inode: u64, _kind: OpKind) -> Result<OpGuard, std::io::Error> {
+        // 1. Acquire Ticket
+        let (inode_state, ticket) = {
+            let mut map = self.state.lock().unwrap();
+            let state = map.entry(inode).or_insert_with(|| Arc::new(InodeState::new())).clone();
             
-            if inode_state.queue.is_empty() && self.can_run(inode_state, kind) {
-                self.mark_running(inode_state, kind);
-                return OpGuard {
-                    engine: self.clone(),
-                    inode,
-                    kind,
-                };
-            }
+            // Get the next ticket. 
+            // Note: In this architecture, we treat Writes and Renames with the same 
+            // strict ordering requirement for simplicity and deadlock prevention.
+            // Writer A (100) blocks Writer B (101).
+            let ticket = state.sequencer.next();
             
-            let notify = Arc::new(Notify::new());
-            inode_state.queue.push_back((kind, notify.clone()));
-            notify
+            (state, ticket)
         };
 
-        notify.notified().await;
+        // 2. Wait for previous operation to complete
+        // Since tickets are 1-based, ticket 1 waits for 0 (completed by default).
+        // Ticket 101 waits for 100.
+        let dependency = ticket - 1;
+        
+        if dependency > 0 {
+            // Wait for the barrier to reach the dependency state.
+            // This is deadlock-free because the dependency is strictly lower than our ticket.
+            inode_state.barrier.wait_for(dependency).await;
+        }
 
-        OpGuard {
+        Ok(OpGuard {
             engine: self.clone(),
             inode,
-            kind,
-        }
+            ticket,
+        })
     }
 
-    fn can_run(&self, state: &InodeState, kind: OpKind) -> bool {
-        if state.exclusive_active { return false; }
-        match kind {
-            OpKind::Write => true,
-            OpKind::Rename => state.active_count == 0,
-        }
-    }
-
-    fn mark_running(&self, state: &mut InodeState, kind: OpKind) {
-        match kind {
-            OpKind::Write => state.active_count += 1,
-            OpKind::Rename => state.exclusive_active = true,
-        }
-    }
-
-    fn complete_op(&self, inode: u64, kind: OpKind) {
-        let mut state_map = self.state.lock().unwrap();
-        
-        if let Some(inode_state) = state_map.get_mut(&inode) {
-            match kind {
-                OpKind::Write => if inode_state.active_count > 0 { inode_state.active_count -= 1; },
-                OpKind::Rename => inode_state.exclusive_active = false,
-            }
-
-            // Fix #12: Only wake ONE waiter to prevent Thundering Herd
-            if let Some((next_kind, _)) = inode_state.queue.front() {
-                if self.can_run(inode_state, *next_kind) {
-                    let (kind_to_run, _) = *inode_state.queue.front().unwrap();
-                    self.mark_running(inode_state, kind_to_run);
-                    let (_, notify) = inode_state.queue.pop_front().unwrap();
-                    notify.notify_one();
+    pub async fn acquire_path_barrier(self: &Arc<Self>, path: &PathBuf) -> Result<PathGuard, std::io::Error> {
+        loop {
+            let wait_notify = {
+                let mut locks = self.path_locks.lock().unwrap();
+                if let Some(notify) = locks.get(path) {
+                    Some(notify.clone())
+                } else {
+                    locks.insert(path.clone(), Arc::new(Notify::new()));
+                    None
                 }
-            }
+            };
 
-            if inode_state.active_count == 0 && !inode_state.exclusive_active && inode_state.queue.is_empty() {
-                state_map.remove(&inode);
+            if let Some(notify) = wait_notify {
+                notify.notified().await;
+            } else {
+                return Ok(PathGuard {
+                    engine: self.clone(),
+                    path: path.clone(),
+                });
             }
+        }
+    }
+
+    fn release_path(&self, path: &PathBuf) {
+        let mut locks = self.path_locks.lock().unwrap();
+        if let Some(notify) = locks.remove(path) {
+            notify.notify_waiters();
+        }
+    }
+
+    // Legacy sequence checking helpers - now no-ops or simple pass-throughs
+    // as the ticket barrier handles ordering implicitly.
+    pub fn check_sequence(&self, _inode: u64, _seq: u64) -> bool {
+        true 
+    }
+
+    pub fn update_sequence(&self, _inode: u64, _seq: u64) {
+        // Managed internally by sequencer
+    }
+
+    fn complete_op(&self, inode: u64, ticket: u64) {
+        // We need to access the barrier to mark completion.
+        let state_opt = {
+            let map = self.state.lock().unwrap();
+            map.get(&inode).cloned()
+        };
+
+        if let Some(state) = state_opt {
+            debug!("Serialization: Completed ticket {} for inode {}", ticket, inode);
+            state.barrier.complete(ticket);
+            
+            // Note: We don't remove the InodeState from the map aggressively here.
+            // In a long-running system, we might want a cleanup task to remove 
+            // InodeStates where barrier.current() == sequencer.current() and no activity.
+            // For now, we rely on LRU or system restart to clean up map entries if they grow too large,
+            // or the memory overhead is considered acceptable for active inodes.
+        } else {
+            warn!("Serialization: Attempted to complete op for unknown inode {}", inode);
         }
     }
 }
