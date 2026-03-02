@@ -301,7 +301,12 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
             .map(|m| m.dev()).unwrap_or(0);
         let dst_is_nfs = dst_caps.is_nfs.load(Ordering::Relaxed);
 
-        // Tier 1: Reflink/FICLONE (instant CoW)
+        // Sparse detection: if actual disk usage is <50% of logical size, it's sparse.
+        // Sparse files must use io_uring (Tier 3) which has SEEK_HOLE/PUNCH_HOLE support.
+        let is_sparse = file_size > 4096
+            && (src_meta.blocks() as u64 * 512) < file_size / 2;
+
+        // Tier 1: Reflink/FICLONE (instant CoW) — preserves sparsity
         // On NFS 4.2: try even cross-device — server handles clone internally
         if (same_device || dst_is_nfs) && file_size > 0 {
             if try_reflink_copy(src_path, &dst_path) {
@@ -315,8 +320,8 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         }
 
         // Tier 1.5: copy_file_range (NFS 4.2 server-side copy, also works on local fs)
-        // On NFS this avoids sending data over the wire entirely
-        if file_size > 0 {
+        // Skip for sparse files — copy_file_range writes zeros into holes
+        if file_size > 0 && !is_sparse {
             match try_copy_file_range(src_path, &dst_path, file_size) {
                 Ok(bytes) if bytes == file_size => {
                     stats.files_cfr += 1;
@@ -337,7 +342,8 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         }
 
         // Tier 2: Small file fast path (std::fs::copy, no io_uring overhead)
-        if file_size <= SMALL_FILE_THRESHOLD {
+        // Skip for sparse files — sendfile writes zeros into holes
+        if file_size <= SMALL_FILE_THRESHOLD && !is_sparse {
             match copy_small_file(src_path, &dst_path) {
                 Ok(bytes) => {
                     stats.files_small += 1;
