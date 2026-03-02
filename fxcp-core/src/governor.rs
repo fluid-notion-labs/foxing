@@ -14,6 +14,7 @@ pub struct Governor {
     stress_score: Arc<Mutex<f64>>,
     memory_usage_pct: Arc<Mutex<f64>>,
     min_hydration_interval: Duration,
+    min_throughput_bytes_sec: AtomicU64,
     #[allow(dead_code)]
     throttled_count: AtomicU64,
 }
@@ -113,8 +114,14 @@ impl Governor {
             stress_score,
             memory_usage_pct,
             min_hydration_interval: Duration::from_millis(hydration_delay_ms),
+            min_throughput_bytes_sec: AtomicU64::new(0),
             throttled_count: AtomicU64::new(0),
         }
+    }
+
+    /// Set minimum throughput floor — governor will not throttle below this rate.
+    pub fn set_min_throughput(&self, bytes_per_sec: u64) {
+        self.min_throughput_bytes_sec.store(bytes_per_sec, Ordering::Relaxed);
     }
 
     fn read_psi(resource: &str) -> Option<PsiStats> {

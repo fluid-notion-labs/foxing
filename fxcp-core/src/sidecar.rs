@@ -69,7 +69,10 @@ impl SyncSignature {
     }
     
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_limit(16 * 1024 * 1024) // 16MB max payload
+            .deserialize(data).ok()
     }
     
     pub fn matches(&self, other: &Self) -> bool {
@@ -273,7 +276,10 @@ pub fn set_merkle_signature(path: &Path, sig: &hashing::MerkleSignature) -> std:
 
 pub fn get_merkle_signature(path: &Path) -> Option<hashing::MerkleSignature> {
     let bytes = get_metadata(path, "merkle")?;
-    let sig: hashing::MerkleSignature = bincode::deserialize(&bytes).ok()?;
+    use bincode::Options;
+    let sig: hashing::MerkleSignature = bincode::DefaultOptions::new()
+        .with_limit(64 * 1024) // 64KB max (xattr limit)
+        .deserialize(&bytes).ok()?;
     // Bounds check
     if sig.chunk_size == 0 { return None; }
     let expected_max = sig.file_size / sig.chunk_size + 2;

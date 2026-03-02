@@ -39,6 +39,8 @@ struct Cli {
     exclude: Vec<String>,
     #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
     cleanup: bool,
+    #[arg(long, help = "Force full hash verification, ignore stored signatures")]
+    strict_hash: bool,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     debug: bool,
 }

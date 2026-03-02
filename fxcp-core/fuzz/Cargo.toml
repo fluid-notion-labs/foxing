@@ -1,0 +1,28 @@
+[package]
+name = "fxcp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fxcp-core = { path = ".." }
+bincode = "1.3.3"
+
+[[bin]]
+name = "fuzz_merkle_deserialize"
+path = "fuzz_targets/fuzz_merkle_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sync_sig_deserialize"
+path = "fuzz_targets/fuzz_sync_sig_deserialize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_path_resolution"
+path = "fuzz_targets/fuzz_path_resolution.rs"
+doc = false

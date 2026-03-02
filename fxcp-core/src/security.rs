@@ -547,3 +547,36 @@ pub fn set_file_attr(path: &Path, flags: u32) -> Result<()> {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Path sanitization — prevent path traversal and symlink escape
+// ---------------------------------------------------------------------------
+
+/// Check that `path` is within `root` after canonicalization.
+/// Rejects symlinks that escape the root directory.
+pub fn path_within_root(path: &Path, root: &Path) -> crate::error::Result<bool> {
+    let canonical = path.canonicalize().map_err(|e| {
+        FxcpError::Security(format!("cannot canonicalize {:?}: {}", path, e))
+    })?;
+    let root_canonical = root.canonicalize().map_err(|e| {
+        FxcpError::Security(format!("cannot canonicalize root {:?}: {}", root, e))
+    })?;
+    Ok(canonical.starts_with(&root_canonical))
+}
+
+/// Canonicalize `path` and verify it stays within `root`.
+/// Returns the canonical path or a security error.
+pub fn canonicalize_safe(path: &Path, root: &Path) -> crate::error::Result<std::path::PathBuf> {
+    let canonical = path.canonicalize().map_err(|e| {
+        FxcpError::Security(format!("cannot canonicalize {:?}: {}", path, e))
+    })?;
+    let root_canonical = root.canonicalize().map_err(|e| {
+        FxcpError::Security(format!("cannot canonicalize root {:?}: {}", root, e))
+    })?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(FxcpError::Security(format!(
+            "path {:?} escapes root {:?} (resolved to {:?})", path, root, canonical
+        )));
+    }
+    Ok(canonical)
+}

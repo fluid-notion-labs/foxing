@@ -299,13 +299,26 @@ struct StatxAtomic {
     __spare1: [u64; 10],
 }
 
-struct CleanupGuard {
+pub struct CleanupGuard {
     files: Vec<PathBuf>,
 }
 
 impl CleanupGuard {
-    fn new(files: Vec<PathBuf>) -> Self {
+    pub fn new(files: Vec<PathBuf>) -> Self {
         Self { files }
+    }
+
+    pub fn empty() -> Self {
+        Self { files: Vec::new() }
+    }
+
+    pub fn register(&mut self, path: PathBuf) {
+        self.files.push(path);
+    }
+
+    /// Remove a path from cleanup list (call after successful rename/commit).
+    pub fn disarm(&mut self, path: &Path) {
+        self.files.retain(|p| p != path);
     }
 }
 
