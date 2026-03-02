@@ -422,16 +422,22 @@ def run_workload_suite(
             "workload": workload_name,
             "phase": phase,
         }
-        for t in ("rsync", "cp", "foxing"):
+        for t in ("rsync", "cp", "foxing", "fxcp"):
             if t in tool_times:
                 comp[f"{t}_ms"] = tool_times[t]
 
-        # Compute ratios (>1.0 means foxing is faster)
+        # Compute ratios (>1.0 means tool is faster than reference)
         if "foxing" in tool_times and tool_times["foxing"] > 0:
             if "rsync" in tool_times and tool_times["rsync"] > 0:
                 comp["foxing_vs_rsync"] = round(tool_times["rsync"] / tool_times["foxing"], 3)
             if "cp" in tool_times and tool_times["cp"] > 0:
                 comp["foxing_vs_cp"] = round(tool_times["cp"] / tool_times["foxing"], 3)
+
+        if "fxcp" in tool_times and tool_times["fxcp"] > 0:
+            if "rsync" in tool_times and tool_times["rsync"] > 0:
+                comp["fxcp_vs_rsync"] = round(tool_times["rsync"] / tool_times["fxcp"], 3)
+            if "cp" in tool_times and tool_times["cp"] > 0:
+                comp["fxcp_vs_cp"] = round(tool_times["cp"] / tool_times["fxcp"], 3)
 
         comparisons.append(comp)
 
@@ -555,6 +561,10 @@ def print_human(report: dict):
                 parts.append(f"fox/rsync={c['foxing_vs_rsync']:.2f}")
             if "foxing_vs_cp" in c:
                 parts.append(f"fox/cp={c['foxing_vs_cp']:.2f}")
+            if "fxcp_vs_rsync" in c:
+                parts.append(f"fxcp/rsync={c['fxcp_vs_rsync']:.2f}")
+            if "fxcp_vs_cp" in c:
+                parts.append(f"fxcp/cp={c['fxcp_vs_cp']:.2f}")
             print("  ".join(parts))
 
     # Summary

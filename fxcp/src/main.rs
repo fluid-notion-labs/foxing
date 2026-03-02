@@ -3,14 +3,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 use tokio::io::unix::AsyncFd;
 use tracing::{info, warn, debug, error};
 
 use fxcp_core::constants;
 use fxcp_core::operations::{
-    SmartCopier, CopyStats, Capabilities, probe_capabilities, determine_copy_strategy,
-    CopyStrategy, OptimizedFs, FsyncLatencyTracker,
+    SmartCopier, CopyStats, probe_capabilities, OptimizedFs, FsyncLatencyTracker,
 };
 use fxcp_core::buffer::BufferPool;
 use fxcp_core::governor::Governor;
@@ -146,7 +144,7 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     std::fs::create_dir_all(destination)?;
     let destination = destination.canonicalize()?;
 
-    let src_caps = probe_capabilities(&source);
+    let _src_caps = probe_capabilities(&source);
     let dst_caps = probe_capabilities(&destination);
 
     // Log storage stack detection
