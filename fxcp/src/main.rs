@@ -18,7 +18,7 @@ use fxcp_core::sidecar;
 #[derive(Parser)]
 #[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
 struct Cli {
-    /// Source path
+    /// Source path (use '-' for stdin)
     source: PathBuf,
     /// Destination path
     destination: PathBuf,
@@ -39,6 +39,8 @@ struct Cli {
     cleanup: bool,
     #[arg(long, help = "Force full hash verification, ignore stored signatures")]
     strict_hash: bool,
+    #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
+    size: Option<u64>,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     debug: bool,
 }
@@ -92,13 +94,135 @@ fn main() {
         .build()
         .expect("Failed to create tokio runtime");
 
-    let result = rt.block_on(run_sync(&cli));
+    let result = if cli.source.as_os_str() == "-" {
+        rt.block_on(run_stdin_to_file(&cli))
+    } else {
+        rt.block_on(run_sync(&cli))
+    };
     match result {
         Ok(stats) => print_summary(&stats),
         Err(e) => {
             error!("fxcp failed: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stdin → file mode: read piped data, write with sparse optimization
+// ---------------------------------------------------------------------------
+
+const STDIN_CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks (matches NFS wsize)
+
+/// Fast zero-block detection using u128 alignment trick.
+fn is_zero(buf: &[u8]) -> bool {
+    let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
+    prefix.iter().all(|&x| x == 0)
+        && chunks.iter().all(|&x| x == 0)
+        && suffix.iter().all(|&x| x == 0)
+}
+
+async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    fxcp_core::metrics::initialize_metrics(512);
+
+    let dst = &cli.destination;
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .open(dst)?;
+    let fd = file.as_raw_fd();
+
+    // Pre-allocate if size known
+    if let Some(size) = cli.size {
+        let ret = unsafe {
+            libc::fallocate(fd, 0, 0, size as i64)
+        };
+        if ret != 0 {
+            debug!("fallocate pre-allocation failed (non-fatal): {}", std::io::Error::last_os_error());
+        }
+    }
+
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = vec![0u8; STDIN_CHUNK_SIZE];
+    let mut offset: u64 = 0;
+    let mut bytes_written: u64 = 0;
+    let mut bytes_sparse: u64 = 0;
+    let mut chunks_data: u64 = 0;
+    let mut chunks_zero: u64 = 0;
+
+    loop {
+        // Read a full chunk from stdin (handling partial reads)
+        let mut filled = 0;
+        while filled < STDIN_CHUNK_SIZE {
+            let n = match stdin.read(&mut buf[filled..]) {
+                Ok(0) => break,     // EOF
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(fxcp_core::FxcpError::Io(e)),
+            };
+            filled += n;
+        }
+        if filled == 0 { break; } // EOF
+
+        if is_zero(&buf[..filled]) {
+            // Zero chunk — create a hole (don't write, just advance offset)
+            // The file will have a hole here (sparse)
+            bytes_sparse += filled as u64;
+            chunks_zero += 1;
+        } else {
+            // Data chunk — write at current offset via pwrite
+            let mut written = 0;
+            while written < filled {
+                let ret = unsafe {
+                    libc::pwrite(fd, buf[written..filled].as_ptr() as *const _,
+                                 filled - written, (offset + written as u64) as i64)
+                };
+                if ret < 0 {
+                    return Err(fxcp_core::FxcpError::Io(std::io::Error::last_os_error()));
+                }
+                written += ret as usize;
+            }
+            bytes_written += filled as u64;
+            chunks_data += 1;
+        }
+        offset += filled as u64;
+    }
+
+    // Truncate to exact size (sets file size even if last chunk was a hole)
+    unsafe { libc::ftruncate(fd, offset as i64) };
+
+    // fsync
+    file.sync_all()?;
+
+    info!("stdin → {:?}: {} total, {} data, {} sparse ({} zero chunks punched)",
+          dst, format_bytes(offset), format_bytes(bytes_written),
+          format_bytes(bytes_sparse), chunks_zero);
+
+    Ok(SyncStats {
+        files_copied: 1,
+        bytes_copied: bytes_written,
+        bytes_small: bytes_sparse, // reuse for sparse display
+        ..Default::default()
+    })
+}
+
+fn format_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", b as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / 1024.0 / 1024.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{} B", b)
     }
 }
 
