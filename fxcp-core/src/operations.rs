@@ -247,6 +247,7 @@ pub struct Capabilities {
     pub btrfs_subvol: AtomicBool,
     pub btrfs_quotas: AtomicBool,
     pub f2fs_atomic_legacy: AtomicBool,
+    pub is_nfs: AtomicBool,
     pub dm_stack: Option<DmStackInfo>,
     pub container: Option<ContainerInfo>,
 }
@@ -264,6 +265,7 @@ impl Default for Capabilities {
             btrfs_subvol: AtomicBool::new(false),
             btrfs_quotas: AtomicBool::new(false),
             f2fs_atomic_legacy: AtomicBool::new(false),
+            is_nfs: AtomicBool::new(false),
             dm_stack: None,
             container: None,
         }
@@ -460,6 +462,10 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
     debug!("probe_capabilities: checking statfs magic");
     if let Ok(s) = statfs::statfs(path) {
         let magic = s.filesystem_type().0 as i64;
+        if magic == NFS_SUPER_MAGIC {
+            caps_inner.is_nfs.store(true, Ordering::Relaxed);
+            debug!("probe_capabilities: NFS detected");
+        }
         if magic == F2FS_SUPER_MAGIC {
             caps_inner.f2fs_atomic_legacy.store(true, Ordering::Relaxed);
             if !caps_inner.atomic_writes.load(Ordering::Relaxed) {

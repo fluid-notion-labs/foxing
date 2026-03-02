@@ -45,11 +45,12 @@ struct Cli {
 
 // Auto-adaptive thresholds
 const SMALL_FILE_THRESHOLD: u64 = 64 * 1024; // Files below 64KB use std::fs::copy (no io_uring)
-const FICLONE: u64 = 0x40049409;              // btrfs/xfs reflink ioctl
+const FICLONE: u64 = 0x40049409;              // btrfs/xfs/nfs reflink ioctl
 
 struct SyncStats {
     files_copied: u64,
     files_reflinked: u64,
+    files_cfr: u64,       // copy_file_range (NFS server-side copy)
     files_small: u64,
     files_skipped: u64,
     files_delta: u64,
@@ -57,6 +58,7 @@ struct SyncStats {
     dirs_created: u64,
     bytes_copied: u64,
     bytes_reflinked: u64,
+    bytes_cfr: u64,
     bytes_small: u64,
     bytes_delta: u64,
     errors: u64,
@@ -64,10 +66,10 @@ struct SyncStats {
 
 impl Default for SyncStats {
     fn default() -> Self {
-        Self { files_copied: 0, files_reflinked: 0, files_small: 0,
+        Self { files_copied: 0, files_reflinked: 0, files_cfr: 0, files_small: 0,
                files_skipped: 0, files_delta: 0, files_deleted: 0,
                dirs_created: 0, bytes_copied: 0, bytes_reflinked: 0,
-               bytes_small: 0, bytes_delta: 0, errors: 0 }
+               bytes_cfr: 0, bytes_small: 0, bytes_delta: 0, errors: 0 }
     }
 }
 
@@ -297,9 +299,11 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         let file_size = src_meta.len();
         let same_device = src_meta.dev() == std::fs::metadata(&destination)
             .map(|m| m.dev()).unwrap_or(0);
+        let dst_is_nfs = dst_caps.is_nfs.load(Ordering::Relaxed);
 
-        // Tier 1: Reflink fast path (instant CoW, same-device btrfs/xfs only)
-        if same_device && file_size > 0 {
+        // Tier 1: Reflink/FICLONE (instant CoW)
+        // On NFS 4.2: try even cross-device — server handles clone internally
+        if (same_device || dst_is_nfs) && file_size > 0 {
             if try_reflink_copy(src_path, &dst_path) {
                 stats.files_reflinked += 1;
                 stats.bytes_reflinked += file_size;
@@ -308,7 +312,28 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                 }
                 continue;
             }
-            // Reflink failed (NOCOW, cross-subvol, etc) — fall through
+        }
+
+        // Tier 1.5: copy_file_range (NFS 4.2 server-side copy, also works on local fs)
+        // On NFS this avoids sending data over the wire entirely
+        if file_size > 0 {
+            match try_copy_file_range(src_path, &dst_path, file_size) {
+                Ok(bytes) if bytes == file_size => {
+                    stats.files_cfr += 1;
+                    stats.bytes_cfr += bytes;
+                    if cli.archive {
+                        let _ = preserve_metadata(src_path, &dst_path);
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    // Partial copy — fall through to other methods
+                    let _ = std::fs::remove_file(&dst_path);
+                }
+                Err(e) => {
+                    debug!("copy_file_range {:?}: {} — falling back", src_path, e);
+                }
+            }
         }
 
         // Tier 2: Small file fast path (std::fs::copy, no io_uring overhead)
@@ -370,6 +395,41 @@ fn try_reflink_copy(src: &Path, dst: &Path) -> bool {
     };
     let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
     ret == 0
+}
+
+/// NFS server-side copy via copy_file_range().
+/// On NFS 4.2, this triggers a server-side COPY operation — data never traverses the network.
+/// Works for both same-server and cross-mount copies if the server supports it.
+fn try_copy_file_range(src: &Path, dst: &Path, size: u64) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+    let src_file = std::fs::File::open(src)?;
+    let dst_file = std::fs::File::create(dst)?;
+    let sfd = src_file.as_raw_fd();
+    let dfd = dst_file.as_raw_fd();
+
+    let mut total = 0u64;
+    let mut off_in = 0i64;
+    let mut off_out = 0i64;
+    while total < size {
+        let remaining = (size - total) as usize;
+        let chunk = remaining.min(1024 * 1024 * 1024); // 1GB max per call
+        let ret = unsafe {
+            libc::copy_file_range(sfd, &mut off_in, dfd, &mut off_out, chunk, 0)
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if total == 0 {
+                // First call failed — not supported, clean up
+                drop(dst_file);
+                let _ = std::fs::remove_file(dst);
+                return Err(err);
+            }
+            return Err(err);
+        }
+        if ret == 0 { break; }
+        total += ret as u64;
+    }
+    Ok(total)
 }
 
 /// Small file fast path: use std::fs::copy (kernel sendfile/splice internally).
@@ -524,13 +584,17 @@ fn run_cleanup(path: &Path) {
 }
 
 fn print_summary(stats: &SyncStats) {
-    let total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_small + stats.bytes_delta;
-    let total_files = stats.files_copied + stats.files_reflinked + stats.files_small + stats.files_delta;
+    let total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_cfr + stats.bytes_small + stats.bytes_delta;
+    let total_files = stats.files_copied + stats.files_reflinked + stats.files_cfr + stats.files_small + stats.files_delta;
     println!("fxcp sync complete:");
     println!("  Files total:   {}", total_files);
     if stats.files_reflinked > 0 {
         println!("  - reflinked:   {} ({:.1} MB, instant CoW)", stats.files_reflinked,
                  stats.bytes_reflinked as f64 / 1024.0 / 1024.0);
+    }
+    if stats.files_cfr > 0 {
+        println!("  - server copy: {} ({:.1} MB, copy_file_range)", stats.files_cfr,
+                 stats.bytes_cfr as f64 / 1024.0 / 1024.0);
     }
     if stats.files_small > 0 {
         println!("  - small copy:  {} ({:.1} MB, sendfile)", stats.files_small,
