@@ -192,7 +192,50 @@ pub trait OptimizedFs {
     fn optimized_fallocate(&mut self, dst: PathBuf, mode: i32, offset: u64, length: u64) -> impl std::future::Future<Output = Result<CopyStats>> + Send;
 }
 
-#[derive(Debug)]
+// ---------------------------------------------------------------------------
+// Container and storage stack detection
+// ---------------------------------------------------------------------------
+
+/// Container runtime information.
+#[derive(Debug, Clone)]
+pub struct ContainerInfo {
+    pub in_container: bool,
+    pub engine: Option<String>,
+    pub rootless: bool,
+}
+
+/// Device-mapper stack layers detected beneath a filesystem.
+#[derive(Debug, Clone)]
+pub struct DmStackInfo {
+    pub has_crypt: bool,
+    pub has_integrity: bool,
+    pub has_cache: bool,
+    pub has_thin: bool,
+    pub has_vdo: bool,
+    pub has_stratis: bool,
+    pub crypt_sector_size: u32,
+    pub integrity_tag_size: u32,
+    pub thin_pool_data_pct: f64,
+    pub thin_pool_meta_pct: f64,
+    pub stack_depth: u8,
+    pub physical_block_size: u32,
+    pub optimal_io_size: u32,
+    pub base_device: Option<String>,
+}
+
+impl Default for DmStackInfo {
+    fn default() -> Self {
+        Self {
+            has_crypt: false, has_integrity: false, has_cache: false,
+            has_thin: false, has_vdo: false, has_stratis: false,
+            crypt_sector_size: 0, integrity_tag_size: 0,
+            thin_pool_data_pct: 0.0, thin_pool_meta_pct: 0.0,
+            stack_depth: 0, physical_block_size: 512, optimal_io_size: 0,
+            base_device: None,
+        }
+    }
+}
+
 pub struct Capabilities {
     pub atomic_writes: AtomicBool,
     pub atomic_min_bytes: AtomicU32,
@@ -204,6 +247,8 @@ pub struct Capabilities {
     pub btrfs_subvol: AtomicBool,
     pub btrfs_quotas: AtomicBool,
     pub f2fs_atomic_legacy: AtomicBool,
+    pub dm_stack: Option<DmStackInfo>,
+    pub container: Option<ContainerInfo>,
 }
 
 impl Default for Capabilities {
@@ -219,6 +264,8 @@ impl Default for Capabilities {
             btrfs_subvol: AtomicBool::new(false),
             btrfs_quotas: AtomicBool::new(false),
             f2fs_atomic_legacy: AtomicBool::new(false),
+            dm_stack: None,
+            container: None,
         }
     }
 }
@@ -369,7 +416,7 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
     }
 
     debug!("probe_capabilities: START {:?}", path);
-    let caps = Arc::new(Capabilities::default());
+    let mut caps_inner = Capabilities::default();
 
     if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
         let mut stx: StatxAtomic = unsafe { std::mem::zeroed() };
@@ -386,26 +433,26 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
         
         if ret == 0 && (stx.stx_mask & STATX_WRITE_ATOMIC) != 0 {
             if stx.stx_atomic_write_unit_max > 0 {
-                caps.atomic_min_bytes.store(stx.stx_atomic_write_unit_min, Ordering::Relaxed);
-                caps.atomic_max_bytes.store(stx.stx_atomic_write_unit_max, Ordering::Relaxed);
-                caps.atomic_writes.store(true, Ordering::Relaxed);
+                caps_inner.atomic_min_bytes.store(stx.stx_atomic_write_unit_min, Ordering::Relaxed);
+                caps_inner.atomic_max_bytes.store(stx.stx_atomic_write_unit_max, Ordering::Relaxed);
+                caps_inner.atomic_writes.store(true, Ordering::Relaxed);
                 debug!("probe_capabilities: Atomic writes detected");
             }
         }
     }
 
     debug!("probe_capabilities: checking uncached_io");
-    caps.uncached_io.store(crate::security::probe_rwf_uncached(path), Ordering::Relaxed);
+    caps_inner.uncached_io.store(crate::security::probe_rwf_uncached(path), Ordering::Relaxed);
 
     debug!("probe_capabilities: checking statfs magic");
     if let Ok(s) = statfs::statfs(path) {
         let magic = s.filesystem_type().0 as i64;
         if magic == F2FS_SUPER_MAGIC {
-            caps.f2fs_atomic_legacy.store(true, Ordering::Relaxed);
-            if !caps.atomic_writes.load(Ordering::Relaxed) {
-                caps.atomic_writes.store(true, Ordering::Relaxed);
-                caps.atomic_min_bytes.store(4096, Ordering::Relaxed);
-                caps.atomic_max_bytes.store(u32::MAX, Ordering::Relaxed);
+            caps_inner.f2fs_atomic_legacy.store(true, Ordering::Relaxed);
+            if !caps_inner.atomic_writes.load(Ordering::Relaxed) {
+                caps_inner.atomic_writes.store(true, Ordering::Relaxed);
+                caps_inner.atomic_min_bytes.store(4096, Ordering::Relaxed);
+                caps_inner.atomic_max_bytes.store(u32::MAX, Ordering::Relaxed);
                 debug!("Probe: F2FS Detected. Enabling Legacy Atomic Writes (IOCTL).");
             }
         }
@@ -415,23 +462,197 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
     if let Ok(f) = std::fs::File::open(path) {
         let fd = f.as_raw_fd();
         if unsafe { libc::lseek(fd, 0, libc::SEEK_DATA) } >= 0 {
-             caps.seek_hole.store(true, Ordering::Relaxed);
+             caps_inner.seek_hole.store(true, Ordering::Relaxed);
         }
         if probe_btrfs_quotas(fd) {
-            caps.btrfs_quotas.store(true, Ordering::Relaxed);
+            caps_inner.btrfs_quotas.store(true, Ordering::Relaxed);
             debug!("Probe: Btrfs Qgroups detected on {:?}", path);
         }
     }
 
     debug!("probe_capabilities: checking reflink");
     if probe_reflink_support(path) {
-        caps.reflink.store(true, Ordering::Relaxed);
+        caps_inner.reflink.store(true, Ordering::Relaxed);
         debug!("probe_capabilities: Reflink supported");
     }
 
+    debug!("probe_capabilities: checking dm-stack");
+    caps_inner.dm_stack = probe_dm_stack(path);
+    caps_inner.container = Some(detect_container());
+    if let Some(ref dm) = caps_inner.dm_stack {
+        debug!("probe_capabilities: dm-stack depth={} crypt={} integrity={} base={:?}",
+               dm.stack_depth, dm.has_crypt, dm.has_integrity, dm.base_device);
+    }
+
+    let caps = Arc::new(caps_inner);
     debug!("probe_capabilities: END {:?}", path);
     GLOBAL_CAPS_CACHE.insert(cache_key, caps.clone());
     caps
+}
+
+// ---------------------------------------------------------------------------
+// Container detection
+// ---------------------------------------------------------------------------
+
+pub fn detect_container() -> ContainerInfo {
+    // podman/toolbx: /run/.containerenv
+    if let Ok(content) = std::fs::read_to_string("/run/.containerenv") {
+        let engine = content.lines()
+            .find(|l| l.starts_with("engine="))
+            .map(|l| l.trim_start_matches("engine=").trim_matches('"').to_string());
+        let rootless = content.contains("rootless=1");
+        return ContainerInfo { in_container: true, engine, rootless };
+    }
+    // docker: /.dockerenv
+    if Path::new("/.dockerenv").exists() {
+        return ContainerInfo { in_container: true, engine: Some("docker".into()), rootless: false };
+    }
+    ContainerInfo { in_container: false, engine: None, rootless: false }
+}
+
+// ---------------------------------------------------------------------------
+// Device-mapper stack probing via /proc/self/mountinfo + sysfs
+// ---------------------------------------------------------------------------
+
+/// Resolve the backing block device for a path by parsing /proc/self/mountinfo.
+/// Works inside containers where stat().st_dev returns virtual device numbers.
+fn resolve_backing_device(path: &Path) -> Option<String> {
+    let canonical = path.canonicalize().ok()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+
+    let mut best_mount = String::new();
+    let mut best_source = String::new();
+    let mut best_len = 0;
+
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 { continue; }
+        let mount_point = fields[4];
+        // Fields after the " - " separator: fs_type source super_options
+        let sep_pos = fields.iter().position(|&f| f == "-");
+        let sep_pos = match sep_pos {
+            Some(p) => p,
+            None => continue,
+        };
+        if sep_pos + 2 >= fields.len() { continue; }
+        let source = fields[sep_pos + 2];
+
+        let mount_path = Path::new(mount_point);
+        if canonical.starts_with(mount_path) {
+            let mlen = mount_point.len();
+            if mlen > best_len {
+                best_len = mlen;
+                best_mount = mount_point.to_string();
+                best_source = source.to_string();
+            }
+        }
+    }
+
+    if best_source.is_empty() || best_source == "none" || best_source == "overlay" {
+        return None;
+    }
+    debug!("resolve_backing_device: {:?} → mount={} source={}", path, best_mount, best_source);
+    Some(best_source)
+}
+
+/// Resolve a /dev/mapper/NAME or /dev/dm-N path to the sysfs block device name (e.g. "dm-0").
+fn resolve_sysfs_block_name(device_path: &str) -> Option<String> {
+    let dev_path = Path::new(device_path);
+    // /dev/mapper/NAME → readlink to /dev/dm-N
+    let resolved = if device_path.starts_with("/dev/mapper/") {
+        std::fs::read_link(dev_path).ok()?
+    } else {
+        dev_path.to_path_buf()
+    };
+    // Extract "dm-0" from "/dev/dm-0"
+    resolved.file_name()?.to_str().map(String::from)
+}
+
+/// Probe the device-mapper stack beneath a filesystem path.
+pub fn probe_dm_stack(path: &Path) -> Option<DmStackInfo> {
+    let device = resolve_backing_device(path)?;
+    let block_name = resolve_sysfs_block_name(&device)?;
+
+    let mut info = DmStackInfo::default();
+    let mut current_dev = block_name.clone();
+
+    // Walk the dm stack
+    loop {
+        let dm_uuid_path = format!("/sys/block/{}/dm/uuid", current_dev);
+        if let Ok(uuid) = std::fs::read_to_string(&dm_uuid_path) {
+            let uuid = uuid.trim();
+            info.stack_depth += 1;
+
+            if uuid.starts_with("CRYPT-LUKS2-") {
+                info.has_crypt = true;
+                info.crypt_sector_size = 4096;
+            } else if uuid.starts_with("CRYPT-LUKS1-") || uuid.starts_with("CRYPT-") {
+                info.has_crypt = true;
+                info.crypt_sector_size = 512;
+            } else if uuid.starts_with("INTEGRITY-") {
+                info.has_integrity = true;
+                // Read tag size from dm table if available
+                info.integrity_tag_size = 4096;
+            } else if uuid.starts_with("LVM-") {
+                // Check if thin pool by looking for pool target
+                let table_path = format!("/sys/block/{}/dm/name", current_dev);
+                if let Ok(name) = std::fs::read_to_string(&table_path) {
+                    if name.trim().contains("tpool") || name.trim().contains("thin") {
+                        info.has_thin = true;
+                    }
+                }
+            } else if uuid.starts_with("VDO-") {
+                info.has_vdo = true;
+            }
+
+            // Check for Stratis naming
+            let name_path = format!("/sys/block/{}/dm/name", current_dev);
+            if let Ok(name) = std::fs::read_to_string(&name_path) {
+                if name.trim().contains("stratis") {
+                    info.has_stratis = true;
+                }
+            }
+        }
+
+        // Walk slaves to find underlying device
+        let slaves_path = format!("/sys/block/{}/slaves", current_dev);
+        if let Ok(entries) = std::fs::read_dir(&slaves_path) {
+            let slaves: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            if slaves.len() == 1 {
+                current_dev = slaves[0].clone();
+                continue; // Keep walking the stack
+            } else if slaves.is_empty() {
+                // Reached the base device
+                info.base_device = Some(current_dev.clone());
+                break;
+            } else {
+                // Multiple slaves (RAID, multipath) — take first, stop recursion
+                info.base_device = Some(slaves[0].clone());
+                break;
+            }
+        } else {
+            // No slaves directory — this is a physical device
+            info.base_device = Some(current_dev.clone());
+            break;
+        }
+    }
+
+    // Read queue properties from base device
+    if let Some(ref base) = info.base_device {
+        let pbs_path = format!("/sys/block/{}/queue/physical_block_size", base);
+        if let Ok(val) = std::fs::read_to_string(&pbs_path) {
+            info.physical_block_size = val.trim().parse().unwrap_or(512);
+        }
+        let oio_path = format!("/sys/block/{}/queue/optimal_io_size", base);
+        if let Ok(val) = std::fs::read_to_string(&oio_path) {
+            info.optimal_io_size = val.trim().parse().unwrap_or(0);
+        }
+    }
+
+    Some(info)
 }
 
 fn probe_btrfs_quotas(fd: RawFd) -> bool {

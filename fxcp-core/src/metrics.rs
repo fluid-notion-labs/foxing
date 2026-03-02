@@ -91,6 +91,20 @@ lazy_static! {
         "Total time spent sleeping due to governor pacing"
     ).unwrap();
 
+    // --- Storage Layer Detection ---
+    pub static ref DM_STACK_DEPTH: Gauge = register_gauge!(
+        "foxing_dm_stack_depth",
+        "Number of device-mapper layers beneath the filesystem"
+    ).unwrap();
+    pub static ref DM_CRYPT_DETECTED: Gauge = register_gauge!(
+        "foxing_dm_crypt_detected",
+        "1 if dm-crypt (LUKS) detected in storage stack"
+    ).unwrap();
+    pub static ref STORAGE_PHYSICAL_BLOCK_SIZE: Gauge = register_gauge!(
+        "foxing_storage_physical_block_size",
+        "Physical block size of base storage device (bytes)"
+    ).unwrap();
+
     // --- [fxcp-core] Memory & Buffer Pool ---
     pub static ref GLOBAL_BUFFER_LIMIT: Gauge = register_gauge!(
         "foxing_global_buffer_limit_bytes",

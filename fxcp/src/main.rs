@@ -147,6 +147,32 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     let src_caps = probe_capabilities(&source);
     let dst_caps = probe_capabilities(&destination);
 
+    // Log storage stack detection
+    if let Some(ref container) = dst_caps.container {
+        if container.in_container {
+            info!("Container: {} (rootless={})",
+                  container.engine.as_deref().unwrap_or("unknown"), container.rootless);
+        }
+    }
+    if let Some(ref dm) = dst_caps.dm_stack {
+        let mut layers = Vec::new();
+        if dm.has_crypt { layers.push(format!("dm-crypt({}B sectors)", dm.crypt_sector_size)); }
+        if dm.has_integrity { layers.push("dm-integrity".into()); }
+        if dm.has_thin { layers.push("dm-thin".into()); }
+        if dm.has_vdo { layers.push("kvdo".into()); }
+        if dm.has_cache { layers.push("dm-cache".into()); }
+        if dm.has_stratis { layers.push("stratis".into()); }
+        info!("Storage: {} on {} [depth={}, phys_blk={}B]",
+              layers.join(" + "),
+              dm.base_device.as_deref().unwrap_or("unknown"),
+              dm.stack_depth,
+              dm.physical_block_size);
+        // Set metrics
+        fxcp_core::metrics::DM_STACK_DEPTH.set(dm.stack_depth as f64);
+        fxcp_core::metrics::DM_CRYPT_DETECTED.set(if dm.has_crypt { 1.0 } else { 0.0 });
+        fxcp_core::metrics::STORAGE_PHYSICAL_BLOCK_SIZE.set(dm.physical_block_size as f64);
+    }
+
     // Compile exclude patterns
     let exclude_patterns: Vec<glob::Pattern> = cli.exclude.iter()
         .filter_map(|p| glob::Pattern::new(p).ok())
