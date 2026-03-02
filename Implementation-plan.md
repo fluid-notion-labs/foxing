@@ -1,0 +1,768 @@
+# Implementation Plan: Foxing Workspace Split
+
+**Reference:** [ADR-Split.md](ADR-Split.md) (ADR-001)
+**Date:** 2026-03-02
+**Author:** Joel Wirāmu Pauling
+**Target:** RHEL10 (kernel 6.12+), Fedora 43 (6.19+)
+
+---
+
+## Overview
+
+This document translates ADR-001 into an actionable, ordered implementation plan. Work is organized into **5 phases** with explicit entry/exit criteria, file-level task breakdowns, and verification gates between phases.
+
+```
+Phase 0: Decouple (prep within monolith)        ~2-3 days
+Phase 1: Workspace Split (fxcp-core + foxingd)   ~3-5 days
+Phase 2: fxcp Binary + Merkle Engine             ~3-5 days
+Phase 3: Storage Layer Awareness                  ~2-3 days
+Phase 4: Hardening + Security                     ~2-3 days
+                                          Total: ~12-19 days
+```
+
+---
+
+## Phase 0: Decouple Within the Monolith
+
+**Goal:** Reduce internal coupling so the workspace split in Phase 1 is mechanical (move files, update imports) rather than surgical (rewrite interfaces).
+
+**Entry criteria:** Current codebase compiles cleanly (`cargo check` passes).
+**Exit criteria:** All changes are non-breaking. `cargo check` and existing tests still pass. No workspace restructuring yet.
+
+### 0.1 Audit and Tag Metrics
+
+Identify which `crate::metrics::*` references belong to the copy-plane vs daemon-plane.
+
+**File:** `src/metrics.rs`
+
+| Action | Detail |
+|--------|--------|
+| Tag copy-plane metrics | `COPY_METHOD_*`, `BYTES_REPLICATED`, `HASH_*`, `SIDECAR_*`, `GLOBAL_BUFFER_*`, `GOVERNOR_*`, `ATOMIC_WRITE_*`, `VERSIONING_*`, `COALESCED_WRITES`, `HYDRATION_HASH_SKIPPED` |
+| Tag daemon-plane metrics | `EVENTS_*`, `ORDERING_*`, `WORKER_*`, `TARGET_*`, `TUNER_*`, `BPF_*`, `REPLICATION_LATENCY`, `IDENTITY_*`, `GENERATION_*`, `JOURNAL_*`, `POISON_*`, `WAL_*`, `LIVE_ADDITIONS`, `SYNTHETIC_*` |
+| Add comments | `// [fxcp-core]` or `// [foxingd]` prefix to each metric declaration |
+
+**Verify:** `grep -c '\[fxcp-core\]' src/metrics.rs` + `grep -c '\[foxingd\]' src/metrics.rs` = total metric count.
+
+### 0.2 Extract SysSpecs from config.rs
+
+`SysSpecs` and `SystemClass` (config.rs) are needed by both fxcp-core (governor, operations) and foxingd (config). Extract them so they can move to fxcp-core cleanly.
+
+**File:** `src/config.rs` → extract `SysSpecs`, `SystemClass`, `SYS` lazy_static into a standalone section with no daemon-specific deps.
+
+**Action:** Ensure `SysSpecs` only depends on `sysinfo` and `std`. Verify no references to `SourceConfig`, `TargetConfig`, or daemon types.
+
+### 0.3 Audit Governor Dependencies
+
+Confirm `governor.rs` has no daemon-specific imports.
+
+**File:** `src/governor.rs`
+
+**Expected deps:** `sysinfo`, `parking_lot`, `crate::metrics` (copy-plane subset only), `crate::constants`, `std::sync`, `tracing`. No `event`, `worker`, `mirror`, `tuner`, `identity` imports.
+
+**Action:** If any daemon deps found, extract them behind an interface.
+
+### 0.4 Audit operations.rs External Dependencies
+
+Confirm `operations.rs` only imports modules destined for fxcp-core.
+
+**File:** `src/operations.rs`
+
+**Expected imports:** `buffer`, `error`, `security`, `metrics` (copy-plane), `governor`, `constants`, `consistency/*`, `sidecar`, `hashing`. No `event`, `worker`, `mirror`, `tuner`, `identity`, `ordering`, `bpf`.
+
+**Action:** Trace all `use crate::*` statements. Document any unexpected cross-boundary imports.
+
+### 0.5 Verify Sidecar Independence
+
+Confirm `sidecar.rs` has no daemon-specific deps beyond `hashing` and `metrics`.
+
+**File:** `src/sidecar.rs`
+
+**Action:** Check imports. Should only use: `hashing`, `error`, `metrics` (SIDECAR_FILES_CREATED), `std`, `libc`, `xattr`, `serde_json`, `hex`, `tokio::sync`, `bincode`.
+
+### 0.6 Document Cross-Boundary Import Map
+
+Create a matrix showing which modules import from which:
+
+```
+                    operations  buffer  hashing  sidecar  security  consistency  governor  constants  metrics  error
+operations.rs         -          ✓       -        -        ✓         ✓            ✓         ✓          ✓       ✓
+buffer.rs             -          -       -        -        -         -            -         ✓          ✓       ✓
+hashing.rs            -          -       -        -        -         -            -         -          ✓       ✓
+sidecar.rs            -          -       ✓        -        -         -            -         -          ✓       -
+security.rs           ✓(caps)    ✓       -        ✓        -         -            -         -          -       ✓
+versioning.rs         -          -       -        ✓        ✓         -            -         -          -       ✓
+consistency/*         -          -       -        ✓        -         -            -         -          -       ✓
+governor.rs           -          -       -        -        -         -            -         ✓          ✓       -
+worker.rs             ✓          -       -        ✓        ✓         ✓            ✓         ✓          ✓       ✓
+hydration_worker.rs   ✓          ✓       ✓        ✓        ✓         ✓            ✓         ✓          ✓       ✓
+```
+
+**Action:** Fill in actual imports. Flag any unexpected edges.
+
+---
+
+## Phase 1: Workspace Split
+
+**Goal:** Three-crate Cargo workspace. foxingd compiles and passes all existing tests. fxcp-core compiles independently without libbpf.
+
+**Entry criteria:** Phase 0 complete. Import map documented. No unexpected cross-boundary deps.
+**Exit criteria:** `cargo check -p fxcp-core` passes without libbpf. `cargo check -p foxingd` passes with identical functionality to current `foxing`.
+
+### 1.1 Create Workspace Root
+
+**File:** `Cargo.toml` (root — replace current)
+
+```toml
+[workspace]
+members = ["fxcp-core", "fxcp", "foxingd"]
+resolver = "2"
+```
+
+### 1.2 Create fxcp-core Crate
+
+```bash
+mkdir -p fxcp-core/src/consistency
+```
+
+**Move files (from `src/` to `fxcp-core/src/`):**
+
+| Source | Destination | Notes |
+|--------|------------|-------|
+| `src/operations.rs` | `fxcp-core/src/operations.rs` | Core: SmartCopier |
+| `src/buffer.rs` | `fxcp-core/src/buffer.rs` | Core: BufferPool |
+| `src/hashing.rs` | `fxcp-core/src/hashing.rs` | Core: BLAKE3 |
+| `src/sidecar.rs` | `fxcp-core/src/sidecar.rs` | Core: SyncSignature, xattr |
+| `src/versioning.rs` | `fxcp-core/src/versioning.rs` | Core: MARS |
+| `src/security.rs` | `fxcp-core/src/security.rs` | Core: metadata sync |
+| `src/governor.rs` | `fxcp-core/src/governor.rs` | Core: system load |
+| `src/constants.rs` | `fxcp-core/src/constants.rs` | Core: tuning constants |
+| `src/consistency/exchange.rs` | `fxcp-core/src/consistency/exchange.rs` | XFS atomic |
+| `src/consistency/journal.rs` | `fxcp-core/src/consistency/journal.rs` | Atomic rename |
+| `src/consistency/serialization.rs` | `fxcp-core/src/consistency/serialization.rs` | Serialization barriers |
+| `src/consistency/sequencer.rs` | `fxcp-core/src/consistency/sequencer.rs` | Epoch sequencer |
+| `src/consistency/wal.rs` | `fxcp-core/src/consistency/wal.rs` | In-memory WAL |
+| `src/consistency/mod.rs` | `fxcp-core/src/consistency/mod.rs` | Module declarations |
+
+**Create new files:**
+
+| File | Content |
+|------|---------|
+| `fxcp-core/Cargo.toml` | Per ADR Section 6.1 dependencies (no libbpf, no ratatui) |
+| `fxcp-core/src/lib.rs` | Module declarations for all moved modules |
+| `fxcp-core/src/error.rs` | `FxcpError` enum (per ADR Section 7) |
+| `fxcp-core/src/metrics.rs` | Copy-plane metrics only (~20 counters extracted from current metrics.rs) |
+
+### 1.3 Create foxingd Crate
+
+```bash
+mkdir -p foxingd/src/bpf
+```
+
+**Move files (from `src/` to `foxingd/src/`):**
+
+| Source | Destination |
+|--------|------------|
+| `src/main.rs` | `foxingd/src/main.rs` |
+| `src/bpf.rs` | `foxingd/src/bpf.rs` |
+| `src/bpf/mirror.bpf.c` | `foxingd/src/bpf/mirror.bpf.c` |
+| `src/bpf/vmlinux.h` | `foxingd/src/bpf/vmlinux.h` |
+| `src/event.rs` | `foxingd/src/event.rs` |
+| `src/worker.rs` | `foxingd/src/worker.rs` |
+| `src/mirror.rs` | `foxingd/src/mirror.rs` |
+| `src/ordering.rs` | `foxingd/src/ordering.rs` |
+| `src/identity.rs` | `foxingd/src/identity.rs` |
+| `src/identity_watch.rs` | `foxingd/src/identity_watch.rs` |
+| `src/projector.rs` | `foxingd/src/projector.rs` |
+| `src/tuner.rs` | `foxingd/src/tuner.rs` |
+| `src/resilience.rs` | `foxingd/src/resilience.rs` |
+| `src/columnar.rs` | `foxingd/src/columnar.rs` |
+| `src/hydration.rs` | `foxingd/src/hydration.rs` |
+| `src/hydration_worker.rs` | `foxingd/src/hydration_worker.rs` |
+| `src/config.rs` | `foxingd/src/config.rs` |
+| `src/api.rs` | `foxingd/src/api.rs` |
+| `src/tui.rs` | `foxingd/src/tui.rs` |
+| `src/lib.rs` | `foxingd/src/lib.rs` (rewritten — daemon module declarations) |
+| `build.rs` | `foxingd/build.rs` |
+
+**Create new files:**
+
+| File | Content |
+|------|---------|
+| `foxingd/Cargo.toml` | Per ADR Section 6.3 deps (fxcp-core + libbpf + axum + etc.) |
+| `foxingd/src/error.rs` | `FoxingError` wrapping `FxcpError` (per ADR Section 7) |
+| `foxingd/src/metrics.rs` | Re-exports fxcp-core metrics + daemon-specific metrics |
+
+### 1.4 Update All Imports
+
+**foxingd modules** that previously used `crate::operations` now use `fxcp_core::operations`:
+
+| File | Change |
+|------|--------|
+| `foxingd/src/worker.rs` | `use fxcp_core::{operations::*, buffer::*, sidecar::*, security::*, governor::*, constants::*, consistency::*};` |
+| `foxingd/src/hydration_worker.rs` | Same pattern — replace `crate::` with `fxcp_core::` for moved modules |
+| `foxingd/src/hydration.rs` | `use fxcp_core::sidecar::*;` |
+| `foxingd/src/mirror.rs` | `use fxcp_core::{operations::probe_capabilities, buffer::BufferPool, governor::Governor};` |
+| `foxingd/src/config.rs` | `use fxcp_core::constants;` + move `SysSpecs`/`SystemClass` to fxcp-core or share via re-export |
+| `foxingd/src/tuner.rs` | `use fxcp_core::constants::*;` |
+
+**Pattern:** Search for `use crate::{module}` in all foxingd files where `{module}` is in fxcp-core. Replace with `use fxcp_core::{module}`.
+
+### 1.5 Split metrics.rs
+
+**fxcp-core/src/metrics.rs** — Define ~20 copy-plane metrics:
+```rust
+lazy_static! {
+    pub static ref COPY_METHOD_REFLINK: IntCounter = ...;
+    pub static ref COPY_METHOD_OFFLOAD: IntCounter = ...;
+    pub static ref COPY_METHOD_STANDARD: IntCounter = ...;
+    pub static ref BYTES_REPLICATED: IntCounter = ...;
+    pub static ref HASH_COMPUTATION_DURATION: Histogram = ...;
+    pub static ref SIDECAR_FILES_CREATED: IntCounter = ...;
+    pub static ref GLOBAL_BUFFER_COUNT: IntGauge = ...;
+    pub static ref GLOBAL_BUFFER_LIMIT: IntGauge = ...;
+    pub static ref GLOBAL_MEMORY_USAGE_BYTES: IntGauge = ...;
+    pub static ref GOVERNOR_STRESSED: IntGauge = ...;
+    pub static ref GOVERNOR_STRESS_SCORE: Gauge = ...;
+    pub static ref ATOMIC_WRITE_FALLBACKS: IntCounter = ...;
+    pub static ref VERSIONING_SUCCESS: IntCounter = ...;
+    pub static ref VERSIONING_FAILURES: IntCounter = ...;
+    pub static ref COALESCED_WRITES: IntCounter = ...;
+    // ... etc
+}
+```
+
+**foxingd/src/metrics.rs** — Re-export + daemon metrics:
+```rust
+pub use fxcp_core::metrics::*;
+
+lazy_static! {
+    pub static ref EVENTS_TOTAL: IntCounterVec = ...;
+    pub static ref EVENTS_DROPPED: IntCounter = ...;
+    pub static ref ORDERING_BUF_SIZE: IntGauge = ...;
+    pub static ref WORKER_BUFFER_UTILIZATION: GaugeVec = ...;
+    // ... 80+ daemon-specific metrics
+}
+```
+
+### 1.6 Remove Old src/ Directory
+
+After all files are moved and both crates compile:
+```bash
+rm -rf src/  # Old monolith source
+rm build.rs  # Moved to foxingd/
+```
+
+### 1.7 Verification Gate
+
+```bash
+cargo check -p fxcp-core    # Must pass without libbpf
+cargo check -p foxingd       # Must pass with full functionality
+cargo check                  # Whole workspace
+```
+
+**Additional checks:**
+- `cargo tree -p fxcp-core | grep -i bpf` → must return nothing
+- `cargo tree -p fxcp-core | grep -i axum` → must return nothing
+- `foxingd` binary size ≈ current `foxing` binary size (no regression)
+
+---
+
+## Phase 2: fxcp Binary + Merkle Engine
+
+**Goal:** Standalone `fxcp` binary that compiles without libbpf and provides rsync-like copy functionality. BLAKE3 Merkle tree delta engine implemented in fxcp-core.
+
+**Entry criteria:** Phase 1 complete. Workspace compiles.
+**Exit criteria:** `cargo build -p fxcp` produces a working binary. `fxcp /src /dst` copies files correctly. Merkle tree delta detection reduces transfer size for unchanged content.
+
+### 2.1 Create fxcp Binary Crate
+
+```bash
+mkdir -p fxcp/src/tui
+```
+
+**Files to create:**
+
+| File | Content |
+|------|---------|
+| `fxcp/Cargo.toml` | Per ADR Section 6.2 deps |
+| `fxcp/src/main.rs` | CLI entry point — see below |
+
+**Move files:**
+
+| Source | Destination |
+|--------|------------|
+| `foxingd/src/tui/explorer.rs` | `fxcp/src/tui/explorer.rs` |
+| `foxingd/src/tui/setup.rs` | `fxcp/src/tui/setup.rs` |
+
+### 2.2 Implement fxcp CLI
+
+**File:** `fxcp/src/main.rs`
+
+Migrate `Commands::Sync` logic from foxingd's `main.rs` (lines 366-443) into a standalone CLI:
+
+```rust
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "fxcp", about = "Smart filesystem copy with CoW/reflink support")]
+struct Cli {
+    /// Source path
+    source: PathBuf,
+    /// Destination path
+    destination: PathBuf,
+
+    #[arg(short, long)]
+    archive: bool,          // -a: preserve permissions, timestamps, xattrs
+    #[arg(short, long)]
+    recursive: bool,        // -r: recurse into directories
+    #[arg(short, long)]
+    verify: bool,           // -v: BLAKE3 verification after copy
+    #[arg(long)]
+    snapshot: bool,         // Create MARS version snapshot
+    #[arg(long)]
+    profile: Option<TargetProfile>,  // Storage profile
+    #[arg(long)]
+    dry_run: bool,          // Show what would be copied
+    #[arg(long)]
+    cleanup: bool,          // Clean orphaned .tmp files and stale dirty flags
+    #[arg(long)]
+    repair: bool,           // Repair target before sync
+    #[arg(long)]
+    enforce_strict_hash: bool,  // Bypass xattr receipts, force full verification
+    #[arg(long)]
+    max_load: Option<f64>,  // Governor load threshold
+    #[arg(long)]
+    bandwidth_limit: Option<u64>,  // Rate limit in bytes/sec
+    #[arg(long)]
+    tui: bool,              // Interactive file selector
+}
+```
+
+**Core logic:**
+1. Parse CLI args
+2. `probe_capabilities()` on source and destination
+3. `determine_copy_strategy()`
+4. Create `Governor` with `--max-load` setting
+5. Create `SmartCopier` with governor, buffer pool, capabilities
+6. Walk source directory (using `walkdir`)
+7. For each file: check dirty flags, compare Merkle signatures, copy if needed
+8. Report summary (bytes copied, method breakdown, elapsed time)
+
+### 2.3 Implement Merkle Tree Engine
+
+**File:** `fxcp-core/src/hashing.rs` (expand existing)
+
+Per ADR Section 9.3, add:
+
+```rust
+pub struct ChunkHash { pub offset: u64, pub length: u32, pub hash: blake3::Hash }
+pub struct MerkleTree { pub chunk_size: u64, pub file_size: u64, pub root: blake3::Hash, pub leaves: Vec<ChunkHash> }
+pub struct DirtyRange { pub offset: u64, pub length: u64 }
+pub struct MerkleSignature { pub root: [u8; 32], pub chunk_size: u64, pub file_size: u64, pub leaf_hashes: Vec<[u8; 32]> }
+
+impl MerkleTree {
+    pub fn from_file(path: &Path, chunk_size: u64) -> Result<Self>;
+    pub fn diff(source: &Self, target: &Self) -> Vec<DirtyRange>;
+    pub fn to_signature(&self) -> MerkleSignature;
+    pub fn from_signature(sig: &MerkleSignature) -> Self;
+    pub fn update_range(&mut self, path: &Path, offset: u64, length: u64) -> Result<blake3::Hash>;
+}
+```
+
+**Implementation order:**
+1. `MerkleTree::from_file()` — sequential chunk hashing with BLAKE3
+2. `MerkleTree::diff()` — leaf-by-leaf comparison → `Vec<DirtyRange>`
+3. `MerkleSignature` serialization/deserialization (bincode)
+4. `MerkleTree::to_signature()` / `from_signature()`
+5. Bounds checking: `leaf_count ≤ file_size / chunk_size + 1`, max payload 64KB for xattr
+
+### 2.4 Update SyncSignature to v4
+
+**File:** `fxcp-core/src/sidecar.rs`
+
+- Add `leaf_count: Option<u32>` to `SyncSignature`
+- Bump `CURRENT_VERSION` to `4`
+- Add `user.foxing.merkle` xattr key for storing `MerkleSignature`
+- Add `set_merkle_signature()` / `get_merkle_signature()` functions
+
+### 2.5 Wire Merkle into SmartCopier
+
+**File:** `fxcp-core/src/operations.rs`
+
+Add a delta-aware copy path:
+```rust
+impl SmartCopier {
+    /// Copy only dirty ranges identified by Merkle tree diff
+    pub async fn copy_delta(
+        &self,
+        src: &Path,
+        dst: &Path,
+        dirty_ranges: &[DirtyRange],
+        file_size: u64,
+        label: &str,
+    ) -> Result<CopyStats>;
+}
+```
+
+This calls `optimized_copy_range()` for each `DirtyRange` instead of `optimized_copy()` for the full file.
+
+### 2.6 Implement fxcp --cleanup
+
+**File:** `fxcp/src/main.rs` (cleanup subpath)
+
+```
+fxcp --cleanup /target/path
+1. Walk target directory
+2. Find .tmp.* files older than 1 hour → remove (with confirmation)
+3. Find files with user.foxing.dirty = true → report
+4. Report summary: N orphaned files removed, M dirty flags found
+```
+
+### 2.7 Verification Gate
+
+```bash
+cargo build -p fxcp                    # Compiles without libbpf
+./target/debug/fxcp --help             # CLI renders correctly
+./target/debug/fxcp /tmp/src /tmp/dst  # Basic copy works
+./target/debug/fxcp --verify /tmp/src /tmp/dst  # BLAKE3 verification
+./target/debug/fxcp --cleanup /tmp/dst  # Cleanup works
+
+# Verify fxcp binary is smaller than foxingd
+ls -la target/debug/fxcp target/debug/foxingd
+
+# Verify no BPF deps leaked
+cargo tree -p fxcp | grep -i bpf  # Must return nothing
+```
+
+---
+
+## Phase 3: Storage Layer Awareness
+
+**Goal:** Implement dm-stack detection (`DmStackInfo`) and storage-layer-aware I/O strategies per ADR Sections 10-13.
+
+**Entry criteria:** Phase 2 complete. fxcp and foxingd both compile and function.
+**Exit criteria:** `probe_capabilities()` detects dm-integrity, dm-crypt, dm-cache, dm-thin, kvdo, Stratis. I/O strategy adapts accordingly.
+
+### 3.1 Implement DmStackInfo Probing
+
+**File:** `fxcp-core/src/operations.rs` (add to capability probing)
+
+```rust
+pub struct DmStackInfo {
+    pub has_integrity: bool,
+    pub has_crypt: bool,
+    pub has_cache: bool,
+    pub has_thin: bool,
+    pub has_vdo: bool,
+    pub has_stratis: bool,
+    pub integrity_tag_size: u32,
+    pub crypt_sector_size: u32,
+    pub thin_pool_data_pct: f64,
+    pub thin_pool_meta_pct: f64,
+    pub stack_depth: u8,
+}
+```
+
+**Detection method:**
+1. `stat()` the target path → get `st_dev`
+2. Resolve device to `/sys/block/<dev>` (handle dm- prefixes)
+3. Walk `/sys/block/<dev>/slaves/` recursively to find dm layers
+4. Read `/sys/block/<dev>/dm/uuid` for each layer → parse type prefix
+5. Read `/sys/block/<dev>/queue/optimal_io_size` and `physical_block_size`
+
+### 3.2 Integrate DmStackInfo into Capabilities
+
+**File:** `fxcp-core/src/operations.rs`
+
+Add `dm_stack: Option<DmStackInfo>` to existing `Capabilities` struct. Populate during `probe_capabilities()`.
+
+### 3.3 Implement NAND-Aware Tuning
+
+**File:** `fxcp-core/src/operations.rs`
+
+When `StorageClass::SdCard` or NAND detected:
+- Cap io_uring queue depth to 2
+- Minimum write alignment: 4KB
+- Enable `FALLOC_FL_PUNCH_HOLE` after deletions (TRIM)
+- Sort copy queue by offset (sequential preference)
+
+### 3.4 Implement Layer-Specific Adaptations
+
+**File:** `fxcp-core/src/operations.rs`
+
+| Detected Layer | Adaptation |
+|---------------|-----------|
+| dm-integrity | Align writes to `integrity_tag_size`, prefer large sequential |
+| dm-verity (target) | Return error: read-only target |
+| dm-verity (source) | Skip BLAKE3 read verification |
+| dm-cache (writethrough) | Tune for HDD latency |
+| dm-cache (writeback) | Watch for latency spikes, use `RWF_UNCACHED` |
+| dm-thin | Check pool data+metadata %, issue DISCARD, warn >85% |
+| kvdo | Align to 4KB, skip pre-compression, avoid O_DIRECT |
+| dm-crypt | Align to `crypt_sector_size`, check AES-NI availability |
+| dm-crypt + kvdo | Warn: dedup ineffective on ciphertext |
+| Stratis | Apply combined XFS + thin + cache + integrity + crypt strategies |
+
+### 3.5 Add Storage Layer Metrics
+
+**File:** `fxcp-core/src/metrics.rs`
+
+```rust
+pub static ref DM_STACK_DEPTH: IntGauge = ...;
+pub static ref THIN_POOL_DATA_PCT: Gauge = ...;
+pub static ref THIN_POOL_META_PCT: Gauge = ...;
+pub static ref CACHE_HIT_RATE: Gauge = ...;
+pub static ref VDO_STALL_DETECTED: IntCounter = ...;
+pub static ref NAND_TRIM_ISSUED: IntCounter = ...;
+```
+
+### 3.6 Verification Gate
+
+```bash
+# Test on various storage configurations:
+# 1. Plain XFS on NVMe → baseline
+# 2. XFS on dm-crypt (LUKS2) → verify alignment adaptation
+# 3. XFS on dm-thin (LVM) → verify pool monitoring
+# 4. XFS on Stratis → verify combined strategy
+# 5. F2FS on SD card → verify NAND adaptations
+# 6. XFS on dm-integrity → verify tag alignment
+
+# For each: run fxcp, check metrics output, verify no errors
+```
+
+---
+
+## Phase 4: Hardening and Security
+
+**Goal:** Implement the adversarial mitigations from ADR Section 14.
+
+**Entry criteria:** Phase 3 complete. All storage layers detected and adapted.
+**Exit criteria:** All 5 security risk areas addressed. Fuzz targets operational. CleanupGuard implemented.
+
+### 4.1 Merkle Signature Bounds Checking
+
+**File:** `fxcp-core/src/hashing.rs`
+
+- `MerkleSignature::deserialize()`: reject `leaf_count > file_size / chunk_size + 1`
+- `MerkleSignature::deserialize()`: reject payload > 64KB (xattr limit)
+- Use `bincode::Options::with_limit(16 * 1024 * 1024)` for sidecar file parsing
+- All deserialization returns `Option<T>` (never panic)
+
+### 4.2 Implement CleanupGuard
+
+**File:** `fxcp-core/src/operations.rs`
+
+```rust
+pub struct CleanupGuard {
+    tmp_paths: Vec<PathBuf>,
+}
+
+impl CleanupGuard {
+    pub fn register(&mut self, path: PathBuf);
+    pub fn disarm(&mut self, path: &Path);  // Remove from cleanup list on success
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        for path in &self.tmp_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+```
+
+Register signal handlers (SIGINT, SIGTERM) that trigger guard drop.
+
+### 4.3 Path Sanitization
+
+**File:** `fxcp-core/src/security.rs`
+
+```rust
+pub fn path_within_root(path: &Path, root: &Path) -> Result<bool>;
+pub fn canonicalize_safe(path: &Path, root: &Path) -> Result<PathBuf>;
+```
+
+- Canonicalize path, verify it's under root
+- Called before every file open in SmartCopier
+- Default to `O_NOFOLLOW` for opens
+- `--follow-symlinks` flag for explicit opt-in
+
+### 4.4 Governor QoS Override
+
+**File:** `fxcp-core/src/governor.rs`
+
+```rust
+impl Governor {
+    pub fn set_min_throughput(&self, bytes_per_sec: u64);
+    pub fn bypass_for_control_plane(&self) -> bool;
+}
+```
+
+- `SmartCopier` constructor accepts optional `min_throughput_bytes_sec`
+- Governor cannot throttle below this floor
+- foxingd's Worker 0 bypasses governor entirely
+
+### 4.5 Enforce Strict Hash Mode
+
+**File:** `fxcp-core/src/sidecar.rs` + `fxcp-core/src/hashing.rs`
+
+- `--enforce-strict-hash` flag ignores stored xattr Merkle signatures
+- Forces full read + recompute of target tree
+- Optional: HMAC mode using a signing key from config
+
+### 4.6 Fuzz Targets
+
+**Directory:** `fxcp-core/fuzz/`
+
+Create `cargo-fuzz` targets:
+
+| Target | Fuzzes |
+|--------|--------|
+| `fuzz_merkle_deserialize` | `MerkleSignature::deserialize()` with arbitrary bytes |
+| `fuzz_sync_sig_deserialize` | `SyncSignature::deserialize()` with arbitrary bytes |
+| `fuzz_path_resolution` | `canonicalize_safe()` with adversarial paths |
+| `fuzz_xattr_parsing` | `get_metadata()` with arbitrary xattr values |
+
+### 4.7 Verification Gate
+
+```bash
+# Fuzz for 1 hour each target
+cargo fuzz run fuzz_merkle_deserialize -- -max_total_time=3600
+cargo fuzz run fuzz_sync_sig_deserialize -- -max_total_time=3600
+cargo fuzz run fuzz_path_resolution -- -max_total_time=3600
+
+# Verify CleanupGuard
+# 1. Start fxcp copy of large file
+# 2. SIGTERM during copy
+# 3. Verify .tmp.* file cleaned up
+
+# Verify path sanitization
+# 1. Create symlink /tmp/evil → /etc/shadow
+# 2. fxcp /tmp/evil /tmp/target → must fail with security error
+
+# Verify Governor QoS
+# 1. Set min_throughput to 1MB/s
+# 2. Generate system load > 4.0
+# 3. Verify fxcp maintains ≥1MB/s throughput despite governor stress
+```
+
+---
+
+## Phase 5: Integration Testing and Documentation
+
+**Goal:** End-to-end validation, documentation updates, CI configuration.
+
+**Entry criteria:** Phase 4 complete.
+**Exit criteria:** All validation criteria from ADR Section 16 met.
+
+### 5.1 ADR Validation Criteria (from Section 16)
+
+| # | Criterion | Test |
+|---|-----------|------|
+| 1 | `cargo build -p fxcp` without BPF support | Build in container without libbpf/bpftool |
+| 2 | `cargo build -p foxingd` identical functionality | Run existing test harness against foxingd |
+| 3 | `fxcp` produces bit-identical results to `foxing sync` | Copy test corpus, compare with `diff -r` |
+| 4 | Existing tests pass against foxingd | `python3 tests/run_harness.py` |
+| 5 | foxingd Prometheus metrics include all current metrics | Compare metric names before/after |
+| 6 | fxcp binary smaller than foxing binary | `ls -la` comparison |
+| 7 | No circular deps | `cargo tree -p fxcp-core` shows no foxingd |
+
+### 5.2 Update README.md
+
+Rewrite to reflect workspace structure:
+- Two binaries: `fxcp` and `foxingd`
+- Installation instructions for each
+- Quick start for fxcp standalone usage
+- Quick start for foxingd daemon mode
+
+### 5.3 Update docs/
+
+- Move `ADR-Split.md` → `docs/adr/001-workspace-split.md`
+- Move `Implementation-plan.md` → `docs/adr/001-implementation-plan.md`
+- Update `FAILURE_SCENARIOS.md` for split architecture
+- Update `CONFIGURATION_DEFAULTS.md` for fxcp standalone config
+
+### 5.4 CI Configuration
+
+Create GitHub Actions / CI pipeline:
+- `cargo check -p fxcp-core` (no BPF deps)
+- `cargo check -p fxcp` (no BPF deps)
+- `cargo check -p foxingd` (with BPF deps)
+- `cargo clippy --workspace`
+- `cargo test --workspace`
+- `cargo audit`
+- Fuzz regression tests
+
+---
+
+## Appendix: File Movement Summary
+
+### Files Moving to fxcp-core (14 files)
+
+```
+src/operations.rs       → fxcp-core/src/operations.rs
+src/buffer.rs           → fxcp-core/src/buffer.rs
+src/hashing.rs          → fxcp-core/src/hashing.rs
+src/sidecar.rs          → fxcp-core/src/sidecar.rs
+src/versioning.rs       → fxcp-core/src/versioning.rs
+src/security.rs         → fxcp-core/src/security.rs
+src/governor.rs         → fxcp-core/src/governor.rs
+src/constants.rs        → fxcp-core/src/constants.rs
+src/consistency/mod.rs  → fxcp-core/src/consistency/mod.rs
+src/consistency/exchange.rs      → fxcp-core/src/consistency/exchange.rs
+src/consistency/journal.rs       → fxcp-core/src/consistency/journal.rs
+src/consistency/serialization.rs → fxcp-core/src/consistency/serialization.rs
+src/consistency/sequencer.rs     → fxcp-core/src/consistency/sequencer.rs
+src/consistency/wal.rs           → fxcp-core/src/consistency/wal.rs
+```
+
+### Files Moving to fxcp (2 files)
+
+```
+src/tui/explorer.rs → fxcp/src/tui/explorer.rs
+src/tui/setup.rs    → fxcp/src/tui/setup.rs
+```
+
+### Files Moving to foxingd (20 files)
+
+```
+src/main.rs            → foxingd/src/main.rs
+src/lib.rs             → foxingd/src/lib.rs
+src/bpf.rs             → foxingd/src/bpf.rs
+src/bpf/mirror.bpf.c   → foxingd/src/bpf/mirror.bpf.c
+src/event.rs           → foxingd/src/event.rs
+src/worker.rs          → foxingd/src/worker.rs
+src/mirror.rs          → foxingd/src/mirror.rs
+src/ordering.rs        → foxingd/src/ordering.rs
+src/identity.rs        → foxingd/src/identity.rs
+src/identity_watch.rs  → foxingd/src/identity_watch.rs
+src/projector.rs       → foxingd/src/projector.rs
+src/tuner.rs           → foxingd/src/tuner.rs
+src/resilience.rs      → foxingd/src/resilience.rs
+src/columnar.rs        → foxingd/src/columnar.rs
+src/hydration.rs       → foxingd/src/hydration.rs
+src/hydration_worker.rs → foxingd/src/hydration_worker.rs
+src/config.rs          → foxingd/src/config.rs
+src/api.rs             → foxingd/src/api.rs
+src/tui.rs             → foxingd/src/tui.rs
+build.rs               → foxingd/build.rs
+```
+
+### New Files to Create (7 files)
+
+```
+Cargo.toml (workspace root)
+fxcp-core/Cargo.toml
+fxcp-core/src/lib.rs
+fxcp-core/src/error.rs
+fxcp-core/src/metrics.rs
+fxcp/Cargo.toml
+fxcp/src/main.rs
+foxingd/Cargo.toml
+foxingd/src/error.rs
+foxingd/src/metrics.rs
+```
+
+---
+
+*This implementation plan is derived from ADR-001 (ADR-Split.md). All architectural decisions, interface contracts, and security mitigations are defined in the ADR. This document focuses on execution order, file-level tasks, and verification gates.*
