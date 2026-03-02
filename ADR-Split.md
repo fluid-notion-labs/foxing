@@ -734,9 +734,435 @@ This Merkle tree engine is a **Phase 2** deliverable — after the workspace spl
 
 ---
 
-## 10. Consequences
+## 10. SD Card, NAND Flash, and eMMC Considerations
 
-### 10.1 Benefits
+### 10.1 The NAND Problem
+
+NAND flash storage (SD cards, eMMC, USB flash drives, low-end SSDs) presents fundamentally different I/O characteristics from rotating media or enterprise NVMe. fxcp must be NAND-aware because it is a primary deployment target — replicating data *to* portable flash media for backup, archival, or offline transport is a core use case.
+
+**Key NAND constraints:**
+
+| Constraint | Impact on fxcp |
+|-----------|----------------|
+| **Write amplification** | NAND cannot overwrite in-place. Each logical write triggers an erase-program cycle on a larger erase block (typically 512KB-4MB). Random small writes cause catastrophic amplification (10x-50x) |
+| **Erase block alignment** | Writes crossing erase block boundaries trigger two erase cycles instead of one |
+| **Wear leveling** | Flash cells have finite P/E (program/erase) cycles (1K-100K depending on MLC/TLC/QLC). Uneven write patterns accelerate wear on hot blocks |
+| **Write cliff** | Performance degrades sharply when the FTL (Flash Translation Layer) runs out of pre-erased blocks, triggering synchronous garbage collection |
+| **No hardware atomicity** | Consumer flash lacks the power-loss protection of enterprise NVMe. Interrupted writes corrupt data at the page level |
+| **TRIM/DISCARD** | Informing the FTL about freed blocks enables proactive garbage collection and reduces write amplification |
+
+### 10.2 fxcp NAND-Aware I/O Strategy
+
+**Write Coalescing:** The current `SdCard` profile in `constants.rs` already sets conservative batch limits (`HYDRATION_BATCH_LIMITS_SDCARD: (128, 1024)`). fxcp-core should extend this with:
+
+```
+fxcp-core NAND strategy:
+1. Coalesce small writes into large sequential bursts (≥ erase block size)
+2. Align write offsets to 4KB boundaries (FTL page size)
+3. Issue TRIM/DISCARD after file deletion (fadvise + fallocate PUNCH_HOLE)
+4. Prefer sequential write patterns over random (sort copy queue by offset)
+5. Use F2FS atomic writes where available (existing support in operations.rs)
+6. Limit concurrent writers to 1-2 (reduce FTL contention / GC pressure)
+7. Detect write cliff via latency spike monitoring (tuner.rs StorageClass)
+```
+
+**F2FS Integration (existing):** The codebase already supports F2FS atomic writes via `F2FS_IOC_START_ATOMIC_WRITE` / `F2FS_IOC_COMMIT_ATOMIC_WRITE` (operations.rs lines 46-50, 685-842). F2FS is the optimal filesystem for NAND targets because it:
+- Implements log-structured writing (sequential only, no in-place overwrites)
+- Maintains hot/warm/cold data separation (reduces GC overhead)
+- Supports multi-stream writes (aligns to NAND allocation units)
+- Provides native TRIM support via `discard` mount option
+
+**TRIM/DISCARD Support (new for fxcp-core):** When fxcp deletes files on a target or punches holes in sparse files, it should issue `FITRIM` or `fallocate(FALLOC_FL_PUNCH_HOLE)` to inform the FTL:
+
+```rust
+// fxcp-core/src/operations.rs (proposed addition)
+pub fn issue_trim(path: &Path) -> Result<()> {
+    // After file deletion or hole punch, issue FITRIM to inform FTL
+    // Only on filesystems that support it (F2FS, ext4, XFS on flash)
+}
+```
+
+**Merkle Tree Impact:** On NAND targets, chunk size should be large (≥128KB, matching or exceeding FTL page groups) to reduce write amplification during delta transfers. The per-profile chunk size table in Section 9.2 should be respected: `SdCard → 128KB` minimum.
+
+### 10.3 eMMC-Specific Considerations
+
+eMMC (embedded MultiMediaCard) is used in single-board computers (Raspberry Pi, ODROID, etc.) and IoT devices — another core fxcp deployment target. eMMC adds:
+
+- **Command queuing depth = 1** (unlike NVMe's 64K queues). fxcp must serialize I/O and avoid io_uring queue depth > 1
+- **Partition switching latency** (hardware partitions, not filesystem partitions). Avoid cross-partition copies
+- **Boot partition write protection** — fxcp should detect and skip write-protected eMMC boot partitions
+- **RPMB (Replay Protected Memory Block)** — authenticated secure storage partition, not a copy target
+
+### 10.4 foxingd Integration
+
+When foxingd targets a NAND device:
+- The tuner should detect `StorageClass::SdCard` or `StorageClass::NandFlash` (proposed extension to the enum)
+- Governor throttling should be more aggressive (NAND GC stalls affect the entire device, not just one partition)
+- Write coalescing windows should be wider (accumulate more changes before flushing)
+- Hydration should use single-threaded sequential mode (`HydrationMode::PrioritizeStructure`) to minimize random writes
+
+---
+
+## 11. The Storage Layer Cake: Stratis, LVM, and Device-Mapper Stacks
+
+### 11.1 The Layer Cake Problem
+
+Modern Linux storage is built on composable device-mapper (dm) targets stacked into pipelines. A single target path may traverse multiple layers, each adding overhead, alignment constraints, and behavioral characteristics that fxcp must understand:
+
+```
+Application I/O
+    │
+    ▼
+┌─────────────────────────┐
+│  Filesystem (XFS/Btrfs)  │  ← fxcp operates here
+├─────────────────────────┤
+│  dm-integrity            │  ← per-sector checksums (4KB → 4KB+tag overhead)
+├─────────────────────────┤
+│  dm-crypt (LUKS)         │  ← encryption (AES-XTS, sector-aligned)
+├─────────────────────────┤
+│  dm-cache / bcache       │  ← SSD cache tier fronting HDD
+├─────────────────────────┤
+│  LVM (dm-linear/striped) │  ← logical volume management
+├─────────────────────────┤
+│  dm-thin                 │  ← thin provisioning + snapshots
+├─────────────────────────┤
+│  kvdo                    │  ← deduplication + compression
+├─────────────────────────┤
+│  Physical Block Device   │  ← NVMe / SSD / HDD / NAND
+└─────────────────────────┘
+```
+
+**Stratis** [docs.redhat.com: Stratis file systems] automates this stack, composing a managed pool from:
+- XFS filesystem (mandatory, top layer)
+- dm-thin (thin provisioning, snapshots)
+- dm-cache (optional SSD cache tier)
+- dm-integrity (optional data integrity)
+- dm-crypt (optional encryption)
+
+Each layer imposes I/O transformation that affects fxcp's copy strategy:
+
+### 11.2 Layer Detection in fxcp-core
+
+fxcp-core should probe the dm stack beneath a target path to adapt its I/O strategy. Detection methods:
+
+```rust
+// fxcp-core/src/operations.rs (proposed additions to probe_capabilities)
+
+/// Detect device-mapper layers beneath a filesystem mount
+pub struct DmStackInfo {
+    pub has_integrity: bool,     // dm-integrity present
+    pub has_crypt: bool,         // dm-crypt/LUKS present
+    pub has_cache: bool,         // dm-cache/bcache present
+    pub has_thin: bool,          // dm-thin (thin provisioning)
+    pub has_vdo: bool,           // kvdo (dedup+compression)
+    pub has_stratis: bool,       // Managed by Stratis
+    pub integrity_tag_size: u32, // Bytes per sector for integrity tags
+    pub crypt_sector_size: u32,  // Crypto sector size (512 or 4096)
+    pub thin_pool_usage: f64,    // Thin pool utilization percentage
+    pub cache_hit_rate: f64,     // dm-cache hit rate (if available)
+    pub stack_depth: u8,         // Number of dm layers
+}
+
+impl DmStackInfo {
+    /// Probe by reading /sys/block/*/dm/uuid and walking the dm table
+    pub fn probe(mount_point: &Path) -> Result<Self>;
+}
+```
+
+**Detection approaches:**
+1. **`/sys/block/<dev>/dm/uuid`** — dm UUID prefix indicates type: `CRYPT-`, `INTEGRITY-`, `VDO-`, `LVM-`, `mpath-`
+2. **`dmsetup table <dev>`** — Shows the dm target type and parameters for each layer
+3. **`/sys/block/<dev>/dm/name`** — Stratis naming convention: `stratis-1-private-<pool>-<vol>`
+4. **`/proc/mounts`** — Mount options reveal `discard`, `data=ordered`, etc.
+5. **`statfs()` magic** — Already used for XFS/Btrfs/F2FS detection; extend for layer awareness
+6. **`/sys/block/<dev>/queue/`** — Optimal I/O size, minimum I/O size, physical block size
+
+### 11.3 dm-integrity
+
+**What it does:** Adds per-sector integrity tags (checksums or MACs) stored out-of-band. Every write includes a tag; every read verifies it. Protects against silent data corruption (bit rot).
+
+**Impact on fxcp:**
+- **Write amplification:** Each 4KB data write also writes a 4-80 byte tag. For small random writes, this is negligible. For bulk sequential writes, the tag overhead is amortized
+- **Alignment:** Writes must be aligned to the integrity sector size (typically 4KB). Unaligned writes trigger read-modify-write cycles
+- **Journal mode:** dm-integrity can journal writes for crash consistency. This doubles the write amplification but ensures tag+data atomicity
+- **Read verification:** fxcp can rely on dm-integrity for block-level checksums and potentially skip its own BLAKE3 verification for bit-rot detection (though BLAKE3 still provides file-level semantic verification)
+
+**fxcp adaptation:**
+```
+When dm-integrity detected:
+1. Align all writes to integrity_tag_size boundaries (min 4KB)
+2. Prefer large sequential writes (amortize tag overhead)
+3. Consider disabling fxcp-level block checksums (dm-integrity already provides them)
+4. Merkle tree chunk_size must be ≥ integrity sector size
+5. Account for ~1-3% capacity overhead in space calculations
+```
+
+### 11.4 dm-verity
+
+**What it does:** Read-only integrity verification using a Merkle tree of block hashes. Used for verified boot (Android dm-verity), immutable container images, and read-only system partitions.
+
+**Impact on fxcp:**
+- dm-verity targets are **read-only by design**. fxcp cannot write to a dm-verity device
+- fxcp can *read from* a dm-verity source with confidence — the kernel guarantees block-level integrity
+- When the *source* is dm-verity protected, fxcp can skip its own BLAKE3 verification (kernel already guarantees integrity)
+
+**fxcp adaptation:**
+```
+When dm-verity detected on target:
+  → Error: "Target is dm-verity protected (read-only). Cannot write."
+When dm-verity detected on source:
+  → Skip BLAKE3 verification on read (kernel provides block integrity)
+  → Log: "Source is dm-verity protected. Block integrity guaranteed by kernel."
+```
+
+### 11.5 dm-cache and bcache
+
+**What it does:** Places a fast SSD/NVMe cache tier in front of a slow HDD pool. Frequently accessed blocks are promoted to the cache; cold blocks are demoted to the backing store.
+
+Common configurations:
+- **dm-cache** (kernel, managed by LVM or Stratis) — writeback or writethrough modes
+- **bcache** (kernel, standalone) — similar but different device model
+- **lvmcache** (LVM integration with dm-cache)
+
+**Impact on fxcp:**
+- **Writeback mode:** Writes hit fast cache first, then lazily migrate to backing HDD. fxcp sees NVMe-class latency initially but may hit cache eviction storms during large bulk copies
+- **Writethrough mode:** Writes go to both cache and backing store. Latency is bounded by the slower device
+- **Cache thrashing:** Bulk sequential writes from fxcp may evict valuable cached data. This is the "cache pollution" problem
+
+**fxcp adaptation:**
+```
+When dm-cache detected:
+1. If writethrough: tune for HDD latency (backing store is the bottleneck)
+2. If writeback: start with aggressive tuning but watch for latency spikes
+   (indicates cache pressure / eviction storms)
+3. Use RWF_UNCACHED (Linux 6.14+) or O_DIRECT to bypass page cache
+   and reduce cache pollution during bulk hydration
+4. Limit concurrent I/O to avoid saturating cache → HDD migration bandwidth
+5. Tuner should detect cache_hit_rate drops and throttle proactively
+```
+
+### 11.6 LVM Thin Provisioning
+
+**What it does:** dm-thin provides logical volumes that start at zero allocation and grow on demand from a shared pool. Supports instant snapshots via copy-on-write at the block level.
+
+**Impact on fxcp:**
+- **Overprovisioning:** The thin pool can be larger than physical storage. fxcp must check *pool* free space, not *volume* free space
+- **Snapshot interaction:** Writing to a thin volume with snapshots triggers CoW at the block layer (in addition to any filesystem-level CoW like Btrfs reflink). Double CoW amplification
+- **Zeroed blocks:** Newly allocated thin blocks are zero-filled by default. fxcp's sparse file detection (`FIEMAP` + `FALLOC_FL_PUNCH_HOLE`) interacts with thin provisioning — punching holes returns blocks to the pool
+- **Metadata exhaustion:** Thin pool metadata can run out before data space. fxcp should monitor both data and metadata usage
+
+**fxcp adaptation:**
+```
+When dm-thin detected:
+1. Check thin pool data AND metadata usage (lvs --noheadings -o data_percent,metadata_percent)
+2. TRIM/DISCARD support is critical — issue discard on deleted files to return blocks to pool
+3. Prefer large sequential writes to minimize thin block allocation overhead
+4. Warn if thin pool is >85% full (risk of pool exhaustion → I/O errors)
+5. If target has thin snapshots, account for CoW amplification in space estimates
+```
+
+### 11.7 Stratis-Managed Volumes
+
+**Stratis** [fedoramagazine.org: Getting started with Stratis] composes the above layers into a managed storage pool. fxcp should detect Stratis-managed volumes (via `/sys/block/*/dm/uuid` prefix `stratis-`) and apply the combined strategies:
+
+```
+Stratis stack = XFS + dm-thin + [dm-cache] + [dm-integrity] + [dm-crypt]
+
+fxcp Stratis strategy:
+1. Use XFS-specific optimizations (reflink, atomic exchange, FICLONE)
+2. Apply thin provisioning awareness (pool space monitoring, DISCARD)
+3. If dm-cache present: RWF_UNCACHED for bulk writes, respect cache tier
+4. If dm-integrity present: align to integrity sector boundaries
+5. If dm-crypt present: align to crypto sector boundaries (see Section 13)
+6. Report combined stack depth and layer overhead in metrics
+```
+
+### 11.8 foxingd Integration with Layer Cake
+
+foxingd should probe the dm stack at startup (via `DmStackInfo::probe()`) and propagate the information into:
+- **TunerBoard** — adjust batch sizes and flush intervals based on stack depth and layer types
+- **Governor** — tighter throttling when dm-cache or thin provisioning is near capacity
+- **Metrics** — export `foxing_target_dm_stack_depth`, `foxing_target_thin_pool_usage`, `foxing_target_cache_hit_rate`
+- **Hydration** — select `HydrationMode` based on cache presence (sequential for uncached HDD, parallel for cached)
+
+---
+
+## 12. kvdo: Kernel Virtual Data Optimizer
+
+### 12.1 What kvdo Does
+
+kvdo (kernel VDO) [docs.redhat.com: VDO] is a device-mapper target providing inline **deduplication** and **compression** at the block layer. It operates on 4KB blocks:
+
+```
+Logical Write (any size)
+    │
+    ▼
+┌──────────────────────────┐
+│  VDO Deduplication       │  ← BLAKE2 hash of each 4KB block
+│  ├── Dedupe Index (UDS)  │  ← Universal Deduplication Service
+│  └── If duplicate:       │  ← Point to existing physical block
+│       skip physical write │
+├──────────────────────────┤
+│  VDO Compression (LZ4)   │  ← Compress non-duplicate blocks
+│  └── Pack compressed     │  ← Multiple logical blocks → one physical
+│       blocks together     │
+├──────────────────────────┤
+│  VDO Slab Allocator      │  ← Manages physical block allocation
+└──────────────────────────┘
+```
+
+### 12.2 Existing VDO Support
+
+The codebase already has VDO zero-block optimization in `operations.rs`:
+- `is_block_zero()` — Detects zero-filled buffers using AVX512/AVX2 SIMD (lines 1912-1980)
+- `vdo_optimization` config flag (config.rs) with `vdo_stall_threshold` tuning
+- When a buffer is all-zeros, VDO deduplicates it to a single shared zero block at near-zero cost
+
+### 12.3 Enhanced kvdo Awareness for fxcp-core
+
+Beyond zero-block detection, fxcp should be kvdo-aware in several ways:
+
+**4KB Block Alignment:** kvdo operates on fixed 4KB blocks. All writes should be aligned to 4KB boundaries. Unaligned writes cause read-modify-write at the VDO layer:
+
+```
+fxcp kvdo strategy:
+1. Align all write offsets to 4KB boundaries
+2. Pad final write to 4KB boundary (VDO will compress the padding)
+3. Use 4KB as the minimum Merkle tree chunk granularity
+4. Prefer large sequential writes (reduces UDS index lookup pressure)
+```
+
+**Deduplication-Aware Delta Transfer:** When transferring to a VDO target, fxcp's Merkle tree delta detection and VDO's deduplication are complementary:
+- **fxcp Merkle diff** identifies which *file-level chunks* changed (64KB-1MB granularity)
+- **VDO deduplication** identifies which *block-level 4KB blocks* are duplicates across the entire pool
+- fxcp should write all dirty Merkle chunks and let VDO deduplicate at the block level — don't try to out-smart VDO's index
+
+**Compression Awareness:** VDO uses LZ4 compression. fxcp should:
+- **Not** pre-compress data before writing to a VDO target (double compression wastes CPU and may expand data)
+- Detect VDO targets and disable any application-level compression in the copy pipeline
+- Avoid `O_DIRECT` on VDO targets when possible (VDO benefits from page cache batching of small writes)
+
+**Space Reporting:** VDO logical size can be much larger than physical size (overprovisioned). fxcp must check VDO *physical* free space:
+```
+vdostats --human-readable <vdo-device>
+  → Used: 30% (physical), Savings: 65% (dedup + compression ratio)
+```
+
+### 12.4 VDO Stall Detection
+
+The existing `vdo_stall_threshold` handles the case where VDO's UDS index lookup becomes a bottleneck. When write latency spikes above the threshold, fxcp should:
+1. Reduce concurrent I/O depth (less UDS index pressure)
+2. Increase write coalescing (fewer, larger writes = fewer index lookups)
+3. Report `foxing_vdo_stall_detected` metric
+
+### 12.5 Impact on Merkle Tree
+
+For VDO targets:
+- Merkle chunk size should be a multiple of 4KB (already satisfied by default 64KB)
+- Zero-block chunks can be skipped entirely in delta transfer (VDO already has them)
+- Leaf hashes in the Merkle signature help VDO by providing a pre-computed content fingerprint — though VDO uses BLAKE2 internally, not BLAKE3, so the hashes are not directly reusable
+
+---
+
+## 13. dm-crypt and LUKS
+
+### 13.1 What dm-crypt Does
+
+dm-crypt [gitlab.com/cryptsetup] provides transparent block-level encryption, most commonly configured via LUKS (Linux Unified Key Setup). Every block written passes through:
+
+```
+Plaintext I/O (from filesystem)
+    │
+    ▼
+┌──────────────────────────┐
+│  dm-crypt                │
+│  ├── Cipher: AES-256-XTS │  ← Most common (hardware-accelerated via AES-NI)
+│  ├── Sector size: 4096   │  ← LUKS2 default (512 for LUKS1)
+│  ├── IV mode: plain64    │  ← Initialization vector per-sector
+│  └── Key derivation:     │  ← Argon2id (LUKS2) or PBKDF2 (LUKS1)
+│       LUKS header         │
+└──────────────────────────┘
+    │
+    ▼
+Ciphertext (to physical device)
+```
+
+### 13.2 Impact on fxcp I/O
+
+**Crypto sector alignment:** dm-crypt encrypts in fixed sectors. LUKS2 defaults to 4096-byte sectors. Writes that are not aligned to the crypto sector size trigger a read-modify-encrypt-write cycle:
+
+```
+Unaligned write (e.g., 3000 bytes at offset 1000):
+1. Read existing 4KB sector from disk
+2. Decrypt sector
+3. Modify bytes 1000-3999
+4. Re-encrypt entire 4KB sector
+5. Write back to disk
+→ 1 read + 1 write amplification for every unaligned write
+```
+
+**fxcp adaptation:**
+```
+When dm-crypt detected:
+1. Align all writes to crypt_sector_size (4096 for LUKS2, 512 for LUKS1)
+2. Prefer large sequential writes (amortize crypto overhead)
+3. io_uring submission should batch writes to maximize AES-NI pipeline utilization
+4. Merkle tree chunk_size must be ≥ crypt_sector_size
+5. Do NOT use O_DIRECT if filesystem is on dm-crypt with misaligned sector size
+   (dm-crypt handles alignment internally, but O_DIRECT bypasses this)
+```
+
+### 13.3 Hardware Crypto Acceleration
+
+Modern CPUs provide AES-NI (x86_64) or ARM CE (AArch64) for hardware-accelerated AES. When crypto acceleration is available, dm-crypt overhead is typically <5% for sequential I/O. Without hardware acceleration, overhead can reach 30-50%.
+
+fxcp should detect crypto acceleration availability:
+```rust
+// fxcp-core: detect hardware crypto support
+fn has_aes_acceleration() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { is_x86_feature_detected!("aes") }
+    #[cfg(target_arch = "aarch64")]
+    { /* check /proc/cpuinfo for "aes" in Features */ }
+}
+```
+
+When no hardware acceleration is detected and the target is dm-crypt:
+- Throttle I/O to avoid CPU saturation from software encryption
+- Reduce concurrent io_uring queue depth (crypto is CPU-bound, not I/O-bound)
+- Governor should monitor CPU pressure via PSI (`/proc/pressure/cpu`)
+
+### 13.4 LUKS Header Awareness
+
+The LUKS header occupies the first 2-16MB of the device (LUKS2 default: 16MB). fxcp should:
+- Never attempt to copy the LUKS header as file data (it's below the filesystem)
+- When doing block-level operations (e.g., cloning a LUKS partition), be aware of the header offset
+- Report LUKS version in diagnostics for troubleshooting
+
+### 13.5 Interaction with Other dm Layers
+
+dm-crypt is frequently stacked with other layers:
+
+| Stack | Behavior | fxcp Impact |
+|-------|----------|-------------|
+| **dm-crypt + dm-integrity** | Authenticated encryption (AEAD: AES-GCM or AEGIS). Integrity tags stored alongside ciphertext | Writes must satisfy both alignment constraints (crypto sector + integrity tag). Use `max(crypt_sector_size, integrity_sector_size)` for alignment |
+| **dm-crypt + dm-thin** | Encrypted thin volumes. Common in Stratis | DISCARD passthrough must be enabled (`allow_discards` in crypttab). Otherwise TRIM from fxcp is silently dropped, preventing thin pool space reclamation |
+| **dm-crypt + kvdo** | Encrypted deduplicated storage | VDO deduplication happens on *ciphertext*. Since identical plaintext produces different ciphertext (per-sector IV), deduplication is ineffective. fxcp should warn about this combination |
+| **dm-crypt + dm-cache** | Encrypted cached storage | Cache operates on ciphertext. No special fxcp handling needed beyond standard dm-cache awareness |
+
+### 13.6 Merkle Tree and Encrypted Targets
+
+The BLAKE3 Merkle tree operates at the filesystem/plaintext level, above dm-crypt. This means:
+- Merkle hashes are computed on plaintext (correct — fxcp never sees ciphertext)
+- Merkle signatures stored in xattr sidecars are themselves encrypted at rest (by dm-crypt)
+- No special Merkle tree adaptation needed for dm-crypt targets
+- However, crypto CPU overhead should be factored into the Merkle tree computation budget — on slow CPUs without AES-NI, both BLAKE3 hashing and AES encryption compete for CPU cycles
+
+---
+
+## 14. Consequences
+
+### 14.1 Benefits
 
 | Benefit | Description |
 |---------|-------------|
@@ -748,7 +1174,7 @@ This Merkle tree engine is a **Phase 2** deliverable — after the workspace spl
 | **Targeted testing** | Copy engine tests run without BPF infrastructure. Daemon tests can mock fxcp-core |
 | **Quick Fox realized** | fxcp embodies the "Quick Fox" as an independent tool — fast, nimble, no daemon baggage |
 
-### 10.2 Risks and Mitigations
+### 14.2 Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
@@ -758,7 +1184,7 @@ This Merkle tree engine is a **Phase 2** deliverable — after the workspace spl
 | Migration breaks `foxing sync` users | Users must switch to `fxcp` | foxingd can retain `sync` subcommand as thin wrapper during deprecation period |
 | `ONE_SHOT_MODE` global state sharing | `AtomicBool` in constants used by both planes | Lives in fxcp-core. Both binaries set it at startup |
 
-### 10.3 Trade-offs
+### 14.3 Trade-offs
 
 1. **Workspace complexity vs modularity** — Three crates require coordinating versions and CI. This is the standard Rust workspace pattern, well-supported by Cargo.
 2. **Two metrics modules** — fxcp-core (~20 metrics) + foxingd (~80 additional). Acceptable given clean separation.
@@ -766,7 +1192,7 @@ This Merkle tree engine is a **Phase 2** deliverable — after the workspace spl
 
 ---
 
-## 11. Validation Criteria
+## 15. Validation Criteria
 
 The split is successful when:
 
@@ -780,7 +1206,7 @@ The split is successful when:
 
 ---
 
-## 12. References
+## 16. References
 
 ### Linux Kernel & VFS
 - Linux VFS Documentation: https://docs.kernel.org/filesystems/vfs.html
@@ -837,14 +1263,30 @@ The split is successful when:
 - Strong vs Eventual Consistency: https://www.geeksforgeeks.org/system-design/strong-vs-eventual-consistency-in-system-design/
 - Event-Driven Architecture: https://www.confluent.io/learn/event-driven-architecture/
 
-### Storage Technologies
+### Storage Technologies & Device-Mapper
 - LVM on Software RAID: https://wiki.archlinux.org/title/LVM_on_software_RAID
-- Stratis (Fedora): https://fedoramagazine.org/getting-started-with-stratis-up-and-running/
+- **Stratis (Fedora):** https://fedoramagazine.org/getting-started-with-stratis-up-and-running/
+- **Stratis (RHEL):** https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/managing_file_systems/setting-up-stratis-file-systems_managing-file-systems
+- **RHEL Storage Administration:** https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/system_design_guide/managing_storage_devices
 - Thin Provisioned Volumes (RHEL): https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/6/html/logical_volume_manager_administration/thinprovisioned_volumes
+- RAID vs LVM vs mdadm: https://recoverhdd.com/blog/comparison-and-difference-between-raid-lvm-and-mdadm.html
+- RAID vs LVM: https://www.linuxtoday.com/blog/raid-vs-lvm/
+- dm-integrity (LWN): https://lwn.net/Articles/755454/
+- RAID doesn't protect against bit rot: https://securitypitfalls.wordpress.com/2018/05/08/raid-doesnt-work
 - Persistent Memory (PMDK): https://github.com/pmem/pmdk
 - PMem Overview: https://pmem.io/
 - Intel Optane PMem I/O: https://www.intel.com/content/www/us/en/developer/articles/technical/speeding-up-io-workloads-with-intel-optane-dc-persistent-memory-modules.html
 - PMem Programming (USENIX): https://www.usenix.org/system/files/login/articles/login_summer17_07_rudoff.pdf
+
+### Encryption & dm-crypt
+- **LUKS / cryptsetup:** https://gitlab.com/cryptsetup/cryptsetup
+- Noise Protocol Framework: http://noiseprotocol.org/
+- Noise Explorer: https://noiseexplorer.com/
+- WireGuard Whitepaper: https://www.wireguard.com/papers/wireguard.pdf
+- Signal Double Ratchet: https://signal.org/docs/specifications/doubleratchet/
+
+### NAND Flash & F2FS
+- Filesystem comparison (ext4/Btrfs/XFS/ZFS): https://eagleeyet.net/blog/operating-systems/linux/file-systems/ext4-vs-btrfs-vs-xfs-vs-zfs-a-linux-file-system-comparison-for-beginners/
 
 ### Rust Language & Tooling
 - The Rust Book: https://doc.rust-lang.org/book/
