@@ -1998,6 +1998,41 @@ pub fn apply_lock(path: &Path, lock_type: u32, lock_map: &DashMap<u64, std::fs::
     
     if ret == 0 { if let Ok(meta) = file.metadata() { lock_map.insert(meta.ino(), file); } }
     else { debug!("Failed to apply lock on {:?}: {}", path, std::io::Error::last_os_error()); }
-    
+
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Delta copy — transfer only dirty ranges identified by Merkle tree diff
+// ---------------------------------------------------------------------------
+impl SmartCopier {
+    /// Copy only the specified dirty ranges from src to dst.
+    /// Each DirtyRange triggers an `optimized_copy_range()` call.
+    pub async fn copy_delta(
+        &mut self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        dirty_ranges: &[crate::hashing::DirtyRange],
+        file_size: u64,
+        label: &str,
+    ) -> Result<CopyStats> {
+        let mut total_stats = CopyStats::default();
+
+        for range in dirty_ranges {
+            let stats = self.optimized_copy_range(
+                src.to_path_buf(),
+                dst.to_path_buf(),
+                range.offset,
+                range.length,
+                file_size,
+                label.to_string(),
+                None,
+                self.skip_fsync,
+            ).await?;
+            total_stats.bytes_processed += stats.bytes_processed;
+            total_stats.ops_count += stats.ops_count;
+        }
+
+        Ok(total_stats)
+    }
 }

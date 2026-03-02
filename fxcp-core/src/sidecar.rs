@@ -23,14 +23,15 @@ pub struct SyncSignature {
     pub size: u64,
     pub mtime_sec: i64,
     pub mtime_nsec: i64,
-    pub hash: Option<String>, // Hex-encoded BLAKE3 Lite Hash
-    pub merkle_root: Option<String>, // Hex-encoded BLAKE3 Full Merkle Root
+    pub hash: Option<String>,         // Hex-encoded BLAKE3 Lite Hash
+    pub merkle_root: Option<String>,  // Hex-encoded BLAKE3 Full Merkle Root
     pub chunk_size: Option<u64>,      // Fixed chunk boundary
-    pub version: u8,          // Schema version
+    pub leaf_count: Option<u32>,      // Number of Merkle leaves (v4+)
+    pub version: u8,                  // Schema version
 }
 
 impl SyncSignature {
-    pub const CURRENT_VERSION: u8 = 3;
+    pub const CURRENT_VERSION: u8 = 4;
     
     pub fn compute(path: &Path) -> crate::error::Result<Self> {
         let meta = std::fs::metadata(path)?;
@@ -58,6 +59,7 @@ impl SyncSignature {
             hash,
             merkle_root,
             chunk_size: Some(hashing::CHUNK_SIZE as u64),
+            leaf_count: None,
             version: Self::CURRENT_VERSION,
         })
     }
@@ -255,6 +257,28 @@ pub fn set_sync_signature(path: &Path, sig: &SyncSignature) -> std::io::Result<(
 pub fn get_sync_signature(path: &Path) -> Option<SyncSignature> {
     get_metadata(path, "sig")
         .and_then(|bytes| SyncSignature::deserialize(&bytes))
+}
+
+pub fn set_merkle_signature(path: &Path, sig: &hashing::MerkleSignature) -> std::io::Result<()> {
+    let data = bincode::serialize(sig)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if data.len() > 64 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "merkle signature too large for xattr storage",
+        ));
+    }
+    set_metadata(path, "merkle", &data)
+}
+
+pub fn get_merkle_signature(path: &Path) -> Option<hashing::MerkleSignature> {
+    let bytes = get_metadata(path, "merkle")?;
+    let sig: hashing::MerkleSignature = bincode::deserialize(&bytes).ok()?;
+    // Bounds check
+    if sig.chunk_size == 0 { return None; }
+    let expected_max = sig.file_size / sig.chunk_size + 2;
+    if sig.leaf_hashes.len() as u64 > expected_max { return None; }
+    Some(sig)
 }
 
 enum SidecarOp {

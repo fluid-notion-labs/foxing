@@ -41,6 +41,7 @@ import verify
 # Constants
 # ---------------------------------------------------------------------------
 FOXING_BINARY = PROJECT_ROOT / "target" / "release" / "foxingd"
+FXCP_BINARY = PROJECT_ROOT / "target" / "release" / "fxcp"
 DEFAULT_TEST_ROOT = PROJECT_ROOT / "test_harness"
 TMPFS_PREFIX = "foxing_test_"
 BUILD_TIMEOUT = 300  # 5 min cargo build timeout
@@ -50,6 +51,7 @@ TOOLS = {
     "rsync":  lambda src, dst: ["rsync", "-a", "--delete", f"{src}/", f"{dst}/"],
     "cp":     lambda src, dst: ["cp", "-a", f"{src}/.", f"{dst}/"],
     "foxing": lambda src, dst: [str(FOXING_BINARY), "sync", "-a", str(src), str(dst)],
+    "fxcp":   lambda src, dst: [str(FXCP_BINARY), "-a", str(src), str(dst)],
 }
 
 
@@ -157,7 +159,7 @@ def build_foxing(force: bool = False) -> dict:
     start = time.monotonic()
     try:
         result = subprocess.run(
-            ["cargo", "build", "--release", "-p", "foxingd"],
+            ["cargo", "build", "--release", "-p", "foxingd", "-p", "fxcp"],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
