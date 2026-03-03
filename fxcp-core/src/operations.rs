@@ -248,6 +248,8 @@ pub struct Capabilities {
     pub btrfs_quotas: AtomicBool,
     pub f2fs_atomic_legacy: AtomicBool,
     pub is_nfs: AtomicBool,
+    pub dio_mem_align: AtomicU32,      // STATX_DIOALIGN: memory alignment for O_DIRECT
+    pub dio_offset_align: AtomicU32,   // STATX_DIOALIGN: file offset alignment for O_DIRECT
     pub dm_stack: Option<DmStackInfo>,
     pub container: Option<ContainerInfo>,
 }
@@ -266,6 +268,8 @@ impl Default for Capabilities {
             btrfs_quotas: AtomicBool::new(false),
             f2fs_atomic_legacy: AtomicBool::new(false),
             is_nfs: AtomicBool::new(false),
+            dio_mem_align: AtomicU32::new(0),
+            dio_offset_align: AtomicU32::new(0),
             dm_stack: None,
             container: None,
         }
@@ -295,11 +299,15 @@ struct StatxAtomic {
     stx_dev_major: u32,
     stx_dev_minor: u32,
     stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
     stx_atomic_write_unit_min: u32,
     stx_atomic_write_unit_max: u32,
     stx_atomic_write_segments_max: u32,
-    __spare1: [u64; 10],
+    __spare1: [u64; 9],
 }
+
+const STATX_DIOALIGN: u32 = 0x00002000;
 
 pub struct CleanupGuard {
     files: Vec<PathBuf>,
@@ -441,17 +449,32 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
                 libc::AT_FDCWD,
                 c_path.as_ptr(),
                 libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT,
-                STATX_WRITE_ATOMIC,
+                STATX_WRITE_ATOMIC | STATX_DIOALIGN,
                 &mut stx as *mut _
             )
         };
-        
-        if ret == 0 && (stx.stx_mask & STATX_WRITE_ATOMIC) != 0 {
-            if stx.stx_atomic_write_unit_max > 0 {
+
+        if ret == 0 {
+            if (stx.stx_mask & STATX_WRITE_ATOMIC) != 0 && stx.stx_atomic_write_unit_max > 0 {
                 caps_inner.atomic_min_bytes.store(stx.stx_atomic_write_unit_min, Ordering::Relaxed);
                 caps_inner.atomic_max_bytes.store(stx.stx_atomic_write_unit_max, Ordering::Relaxed);
                 caps_inner.atomic_writes.store(true, Ordering::Relaxed);
                 debug!("probe_capabilities: Atomic writes detected");
+            }
+            if (stx.stx_mask & STATX_DIOALIGN) != 0 {
+                let mut mem_align = stx.stx_dio_mem_align;
+                let mut off_align = stx.stx_dio_offset_align;
+                // KVDO OVERRIDE: clamp to 4096 if kvdo detected in dm stack
+                if let Some(ref dm) = caps_inner.dm_stack {
+                    if dm.has_vdo {
+                        mem_align = 4096;
+                        off_align = 4096;
+                        debug!("probe_capabilities: kvdo detected, clamping DIO alignment to 4096");
+                    }
+                }
+                caps_inner.dio_mem_align.store(mem_align, Ordering::Relaxed);
+                caps_inner.dio_offset_align.store(off_align, Ordering::Relaxed);
+                debug!("probe_capabilities: DIO alignment: mem={} offset={}", mem_align, off_align);
             }
         }
     }

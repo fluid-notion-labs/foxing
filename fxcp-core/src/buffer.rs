@@ -20,6 +20,17 @@ unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
+    /// NUMA-aware allocation stub for enterprise server configurations.
+    /// Falls back to standard allocation if node < 0 or mbind unavailable.
+    #[allow(unused_variables)]
+    pub fn try_new_numa(capacity: usize, alignment: usize, numa_node: i32) -> Result<Self> {
+        // TODO: On dual-socket servers, use mmap + mbind(MPOL_BIND) to pin
+        // buffers to the same NUMA node as the NVMe controller to avoid
+        // QPI cross-talk. Discover node via /sys/class/block/*/device/numa_node.
+        // For now, fall back to standard allocation.
+        Self::try_new(capacity, alignment)
+    }
+
     pub fn try_new(capacity: usize, alignment: usize) -> Result<Self> {
         // Fix: Limit is already in bytes, don't multiply by 1024*1024 again
         let limit_bytes = GLOBAL_BUFFER_LIMIT.get() as u64;
