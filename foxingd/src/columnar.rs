@@ -60,6 +60,29 @@ impl EventBatch {
         self.next_index.fetch_sub(1, Ordering::SeqCst);
         Some(evt)
     }
+    /// Remove all elements where the predicate returns false.
+    pub fn retain<F: Fn(usize) -> bool>(&mut self, keep: F) {
+        let mut write = 0;
+        for read in 0..self.len() {
+            if keep(read) {
+                if write != read {
+                    self.inodes[write] = self.inodes[read];
+                    self.types[write] = self.types[read];
+                    self.offsets[write] = self.offsets[read];
+                    self.lengths[write] = self.lengths[read];
+                    self.events[write] = self.events[read].clone();
+                }
+                write += 1;
+            }
+        }
+        self.inodes.truncate(write);
+        self.types.truncate(write);
+        self.offsets.truncate(write);
+        self.lengths.truncate(write);
+        self.events.truncate(write);
+        self.next_index.store(write, Ordering::SeqCst);
+    }
+
     pub fn try_coalesce_head(&mut self, scan_depth: usize, limit: u64) -> Option<Arc<Event>> {
         if self.is_empty() {
             return None;

@@ -362,4 +362,63 @@ impl Coalescer {
     pub fn contains_inode(&self, inode: u64) -> bool {
         self.batch.events.iter().any(|e| e.inode == inode)
     }
+
+    /// Elastic look-ahead: adjusts scan depth based on buffer utilization.
+    /// Higher load = deeper scan to find topological cancellations.
+    pub fn try_elastic_coalesce(
+        &mut self,
+        base_limit: u64,
+        max_capacity: usize,
+    ) -> Option<Arc<Event>> {
+        if self.batch.is_empty() { return None; }
+
+        let current_len = self.batch.len();
+        let util_pct = current_len as f64 / max_capacity.max(1) as f64;
+
+        // Elastic depth: higher load = deeper scan to prune transient lifecycles
+        let dynamic_m = if util_pct > 0.8 {
+            self.scan_depth * 10
+        } else if util_pct > 0.5 {
+            self.scan_depth * 2
+        } else {
+            self.scan_depth
+        };
+
+        // Topological pruning: remove create→write→unlink chains for same inode
+        if self.prune_transient_lifecycles(dynamic_m) {
+            return self.pop_batch(base_limit, Duration::ZERO, false);
+        }
+
+        self.batch.try_coalesce_head(dynamic_m, base_limit)
+    }
+
+    /// Look ahead `m_depth` events. If a file is created and then unlinked
+    /// within this window, remove ALL events for that inode from the batch.
+    fn prune_transient_lifecycles(&mut self, m_depth: usize) -> bool {
+        let scan_len = self.batch.len().min(m_depth);
+        if scan_len == 0 { return false; }
+
+        let mut unlinked_inodes = HashSet::new();
+        for i in 0..scan_len {
+            if self.batch.types[i] == EventType::Unlink {
+                unlinked_inodes.insert(self.batch.inodes[i]);
+            }
+        }
+
+        if unlinked_inodes.is_empty() { return false; }
+
+        let original_len = self.batch.len();
+        // Collect which indices to keep (avoids borrow conflict on self.batch)
+        let inodes_snapshot: Vec<u64> = self.batch.inodes[..scan_len.min(self.batch.inodes.len())].to_vec();
+        self.batch.retain(|idx| {
+            idx >= inodes_snapshot.len() || !unlinked_inodes.contains(&inodes_snapshot[idx])
+        });
+
+        let pruned = original_len != self.batch.len();
+        if pruned {
+            tracing::debug!("Elastic coalescer: pruned {} transient events ({} inodes)",
+                           original_len - self.batch.len(), unlinked_inodes.len());
+        }
+        pruned
+    }
 }
