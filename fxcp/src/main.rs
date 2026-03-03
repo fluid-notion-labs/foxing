@@ -128,6 +128,52 @@ fn is_zero(buf: &[u8]) -> bool {
         && suffix.iter().all(|&x| x == 0)
 }
 
+/// Detect compression format from magic bytes at the start of a stream.
+fn detect_compression(header: &[u8]) -> Option<&'static str> {
+    if header.len() < 4 { return None; }
+    // zstd magic: 0xFD2FB528
+    if header[0] == 0xFD && header[1] == 0x2F && header[2] == 0xB5 && header[3] == 0x28 {
+        return Some("zstd");
+    }
+    // gzip magic: 0x1F 0x8B
+    if header[0] == 0x1F && header[1] == 0x8B {
+        return Some("gzip");
+    }
+    // lz4 frame magic: 0x04224D18
+    if header[0] == 0x04 && header[1] == 0x22 && header[2] == 0x4D && header[3] == 0x18 {
+        return Some("lz4");
+    }
+    // xz magic: 0xFD377A585A00
+    if header.len() >= 6 && header[0] == 0xFD && header[1] == 0x37
+        && header[2] == 0x7A && header[3] == 0x58 && header[4] == 0x5A && header[5] == 0x00 {
+        return Some("xz");
+    }
+    None
+}
+
+/// Wrap a reader in a decompressor based on detected format.
+/// Returns the decompressing reader and format name.
+fn wrap_decompressor<'a>(
+    reader: Box<dyn std::io::Read + 'a>,
+    format: &str,
+) -> (Box<dyn std::io::Read + 'a>, &'static str) {
+    match format {
+        "zstd" => {
+            let dec = zstd::stream::Decoder::new(reader).expect("zstd decoder init failed");
+            (Box::new(dec), "zstd")
+        }
+        "gzip" => {
+            let dec = flate2::read::GzDecoder::new(reader);
+            (Box::new(dec), "gzip")
+        }
+        "lz4" => {
+            let dec = lz4_flex::frame::FrameDecoder::new(reader);
+            (Box::new(dec), "lz4")
+        }
+        _ => (reader, "raw")
+    }
+}
+
 async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
@@ -182,7 +228,33 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     let mut last_checkpoint = std::time::Instant::now();
     let mut checkpoint_count = 0u64;
 
-    let mut stdin = std::io::stdin().lock();
+    // Auto-detect compression from magic bytes
+    let raw_stdin = std::io::stdin().lock();
+    let mut header_buf = [0u8; 6];
+    let mut header_reader: Box<dyn std::io::Read> = Box::new(raw_stdin);
+    let header_len = {
+        let mut n = 0;
+        while n < 6 {
+            match std::io::Read::read(&mut header_reader, &mut header_buf[n..]) {
+                Ok(0) => break,
+                Ok(r) => n += r,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(fxcp_core::FxcpError::Io(e)),
+            }
+        }
+        n
+    };
+
+    let compression = detect_compression(&header_buf[..header_len]);
+    // Chain the already-read header bytes with the rest of stdin
+    let chained: Box<dyn std::io::Read> = Box::new(std::io::Cursor::new(header_buf[..header_len].to_vec()).chain(header_reader));
+    let (mut reader, comp_name): (Box<dyn std::io::Read>, &str) = if let Some(fmt) = compression {
+        info!("Detected {} compressed input — decompressing inline", fmt);
+        wrap_decompressor(chained, fmt)
+    } else {
+        (chained, "raw")
+    };
+
     let mut buf = vec![0u8; STDIN_CHUNK_SIZE];
     let mut offset: u64 = 0;
     let mut bytes_written: u64 = 0;
@@ -194,7 +266,7 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         // Read a full chunk from stdin (handling partial reads)
         let mut filled = 0;
         while filled < STDIN_CHUNK_SIZE {
-            let n = match stdin.read(&mut buf[filled..]) {
+            let n = match reader.read(&mut buf[filled..]) {
                 Ok(0) => break,     // EOF
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
