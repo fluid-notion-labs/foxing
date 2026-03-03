@@ -165,6 +165,19 @@ struct {
     __type(value, struct pending_write);
 } write_aggregator SEC(".maps");
 
+struct rename_args {
+    struct dentry *old_dentry;
+    struct dentry *new_dentry;
+    __u32 flags;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct rename_args);
+} pending_renames SEC(".maps");
+
 struct stats {
     __u64 events_submitted;
     __u64 events_dropped;
@@ -472,23 +485,62 @@ int BPF_KPROBE(trace_vfs_fsync, struct file *file, loff_t start, loff_t end, int
 }
 
 SEC("kprobe/vfs_rename")
-int BPF_KPROBE(trace_rename, struct renamedata___p *rd) {
+int BPF_KPROBE(trace_rename_entry, struct renamedata___p *rd) {
+    if (is_ignored_pid()) return 0;
     struct dentry *old_dentry = BPF_CORE_READ(rd, old_dentry);
     if (!old_dentry) return 0;
     struct inode *inode = BPF_CORE_READ(old_dentry, d_inode);
     if (!inode) return 0;
-    if (is_ignored_pid()) return 0;
 
     struct super_block *sb = BPF_CORE_READ(inode, i_sb);
     __u32 raw_dev_id = BPF_CORE_READ(sb, s_dev);
     __u32 dev_id = normalize_dev_id(raw_dev_id);
     if (!bpf_map_lookup_elem(&watched_devs, &dev_id)) return 0;
 
+    __u64 pid = bpf_get_current_pid_tgid();
+    struct rename_args args;
+    args.old_dentry = old_dentry;
+    args.new_dentry = BPF_CORE_READ(rd, new_dentry);
+    args.flags = 0;
+    if (bpf_core_field_exists(rd->flags)) {
+        args.flags = BPF_CORE_READ(rd, flags);
+    }
+    bpf_map_update_elem(&pending_renames, &pid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("kretprobe/vfs_rename")
+int BPF_KRETPROBE(trace_rename_exit, int ret) {
+    __u64 pid = bpf_get_current_pid_tgid();
+    struct rename_args *args = bpf_map_lookup_elem(&pending_renames, &pid);
+    if (!args) return 0;
+
+    // Only emit event if kernel operation succeeded
+    if (ret != 0) {
+        bpf_map_delete_elem(&pending_renames, &pid);
+        return 0;
+    }
+
+    struct dentry *old_dentry = args->old_dentry;
+    struct dentry *new_dentry = args->new_dentry;
+    __u32 rename_flags = args->flags;
+    bpf_map_delete_elem(&pending_renames, &pid);
+
+    struct inode *inode = BPF_CORE_READ(old_dentry, d_inode);
+    if (!inode) return 0;
+
+    struct super_block *sb = BPF_CORE_READ(inode, i_sb);
+    __u32 dev_id = normalize_dev_id(BPF_CORE_READ(sb, s_dev));
+
     __u64 seq_num = get_next_seq();
     if (seq_num == 0) return 0;
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) return 0;
+    if (!e) {
+        __u32 z=0; struct stats *s = bpf_map_lookup_elem(&statistics, &z);
+        if (s) __sync_fetch_and_add(&s->events_dropped, 1);
+        return 0;
+    }
 
     __builtin_memset(e, 0, sizeof(*e));
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -504,10 +556,7 @@ int BPF_KPROBE(trace_rename, struct renamedata___p *rd) {
     e->timestamp_ns = bpf_ktime_get_ns();
     e->inode = BPF_CORE_READ(inode, i_ino);
     e->generation = BPF_CORE_READ(inode, i_generation);
-
-    if (bpf_core_field_exists(rd->flags)) {
-        e->flags = BPF_CORE_READ(rd, flags);
-    }
+    e->flags = rename_flags;
 
     struct dentry *op = BPF_CORE_READ(old_dentry, d_parent);
     if (op) e->parent_inode = BPF_CORE_READ(op, d_inode, i_ino);
@@ -515,7 +564,6 @@ int BPF_KPROBE(trace_rename, struct renamedata___p *rd) {
     const unsigned char *old_name_ptr = BPF_CORE_READ(old_dentry, d_name.name);
     bpf_core_read_str(&e->name, sizeof(e->name), (const char *)old_name_ptr);
 
-    struct dentry *new_dentry = BPF_CORE_READ(rd, new_dentry);
     __u64 new_parent_ino = 0;
     if (new_dentry) {
         const unsigned char *new_name_ptr = BPF_CORE_READ(new_dentry, d_name.name);
@@ -564,13 +612,21 @@ SEC("kretprobe/vfs_symlink")
 int BPF_KRETPROBE(trace_symlink_exit, int ret) { return process_stashed_dentry(ret, EVENT_SYMLINK); }
 
 SEC("kprobe/vfs_unlink")
-int BPF_KPROBE(trace_unlink, void *idmap, struct inode *dir, struct dentry *dentry) {
-    return submit_event(BPF_CORE_READ(dentry, d_inode), dentry, EVENT_UNLINK, 0, 0, 0);
+int BPF_KPROBE(trace_unlink_entry, void *idmap, struct inode *dir, struct dentry *dentry) {
+    return stash_dentry(dentry);
+}
+SEC("kretprobe/vfs_unlink")
+int BPF_KRETPROBE(trace_unlink_exit, int ret) {
+    return process_stashed_dentry(ret, EVENT_UNLINK);
 }
 
 SEC("kprobe/vfs_rmdir")
-int BPF_KPROBE(trace_rmdir, void *idmap, struct inode *dir, struct dentry *dentry) {
-    return submit_event(BPF_CORE_READ(dentry, d_inode), dentry, EVENT_RMDIR, 0, 0, 0);
+int BPF_KPROBE(trace_rmdir_entry, void *idmap, struct inode *dir, struct dentry *dentry) {
+    return stash_dentry(dentry);
+}
+SEC("kretprobe/vfs_rmdir")
+int BPF_KRETPROBE(trace_rmdir_exit, int ret) {
+    return process_stashed_dentry(ret, EVENT_RMDIR);
 }
 
 SEC("kprobe/notify_change")
