@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-03-02T11:59:32.489805+00:00",
+  "timestamp": "2026-03-03T05:01:17.016701+00:00",
   "env": {
     "kernel": "6.17.7",
     "fs": "btrfs",
@@ -23,12 +23,12 @@
       "tool": "rsync",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 576,
+      "duration_ms": 777,
       "metrics": {
         "files": 10000,
         "bytes": 40960000,
-        "throughput_mbps": 67.82,
-        "files_per_sec": 17361.1
+        "throughput_mbps": 50.27,
+        "files_per_sec": 12870.0
       },
       "verify": {
         "status": "PASS",
@@ -42,12 +42,12 @@
       "tool": "cp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 431,
+      "duration_ms": 413,
       "metrics": {
         "files": 10000,
         "bytes": 40960000,
-        "throughput_mbps": 90.63,
-        "files_per_sec": 23201.9
+        "throughput_mbps": 94.58,
+        "files_per_sec": 24213.1
       },
       "verify": {
         "status": "PASS",
@@ -76,12 +76,12 @@
       "tool": "fxcp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 736,
+      "duration_ms": 717,
       "metrics": {
         "files": 10000,
         "bytes": 40960000,
-        "throughput_mbps": 53.07,
-        "files_per_sec": 13587.0
+        "throughput_mbps": 54.48,
+        "files_per_sec": 13947.0
       },
       "verify": {
         "status": "PASS",
@@ -95,12 +95,12 @@
       "tool": "rsync",
       "phase": "delta",
       "status": "PASS",
-      "duration_ms": 187,
+      "duration_ms": 194,
       "metrics": {
         "files": 9982,
         "bytes": 41943286,
-        "throughput_mbps": 213.9,
-        "files_per_sec": 53379.7
+        "throughput_mbps": 206.19,
+        "files_per_sec": 51453.6
       },
       "verify": {
         "status": "PASS",
@@ -114,12 +114,12 @@
       "tool": "cp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 521,
+      "duration_ms": 472,
       "metrics": {
         "files": 9982,
         "bytes": 41943286,
-        "throughput_mbps": 76.78,
-        "files_per_sec": 19159.3
+        "throughput_mbps": 84.75,
+        "files_per_sec": 21148.3
       },
       "verify": {
         "status": "FAIL",
@@ -149,12 +149,12 @@
       "tool": "fxcp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 344,
+      "duration_ms": 250,
       "metrics": {
         "files": 9982,
         "bytes": 41943286,
-        "throughput_mbps": 116.28,
-        "files_per_sec": 29017.4
+        "throughput_mbps": 160.0,
+        "files_per_sec": 39928.0
       },
       "verify": {
         "status": "FAIL",
@@ -169,12 +169,12 @@
       "tool": "rsync",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 1591,
+      "duration_ms": 1118,
       "metrics": {
         "files": 10,
         "bytes": 1048576000,
-        "throughput_mbps": 628.54,
-        "files_per_sec": 6.3
+        "throughput_mbps": 894.45,
+        "files_per_sec": 8.9
       },
       "verify": {
         "status": "PASS",
@@ -188,12 +188,12 @@
       "tool": "cp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 4,
+      "duration_ms": 6,
       "metrics": {
         "files": 10,
         "bytes": 1048576000,
-        "throughput_mbps": 250000.0,
-        "files_per_sec": 2500.0
+        "throughput_mbps": 166666.67,
+        "files_per_sec": 1666.7
       },
       "verify": {
         "status": "PASS",
@@ -207,12 +207,12 @@
       "tool": "foxing",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 4758,
+      "duration_ms": 4040,
       "metrics": {
         "files": 10,
         "bytes": 1048576000,
-        "throughput_mbps": 210.17,
-        "files_per_sec": 2.1
+        "throughput_mbps": 247.52,
+        "files_per_sec": 2.5
       },
       "verify": {
         "status": "PASS",
@@ -226,12 +226,12 @@
       "tool": "fxcp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 27,
+      "duration_ms": 24,
       "metrics": {
         "files": 10,
         "bytes": 1048576000,
-        "throughput_mbps": 37037.04,
-        "files_per_sec": 370.4
+        "throughput_mbps": 41666.67,
+        "files_per_sec": 416.7
       },
       "verify": {
         "status": "PASS",
@@ -245,12 +245,12 @@
       "tool": "rsync",
       "phase": "delta",
       "status": "PASS",
-      "duration_ms": 62,
+      "duration_ms": 58,
       "metrics": {
         "files": 9,
         "bytes": 943718400,
-        "throughput_mbps": 14516.13,
-        "files_per_sec": 145.2
+        "throughput_mbps": 15517.24,
+        "files_per_sec": 155.2
       },
       "verify": {
         "status": "PASS",
@@ -264,12 +264,12 @@
       "tool": "cp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 194,
+      "duration_ms": 187,
       "metrics": {
         "files": 9,
         "bytes": 943718400,
-        "throughput_mbps": 4639.18,
-        "files_per_sec": 46.4
+        "throughput_mbps": 4812.83,
+        "files_per_sec": 48.1
       },
       "verify": {
         "status": "FAIL",
@@ -284,12 +284,12 @@
       "tool": "foxing",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 3394,
+      "duration_ms": 2774,
       "metrics": {
         "files": 9,
         "bytes": 943718400,
-        "throughput_mbps": 265.17,
-        "files_per_sec": 2.7
+        "throughput_mbps": 324.44,
+        "files_per_sec": 3.2
       },
       "verify": {
         "status": "FAIL",
@@ -304,12 +304,12 @@
       "tool": "fxcp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 23,
+      "duration_ms": 20,
       "metrics": {
         "files": 9,
         "bytes": 943718400,
-        "throughput_mbps": 39130.43,
-        "files_per_sec": 391.3
+        "throughput_mbps": 45000.0,
+        "files_per_sec": 450.0
       },
       "verify": {
         "status": "FAIL",
@@ -324,12 +324,12 @@
       "tool": "rsync",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 3522,
+      "duration_ms": 2723,
       "metrics": {
         "files": 5000,
         "bytes": 2232111538,
-        "throughput_mbps": 604.4,
-        "files_per_sec": 1419.6
+        "throughput_mbps": 781.75,
+        "files_per_sec": 1836.2
       },
       "verify": {
         "status": "PASS",
@@ -343,12 +343,12 @@
       "tool": "cp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 228,
+      "duration_ms": 213,
       "metrics": {
         "files": 5000,
         "bytes": 2232111538,
-        "throughput_mbps": 9336.44,
-        "files_per_sec": 21929.8
+        "throughput_mbps": 9993.93,
+        "files_per_sec": 23474.2
       },
       "verify": {
         "status": "PASS",
@@ -377,12 +377,12 @@
       "tool": "fxcp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 359,
+      "duration_ms": 331,
       "metrics": {
         "files": 5000,
         "bytes": 2232111538,
-        "throughput_mbps": 5929.55,
-        "files_per_sec": 13927.6
+        "throughput_mbps": 6431.14,
+        "files_per_sec": 15105.7
       },
       "verify": {
         "status": "PASS",
@@ -396,12 +396,12 @@
       "tool": "rsync",
       "phase": "delta",
       "status": "PASS",
-      "duration_ms": 276,
+      "duration_ms": 309,
       "metrics": {
         "files": 5017,
         "bytes": 2191960824,
-        "throughput_mbps": 7573.97,
-        "files_per_sec": 18177.5
+        "throughput_mbps": 6765.1,
+        "files_per_sec": 16236.2
       },
       "verify": {
         "status": "PASS",
@@ -415,12 +415,12 @@
       "tool": "cp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 681,
+      "duration_ms": 659,
       "metrics": {
         "files": 5017,
         "bytes": 2191960824,
-        "throughput_mbps": 3069.63,
-        "files_per_sec": 7367.1
+        "throughput_mbps": 3172.1,
+        "files_per_sec": 7613.1
       },
       "verify": {
         "status": "FAIL",
@@ -450,12 +450,12 @@
       "tool": "fxcp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 209,
+      "duration_ms": 94,
       "metrics": {
         "files": 5017,
         "bytes": 2191960824,
-        "throughput_mbps": 10001.99,
-        "files_per_sec": 24004.8
+        "throughput_mbps": 22238.48,
+        "files_per_sec": 53372.3
       },
       "verify": {
         "status": "FAIL",
@@ -470,12 +470,12 @@
       "tool": "rsync",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 56,
+      "duration_ms": 58,
       "metrics": {
         "files": 50,
         "bytes": 204800,
-        "throughput_mbps": 3.49,
-        "files_per_sec": 892.9
+        "throughput_mbps": 3.37,
+        "files_per_sec": 862.1
       },
       "verify": {
         "status": "PASS",
@@ -489,12 +489,12 @@
       "tool": "cp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 11,
+      "duration_ms": 12,
       "metrics": {
         "files": 50,
         "bytes": 204800,
-        "throughput_mbps": 17.76,
-        "files_per_sec": 4545.5
+        "throughput_mbps": 16.28,
+        "files_per_sec": 4166.7
       },
       "verify": {
         "status": "PASS",
@@ -508,12 +508,12 @@
       "tool": "foxing",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 5155,
+      "duration_ms": 5375,
       "metrics": {
         "files": 50,
         "bytes": 204800,
         "throughput_mbps": 0.04,
-        "files_per_sec": 9.7
+        "files_per_sec": 9.3
       },
       "verify": {
         "status": "PASS",
@@ -527,12 +527,12 @@
       "tool": "fxcp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 32,
+      "duration_ms": 30,
       "metrics": {
         "files": 50,
         "bytes": 204800,
-        "throughput_mbps": 6.1,
-        "files_per_sec": 1562.5
+        "throughput_mbps": 6.51,
+        "files_per_sec": 1666.7
       },
       "verify": {
         "status": "PASS",
@@ -565,12 +565,12 @@
       "tool": "cp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 10,
+      "duration_ms": 9,
       "metrics": {
         "files": 49,
         "bytes": 209960,
-        "throughput_mbps": 20.02,
-        "files_per_sec": 4900.0
+        "throughput_mbps": 22.25,
+        "files_per_sec": 5444.4
       },
       "verify": {
         "status": "FAIL",
@@ -585,12 +585,12 @@
       "tool": "foxing",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 2053,
+      "duration_ms": 2131,
       "metrics": {
         "files": 49,
         "bytes": 209960,
-        "throughput_mbps": 0.1,
-        "files_per_sec": 23.9
+        "throughput_mbps": 0.09,
+        "files_per_sec": 23.0
       },
       "verify": {
         "status": "FAIL",
@@ -605,12 +605,12 @@
       "tool": "fxcp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 24,
+      "duration_ms": 33,
       "metrics": {
         "files": 49,
         "bytes": 209960,
-        "throughput_mbps": 8.34,
-        "files_per_sec": 2041.7
+        "throughput_mbps": 6.07,
+        "files_per_sec": 1484.8
       },
       "verify": {
         "status": "FAIL",
@@ -625,12 +625,12 @@
       "tool": "rsync",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 738,
+      "duration_ms": 942,
       "metrics": {
         "files": 10,
         "bytes": 524288000,
-        "throughput_mbps": 677.51,
-        "files_per_sec": 13.6
+        "throughput_mbps": 530.79,
+        "files_per_sec": 10.6
       },
       "verify": {
         "status": "PASS",
@@ -663,12 +663,12 @@
       "tool": "foxing",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 4071,
+      "duration_ms": 4550,
       "metrics": {
         "files": 10,
         "bytes": 524288000,
-        "throughput_mbps": 122.82,
-        "files_per_sec": 2.5
+        "throughput_mbps": 109.89,
+        "files_per_sec": 2.2
       },
       "verify": {
         "status": "PASS",
@@ -682,12 +682,12 @@
       "tool": "fxcp",
       "phase": "cold",
       "status": "PASS",
-      "duration_ms": 25,
+      "duration_ms": 22,
       "metrics": {
         "files": 10,
         "bytes": 524288000,
-        "throughput_mbps": 20000.0,
-        "files_per_sec": 400.0
+        "throughput_mbps": 22727.27,
+        "files_per_sec": 454.5
       },
       "verify": {
         "status": "PASS",
@@ -701,12 +701,12 @@
       "tool": "rsync",
       "phase": "delta",
       "status": "PASS",
-      "duration_ms": 57,
+      "duration_ms": 58,
       "metrics": {
         "files": 9,
         "bytes": 471859200,
-        "throughput_mbps": 7894.74,
-        "files_per_sec": 157.9
+        "throughput_mbps": 7758.62,
+        "files_per_sec": 155.2
       },
       "verify": {
         "status": "PASS",
@@ -720,12 +720,12 @@
       "tool": "cp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 100,
+      "duration_ms": 86,
       "metrics": {
         "files": 9,
         "bytes": 471859200,
-        "throughput_mbps": 4500.0,
-        "files_per_sec": 90.0
+        "throughput_mbps": 5232.56,
+        "files_per_sec": 104.7
       },
       "verify": {
         "status": "FAIL",
@@ -740,12 +740,12 @@
       "tool": "foxing",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 2703,
+      "duration_ms": 2592,
       "metrics": {
         "files": 9,
         "bytes": 471859200,
-        "throughput_mbps": 166.48,
-        "files_per_sec": 3.3
+        "throughput_mbps": 173.61,
+        "files_per_sec": 3.5
       },
       "verify": {
         "status": "FAIL",
@@ -760,12 +760,12 @@
       "tool": "fxcp",
       "phase": "delta",
       "status": "FAIL",
-      "duration_ms": 22,
+      "duration_ms": 24,
       "metrics": {
         "files": 9,
         "bytes": 471859200,
-        "throughput_mbps": 20454.55,
-        "files_per_sec": 409.1
+        "throughput_mbps": 18750.0,
+        "files_per_sec": 375.0
       },
       "verify": {
         "status": "FAIL",
@@ -779,122 +779,122 @@
     {
       "workload": "small_files",
       "phase": "cold",
-      "rsync_ms": 576,
-      "cp_ms": 431,
+      "rsync_ms": 777,
+      "cp_ms": 413,
       "foxing_ms": 60000,
-      "fxcp_ms": 736,
-      "foxing_vs_rsync": 0.01,
+      "fxcp_ms": 717,
+      "foxing_vs_rsync": 0.013,
       "foxing_vs_cp": 0.007,
-      "fxcp_vs_rsync": 0.783,
-      "fxcp_vs_cp": 0.586
+      "fxcp_vs_rsync": 1.084,
+      "fxcp_vs_cp": 0.576
     },
     {
       "workload": "small_files",
       "phase": "delta",
-      "rsync_ms": 187,
-      "cp_ms": 521,
+      "rsync_ms": 194,
+      "cp_ms": 472,
       "foxing_ms": 60000,
-      "fxcp_ms": 344,
+      "fxcp_ms": 250,
       "foxing_vs_rsync": 0.003,
-      "foxing_vs_cp": 0.009,
-      "fxcp_vs_rsync": 0.544,
-      "fxcp_vs_cp": 1.515
+      "foxing_vs_cp": 0.008,
+      "fxcp_vs_rsync": 0.776,
+      "fxcp_vs_cp": 1.888
     },
     {
       "workload": "large_files",
       "phase": "cold",
-      "rsync_ms": 1591,
-      "cp_ms": 4,
-      "foxing_ms": 4758,
-      "fxcp_ms": 27,
-      "foxing_vs_rsync": 0.334,
+      "rsync_ms": 1118,
+      "cp_ms": 6,
+      "foxing_ms": 4040,
+      "fxcp_ms": 24,
+      "foxing_vs_rsync": 0.277,
       "foxing_vs_cp": 0.001,
-      "fxcp_vs_rsync": 58.926,
-      "fxcp_vs_cp": 0.148
+      "fxcp_vs_rsync": 46.583,
+      "fxcp_vs_cp": 0.25
     },
     {
       "workload": "large_files",
       "phase": "delta",
-      "rsync_ms": 62,
-      "cp_ms": 194,
-      "foxing_ms": 3394,
-      "fxcp_ms": 23,
-      "foxing_vs_rsync": 0.018,
-      "foxing_vs_cp": 0.057,
-      "fxcp_vs_rsync": 2.696,
-      "fxcp_vs_cp": 8.435
+      "rsync_ms": 58,
+      "cp_ms": 187,
+      "foxing_ms": 2774,
+      "fxcp_ms": 20,
+      "foxing_vs_rsync": 0.021,
+      "foxing_vs_cp": 0.067,
+      "fxcp_vs_rsync": 2.9,
+      "fxcp_vs_cp": 9.35
     },
     {
       "workload": "mixed",
       "phase": "cold",
-      "rsync_ms": 3522,
-      "cp_ms": 228,
+      "rsync_ms": 2723,
+      "cp_ms": 213,
       "foxing_ms": 60000,
-      "fxcp_ms": 359,
-      "foxing_vs_rsync": 0.059,
+      "fxcp_ms": 331,
+      "foxing_vs_rsync": 0.045,
       "foxing_vs_cp": 0.004,
-      "fxcp_vs_rsync": 9.811,
-      "fxcp_vs_cp": 0.635
+      "fxcp_vs_rsync": 8.227,
+      "fxcp_vs_cp": 0.644
     },
     {
       "workload": "mixed",
       "phase": "delta",
-      "rsync_ms": 276,
-      "cp_ms": 681,
+      "rsync_ms": 309,
+      "cp_ms": 659,
       "foxing_ms": 60000,
-      "fxcp_ms": 209,
+      "fxcp_ms": 94,
       "foxing_vs_rsync": 0.005,
       "foxing_vs_cp": 0.011,
-      "fxcp_vs_rsync": 1.321,
-      "fxcp_vs_cp": 3.258
+      "fxcp_vs_rsync": 3.287,
+      "fxcp_vs_cp": 7.011
     },
     {
       "workload": "deep_tree",
       "phase": "cold",
-      "rsync_ms": 56,
-      "cp_ms": 11,
-      "foxing_ms": 5155,
-      "fxcp_ms": 32,
+      "rsync_ms": 58,
+      "cp_ms": 12,
+      "foxing_ms": 5375,
+      "fxcp_ms": 30,
       "foxing_vs_rsync": 0.011,
       "foxing_vs_cp": 0.002,
-      "fxcp_vs_rsync": 1.75,
-      "fxcp_vs_cp": 0.344
+      "fxcp_vs_rsync": 1.933,
+      "fxcp_vs_cp": 0.4
     },
     {
       "workload": "deep_tree",
       "phase": "delta",
       "rsync_ms": 53,
-      "cp_ms": 10,
-      "foxing_ms": 2053,
-      "fxcp_ms": 24,
-      "foxing_vs_rsync": 0.026,
-      "foxing_vs_cp": 0.005,
-      "fxcp_vs_rsync": 2.208,
-      "fxcp_vs_cp": 0.417
+      "cp_ms": 9,
+      "foxing_ms": 2131,
+      "fxcp_ms": 33,
+      "foxing_vs_rsync": 0.025,
+      "foxing_vs_cp": 0.004,
+      "fxcp_vs_rsync": 1.606,
+      "fxcp_vs_cp": 0.273
     },
     {
       "workload": "sparse",
       "phase": "cold",
-      "rsync_ms": 738,
+      "rsync_ms": 942,
       "cp_ms": 3,
-      "foxing_ms": 4071,
-      "fxcp_ms": 25,
-      "foxing_vs_rsync": 0.181,
+      "foxing_ms": 4550,
+      "fxcp_ms": 22,
+      "foxing_vs_rsync": 0.207,
       "foxing_vs_cp": 0.001,
-      "fxcp_vs_rsync": 29.52,
-      "fxcp_vs_cp": 0.12
+      "fxcp_vs_rsync": 42.818,
+      "fxcp_vs_cp": 0.136
     },
     {
       "workload": "sparse",
       "phase": "delta",
-      "rsync_ms": 57,
-      "cp_ms": 100,
-      "foxing_ms": 2703,
-      "fxcp_ms": 22,
-      "foxing_vs_rsync": 0.021,
-      "foxing_vs_cp": 0.037,
-      "fxcp_vs_rsync": 2.591,
-      "fxcp_vs_cp": 4.545
+      "rsync_ms": 58,
+      "cp_ms": 86,
+      "foxing_ms": 2592,
+      "fxcp_ms": 24,
+      "foxing_vs_rsync": 0.022,
+      "foxing_vs_cp": 0.033,
+      "fxcp_vs_rsync": 2.417,
+      "fxcp_vs_cp": 3.583
     }
   ],
   "summary": {
