@@ -34,6 +34,40 @@ use std::io::ErrorKind;
 use fxcp_core::sidecar::{SyncSignature, get_sync_signature, set_sync_signature};
 use fxcp_core::hashing;
 use rand::seq::IndexedRandom;
+use serde::{Serialize, Deserialize};
+
+/// Serializable frontier for resumable hydration scans.
+/// Replaces recursive WalkDir with a BFS queue that can be
+/// checkpointed to disk and resumed after daemon restart.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HydrationFrontier {
+    pub pending_dirs: Vec<PathBuf>,
+    pub completed_dirs: usize,
+    pub files_queued: u64,
+}
+
+impl HydrationFrontier {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            pending_dirs: vec![root],
+            completed_dirs: 0,
+            files_queued: 0,
+        }
+    }
+
+    /// Try to load a saved frontier checkpoint from disk.
+    pub fn load(checkpoint_path: &Path) -> Option<Self> {
+        let data = std::fs::read_to_string(checkpoint_path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Save frontier state to disk for crash recovery.
+    pub fn save(&self, checkpoint_path: &Path) -> std::io::Result<()> {
+        let data = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(checkpoint_path, data)
+    }
+}
 
 #[derive(Debug)]
 pub struct HydrationState {
@@ -329,6 +363,100 @@ impl Hydrator {
         self.source.hydration.active.store(false, Ordering::SeqCst);
         info!("Hydration: Full scan complete for {:?}", self.source.path);
         
+        if !self.source.hydration.shutdown_requested.load(Ordering::Relaxed) {
+            self.start_watcher_if_needed(enable_watching);
+        }
+    }
+
+    /// Frontier-based BFS scan: iterative, checkpointable, and resumable.
+    /// If a previous scan was interrupted, it resumes from the saved checkpoint.
+    pub fn execute_frontier_scan(&self, enable_watching: bool) {
+        self.source.hydration.active.store(true, Ordering::SeqCst);
+
+        let checkpoint_path = self.source.path.join(".foxing_frontier.json");
+
+        // Try to resume from saved checkpoint
+        let mut frontier = match HydrationFrontier::load(&checkpoint_path) {
+            Some(f) => {
+                info!("Hydration: Resuming frontier scan ({} dirs pending, {} completed)",
+                      f.pending_dirs.len(), f.completed_dirs);
+                f
+            }
+            None => {
+                info!("Hydration: Starting frontier scan from root {:?}", self.source.path);
+                HydrationFrontier::new(self.source.path.clone())
+            }
+        };
+
+        let root_dev = self.source.dev;
+        let cross = self.source.cross_subvolumes;
+
+        while let Some(current_dir) = frontier.pending_dirs.pop() {
+            if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) {
+                info!("Hydration: Saving frontier checkpoint on shutdown...");
+                let _ = frontier.save(&checkpoint_path);
+                self.source.hydration.active.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            let entries = match std::fs::read_dir(&current_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("Hydration frontier: skip {:?}: {}", current_dir, e);
+                    continue;
+                }
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                // Cross-subvolume filter
+                if !cross {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.dev() as u32 != root_dev { continue; }
+                    }
+                }
+
+                if entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                    frontier.pending_dirs.push(path);
+                } else if entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+                    // Queue file for sync via existing bulk job infrastructure
+                    let rel_path = match path.strip_prefix(&self.source.path) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    let bulk_queue = self.source.bulk_job_queue.lock();
+                    if let Some(queue_sender) = bulk_queue.as_ref() {
+                        if let Ok(meta) = entry.metadata() {
+                            for target in &self.targets {
+                                queue_sender.submit_job(rel_path.clone(), target.clone(), Some(meta.ino()));
+                            }
+                            frontier.files_queued += 1;
+                        }
+                    }
+                }
+            }
+
+            frontier.completed_dirs += 1;
+            self.source.hydration.scanned.fetch_add(1, Ordering::Relaxed);
+
+            // Governor pacing
+            self.governor.pace_hydration();
+
+            // Checkpoint every 1000 directories
+            if frontier.completed_dirs % 1000 == 0 {
+                let _ = frontier.save(&checkpoint_path);
+                debug!("Hydration frontier: checkpoint at {} dirs, {} files queued",
+                       frontier.completed_dirs, frontier.files_queued);
+            }
+        }
+
+        // Scan complete — remove checkpoint
+        let _ = std::fs::remove_file(&checkpoint_path);
+        self.source.hydration.active.store(false, Ordering::SeqCst);
+        info!("Hydration: Frontier scan complete ({} dirs, {} files)",
+              frontier.completed_dirs, frontier.files_queued);
+
         if !self.source.hydration.shutdown_requested.load(Ordering::Relaxed) {
             self.start_watcher_if_needed(enable_watching);
         }
