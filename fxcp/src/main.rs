@@ -141,18 +141,34 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         }
     }
 
-    let file = std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
-        .open(dst)?;
+    // Block device detection: skip O_TRUNC/O_CREAT for raw devices
+    let is_block_device = dst.exists() && {
+        use std::os::unix::fs::FileTypeExt;
+        let m = std::fs::metadata(dst).map(|m| m.file_type()).ok();
+        m.map(|ft| ft.is_block_device()).unwrap_or(false)
+    };
+
+    let file = if is_block_device {
+        info!("Block device detected: {:?} (skipping truncate/create)", dst);
+        std::fs::OpenOptions::new()
+            .read(true).write(true)
+            .open(dst)?
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(dst)?
+    };
     let fd = file.as_raw_fd();
 
-    // Pre-allocate if size known
-    if let Some(size) = cli.size {
-        let ret = unsafe {
-            libc::fallocate(fd, 0, 0, size as i64)
-        };
-        if ret != 0 {
-            debug!("fallocate pre-allocation failed (non-fatal): {}", std::io::Error::last_os_error());
+    // Pre-allocate if size known (not applicable to block devices)
+    if !is_block_device {
+        if let Some(size) = cli.size {
+            let ret = unsafe {
+                libc::fallocate(fd, 0, 0, size as i64)
+            };
+            if ret != 0 {
+                debug!("fallocate pre-allocation failed (non-fatal): {}", std::io::Error::last_os_error());
+            }
         }
     }
 
@@ -240,7 +256,10 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     }
 
     // Truncate to exact size (sets file size even if last chunk was a hole)
-    unsafe { libc::ftruncate(fd, offset as i64) };
+    // Skip for block devices — they have fixed size
+    if !is_block_device {
+        unsafe { libc::ftruncate(fd, offset as i64) };
+    }
 
     // fsync
     file.sync_all()?;
