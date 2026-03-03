@@ -60,6 +60,99 @@ lazy_static! {
     static ref GLOBAL_CAPS_CACHE: DashMap<PathBuf, Arc<Capabilities>> = DashMap::new();
 }
 
+// ---------------------------------------------------------------------------
+// Public SIMD-accelerated zero-block detection
+// ---------------------------------------------------------------------------
+
+/// Check if a buffer is entirely zero. Uses architecture-specific SIMD:
+/// - x86_64: AVX-512 (256B/iter), AVX2 (32B/iter), runtime-detected
+/// - AArch64: NEON vmaxvq_u8 (64B/iter)
+/// - Generic: u128-aligned comparison fallback
+#[inline(always)]
+pub fn is_zero_block(buf: &[u8]) -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { is_zero_avx512(buf) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { is_zero_avx2(buf) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return is_zero_neon(buf);
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
+        chunks.iter().all(|&x| x == 0) && prefix.iter().all(|&x| x == 0) && suffix.iter().all(|&x| x == 0)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn is_zero_neon(buf: &[u8]) -> bool {
+    use std::arch::aarch64::*;
+    let len = buf.len();
+    let ptr = buf.as_ptr();
+    let mut i = 0;
+    unsafe {
+        while i + 64 <= len {
+            let a = vld1q_u8(ptr.add(i));
+            let b = vld1q_u8(ptr.add(i + 16));
+            let c = vld1q_u8(ptr.add(i + 32));
+            let d = vld1q_u8(ptr.add(i + 48));
+            let combined = vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d));
+            if vmaxvq_u8(combined) != 0 { return false; }
+            i += 64;
+        }
+    }
+    buf[i..].iter().all(|&b| b == 0)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn is_zero_avx512(buf: &[u8]) -> bool {
+    let len = buf.len();
+    let ptr = buf.as_ptr();
+    let mut i = 0;
+    unsafe {
+        while i + 256 <= len {
+            let a = _mm512_loadu_si512(ptr.add(i) as *const _);
+            let b = _mm512_loadu_si512(ptr.add(i + 64) as *const _);
+            let c = _mm512_loadu_si512(ptr.add(i + 128) as *const _);
+            let d = _mm512_loadu_si512(ptr.add(i + 192) as *const _);
+            let combined = _mm512_or_si512(_mm512_or_si512(a, b), _mm512_or_si512(c, d));
+            if _mm512_test_epi64_mask(combined, combined) != 0 { return false; }
+            i += 256;
+        }
+        while i + 64 <= len {
+            let a = _mm512_loadu_si512(ptr.add(i) as *const _);
+            if _mm512_test_epi64_mask(a, a) != 0 { return false; }
+            i += 64;
+        }
+        buf[i..].iter().all(|&b| b == 0)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn is_zero_avx2(buf: &[u8]) -> bool {
+    let len = buf.len();
+    let ptr = buf.as_ptr();
+    let mut i = 0;
+    unsafe {
+        while i + 32 <= len {
+            let a = _mm256_loadu_si256(ptr.add(i) as *const _);
+            if _mm256_testz_si256(a, a) == 0 { return false; }
+            i += 32;
+        }
+        buf[i..].iter().all(|&b| b == 0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FsyncLatencyTracker {
     avg_us: u64,
@@ -2178,108 +2271,7 @@ impl SmartCopier {
 
     #[inline(always)]
     fn is_block_zero(buf: &[u8]) -> bool {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if is_x86_feature_detected!("avx512f") {
-                return unsafe { Self::is_block_zero_avx512(buf) };
-            }
-            if is_x86_feature_detected!("avx2") {
-                return unsafe { Self::is_block_zero_avx2(buf) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            return Self::is_block_zero_neon(buf);
-        }
-
-        // Generic fallback: works on all architectures (RISC-V, ppc64le, s390x, etc.)
-        // Uses u128-aligned comparison for reasonable performance
-        #[allow(unreachable_code)]
-        {
-            let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
-            chunks.iter().all(|&x| x == 0) && prefix.iter().all(|&x| x == 0) && suffix.iter().all(|&x| x == 0)
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn is_block_zero_neon(buf: &[u8]) -> bool {
-        use std::arch::aarch64::*;
-        let len = buf.len();
-        let ptr = buf.as_ptr();
-        let mut i = 0;
-
-        unsafe {
-            while i + 64 <= len {
-                let a = vld1q_u8(ptr.add(i));
-                let b = vld1q_u8(ptr.add(i + 16));
-                let c = vld1q_u8(ptr.add(i + 32));
-                let d = vld1q_u8(ptr.add(i + 48));
-                let or_ab = vorrq_u8(a, b);
-                let or_cd = vorrq_u8(c, d);
-                let combined = vorrq_u8(or_ab, or_cd);
-                if vmaxvq_u8(combined) != 0 {
-                    return false;
-                }
-                i += 64;
-            }
-        }
-
-        buf[i..].iter().all(|&b| b == 0)
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx512f")]
-    unsafe fn is_block_zero_avx512(buf: &[u8]) -> bool {
-        unsafe {
-            let len = buf.len();
-            let ptr = buf.as_ptr();
-            let mut i = 0;
-
-            while i + 256 <= len {
-                let a = _mm512_loadu_si512(ptr.add(i) as *const _);
-                let b = _mm512_loadu_si512(ptr.add(i + 64) as *const _);
-                let c = _mm512_loadu_si512(ptr.add(i + 128) as *const _);
-                let d = _mm512_loadu_si512(ptr.add(i + 192) as *const _);
-
-                let combined = _mm512_or_si512(_mm512_or_si512(a, b), _mm512_or_si512(c, d));
-                if _mm512_test_epi64_mask(combined, combined) != 0 {
-                    return false;
-                }
-                i += 256;
-            }
-
-            while i + 64 <= len {
-                let a = _mm512_loadu_si512(ptr.add(i) as *const _);
-                if _mm512_test_epi64_mask(a, a) != 0 {
-                    return false;
-                }
-                i += 64;
-            }
-
-            // Fallback for remaining bytes
-            buf[i..].iter().all(|&b| b == 0)
-        }
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2")]
-    unsafe fn is_block_zero_avx2(buf: &[u8]) -> bool {
-        unsafe {
-            let len = buf.len();
-            let ptr = buf.as_ptr();
-            let mut i = 0;
-
-            while i + 32 <= len {
-                let a = _mm256_loadu_si256(ptr.add(i) as *const _);
-                if _mm256_testz_si256(a, a) == 0 {
-                    return false;
-                }
-                i += 32;
-            }
-
-            buf[i..].iter().all(|&b| b == 0)
-        }
+        is_zero_block(buf)
     }
 }
 

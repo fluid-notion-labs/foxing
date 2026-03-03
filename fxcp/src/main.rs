@@ -120,12 +120,9 @@ fn main() {
 
 const STDIN_CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks (matches NFS wsize)
 
-/// Fast zero-block detection using u128 alignment trick.
+/// SIMD-accelerated zero-block detection (AVX-512/AVX2 on x86_64, NEON on AArch64).
 fn is_zero(buf: &[u8]) -> bool {
-    let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
-    prefix.iter().all(|&x| x == 0)
-        && chunks.iter().all(|&x| x == 0)
-        && suffix.iter().all(|&x| x == 0)
+    fxcp_core::operations::is_zero_block(buf)
 }
 
 /// Detect compression format from magic bytes at the start of a stream.
