@@ -2187,10 +2187,45 @@ impl SmartCopier {
                 return unsafe { Self::is_block_zero_avx2(buf) };
             }
         }
-        
-        // Fallback / Generic
-        let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
-        chunks.iter().all(|&x| x == 0) && prefix.iter().all(|&x| x == 0) && suffix.iter().all(|&x| x == 0)
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            return Self::is_block_zero_neon(buf);
+        }
+
+        // Generic fallback: works on all architectures (RISC-V, ppc64le, s390x, etc.)
+        // Uses u128-aligned comparison for reasonable performance
+        #[allow(unreachable_code)]
+        {
+            let (prefix, chunks, suffix) = unsafe { buf.align_to::<u128>() };
+            chunks.iter().all(|&x| x == 0) && prefix.iter().all(|&x| x == 0) && suffix.iter().all(|&x| x == 0)
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn is_block_zero_neon(buf: &[u8]) -> bool {
+        use std::arch::aarch64::*;
+        let len = buf.len();
+        let ptr = buf.as_ptr();
+        let mut i = 0;
+
+        unsafe {
+            while i + 64 <= len {
+                let a = vld1q_u8(ptr.add(i));
+                let b = vld1q_u8(ptr.add(i + 16));
+                let c = vld1q_u8(ptr.add(i + 32));
+                let d = vld1q_u8(ptr.add(i + 48));
+                let or_ab = vorrq_u8(a, b);
+                let or_cd = vorrq_u8(c, d);
+                let combined = vorrq_u8(or_ab, or_cd);
+                if vmaxvq_u8(combined) != 0 {
+                    return false;
+                }
+                i += 64;
+            }
+        }
+
+        buf[i..].iter().all(|&b| b == 0)
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
