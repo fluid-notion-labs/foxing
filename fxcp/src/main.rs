@@ -41,6 +41,12 @@ struct Cli {
     strict_hash: bool,
     #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
     size: Option<u64>,
+    #[arg(long, help = "Interval in seconds to create CoW checkpoints of stdin stream")]
+    checkpoint_interval: Option<u64>,
+    #[arg(long, default_value = "5", help = "Number of stream checkpoints to keep")]
+    checkpoint_keep: usize,
+    #[arg(long, help = "Use zero-copy splice (mutually exclusive with sparse detection)")]
+    zero_copy: bool,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     debug: bool,
 }
@@ -136,7 +142,7 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     }
 
     let file = std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true)
+        .read(true).write(true).create(true).truncate(true)
         .open(dst)?;
     let fd = file.as_raw_fd();
 
@@ -149,6 +155,16 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
             debug!("fallocate pre-allocation failed (non-fatal): {}", std::io::Error::last_os_error());
         }
     }
+
+    // Mutual exclusivity: zero-copy splice bypasses userspace buffers, can't detect zeros
+    let use_sparse = !cli.zero_copy;
+    if cli.zero_copy && cli.checkpoint_interval.is_none() {
+        // zero_copy without checkpointing is just a pass-through
+    }
+
+    let checkpoint_interval = cli.checkpoint_interval.map(std::time::Duration::from_secs);
+    let mut last_checkpoint = std::time::Instant::now();
+    let mut checkpoint_count = 0u64;
 
     let mut stdin = std::io::stdin().lock();
     let mut buf = vec![0u8; STDIN_CHUNK_SIZE];
@@ -172,7 +188,7 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         }
         if filled == 0 { break; } // EOF
 
-        if is_zero(&buf[..filled]) {
+        if use_sparse && is_zero(&buf[..filled]) {
             // Zero chunk — create a hole (don't write, just advance offset)
             // The file will have a hole here (sparse)
             bytes_sparse += filled as u64;
@@ -194,6 +210,33 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
             chunks_data += 1;
         }
         offset += filled as u64;
+
+        // Rolling checkpoint: create CoW snapshot via FICLONE at intervals
+        if let Some(interval) = checkpoint_interval {
+            if last_checkpoint.elapsed() >= interval {
+                file.sync_all()?;
+                let ts = chrono::Utc::now().timestamp();
+                let snap_path = dst.with_extension(format!("snap.{}", ts));
+                // FICLONE the current file to create an instant snapshot
+                if let Ok(snap_file) = std::fs::File::create(&snap_path) {
+                    let ret = unsafe {
+                        libc::ioctl(snap_file.as_raw_fd(), FICLONE, fd)
+                    };
+                    if ret == 0 {
+                        checkpoint_count += 1;
+                        info!("Stream checkpoint #{}: {:?} ({})", checkpoint_count, snap_path, format_bytes(offset));
+
+                        // Prune old checkpoints beyond keep limit
+                        if checkpoint_count > cli.checkpoint_keep as u64 {
+                            prune_stream_checkpoints(dst, cli.checkpoint_keep);
+                        }
+                    } else {
+                        debug!("FICLONE checkpoint failed (non-fatal): {}", std::io::Error::last_os_error());
+                    }
+                }
+                last_checkpoint = std::time::Instant::now();
+            }
+        }
     }
 
     // Truncate to exact size (sets file size even if last chunk was a hole)
@@ -212,6 +255,30 @@ async fn run_stdin_to_file(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         bytes_small: bytes_sparse, // reuse for sparse display
         ..Default::default()
     })
+}
+
+fn prune_stream_checkpoints(base_path: &Path, keep: usize) {
+    let parent = match base_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let stem = base_path.file_name().unwrap_or_default().to_string_lossy();
+    let mut snaps: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&*stem) && name.contains(".snap.") {
+                snaps.push(entry.path());
+            }
+        }
+    }
+    snaps.sort();
+    while snaps.len() > keep {
+        if let Some(oldest) = snaps.first() {
+            let _ = std::fs::remove_file(oldest);
+            snaps.remove(0);
+        }
+    }
 }
 
 fn format_bytes(b: u64) -> String {
