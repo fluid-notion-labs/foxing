@@ -580,3 +580,79 @@ pub fn canonicalize_safe(path: &Path, root: &Path) -> crate::error::Result<std::
     }
     Ok(canonical)
 }
+
+// ---------------------------------------------------------------------------
+// openat2 RESOLVE_BENEATH — kernel-enforced path containment (Linux 5.6+)
+// ---------------------------------------------------------------------------
+
+const RESOLVE_BENEATH: u64 = 0x08;
+const SYS_OPENAT2: i64 = 437;
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Open a file beneath `root` using openat2(2) with RESOLVE_BENEATH.
+/// The kernel rejects any path that escapes `root` via `..` or symlinks.
+/// Falls back to canonicalize_safe + standard open if openat2 unavailable.
+pub fn open_beneath(
+    root: &Path,
+    relative_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> crate::error::Result<std::fs::File> {
+    use std::os::unix::io::{FromRawFd, AsRawFd};
+
+    // Open the root directory
+    let root_dir = std::fs::File::open(root).map_err(|e| {
+        FxcpError::Security(format!("cannot open root {:?}: {}", root, e))
+    })?;
+    let root_fd = root_dir.as_raw_fd();
+
+    let rel_cstr = std::ffi::CString::new(
+        relative_path.as_os_str().as_encoded_bytes()
+    ).map_err(|e| FxcpError::Security(format!("invalid path: {}", e)))?;
+
+    let how = OpenHow {
+        flags: flags as u64,
+        mode: mode as u64,
+        resolve: RESOLVE_BENEATH,
+    };
+
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPENAT2,
+            root_fd,
+            rel_cstr.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+
+    if fd >= 0 {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOSYS) {
+            // openat2 not available — fall back to canonicalize_safe
+            let full_path = root.join(relative_path);
+            let safe = canonicalize_safe(&full_path, root)?;
+            let file = std::fs::OpenOptions::new()
+                .read((flags & libc::O_RDONLY) == libc::O_RDONLY || (flags & libc::O_RDWR) != 0)
+                .write((flags & libc::O_WRONLY) != 0 || (flags & libc::O_RDWR) != 0)
+                .create((flags & libc::O_CREAT) != 0)
+                .truncate((flags & libc::O_TRUNC) != 0)
+                .open(&safe)?;
+            Ok(file)
+        } else if err.raw_os_error() == Some(libc::EXDEV) {
+            Err(FxcpError::Security(format!(
+                "path {:?} escapes root {:?} (RESOLVE_BENEATH rejected)", relative_path, root
+            )))
+        } else {
+            Err(FxcpError::Io(err))
+        }
+    }
+}
