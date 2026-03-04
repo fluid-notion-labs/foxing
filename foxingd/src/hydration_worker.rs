@@ -36,6 +36,14 @@ use fxcp_core::hashing;
 use rand::seq::IndexedRandom;
 use serde::{Serialize, Deserialize};
 
+/// Convert a raw st_dev value to the synthetic device ID used by mirror.rs.
+/// Mirror uses (major << 20) | minor, but st_dev uses kernel encoding.
+fn normalize_dev(raw_dev: u64) -> u32 {
+    let maj = ((raw_dev >> 8) & 0xfff) as u32;
+    let min = ((raw_dev & 0xff) | ((raw_dev >> 12) & 0xfff00)) as u32;
+    (maj << 20) | min
+}
+
 /// Serializable frontier for resumable hydration scans.
 /// Replaces recursive WalkDir with a BFS queue that can be
 /// checkpointed to disk and resumed after daemon restart.
@@ -205,7 +213,7 @@ impl Hydrator {
         for entry_res in walker.into_iter().filter_entry(move |e| {
             if cross { return true; }
             if let Ok(meta) = e.metadata() {
-                if meta.dev() as u32 != root_dev {
+                if normalize_dev(meta.dev()) != root_dev {
                     return false;
                 }
             }
@@ -413,7 +421,7 @@ impl Hydrator {
                 // Cross-subvolume filter
                 if !cross {
                     if let Ok(meta) = entry.metadata() {
-                        if meta.dev() as u32 != root_dev { continue; }
+                        if normalize_dev(meta.dev()) != root_dev { continue; }
                     }
                 }
 
