@@ -97,9 +97,12 @@ impl RetryQueue {
         None
     }
 
-    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
 
@@ -184,6 +187,8 @@ pub async fn run_worker(
     let mut flush_interval = tokio::time::interval(Duration::from_micros(tuner.current_flush_us));
     let mut tune_interval = tokio::time::interval(Duration::from_micros(constants::WORKER_TUNE_INTERVAL_US));
     tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut retry_interval = tokio::time::interval(Duration::from_millis(constants::WORKER_RETRY_QUEUE_BASE_BACKOFF_MS));
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut last_tune = Instant::now();
     let mut bytes_since_tune = 0u64;
@@ -280,9 +285,19 @@ pub async fn run_worker(
             peak_coalescer_len = 0;
         }
 
+        // Idle detection: when no pending work, reduce polling to save CPU
+        if coalescer.is_empty() && retry_queue.is_empty() {
+            // No work pending — next interesting event is either:
+            // 1. A new event from BPF (event_rx)
+            // 2. A stats update from hydration (external_stats_rx)
+            // 3. Shutdown signal
+            // All of these will properly wake through tokio channels.
+            // Don't spin on timer branches.
+        }
+
         tokio::select! {
             biased;
-            
+
             _ = shutdown_rx.recv() => {
                 info!("Worker {}: Shutdown signal received.", worker_id);
                 break;
@@ -343,7 +358,8 @@ pub async fn run_worker(
                 }
             }
 
-            Some((evt, attempts)) = std::future::ready(retry_queue.pop_ready()) => {
+            _ = retry_interval.tick(), if !retry_queue.is_empty() => {
+                if let Some((evt, attempts)) = retry_queue.pop_ready() {
                 let start_time = Instant::now();
                 let (res, sc, dt) = process_single_event_with_wal(
                     evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
@@ -370,9 +386,10 @@ pub async fn run_worker(
                         retry_queue.push(evt, attempts);
                     }
                 }
+                }  // close if let Some
             }
 
-            _ = flush_interval.tick() => {
+            _ = flush_interval.tick(), if !coalescer.is_empty() => {
                 if let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
                     let start_time = Instant::now();
                     let (res, sc, dt) = process_single_event_with_wal(
@@ -400,10 +417,9 @@ pub async fn run_worker(
                 }
             }
             
-            _ = tune_interval.tick() => {
-                // Yield to other tasks when idle — prevents starving hydration workers
-                tokio::task::yield_now().await;
-            }
+            // Idle detection: when no events and no work pending, sleep to avoid spinning.
+            // The event_rx.recv() below will properly wake when events arrive.
+            _ = tune_interval.tick(), if !coalescer.is_empty() || !retry_queue.is_empty() => {}
 
             Some(evt) = event_rx.recv(), if coalescer.len() < 10000 => {
                 coalescer.push(evt);
