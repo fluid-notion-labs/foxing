@@ -97,6 +97,8 @@ impl HydrationQueue {
         // Round-robin across per-worker channels
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         let sender = &self.senders[worker_idx];
+        let capacity = sender.capacity();
+        let max_cap = sender.max_capacity();
 
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -105,8 +107,13 @@ impl HydrationQueue {
             }
 
             match sender.try_send(job.clone()) {
-                Ok(_) => return,
+                Ok(_) => {
+                    debug!("submit_job: worker={} capacity={}/{} path={:?}",
+                           worker_idx, capacity - 1, max_cap, job.rel_path);
+                    return;
+                },
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("submit_job: worker={} FULL (capacity={}/{})", worker_idx, capacity, max_cap);
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 },
