@@ -48,6 +48,9 @@ grep 'foxing_target_storage_class{' "$SNAP_FILE" 2>/dev/null || echo "  (no stor
 echo "--- Events ---"
 grep -E 'foxing_events_total\b|foxing_events_dropped\b|foxing_late_events_total\b' "$SNAP_FILE" 2>/dev/null || echo "  (no event data)"
 
+echo "--- Event Types ---"
+grep 'foxing_events_total{' "$SNAP_FILE" 2>/dev/null | sort || echo "  (no event type data)"
+
 # Coalescer
 echo "--- Coalescer ---"
 grep -E 'foxing_coalesced_writes\b|foxing_target_coalesce_bytes{' "$SNAP_FILE" 2>/dev/null || echo "  (no coalesce data)"
@@ -78,7 +81,7 @@ grep -E 'foxing_events_repair|foxing_events_source_gone' "$SNAP_FILE" 2>/dev/nul
 
 # Bytes replicated
 echo "--- Data Movement ---"
-grep -E 'foxing_bytes_replicated\b' "$SNAP_FILE" 2>/dev/null || echo "  (no bytes data)"
+grep 'foxing_bytes_replicated' "$SNAP_FILE" 2>/dev/null || echo "  (no bytes data)"
 
 echo ""
 echo "Full snapshot: $SNAP_FILE"

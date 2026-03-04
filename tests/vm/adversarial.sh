@@ -103,12 +103,13 @@ get_tuner_states() {
 }
 
 get_copy_count() {
-    # Total copies across all methods — THE key progress indicator
-    local std off ref
+    # Total copies across all methods + repair completions — THE key progress indicator
+    local std off ref repair
     std=$(get_metric_sum "foxing_copy_method_standard_total")
     off=$(get_metric_sum "foxing_copy_method_offload_total")
     ref=$(get_metric_sum "foxing_copy_method_reflink_total")
-    echo "$std $off $ref" | awk '{print $1+$2+$3}'
+    repair=$(get_metric "foxing_events_repair_completed_total")
+    echo "$std $off $ref ${repair:-0}" | awk '{print $1+$2+$3+$4}'
 }
 
 # wait_for_progress: wait for a count to reach target, with stall detection
@@ -294,25 +295,30 @@ phase0() {
     fi
 
     # --- rsync baseline ---
-    rm -rf "$baseline_tgt" 2>/dev/null || true
-    log "Running rsync baseline..."
-    local rsync_start=$(date +%s%N)
-    rsync -a "$baseline_dir/" "$baseline_tgt/"
-    sync
-    local rsync_end=$(date +%s%N)
-    local rsync_ms=$(( (rsync_end - rsync_start) / 1000000 ))
-    if [[ $rsync_ms -gt 0 ]]; then
-        BASELINE_RSYNC_MBPS=$(( total_mb * 1000 / rsync_ms ))
-    fi
-    log "  rsync: ${rsync_ms}ms (${BASELINE_RSYNC_MBPS} MB/s)"
+    if command -v rsync &>/dev/null; then
+        rm -rf "$baseline_tgt" 2>/dev/null || true
+        log "Running rsync baseline..."
+        local rsync_start=$(date +%s%N)
+        rsync -a "$baseline_dir/" "$baseline_tgt/"
+        sync
+        local rsync_end=$(date +%s%N)
+        local rsync_ms=$(( (rsync_end - rsync_start) / 1000000 ))
+        if [[ $rsync_ms -gt 0 ]]; then
+            BASELINE_RSYNC_MBPS=$(( total_mb * 1000 / rsync_ms ))
+        fi
+        log "  rsync: ${rsync_ms}ms (${BASELINE_RSYNC_MBPS} MB/s)"
 
-    # Verify rsync
-    local rsync_count
-    rsync_count=$(find "$baseline_tgt" -type f 2>/dev/null | wc -l)
-    if [[ $rsync_count -ne 111 ]]; then
-        fail "rsync baseline: only $rsync_count/111 files"
-        signals="${signals}rsync_broken "
-        result="FAIL"
+        # Verify rsync
+        local rsync_count
+        rsync_count=$(find "$baseline_tgt" -type f 2>/dev/null | wc -l)
+        if [[ $rsync_count -ne 111 ]]; then
+            fail "rsync baseline: only $rsync_count/111 files"
+            signals="${signals}rsync_broken "
+            result="FAIL"
+        fi
+    else
+        log "rsync not installed — skipping rsync baseline"
+        BASELINE_RSYNC_MBPS=0
     fi
 
     # Cleanup baseline
@@ -410,7 +416,9 @@ phase1() {
         local tgt_count
         tgt_count=$(find "$TARGET/adversarial-hydration" -type f 2>/dev/null | wc -l)
 
-        log "  t+${elapsed}s: target=${tgt_count}/${total_files} tuner=${current_state} new_copies=${copy_delta}"
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/${total_files} copies=${copies} repairs=${repair:-0} tuner=${current_state}"
 
         if [[ $tgt_count -ge $total_files ]]; then
             log "Target converged!"
@@ -529,7 +537,9 @@ phase2() {
         local tgt_count
         tgt_count=$(find "$TARGET/adversarial-writestorm" -type f 2>/dev/null | wc -l)
 
-        log "  t+${elapsed}s: target=${tgt_count}/${src_count} copies=${copies} retries=${retry_size}"
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/${src_count} copies=${copies} repairs=${repair:-0} retries=${retry_size}"
 
         # Converged if retry empty and copies match
         if [[ "${retry_size:-0}" == "0" ]] || [[ "${retry_size:-0}" == "0.0" ]]; then
@@ -645,7 +655,9 @@ phase3() {
         local copies
         copies=$(get_copy_count)
 
-        log "  t+${elapsed}s: finals=${tgt_e}/100 cross=${tgt_cross}/50 copies=${copies}"
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: finals=${tgt_e}/100 cross=${tgt_cross}/50 copies=${copies} repairs=${repair:-0}"
 
         [[ $tgt_e -ge 100 ]] && [[ $tgt_cross -ge 50 ]] && break
 
@@ -715,7 +727,11 @@ phase4() {
         elapsed=$((elapsed + 5))
         local tgt_count
         tgt_count=$(find "$TARGET/adversarial-resync" -type f 2>/dev/null | wc -l)
-        log "  t+${elapsed}s: $tgt_count/200"
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/200 copies=${copies} repairs=${repair:-0}"
         [[ $tgt_count -ge 200 ]] && break
         if [[ $tgt_count -eq $last_count ]]; then
             stall_elapsed=$((stall_elapsed + 5))
@@ -765,7 +781,11 @@ phase4() {
         tgt_count=$(find "$TARGET/adversarial-resync" -type f 2>/dev/null | wc -l)
         local retries
         retries=$(get_metric_sum "foxing_worker_retry_queue_size")
-        log "  t+${elapsed}s: target=${tgt_count}/300 retries=${retries}"
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/300 copies=${copies} repairs=${repair:-0} retries=${retries}"
         [[ $tgt_count -ge 300 ]] && break
         if [[ $tgt_count -eq $last_count ]]; then
             stall_elapsed=$((stall_elapsed + 5))
@@ -834,7 +854,9 @@ phase5() {
         local tgt_mb=$((tgt_size / 1048576))
         local copies
         copies=$(get_copy_count)
-        log "  t+${elapsed}s: ${tgt_mb}MB/100MB copies=${copies}"
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: ${tgt_mb}MB/100MB copies=${copies} repairs=${repair:-0}"
 
         if [[ $tgt_size -gt 5242880 ]] && [[ $tgt_size -lt 104857600 ]]; then
             partial=true
@@ -871,7 +893,11 @@ phase5() {
         elapsed=$((elapsed + 5))
         local tgt_size
         tgt_size=$(stat -c '%s' "$TARGET/adversarial-largefile/bigfile.dat" 2>/dev/null || echo "0")
-        log "  t+${elapsed}s: ${tgt_size}B / 104857600B"
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: ${tgt_size}B / 104857600B copies=${copies} repairs=${repair:-0}"
         [[ $tgt_size -ge 104857600 ]] && break
         if [[ $tgt_size -eq $last_size ]]; then
             stall_elapsed=$((stall_elapsed + 5))

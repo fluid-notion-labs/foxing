@@ -15,6 +15,17 @@ ts() { date '+%Y-%m-%dT%H:%M:%S'; }
 log() { echo "[$(ts)] $*"; }
 warn() { echo "[$(ts)] WARNING: $*" >&2; }
 
+find_bcc_tool() {
+    local name="$1"
+    for candidate in "/usr/share/bcc/tools/$name" "${name}-bpfcc" "$name"; do
+        if [[ -x "$candidate" ]] || command -v "$candidate" &>/dev/null; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -98,26 +109,40 @@ fi
 # 3. offcputime
 # ===================================================================
 OFFCPU_FILE="$OUT_DIR/offcputime.txt"
-if command -v offcputime-bpfcc &>/dev/null; then
-    log "Running offcputime-bpfcc for ${DURATION}s ..."
-    offcputime-bpfcc -p "$PID" "$DURATION" > "$OFFCPU_FILE" 2>&1 || warn "offcputime returned non-zero"
-    log "offcputime saved to $OFFCPU_FILE"
+OFFCPUTIME=$(find_bcc_tool offcputime) || true
+if [[ -n "$OFFCPUTIME" ]]; then
+    log "Running offcputime for ${DURATION}s ..."
+    "$OFFCPUTIME" -p "$PID" "$DURATION" > "$OFFCPU_FILE" 2>"$OUT_DIR/offcputime-stderr.txt" || warn "offcputime exit=$?"
 else
-    warn "offcputime-bpfcc not installed — skipping"
-    echo "(offcputime-bpfcc not available)" > "$OFFCPU_FILE"
+    warn "offcputime not found (install bcc-tools)"
+    echo "(offcputime not available)" > "$OFFCPU_FILE"
 fi
 
 # ===================================================================
 # 4. nfsslower
 # ===================================================================
 NFS_FILE="$OUT_DIR/nfsslower.txt"
-if command -v nfsslower-bpfcc &>/dev/null; then
-    log "Running nfsslower-bpfcc (>10ms) for ${DURATION}s ..."
-    timeout "$((DURATION + 2))" nfsslower-bpfcc 10 -d "$DURATION" > "$NFS_FILE" 2>&1 || warn "nfsslower returned non-zero"
-    log "nfsslower saved to $NFS_FILE"
+NFSSLOWER=$(find_bcc_tool nfsslower) || true
+if [[ -n "$NFSSLOWER" ]]; then
+    log "Running nfsslower (>10ms) for ${DURATION}s ..."
+    timeout "$((DURATION + 2))" "$NFSSLOWER" 10 > "$NFS_FILE" 2>"$OUT_DIR/nfsslower-stderr.txt" || warn "nfsslower exit=$?"
 else
-    warn "nfsslower-bpfcc not installed — skipping"
-    echo "(nfsslower-bpfcc not available)" > "$NFS_FILE"
+    warn "nfsslower not found (install bcc-tools)"
+    echo "(nfsslower not available)" > "$NFS_FILE"
+fi
+
+# --- 4b. biolatency (block I/O latency histogram) ---
+BIOLATENCY=$(find_bcc_tool biolatency) || true
+if [[ -n "$BIOLATENCY" ]]; then
+    log "Running biolatency for ${DURATION}s ..."
+    timeout "$((DURATION + 2))" "$BIOLATENCY" -m 1 "$DURATION" > "$OUT_DIR/biolatency.txt" 2>"$OUT_DIR/biolatency-stderr.txt" || true
+fi
+
+# --- 4c. runqlat (scheduler run queue latency) ---
+RUNQLAT=$(find_bcc_tool runqlat) || true
+if [[ -n "$RUNQLAT" ]]; then
+    log "Running runqlat for ${DURATION}s ..."
+    timeout "$((DURATION + 2))" "$RUNQLAT" -m 1 "$DURATION" > "$OUT_DIR/runqlat.txt" 2>"$OUT_DIR/runqlat-stderr.txt" || true
 fi
 
 # ===================================================================
@@ -242,6 +267,19 @@ log "Generating summary ..."
         fi
     else
         echo "  (nfsslower data unavailable)"
+    fi
+    echo ""
+
+    if [[ -f "$OUT_DIR/biolatency.txt" ]] && [[ -s "$OUT_DIR/biolatency.txt" ]]; then
+        echo ""
+        echo ">> Block I/O Latency Histogram"
+        head -30 "$OUT_DIR/biolatency.txt"
+    fi
+
+    if [[ -f "$OUT_DIR/runqlat.txt" ]] && [[ -s "$OUT_DIR/runqlat.txt" ]]; then
+        echo ""
+        echo ">> Scheduler Run Queue Latency"
+        head -20 "$OUT_DIR/runqlat.txt"
     fi
     echo ""
 

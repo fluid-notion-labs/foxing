@@ -91,7 +91,7 @@ if pgrep -x foxingd >/dev/null 2>&1; then
 fi
 
 # --- Install dependencies ---
-for cmd in fio sha256sum bc curl; do
+for cmd in fio sha256sum bc curl rsync; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Installing $cmd..."
         dnf install -y "$cmd" 2>/dev/null || yum install -y "$cmd" 2>/dev/null || true
@@ -106,6 +106,12 @@ fi
 if ! command -v offcputime-bpfcc &>/dev/null; then
     echo "Installing bcc-tools..."
     dnf install -y bcc-tools 2>/dev/null || true
+fi
+
+# Install kernel-devel for perf tracepoint support
+if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
+    echo "Installing kernel-devel for perf tracepoints..."
+    dnf install -y "kernel-devel-$(uname -r)" 2>/dev/null || true
 fi
 
 echo ""
