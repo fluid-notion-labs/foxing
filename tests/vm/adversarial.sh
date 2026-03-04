@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# adversarial.sh — 6-phase adversarial stress test for foxingd (XFS → NFS)
+# adversarial.sh — 9-phase adversarial stress test for foxingd (XFS → NFS)
 #
 # Tests BBR tuner, PoisonCabinet, CircuitBreaker, elastic coalescer, and
 # sidecar resync under adversarial I/O conditions replicating from fast
@@ -1014,6 +1014,664 @@ phase6() {
 }
 
 # ============================================================================
+# Phase 7: BLAKE3 Delta Copy on Resync
+# ============================================================================
+phase7() {
+    local phase_start=$(date +%s)
+    log ""
+    log "============================================"
+    log "PHASE 7: BLAKE3 Delta Copy on Resync"
+    log "============================================"
+
+    local signals=""
+    local result="PASS"
+    local test_dir="$SOURCE/adversarial-delta"
+
+    # Fresh start for isolation
+    stop_foxingd
+    clean_source
+    clean_target
+    mkdir -p "$test_dir"
+
+    # Create 20 × 2MB files (above MERKLE_DELTA_THRESHOLD=1MB)
+    log "Creating 20 × 2MB files..."
+    for i in $(seq 1 20); do
+        dd if=/dev/urandom of="$test_dir/large_${i}.dat" bs=1M count=2 2>/dev/null
+    done
+
+    # First sync — stores Merkle signatures
+    log "First sync (stores Merkle signatures)..."
+    if ! start_foxingd; then
+        record_result 7 "BLAKE3 Delta Copy" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_start_failed"
+        return
+    fi
+
+    collect_metrics "phase7-pre"
+
+    # Wait for hydration to complete (20 files on target)
+    local elapsed=0 last_count=0 stall_elapsed=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local tgt_count
+        tgt_count=$(find "$TARGET/adversarial-delta" -type f 2>/dev/null | wc -l)
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/20 copies=${copies} repairs=${repair:-0}"
+        [[ $tgt_count -ge 20 ]] && break
+        # Stall detection
+        if [[ $tgt_count -eq $last_count ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
+                signal "STALL: no progress for ${STALL_TIMEOUT}s (target=${tgt_count}/20)"
+                signals="${signals}STALLED_initial "
+                diagnose_stall "${FOXINGD_PID:-}" "phase7-initial"
+                break
+            fi
+        else
+            stall_elapsed=0
+        fi
+        last_count=$tgt_count
+    done
+
+    # Give foxingd time to store Merkle signatures (happens after copy)
+    sleep 5
+
+    collect_metrics "phase7-post-initial"
+    stop_foxingd
+
+    # Verify initial sync worked
+    local initial_tgt
+    initial_tgt=$(find "$TARGET/adversarial-delta" -type f 2>/dev/null | wc -l)
+    if [[ $initial_tgt -lt 20 ]]; then
+        fail "Initial sync incomplete: ${initial_tgt}/20 — delta test cannot proceed"
+        signals="${signals}initial_incomplete=${initial_tgt}/20 "
+        record_result 7 "BLAKE3 Delta Copy" "FAIL" "$(($(date +%s) - phase_start))" "$signals"
+        return
+    fi
+
+    # Modify middle chunk of 10 files (1 of ~32 chunks = ~3% of data)
+    log "Modifying middle 64KB chunk of 10 files..."
+    for i in $(seq 1 10); do
+        dd if=/dev/urandom of="$test_dir/large_${i}.dat" bs=65536 count=1 seek=8 conv=notrunc 2>/dev/null
+    done
+
+    # Second sync — should trigger delta copy
+    log "Second sync (delta copy expected)..."
+    if ! start_foxingd; then
+        record_result 7 "BLAKE3 Delta Copy" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_restart_failed"
+        return
+    fi
+
+    # Monitor delta metrics
+    elapsed=0
+    stall_elapsed=0
+    local last_delta=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local delta_attempted
+        delta_attempted=$(get_metric "foxing_delta_copy_attempted_total")
+        local delta_saved
+        delta_saved=$(get_metric "foxing_delta_copy_bytes_saved_total")
+        local delta_fell
+        delta_fell=$(get_metric "foxing_delta_copy_fell_through_total")
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: delta_attempted=${delta_attempted:-0} bytes_saved=${delta_saved:-0} fell_through=${delta_fell:-0} copies=${copies} repairs=${repair:-0}"
+
+        # Break when delta activity settles
+        local current_delta=${delta_attempted:-0}
+        if [[ "$current_delta" != "0" ]] && [[ "$current_delta" == "$last_delta" ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            [[ $stall_elapsed -ge 15 ]] && break  # delta done, no new activity
+        else
+            stall_elapsed=0
+        fi
+        last_delta=$current_delta
+    done
+
+    collect_metrics "phase7-post"
+    stop_foxingd
+
+    # Read final delta metrics from snapshot
+    local delta_attempted
+    delta_attempted=$(get_metric "foxing_delta_copy_attempted_total")
+    local delta_saved
+    delta_saved=$(get_metric "foxing_delta_copy_bytes_saved_total")
+
+    # foxingd is stopped — metrics endpoint gone, use last collected values
+    # Re-read from collected snapshot if available
+    if [[ -f "$REPORT_DIR/phase7-post.txt" ]]; then
+        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$REPORT_DIR/phase7-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$REPORT_DIR/phase7-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    fi
+
+    if [[ "${delta_attempted:-0}" == "0" ]]; then
+        fail "Delta copy not triggered"
+        signals="${signals}no_delta "
+        result="FAIL"
+    else
+        pass "Delta copy triggered: ${delta_attempted} attempts, ${delta_saved:-0} bytes saved"
+    fi
+
+    # SHA-256 correctness check
+    local mismatches=0
+    for i in $(seq 1 20); do
+        local src_h
+        src_h=$(sha256sum "$test_dir/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        local tgt_h
+        tgt_h=$(sha256sum "$TARGET/adversarial-delta/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        [[ "$src_h" != "$tgt_h" ]] && mismatches=$((mismatches + 1))
+    done
+    if [[ $mismatches -gt 0 ]]; then
+        fail "SHA-256 mismatches: $mismatches/20"
+        signals="${signals}hash_mismatch=$mismatches "
+        result="FAIL"
+    else
+        pass "All 20 files SHA-256 match after delta resync"
+    fi
+
+    record_result 7 "BLAKE3 Delta Copy" "$result" "$(($(date +%s) - phase_start))" "$signals"
+}
+
+# ============================================================================
+# Phase 8: Adversarial Directory Merkle Pruning
+# ============================================================================
+phase8() {
+    local phase_start=$(date +%s)
+    log ""
+    log "============================================"
+    log "PHASE 8: Adversarial Directory Merkle Pruning"
+    log "============================================"
+
+    local signals=""
+    local result="PASS"
+    local test_dir="$SOURCE/adversarial-dirprune"
+
+    # Fresh start for isolation
+    stop_foxingd
+    clean_source
+    clean_target
+
+    # Create 6 subdirectories: stable-a/b/c, modify-d/e, inject-f
+    # Each stable/modify dir has 20 × 4KB files
+    log "Creating directory tree with 6 subdirectories..."
+    for dir in stable-a stable-b stable-c modify-d modify-e inject-f; do
+        mkdir -p "$test_dir/$dir"
+        for i in $(seq 1 20); do
+            dd if=/dev/urandom of="$test_dir/$dir/file_${i}.dat" bs=4096 count=1 2>/dev/null
+        done
+    done
+
+    local total_files
+    total_files=$(find "$test_dir" -type f | wc -l)
+    log "Created $total_files files across 6 directories"
+
+    # First sync — dir hashes stored
+    log "First sync (stores directory Merkle hashes)..."
+    if ! start_foxingd; then
+        record_result 8 "Directory Merkle Pruning" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_start_failed"
+        return
+    fi
+
+    collect_metrics "phase8-pre"
+
+    # Wait for hydration to complete
+    local elapsed=0 last_count=0 stall_elapsed=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local tgt_count
+        tgt_count=$(find "$TARGET/adversarial-dirprune" -type f 2>/dev/null | wc -l)
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/${total_files} copies=${copies} repairs=${repair:-0}"
+        [[ $tgt_count -ge $total_files ]] && break
+        # Stall detection
+        if [[ $tgt_count -eq $last_count ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
+                signal "STALL: no progress for ${STALL_TIMEOUT}s (target=${tgt_count}/${total_files})"
+                signals="${signals}STALLED_initial "
+                diagnose_stall "${FOXINGD_PID:-}" "phase8-initial"
+                break
+            fi
+        else
+            stall_elapsed=0
+        fi
+        last_count=$tgt_count
+    done
+
+    # Give foxingd time to store directory hashes
+    sleep 5
+
+    collect_metrics "phase8-post-initial"
+    stop_foxingd
+
+    # Verify initial sync
+    local initial_tgt
+    initial_tgt=$(find "$TARGET/adversarial-dirprune" -type f 2>/dev/null | wc -l)
+    if [[ $initial_tgt -lt $total_files ]]; then
+        fail "Initial sync incomplete: ${initial_tgt}/${total_files} — pruning test cannot proceed"
+        signals="${signals}initial_incomplete=${initial_tgt}/${total_files} "
+        record_result 8 "Directory Merkle Pruning" "FAIL" "$(($(date +%s) - phase_start))" "$signals"
+        return
+    fi
+
+    # Adversarial modifications (direct shell, foxingd stopped)
+    log "Applying adversarial modifications..."
+
+    # stable-a/b/c: NO CHANGES
+    log "  stable-a/b/c: unchanged"
+
+    # modify-d: modify 5 files
+    log "  modify-d: appending to 5 files..."
+    for i in $(seq 1 5); do
+        echo "changed-$(date +%N)" >> "$test_dir/modify-d/file_${i}.dat"
+    done
+
+    # modify-e: delete 3 files, add 2 new files
+    log "  modify-e: deleting 3 files, adding 2 new files..."
+    for i in $(seq 18 20); do
+        rm -f "$test_dir/modify-e/file_${i}.dat"
+    done
+    for i in $(seq 21 22); do
+        dd if=/dev/urandom of="$test_dir/modify-e/file_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+
+    # inject-f: add 10 new files
+    log "  inject-f: adding 10 new files..."
+    for i in $(seq 21 30); do
+        dd if=/dev/urandom of="$test_dir/inject-f/file_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+
+    # Source root: add 5 files directly
+    log "  root: adding 5 files..."
+    for i in $(seq 1 5); do
+        dd if=/dev/urandom of="$test_dir/root_file_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+
+    local post_mod_src
+    post_mod_src=$(find "$test_dir" -type f | wc -l)
+    log "Post-modification source: $post_mod_src files"
+
+    # Restart foxingd — resync with pruning
+    log "Restarting foxingd for resync with directory pruning..."
+    if ! start_foxingd; then
+        record_result 8 "Directory Merkle Pruning" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_restart_failed"
+        return
+    fi
+
+    # Monitor dir pruning metrics
+    elapsed=0
+    stall_elapsed=0
+    local last_pruned=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local dir_pruned
+        dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        local tgt_count
+        tgt_count=$(find "$TARGET/adversarial-dirprune" -type f 2>/dev/null | wc -l)
+        log "  t+${elapsed}s: dir_pruned=${dir_pruned:-0} target=${tgt_count}/${post_mod_src} copies=${copies} repairs=${repair:-0}"
+
+        # Break when activity settles (pruning done + target converged)
+        if [[ $tgt_count -ge $post_mod_src ]]; then
+            log "  Target converged"
+            break
+        fi
+
+        # Stall detection
+        if [[ $tgt_count -eq $last_count ]] && [[ "${dir_pruned:-0}" == "${last_pruned}" ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
+                signal "STALL: no progress for ${STALL_TIMEOUT}s"
+                signals="${signals}STALLED_resync "
+                diagnose_stall "${FOXINGD_PID:-}" "phase8-resync"
+                break
+            fi
+        else
+            stall_elapsed=0
+        fi
+        last_count=$tgt_count
+        last_pruned=${dir_pruned:-0}
+    done
+
+    collect_metrics "phase8-post"
+    stop_foxingd
+
+    # Read pruning metric from snapshot
+    local dir_pruned
+    dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
+    if [[ -f "$REPORT_DIR/phase8-post.txt" ]]; then
+        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$REPORT_DIR/phase8-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    fi
+
+    # Verify dir_pruned >= 3 (stable-a, stable-b, stable-c should be pruned)
+    if [[ "${dir_pruned:-0}" == "0" ]]; then
+        fail "No directories pruned (expected >= 3 stable dirs)"
+        signals="${signals}no_pruning "
+        result="FAIL"
+    elif [[ "${dir_pruned%%.*}" -lt 3 ]]; then
+        signal "Only ${dir_pruned} dirs pruned (expected >= 3)"
+        signals="${signals}low_pruning=${dir_pruned} "
+    else
+        pass "Directory pruning: ${dir_pruned} dirs pruned"
+    fi
+
+    # Verify modify-d changes reflected on target
+    local mod_d_mismatch=0
+    for i in $(seq 1 5); do
+        local src_h
+        src_h=$(sha256sum "$test_dir/modify-d/file_${i}.dat" 2>/dev/null | awk '{print $1}')
+        local tgt_h
+        tgt_h=$(sha256sum "$TARGET/adversarial-dirprune/modify-d/file_${i}.dat" 2>/dev/null | awk '{print $1}')
+        [[ "$src_h" != "$tgt_h" ]] && mod_d_mismatch=$((mod_d_mismatch + 1))
+    done
+    if [[ $mod_d_mismatch -gt 0 ]]; then
+        fail "modify-d: $mod_d_mismatch/5 modified files not synced"
+        signals="${signals}modify_d_missed=$mod_d_mismatch "
+        result="FAIL"
+    else
+        pass "modify-d: all 5 modified files synced"
+    fi
+
+    # Verify modify-e: deleted files removed, new files present
+    local mod_e_tgt
+    mod_e_tgt=$(find "$TARGET/adversarial-dirprune/modify-e" -type f 2>/dev/null | wc -l)
+    local mod_e_src
+    mod_e_src=$(find "$test_dir/modify-e" -type f 2>/dev/null | wc -l)
+    if [[ $mod_e_tgt -ne $mod_e_src ]]; then
+        fail "modify-e: target has $mod_e_tgt files, source has $mod_e_src"
+        signals="${signals}modify_e_count_mismatch "
+        result="FAIL"
+    else
+        pass "modify-e: file count matches ($mod_e_src files)"
+    fi
+
+    # Verify inject-f has all 30 files on target
+    local inject_tgt
+    inject_tgt=$(find "$TARGET/adversarial-dirprune/inject-f" -type f 2>/dev/null | wc -l)
+    if [[ $inject_tgt -lt 30 ]]; then
+        fail "inject-f: only $inject_tgt/30 files on target"
+        signals="${signals}inject_f_incomplete=$inject_tgt/30 "
+        result="FAIL"
+    else
+        pass "inject-f: all 30 files present on target"
+    fi
+
+    # Verify root files
+    local root_tgt
+    root_tgt=$(find "$TARGET/adversarial-dirprune" -maxdepth 1 -name 'root_file_*.dat' -type f 2>/dev/null | wc -l)
+    if [[ $root_tgt -lt 5 ]]; then
+        fail "Root files: only $root_tgt/5 on target"
+        signals="${signals}root_files_incomplete=$root_tgt/5 "
+        result="FAIL"
+    else
+        pass "Root files: all 5 present on target"
+    fi
+
+    record_result 8 "Directory Merkle Pruning" "$result" "$(($(date +%s) - phase_start))" "$signals"
+}
+
+# ============================================================================
+# Phase 9: Combined Delta + Pruning
+# ============================================================================
+phase9() {
+    local phase_start=$(date +%s)
+    log ""
+    log "============================================"
+    log "PHASE 9: Combined Delta + Pruning"
+    log "============================================"
+
+    local signals=""
+    local result="PASS"
+    local test_dir="$SOURCE/adversarial-combined"
+
+    # Fresh start for isolation
+    stop_foxingd
+    clean_source
+    clean_target
+
+    # Create mixed tree
+    log "Creating mixed directory tree..."
+
+    # small-stable/ (30 × 4KB) — should be pruned on resync
+    mkdir -p "$test_dir/small-stable"
+    for i in $(seq 1 30); do
+        dd if=/dev/urandom of="$test_dir/small-stable/file_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+
+    # large-stable/ (5 × 2MB) — should be pruned on resync
+    mkdir -p "$test_dir/large-stable"
+    for i in $(seq 1 5); do
+        dd if=/dev/urandom of="$test_dir/large-stable/large_${i}.dat" bs=1M count=2 2>/dev/null
+    done
+
+    # large-modify/ (5 × 2MB) — will have chunks modified → delta copy
+    mkdir -p "$test_dir/large-modify"
+    for i in $(seq 1 5); do
+        dd if=/dev/urandom of="$test_dir/large-modify/large_${i}.dat" bs=1M count=2 2>/dev/null
+    done
+
+    # mixed/ (10 × 4KB + 3 × 2MB) — partial modification
+    mkdir -p "$test_dir/mixed"
+    for i in $(seq 1 10); do
+        dd if=/dev/urandom of="$test_dir/mixed/small_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+    for i in $(seq 1 3); do
+        dd if=/dev/urandom of="$test_dir/mixed/large_${i}.dat" bs=1M count=2 2>/dev/null
+    done
+
+    local total_files
+    total_files=$(find "$test_dir" -type f | wc -l)
+    log "Created $total_files files across 4 directories"
+
+    # First sync — full hydration
+    log "First sync (full hydration)..."
+    if ! start_foxingd; then
+        record_result 9 "Combined Delta + Pruning" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_start_failed"
+        return
+    fi
+
+    collect_metrics "phase9-pre"
+
+    # Wait for hydration to complete
+    local elapsed=0 last_count=0 stall_elapsed=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local tgt_count
+        tgt_count=$(find "$TARGET/adversarial-combined" -type f 2>/dev/null | wc -l)
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: target=${tgt_count}/${total_files} copies=${copies} repairs=${repair:-0}"
+        [[ $tgt_count -ge $total_files ]] && break
+        # Stall detection
+        if [[ $tgt_count -eq $last_count ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
+                signal "STALL: no progress for ${STALL_TIMEOUT}s (target=${tgt_count}/${total_files})"
+                signals="${signals}STALLED_initial "
+                diagnose_stall "${FOXINGD_PID:-}" "phase9-initial"
+                break
+            fi
+        else
+            stall_elapsed=0
+        fi
+        last_count=$tgt_count
+    done
+
+    # Give foxingd time to store Merkle signatures and dir hashes
+    sleep 5
+
+    collect_metrics "phase9-post-initial"
+    stop_foxingd
+
+    # Verify initial sync
+    local initial_tgt
+    initial_tgt=$(find "$TARGET/adversarial-combined" -type f 2>/dev/null | wc -l)
+    if [[ $initial_tgt -lt $total_files ]]; then
+        fail "Initial sync incomplete: ${initial_tgt}/${total_files} — combined test cannot proceed"
+        signals="${signals}initial_incomplete=${initial_tgt}/${total_files} "
+        record_result 9 "Combined Delta + Pruning" "FAIL" "$(($(date +%s) - phase_start))" "$signals"
+        return
+    fi
+
+    # Modify: large-modify 1 chunk/file, mixed 1 small + 1 large chunk
+    log "Applying targeted modifications..."
+
+    # large-modify: modify middle chunk of each file
+    log "  large-modify: modifying 1 chunk in each of 5 files..."
+    for i in $(seq 1 5); do
+        dd if=/dev/urandom of="$test_dir/large-modify/large_${i}.dat" bs=65536 count=1 seek=8 conv=notrunc 2>/dev/null
+    done
+
+    # mixed: modify 1 small file, modify 1 chunk in 1 large file
+    log "  mixed: modifying 1 small file + 1 large file chunk..."
+    echo "modified-$(date +%N)" >> "$test_dir/mixed/small_1.dat"
+    dd if=/dev/urandom of="$test_dir/mixed/large_1.dat" bs=65536 count=1 seek=8 conv=notrunc 2>/dev/null
+
+    # small-stable and large-stable: NO CHANGES
+
+    # Restart foxingd — should use both delta copy AND dir pruning
+    log "Restarting foxingd for combined resync..."
+    if ! start_foxingd; then
+        record_result 9 "Combined Delta + Pruning" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_restart_failed"
+        return
+    fi
+
+    # Monitor both delta and pruning metrics
+    elapsed=0
+    stall_elapsed=0
+    local last_delta=0 last_pruned=0
+    while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local delta_attempted
+        delta_attempted=$(get_metric "foxing_delta_copy_attempted_total")
+        local delta_saved
+        delta_saved=$(get_metric "foxing_delta_copy_bytes_saved_total")
+        local dir_pruned
+        dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
+        local copies
+        copies=$(get_copy_count)
+        local repair
+        repair=$(get_metric "foxing_events_repair_completed_total")
+        log "  t+${elapsed}s: delta=${delta_attempted:-0} saved=${delta_saved:-0} pruned=${dir_pruned:-0} copies=${copies} repairs=${repair:-0}"
+
+        # Break when both metrics settle
+        local current_delta=${delta_attempted:-0}
+        local current_pruned=${dir_pruned:-0}
+        if [[ "$current_delta" == "$last_delta" ]] && [[ "$current_pruned" == "$last_pruned" ]]; then
+            stall_elapsed=$((stall_elapsed + 5))
+            # Wait for at least some activity before declaring settled
+            if [[ $stall_elapsed -ge 15 ]] && { [[ "$current_delta" != "0" ]] || [[ "$current_pruned" != "0" ]]; }; then
+                log "  Activity settled"
+                break
+            fi
+            if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
+                signal "STALL: no progress for ${STALL_TIMEOUT}s"
+                signals="${signals}STALLED_resync "
+                diagnose_stall "${FOXINGD_PID:-}" "phase9-resync"
+                break
+            fi
+        else
+            stall_elapsed=0
+        fi
+        last_delta=$current_delta
+        last_pruned=$current_pruned
+    done
+
+    collect_metrics "phase9-post"
+    stop_foxingd
+
+    # Read final metrics from snapshot
+    local delta_attempted dir_pruned delta_saved
+    if [[ -f "$REPORT_DIR/phase9-post.txt" ]]; then
+        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    fi
+
+    # Verify both mechanisms activated
+    if [[ "${dir_pruned:-0}" == "0" ]]; then
+        fail "No directory pruning observed"
+        signals="${signals}no_pruning "
+        result="FAIL"
+    else
+        pass "Directory pruning active: ${dir_pruned} dirs pruned"
+    fi
+
+    if [[ "${delta_attempted:-0}" == "0" ]]; then
+        fail "No delta copy observed"
+        signals="${signals}no_delta "
+        result="FAIL"
+    else
+        pass "Delta copy active: ${delta_attempted} attempts, ${delta_saved:-0} bytes saved"
+    fi
+
+    # SHA-256 correctness across all directories
+    local mismatches=0
+    local checked=0
+
+    # large-modify files (modified via delta)
+    for i in $(seq 1 5); do
+        local src_h
+        src_h=$(sha256sum "$test_dir/large-modify/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        local tgt_h
+        tgt_h=$(sha256sum "$TARGET/adversarial-combined/large-modify/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        checked=$((checked + 1))
+        [[ "$src_h" != "$tgt_h" ]] && mismatches=$((mismatches + 1))
+    done
+
+    # large-stable files (should be pruned, unchanged)
+    for i in $(seq 1 5); do
+        local src_h
+        src_h=$(sha256sum "$test_dir/large-stable/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        local tgt_h
+        tgt_h=$(sha256sum "$TARGET/adversarial-combined/large-stable/large_${i}.dat" 2>/dev/null | awk '{print $1}')
+        checked=$((checked + 1))
+        [[ "$src_h" != "$tgt_h" ]] && mismatches=$((mismatches + 1))
+    done
+
+    # mixed modified files
+    local src_h tgt_h
+    src_h=$(sha256sum "$test_dir/mixed/small_1.dat" 2>/dev/null | awk '{print $1}')
+    tgt_h=$(sha256sum "$TARGET/adversarial-combined/mixed/small_1.dat" 2>/dev/null | awk '{print $1}')
+    checked=$((checked + 1))
+    [[ "$src_h" != "$tgt_h" ]] && mismatches=$((mismatches + 1))
+
+    src_h=$(sha256sum "$test_dir/mixed/large_1.dat" 2>/dev/null | awk '{print $1}')
+    tgt_h=$(sha256sum "$TARGET/adversarial-combined/mixed/large_1.dat" 2>/dev/null | awk '{print $1}')
+    checked=$((checked + 1))
+    [[ "$src_h" != "$tgt_h" ]] && mismatches=$((mismatches + 1))
+
+    if [[ $mismatches -gt 0 ]]; then
+        fail "SHA-256 mismatches: $mismatches/$checked"
+        signals="${signals}hash_mismatch=$mismatches/$checked "
+        result="FAIL"
+    else
+        pass "All $checked checked files SHA-256 match"
+    fi
+
+    record_result 9 "Combined Delta + Pruning" "$result" "$(($(date +%s) - phase_start))" "$signals"
+}
+
+# ============================================================================
 # Report Generation
 # ============================================================================
 generate_report() {
@@ -1132,6 +1790,9 @@ should_run 3 && phase3
 should_run 4 && phase4
 should_run 5 && phase5
 should_run 6 && phase6
+should_run 7 && phase7
+should_run 8 && phase8
+should_run 9 && phase9
 
 stop_foxingd
 generate_report
