@@ -10,6 +10,35 @@ use std::fs;
 use crate::constants;
 use std::thread;
 
+/// Detect if running inside a hypervisor (KVM, VMware, Xen, Hyper-V, etc.)
+pub fn detect_hypervisor() -> Option<String> {
+    // Method 1: systemd-detect-virt (most reliable)
+    if let Ok(output) = std::process::Command::new("systemd-detect-virt")
+        .output()
+    {
+        let virt = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() && virt != "none" && !virt.is_empty() {
+            return Some(virt);
+        }
+    }
+    // Method 2: DMI vendor string
+    if let Ok(vendor) = fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
+        let v = vendor.trim().to_lowercase();
+        if v.contains("qemu") || v.contains("vmware") || v.contains("xen")
+            || v.contains("microsoft") || v.contains("amazon")
+            || v.contains("google") || v.contains("digitalocean") {
+            return Some(v);
+        }
+    }
+    // Method 3: hypervisor CPUID flag (Linux exposes this)
+    if std::path::Path::new("/sys/hypervisor/type").exists() {
+        if let Ok(t) = fs::read_to_string("/sys/hypervisor/type") {
+            return Some(t.trim().to_string());
+        }
+    }
+    None
+}
+
 pub struct Governor {
     stress_score: Arc<Mutex<f64>>,
     memory_usage_pct: Arc<Mutex<f64>>,
@@ -22,9 +51,19 @@ pub struct Governor {
 impl Governor {
     pub fn new(max_load: f64, hydration_delay_ms: u64, psi_io_limit: f64, psi_cpu_limit: f64) -> Self {
         let is_one_shot = constants::ONE_SHOT_MODE.load(Ordering::Relaxed);
+        let in_hypervisor = detect_hypervisor();
+
         let (effective_io_limit, effective_cpu_limit) = if is_one_shot {
             debug!("Governor: Applying RELAXED thresholds for One-Shot mode.");
             (constants::GOVERNOR_PSI_IO_THRESHOLD_RELAXED, constants::GOVERNOR_PSI_CPU_THRESHOLD_RELAXED)
+        } else if let Some(ref virt_type) = in_hypervisor {
+            // Hypervisor environments have inflated PSI metrics due to
+            // virtio-blk → qcow2 → host storage indirection. Apply 5x relaxation.
+            let relaxed_io = (psi_io_limit * 5.0).max(50.0);
+            let relaxed_cpu = (psi_cpu_limit * 5.0).max(50.0);
+            warn!("Governor: Hypervisor detected ({}). Relaxing PSI thresholds: IO>{:.1}, CPU>{:.1}",
+                  virt_type, relaxed_io, relaxed_cpu);
+            (relaxed_io, relaxed_cpu)
         } else {
             (psi_io_limit, psi_cpu_limit)
         };

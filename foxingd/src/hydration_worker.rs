@@ -331,8 +331,9 @@ impl Hydrator {
             .collect();
 
         info!("Hydration: {} files require synchronization", verification_results.len());
-        
+
         let low_watermark = high_watermark / 2;
+        let mut submitted_count = 0u64;
 
         for (rel_path, target_cfg, ino) in verification_results {
             if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) {
@@ -361,13 +362,17 @@ impl Hydrator {
                 let bulk_job_queue = self.source.bulk_job_queue.lock();
                 if let Some(queue_sender) = bulk_job_queue.as_ref() {
                     queue_sender.submit_job(rel_path, target_cfg, Some(ino));
+                    submitted_count += 1;
                     self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    warn!("Hydration: bulk_job_queue is None! Cannot submit job.");
                 }
             }
         }
-        
+
+        info!("Hydration: Submitted {} jobs to bulk queue", submitted_count);
         self.flush_buffer(job_buffer);
-        
+
         self.source.hydration.active.store(false, Ordering::SeqCst);
         info!("Hydration: Full scan complete for {:?}", self.source.path);
         
@@ -888,20 +893,26 @@ pub async fn run_hydration_worker_loop(
             Some(job) => {
                 let target_path_root = job.target_cfg.path.clone();
                 let target_caps = probe_capabilities(&target_path_root);
-                
-                let stats_opt = process_hydration_job(
-                    job.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool, 
+
+                match process_hydration_job(
+                    job.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool,
                     async_fd.clone(), &source_caps, &target_caps, &tracker, &mut fsync_tracker,
                     current_limit,
                     skip_fsync
-                ).await?;
-
-                if let Some(stats) = stats_opt {
-                     if let Some(senders) = stats_senders.get(&job.target_cfg.path) {
-                         if let Some(sender) = senders.choose(&mut rand::rng()) {
-                             let _ = sender.send(stats);
-                         }
-                     }
+                ).await {
+                    Ok(Some(stats)) => {
+                        if let Some(senders) = stats_senders.get(&job.target_cfg.path) {
+                            if let Some(sender) = senders.choose(&mut rand::rng()) {
+                                let _ = sender.send(stats);
+                            }
+                        }
+                    }
+                    Ok(None) => {} // Job skipped (dir, non-file, shutdown)
+                    Err(e) => {
+                        // Log error but continue processing — don't kill the worker
+                        warn!("Hydration Worker {}: Job failed for {:?} -> {:?}: {}. Continuing.",
+                              worker_id, job.rel_path, job.target_cfg.path, e);
+                    }
                 }
                 pending_count.fetch_sub(1, Ordering::SeqCst);
             },
