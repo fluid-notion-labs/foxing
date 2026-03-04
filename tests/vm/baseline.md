@@ -74,3 +74,36 @@ Each large file (50MB) takes 30-60s to copy. Total estimated time for full
 3. **XFS AG-aware worker mapping** for zero-contention parallelism
 
 4. **SIMD columnar scanning** for coalescer acceleration
+
+## koero NVMe Baseline (2026-03-04)
+
+**Host:** koero (RHEL 10.1, 64-core Xeon Gold 6130, 377GB RAM)
+**Storage:** NVMe Tier 1 (Stratis/XFS, 1TB)
+**VM:** 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5
+**Network:** br0 bridge, DHCP, DNS: fox-test.3d.ae.net.nz
+
+### Hydration (555 files, 302MB, 4 targets)
+
+| Target | Files (60s) | Data (60s) | Tuner State | Bytes Replicated |
+|--------|------------|-----------|-------------|-----------------|
+| XFS | 188/555 | 301MB | Startup→? | 315MB |
+| ext4 | 136/555 | 301MB | **Drain (1)** | 315MB |
+| btrfs | 138/555 | 301MB | Conservative (99) | 315MB |
+| f2fs | 123/555 | 297MB | **Drain (1)** | 310MB |
+
+### vs NFS-backed (previous host)
+
+| Metric | NFS-backed qcow2 | NVMe qcow2 | Improvement |
+|--------|----------------:|------------:|:-----------:|
+| XFS files in 60s | 108 | 188 | **1.7x** |
+| ext4 files in 60s | 83 | 136 | **1.6x** |
+| Data per target | 151MB | 301MB | **2.0x** |
+| Tuner transitions | Stuck at Startup | ext4/f2fs reach Drain | Working |
+| Hypervisor detect | kvm (auto 50.0) | kvm (auto 50.0) | Same |
+| CPU idle | 370% | 363% | Same (need P0 fix) |
+
+### Key Observations
+- **NVMe enables real tuner state transitions** (Drain detected on ext4/f2fs)
+- **All data replicated** (300MB/target) but file count stalled (~30% of files)
+- **Hydration queue drain issue persists** — not I/O bound, channel architecture problem
+- **Governor correctly auto-detected KVM** and relaxed PSI thresholds
