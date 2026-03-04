@@ -3,13 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::sync::Arc;
 use sysinfo::System;
-use parking_lot::Mutex;
 use tracing::{warn, debug};
 use crate::metrics;
 use std::fs;
 use crate::constants;
 use std::thread;
 use std::time::Instant;
+
+/// Store f64 in AtomicU64 via bit transmutation (lock-free reads)
+fn f64_to_u64(v: f64) -> u64 { v.to_bits() }
+fn u64_to_f64(v: u64) -> f64 { f64::from_bits(v) }
 
 /// Detect if running inside a hypervisor (KVM, VMware, Xen, Hyper-V, etc.)
 pub fn detect_hypervisor() -> Option<String> {
@@ -41,15 +44,18 @@ pub fn detect_hypervisor() -> Option<String> {
 }
 
 pub struct Governor {
-    stress_score: Arc<Mutex<f64>>,
-    memory_usage_pct: Arc<Mutex<f64>>,
+    /// System stress score — updated by background thread, read lock-free by workers
+    stress_score: Arc<AtomicU64>,
+    /// Memory usage percentage — updated by background thread, read lock-free
+    memory_usage_pct: Arc<AtomicU64>,
     min_hydration_interval: Duration,
     min_throughput_bytes_sec: AtomicU64,
     #[allow(dead_code)]
     throttled_count: AtomicU64,
     copy_success_count: AtomicU64,
     copy_failure_count: AtomicU64,
-    failure_window_start: Mutex<Instant>,
+    /// Epoch millis of failure window start — atomic, no mutex
+    failure_window_start_ms: AtomicU64,
 }
 
 impl Governor {
@@ -77,9 +83,10 @@ impl Governor {
             debug!("Governor: PSI active. Limits: IO>{:.1}, CPU>{:.1}", effective_io_limit, effective_cpu_limit);
         }
 
-        // FIXED: Use Mutex<f64> instead of AtomicU64 transmutation to prevent torn reads/UB
-        let stress_score = Arc::new(Mutex::new(0.0));
-        let memory_usage_pct = Arc::new(Mutex::new(0.0));
+        // Lock-free f64 storage via AtomicU64 bit transmutation
+        // Safe: f64 and u64 are both 8 bytes, AtomicU64 guarantees no torn reads on x86_64
+        let stress_score = Arc::new(AtomicU64::new(f64_to_u64(0.0)));
+        let memory_usage_pct = Arc::new(AtomicU64::new(f64_to_u64(0.0)));
 
         let stress_score_thread = stress_score.clone();
         let memory_usage_thread = memory_usage_pct.clone();
@@ -98,10 +105,7 @@ impl Governor {
                     let total = system.total_memory();
                     let mem_pct = if total > 0 { used as f64 / total as f64 } else { 0.0 };
                     
-                    {
-                        let mut guard = memory_usage_thread.lock();
-                        *guard = mem_pct;
-                    }
+                    memory_usage_thread.store(f64_to_u64(mem_pct), Ordering::Relaxed);
 
                     if mem_pct > 0.90 {
                         let mem_score = (mem_pct - 0.90) * 10.0;
@@ -137,10 +141,7 @@ impl Governor {
                         }
                     }
 
-                    {
-                        let mut guard = stress_score_thread.lock();
-                        *guard = max_score;
-                    }
+                    stress_score_thread.store(f64_to_u64(max_score), Ordering::Relaxed);
 
                     metrics::GOVERNOR_STRESSED.set(if max_score >= 1.0 { 1.0 } else { 0.0 });
                     metrics::GOVERNOR_STRESS_SCORE.set(max_score);
@@ -161,7 +162,9 @@ impl Governor {
             throttled_count: AtomicU64::new(0),
             copy_success_count: AtomicU64::new(0),
             copy_failure_count: AtomicU64::new(0),
-            failure_window_start: Mutex::new(Instant::now()),
+            failure_window_start_ms: AtomicU64::new(
+                Instant::now().elapsed().as_millis() as u64 // epoch-relative
+            ),
         }
     }
 
@@ -205,27 +208,25 @@ impl Governor {
     pub fn reset_failure_window(&self) {
         self.copy_success_count.store(0, Ordering::Relaxed);
         self.copy_failure_count.store(0, Ordering::Relaxed);
-        *self.failure_window_start.lock() = Instant::now();
+        self.failure_window_start_ms.store(0, Ordering::Relaxed);
     }
 
+    /// Lock-free stress score read with failure-rate boost.
+    /// Called ~320 times/second across all workers — must be contention-free.
     pub fn current_stress_score(&self) -> f64 {
-        let mut score = *self.stress_score.lock();
+        let mut score = u64_to_f64(self.stress_score.load(Ordering::Relaxed));
 
         // Boost stress when copy failure rate exceeds threshold
-        let failure_boost = if self.failure_rate() > constants::GOVERNOR_FAILURE_RATE_THRESHOLD {
-            0.3
-        } else {
-            0.0
-        };
-        score += failure_boost;
+        let failure_rate = self.failure_rate();
+        if failure_rate > constants::GOVERNOR_FAILURE_RATE_THRESHOLD {
+            score += 0.3;
+        }
 
-        // Auto-reset failure window after expiry
-        {
-            let start = self.failure_window_start.lock();
-            if start.elapsed() > Duration::from_secs(constants::GOVERNOR_FAILURE_WINDOW_SECS) {
-                drop(start);
-                self.reset_failure_window();
-            }
+        // Auto-reset failure window — lock-free, reset after enough samples
+        let total_ops = self.copy_success_count.load(Ordering::Relaxed)
+            + self.copy_failure_count.load(Ordering::Relaxed);
+        if total_ops > 1000 {
+            self.reset_failure_window();
         }
 
         score
@@ -235,8 +236,9 @@ impl Governor {
         self.current_stress_score() >= 1.0
     }
 
+    /// Lock-free memory usage read.
     pub fn current_memory_usage_pct(&self) -> f64 {
-        *self.memory_usage_pct.lock()
+        u64_to_f64(self.memory_usage_pct.load(Ordering::Relaxed))
     }
 
     pub fn pace_hydration(&self) {
