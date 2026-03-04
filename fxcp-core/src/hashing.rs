@@ -73,8 +73,22 @@ pub fn verify_incremental(src: &Path, dst: &Path, size: u64) -> Result<bool> {
     if !is_hashing_enabled() { return Ok(true); }
     if size < get_lite_threshold_bytes() { return Ok(true); }
 
-    let src_hash = hash_file_lite(src, size)?;
-    let dst_hash = hash_file_lite(dst, size)?;
+    let src_hash = match hash_file_lite(src, size) {
+        Ok(h) => h,
+        Err(crate::error::FxcpError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Source vanished — file lifecycle ended, skip verification
+            return Ok(true);
+        },
+        Err(e) => return Err(e),
+    };
+    let dst_hash = match hash_file_lite(dst, size) {
+        Ok(h) => h,
+        Err(crate::error::FxcpError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Target vanished — needs re-copy, not a verification pass
+            return Ok(false);
+        },
+        Err(e) => return Err(e),
+    };
 
     Ok(src_hash == dst_hash)
 }

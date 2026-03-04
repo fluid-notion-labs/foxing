@@ -7,6 +7,7 @@ use tokio::io::unix::AsyncFd;
 use tracing::{info, warn, debug, error};
 
 use fxcp_core::constants;
+use fxcp_core::error::CopyErrorKind;
 use fxcp_core::operations::{
     SmartCopier, CopyStats, probe_capabilities, OptimizedFs, FsyncLatencyTracker,
 };
@@ -511,8 +512,14 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
         let src_meta = match std::fs::metadata(src_path) {
             Ok(m) => m,
             Err(e) => {
-                warn!("stat {:?}: {}", src_path, e);
-                stats.errors += 1;
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // Source vanished between walk and stat — skip silently
+                    debug!("Source vanished before stat: {:?}", src_path);
+                    stats.files_skipped += 1;
+                } else {
+                    warn!("stat {:?}: {}", src_path, e);
+                    stats.errors += 1;
+                }
                 continue;
             }
         };
@@ -651,8 +658,27 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                 }
             }
             Err(e) => {
-                warn!("copy {:?}: {}", src_path, e);
-                stats.errors += 1;
+                match e.copy_error_kind() {
+                    CopyErrorKind::SourceNotFound | CopyErrorKind::TargetNotFound => {
+                        // In copy context, NotFound almost always means the source
+                        // vanished between stat() and copy() — common in live trees.
+                        // TargetNotFound would mean parent disappeared mid-walk.
+                        debug!("Path vanished during copy: {:?}: {}", src_path, e);
+                        stats.files_skipped += 1;
+                    }
+                    CopyErrorKind::Timeout => {
+                        warn!("Copy timed out: {:?}: {}", src_path, e);
+                        stats.errors += 1;
+                    }
+                    CopyErrorKind::Transient => {
+                        warn!("Transient error copying {:?}: {} (may succeed on retry)", src_path, e);
+                        stats.errors += 1;
+                    }
+                    CopyErrorKind::Permanent => {
+                        error!("Permanent error copying {:?}: {}", src_path, e);
+                        stats.errors += 1;
+                    }
+                }
             }
         }
     }

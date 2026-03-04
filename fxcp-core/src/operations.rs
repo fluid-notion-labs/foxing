@@ -1021,6 +1021,16 @@ impl OptimizedFs for SmartCopier {
     }
 }
 
+/// Ensure the parent directory of a target path exists
+pub fn prepare_target_parent(target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 impl SmartCopier {
     async fn open_source_noatime(path: &Path) -> Result<File> {
         let mut opts = tokio::fs::OpenOptions::new();
@@ -1094,17 +1104,25 @@ impl SmartCopier {
         buffer_limit: Option<usize>,
         skip_fsync: bool,
     ) -> Result<CopyStats> {
+        // Early source existence check — avoid io_uring setup for vanished files
+        if !src.exists() {
+            return Err(FxcpError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Source file no longer exists: {:?}", src)
+            )));
+        }
+
         if offset == 0 && length == src_file_size {
              Self::execute_copy_file(
-                src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, direct_io_ok, 
-                source_caps, target_caps, src_file_size, vdo_stall_threshold, 
-                barrier_callback, source_uncached, target_uncached, governor, 
+                src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, direct_io_ok,
+                source_caps, target_caps, src_file_size, vdo_stall_threshold,
+                barrier_callback, source_uncached, target_uncached, governor,
                 target_label, fsync_tracker, buffer_limit, skip_fsync
              ).await
         } else {
              Self::execute_copy_range(
-                src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, offset, length, 
-                direct_io_ok, src_file_size, source_caps, target_caps, 
+                src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, offset, length,
+                direct_io_ok, src_file_size, source_caps, target_caps,
                 vdo_stall_threshold, source_uncached, target_uncached, governor, 
                 target_label, fsync_tracker, buffer_limit, skip_fsync
              ).await
@@ -1174,6 +1192,7 @@ impl SmartCopier {
         size: u64,
     ) -> Result<(std::fs::File, RawFd)> {
         debug!("prepare_destination_file: {:?}", path);
+        prepare_target_parent(&path)?;
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.read(true).write(true).create(true).truncate(true);
         use std::os::unix::fs::OpenOptionsExt;
@@ -1405,7 +1424,15 @@ impl SmartCopier {
         skip_fsync: bool,
     ) -> Result<std::result::Result<CopyStats, FxcpError>> {
         debug!("execute_full_copy_logic: Start {:?} -> {:?}", src, target_path);
-        
+
+        // Early source existence check — avoid io_uring setup for vanished files
+        if !src.exists() {
+            return Err(FxcpError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Source file no longer exists: {:?}", src)
+            )));
+        }
+
         let sf = Self::open_source_noatime(src).await?;
         let sfd = sf.as_raw_fd();
         

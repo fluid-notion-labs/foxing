@@ -10,4 +10,4 @@ pub mod governor;
 pub mod versioning;
 pub mod consistency;
 
-pub use error::{FxcpError, Result};
+pub use error::{FxcpError, CopyErrorKind, Result};

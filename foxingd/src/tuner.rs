@@ -502,10 +502,18 @@ impl BbrTuner {
                         let min_samples_collected = self.btl_bw_filter.sample_count() >= 3;
                         let time_up = now.duration_since(self.last_cycle) > startup_limit;
                         let queue_full = pending_len > pending_limit;
-                        
-                        if (time_up && min_samples_collected) || (queue_full && min_samples_collected) {
+
+                        // Forced transition when Startup takes too long without bandwidth data
+                        // Handles ENOENT storms where no copies succeed
+                        let forced_timeout = now.duration_since(self.last_cycle) > startup_limit * 3;
+
+                        if (time_up && min_samples_collected) || (queue_full && min_samples_collected) || forced_timeout {
                             if self.transition_to(TunerState::Drain) {
                                 self.last_cycle = now;
+                                if forced_timeout && !min_samples_collected {
+                                    warn!("Tuner: Forced Startup→Drain after {:.1}s with insufficient bandwidth samples",
+                                          startup_limit.as_secs_f64() * 3.0);
+                                }
                             }
                         }
                     },

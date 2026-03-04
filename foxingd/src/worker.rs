@@ -39,6 +39,40 @@ impl HydrationSender {
     }
 }
 
+#[derive(Debug)]
+enum ErrorClass {
+    TargetNotFound,
+    SourceNotFound,
+    Transient,
+    Permanent,
+}
+
+fn classify_error(err: &FoxingError, event_type: &EventType) -> ErrorClass {
+    match err {
+        FoxingError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::NotFound => {
+                // Write-like ops target an existing file — ENOENT means the target
+                // hasn't been created yet, so route to repair (full copy).
+                // For other ops the source is likely gone (transient lifecycle).
+                if matches!(event_type,
+                    EventType::Write | EventType::WriteRange | EventType::Clone
+                    | EventType::Truncate | EventType::Fallocate)
+                {
+                    ErrorClass::TargetNotFound
+                } else {
+                    ErrorClass::SourceNotFound
+                }
+            },
+            std::io::ErrorKind::PermissionDenied => ErrorClass::Permanent,
+            std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted => ErrorClass::Transient,
+            _ => ErrorClass::Transient,
+        },
+        _ => ErrorClass::Transient,
+    }
+}
+
 pub struct BarrierCoordinator {
     pub worker_id: usize,
     pub total_workers: usize,
@@ -86,6 +120,7 @@ impl RetryQueue {
         self.queue.push_back((event, next_attempt, attempts + 1));
     }
 
+    #[allow(dead_code)]
     fn pop_ready(&mut self) -> Option<(Arc<Event>, u32)> {
         if let Some((_, time, _)) = self.queue.front() {
             if Instant::now() >= *time {
@@ -95,6 +130,25 @@ impl RetryQueue {
             }
         }
         None
+    }
+
+    fn pop_ready_batch(&mut self, max: usize) -> Vec<(Arc<Event>, u32)> {
+        let mut batch = Vec::new();
+        let now = Instant::now();
+        while batch.len() < max {
+            if let Some((_, time, _)) = self.queue.front() {
+                if now >= *time {
+                    if let Some((evt, _, attempts)) = self.queue.pop_front() {
+                        batch.push((evt, attempts));
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        batch
     }
 
     fn len(&self) -> usize {
@@ -295,6 +349,60 @@ pub async fn run_worker(
             // Don't spin on timer branches.
         }
 
+        // Retry pressure: force-flush coalescer when retry queue is growing
+        // This prevents event accumulation while retries stagnate on slow targets
+        if retry_queue.len() > 100 && !coalescer.is_empty() {
+            let flush_count = (retry_queue.len() / 100).min(8);
+            for _ in 0..flush_count {
+                if let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
+                    let start_time = Instant::now();
+                    let (res, sc, dt) = process_single_event_with_wal(
+                        evt.clone(), source.clone(), target_cfg.clone(), wal.clone(),
+                        poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                        smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
+                    ).await;
+                    smart_copier = sc;
+                    dirty_tracker = dt;
+                    let duration = start_time.elapsed();
+                    match res {
+                        Ok(stats) => {
+                            bytes_since_tune += stats.bytes_processed;
+                            ops_since_tune += stats.ops_count.max(1);
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+                        },
+                        Err(e) => {
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+
+                            match classify_error(&e, &evt.event_type) {
+                                ErrorClass::TargetNotFound => {
+                                    let abs_path = source.path.join(&evt.name);
+                                    hydration_tx.send_repair_job(abs_path, Some(evt.inode)).await;
+                                    metrics::EVENTS_REPAIR_QUEUED.inc();
+                                },
+                                ErrorClass::SourceNotFound => {
+                                    debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, evt.inode);
+                                    metrics::EVENTS_SOURCE_GONE.inc();
+                                },
+                                ErrorClass::Transient => {
+                                    retry_queue.push(evt, 0);
+                                },
+                                ErrorClass::Permanent => {
+                                    error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, evt.inode, e);
+                                    metrics::EVENTS_DROPPED.inc();
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
         tokio::select! {
             biased;
 
@@ -359,34 +467,61 @@ pub async fn run_worker(
             }
 
             _ = retry_interval.tick(), if !retry_queue.is_empty() => {
-                if let Some((evt, attempts)) = retry_queue.pop_ready() {
-                let start_time = Instant::now();
-                let (res, sc, dt) = process_single_event_with_wal(
-                    evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
-                    poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
-                    smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), attempts
-                ).await;
-                
-                smart_copier = sc;
-                dirty_tracker = dt;
-                let duration = start_time.elapsed();
+                let batch = retry_queue.pop_ready_batch(16);
+                for (evt, attempts) in batch {
+                    let start_time = Instant::now();
+                    let (res, sc, dt) = process_single_event_with_wal(
+                        evt.clone(), source.clone(), target_cfg.clone(), wal.clone(),
+                        poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                        smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), attempts
+                    ).await;
 
-                match res {
-                    Ok(stats) => {
-                        bytes_since_tune += stats.bytes_processed;
-                        ops_since_tune += stats.ops_count.max(1);
-                        accumulated_latency += duration;
-                        if duration > max_latency_in_window { max_latency_in_window = duration; }
-                        latency_samples_count += 1;
-                        let e2e = evt.created_at.elapsed().as_secs_f64();
-                        metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
-                    },
-                    Err(e) => {
-                        warn!("Worker {}: Retry #{} failed for inode {}: {:?}", worker_id, attempts, evt.inode, e);
-                        retry_queue.push(evt, attempts);
+                    smart_copier = sc;
+                    dirty_tracker = dt;
+                    let duration = start_time.elapsed();
+
+                    match res {
+                        Ok(stats) => {
+                            bytes_since_tune += stats.bytes_processed;
+                            ops_since_tune += stats.ops_count.max(1);
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+                            let e2e = evt.created_at.elapsed().as_secs_f64();
+                            metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
+                            let epoch_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as f64;
+                            metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
+                        },
+                        Err(e) => {
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+
+                            match classify_error(&e, &evt.event_type) {
+                                ErrorClass::TargetNotFound => {
+                                    let abs_path = source.path.join(&evt.name);
+                                    hydration_tx.send_repair_job(abs_path, Some(evt.inode)).await;
+                                    metrics::EVENTS_REPAIR_QUEUED.inc();
+                                },
+                                ErrorClass::SourceNotFound => {
+                                    debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, evt.inode);
+                                    metrics::EVENTS_SOURCE_GONE.inc();
+                                },
+                                ErrorClass::Transient => {
+                                    warn!("Worker {}: Retry #{} failed for inode {}: {:?}", worker_id, attempts, evt.inode, e);
+                                    retry_queue.push(evt, attempts);
+                                },
+                                ErrorClass::Permanent => {
+                                    error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, evt.inode, e);
+                                    metrics::EVENTS_DROPPED.inc();
+                                },
+                            }
+                        }
                     }
                 }
-                }  // close if let Some
             }
 
             _ = flush_interval.tick(), if !coalescer.is_empty() => {
@@ -410,9 +545,35 @@ pub async fn run_worker(
                         latency_samples_count += 1;
                         let e2e = evt.created_at.elapsed().as_secs_f64();
                         metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
+                        let epoch_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as f64;
+                        metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
                     } else if let Err(e) = res {
-                        warn!("Worker {}: Event failed (queued for retry): {:?}", worker_id, e);
-                        retry_queue.push(evt, 0);
+                        accumulated_latency += duration;
+                        if duration > max_latency_in_window { max_latency_in_window = duration; }
+                        latency_samples_count += 1;
+
+                        match classify_error(&e, &evt.event_type) {
+                            ErrorClass::TargetNotFound => {
+                                let abs_path = source.path.join(&evt.name);
+                                hydration_tx.send_repair_job(abs_path, Some(evt.inode)).await;
+                                metrics::EVENTS_REPAIR_QUEUED.inc();
+                            },
+                            ErrorClass::SourceNotFound => {
+                                debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, evt.inode);
+                                metrics::EVENTS_SOURCE_GONE.inc();
+                            },
+                            ErrorClass::Transient => {
+                                warn!("Worker {}: Event failed (queued for retry): {:?}", worker_id, e);
+                                retry_queue.push(evt, 0);
+                            },
+                            ErrorClass::Permanent => {
+                                error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, evt.inode, e);
+                                metrics::EVENTS_DROPPED.inc();
+                            },
+                        }
                     }
                 }
             }
@@ -446,10 +607,36 @@ pub async fn run_worker(
                             latency_samples_count += 1;
                             let e2e = batch_evt.created_at.elapsed().as_secs_f64();
                             metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
+                            let epoch_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as f64;
+                            metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
                         },
                         Err(e) => {
-                            warn!("Worker {}: Batch failed: {:?}", worker_id, e);
-                            retry_queue.push(batch_evt, 0);
+                            accumulated_latency += duration;
+                            if duration > max_latency_in_window { max_latency_in_window = duration; }
+                            latency_samples_count += 1;
+
+                            match classify_error(&e, &batch_evt.event_type) {
+                                ErrorClass::TargetNotFound => {
+                                    let abs_path = source.path.join(&batch_evt.name);
+                                    hydration_tx.send_repair_job(abs_path, Some(batch_evt.inode)).await;
+                                    metrics::EVENTS_REPAIR_QUEUED.inc();
+                                },
+                                ErrorClass::SourceNotFound => {
+                                    debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, batch_evt.inode);
+                                    metrics::EVENTS_SOURCE_GONE.inc();
+                                },
+                                ErrorClass::Transient => {
+                                    warn!("Worker {}: Batch failed: {:?}", worker_id, e);
+                                    retry_queue.push(batch_evt, 0);
+                                },
+                                ErrorClass::Permanent => {
+                                    error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, batch_evt.inode, e);
+                                    metrics::EVENTS_DROPPED.inc();
+                                },
+                            }
                         }
                     }
                 }
@@ -537,7 +724,13 @@ async fn process_single_event_with_wal(
         EventType::Clone => {
             let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
             let source_path = source.mount.join(rel);
-            
+
+            if !source_path.exists() {
+                debug!("Worker {}: Source {:?} gone, skipping clone", worker_id, source_path);
+                metrics::EVENTS_SOURCE_GONE.inc();
+                return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+            }
+
             let size = match std::fs::metadata(&source_path) {
                 Ok(m) => m.len(),
                 Err(_) => event.length
@@ -575,21 +768,45 @@ async fn process_single_event_with_wal(
                 dirty_tracker.insert(event.inode);
             }
 
-            op_result = smart_copier.optimized_copy_range(
+            let copy_timeout = {
+                let base_secs = 60u64;
+                let size_mb = (size / (10 * 1024 * 1024)).max(1) as u64;
+                std::time::Duration::from_secs((base_secs + size_mb * 60).min(300))
+            };
+            metrics::WORKER_COPY_IN_FLIGHT.with_label_values(&[&target_label, &worker_id.to_string()]).inc();
+            match tokio::time::timeout(copy_timeout, smart_copier.optimized_copy_range(
                 source_path,
                 target_path.clone(),
                 event.offset,
                 event.length,
                 size,
                 target_label.clone(),
-                None, // Pass None for worker buffer limit (default tuning)
-                false, // Daemon workers always fsync
-            ).await.map_err(Into::into);
+                None,
+                false,
+            )).await {
+                Ok(inner) => { op_result = inner.map_err(Into::into); }
+                Err(_elapsed) => {
+                    warn!("Worker {}: Copy timed out after {:?} for inode {} (size={})",
+                          worker_id, copy_timeout, event.inode, size);
+                    metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                    op_result = Err(FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Copy timed out after {:?}", copy_timeout)
+                    )));
+                }
+            };
+            metrics::WORKER_COPY_IN_FLIGHT.with_label_values(&[&target_label, &worker_id.to_string()]).dec();
         },
         EventType::Write | EventType::WriteRange => {
             let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
             let source_path = source.mount.join(rel);
-            
+
+            if !source_path.exists() {
+                debug!("Worker {}: Source {:?} gone, skipping write", worker_id, source_path);
+                metrics::EVENTS_SOURCE_GONE.inc();
+                return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+            }
+
             let size = match std::fs::metadata(&source_path) {
                 Ok(m) => m.len(),
                 Err(_) => event.length
@@ -639,16 +856,34 @@ async fn process_single_event_with_wal(
                 dirty_tracker.insert(event.inode);
             }
 
-            op_result = smart_copier.optimized_copy_range(
+            let copy_timeout = {
+                let base_secs = 60u64;
+                let size_mb = (size / (10 * 1024 * 1024)).max(1) as u64;
+                std::time::Duration::from_secs((base_secs + size_mb * 60).min(300))
+            };
+            metrics::WORKER_COPY_IN_FLIGHT.with_label_values(&[&target_label, &worker_id.to_string()]).inc();
+            match tokio::time::timeout(copy_timeout, smart_copier.optimized_copy_range(
                 source_path,
                 target_path.clone(),
                 event.offset,
                 event.length,
                 size,
                 target_label.clone(),
-                None, // Pass None for worker buffer limit (default tuning)
-                false, // Daemon workers always fsync
-            ).await.map_err(Into::into);
+                None,
+                false,
+            )).await {
+                Ok(inner) => { op_result = inner.map_err(Into::into); }
+                Err(_elapsed) => {
+                    warn!("Worker {}: Copy timed out after {:?} for inode {} (size={})",
+                          worker_id, copy_timeout, event.inode, size);
+                    metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                    op_result = Err(FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Copy timed out after {:?}", copy_timeout)
+                    )));
+                }
+            };
+            metrics::WORKER_COPY_IN_FLIGHT.with_label_values(&[&target_label, &worker_id.to_string()]).dec();
         },
         EventType::Rename => {
             let old_rel_res = resolve_event_path(&source, event.parent_inode, &event.name).await;
@@ -660,8 +895,20 @@ async fn process_single_event_with_wal(
                         if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
                     }
                     
-                    op_result = smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags).await.map_err(Into::into);
-                    
+                    let rename_timeout = std::time::Duration::from_secs(60);
+                    match tokio::time::timeout(rename_timeout, smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags)).await {
+                        Ok(inner) => { op_result = inner.map_err(Into::into); }
+                        Err(_elapsed) => {
+                            warn!("Worker {}: Rename timed out after {:?} for inode {}",
+                                  worker_id, rename_timeout, event.inode);
+                            metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                            op_result = Err(FoxingError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("Rename timed out after {:?}", rename_timeout)
+                            )));
+                        }
+                    };
+
                     // Update identity map if directory
                     if event.mode & libc::S_IFDIR as u32 != 0 {
                         if let Some(new_name) = &event.new_name {
@@ -702,7 +949,19 @@ async fn process_single_event_with_wal(
                     }
                     
                     info!("Worker: Executing recovered rename: {:?} -> {:?}", old_path, new_target_path);
-                    op_result = smart_copier.optimized_rename(old_path, new_target_path, 0).await.map_err(Into::into);
+                    let rename_timeout = std::time::Duration::from_secs(60);
+                    match tokio::time::timeout(rename_timeout, smart_copier.optimized_rename(old_path, new_target_path, 0)).await {
+                        Ok(inner) => { op_result = inner.map_err(Into::into); }
+                        Err(_elapsed) => {
+                            warn!("Worker {}: RenameIncomplete timed out after {:?} for inode {}",
+                                  worker_id, rename_timeout, event.inode);
+                            metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                            op_result = Err(FoxingError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("RenameIncomplete timed out after {:?}", rename_timeout)
+                            )));
+                        }
+                    };
                 } else {
                     op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to strip prefix from recovered path")));
                 }
@@ -715,7 +974,19 @@ async fn process_single_event_with_wal(
                 sidecar.set_dirty_blind(target_path.clone());
                 dirty_tracker.insert(event.inode);
             }
-            op_result = smart_copier.optimized_truncate(target_path.clone(), event.length).await.map_err(Into::into);
+            let truncate_timeout = std::time::Duration::from_secs(60);
+            match tokio::time::timeout(truncate_timeout, smart_copier.optimized_truncate(target_path.clone(), event.length)).await {
+                Ok(inner) => { op_result = inner.map_err(Into::into); }
+                Err(_elapsed) => {
+                    warn!("Worker {}: Truncate timed out after {:?} for inode {}",
+                          worker_id, truncate_timeout, event.inode);
+                    metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                    op_result = Err(FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Truncate timed out after {:?}", truncate_timeout)
+                    )));
+                }
+            };
         },
         EventType::Unlink | EventType::Rmdir => {
              let event_clone = event.clone();
@@ -811,7 +1082,8 @@ async fn process_single_event_with_wal(
                                  let rel_path = target_path.strip_prefix(&target_cfg.path)
                                     .unwrap_or(Path::new(""))
                                     .to_path_buf();
-                                 hydration_tx.send_repair_job(rel_path, Some(event.inode)).await;
+                                 let abs_source_path = source.path.join(&rel_path);
+                                 hydration_tx.send_repair_job(abs_source_path, Some(event.inode)).await;
                              }
                          }
                          
@@ -831,7 +1103,8 @@ async fn process_single_event_with_wal(
                  let rel_path = target_path.strip_prefix(&target_cfg.path)
                     .unwrap_or(Path::new(""))
                     .to_path_buf();
-                 hydration_tx.send_repair_job(rel_path, Some(event.inode)).await;
+                 let abs_source_path = source.path.join(&rel_path);
+                 hydration_tx.send_repair_job(abs_source_path, Some(event.inode)).await;
              }
         },
         EventType::SetFlags => {
@@ -855,7 +1128,19 @@ async fn process_single_event_with_wal(
                 dirty_tracker.insert(event.inode);
             }
             let mode = event.flags as i32;
-            op_result = smart_copier.optimized_fallocate(target_path.clone(), mode, event.offset, event.length).await.map_err(Into::into);
+            let fallocate_timeout = std::time::Duration::from_secs(60);
+            match tokio::time::timeout(fallocate_timeout, smart_copier.optimized_fallocate(target_path.clone(), mode, event.offset, event.length)).await {
+                Ok(inner) => { op_result = inner.map_err(Into::into); }
+                Err(_elapsed) => {
+                    warn!("Worker {}: Fallocate timed out after {:?} for inode {}",
+                          worker_id, fallocate_timeout, event.inode);
+                    metrics::COPY_TIMEOUT_TOTAL.with_label_values(&[&target_label]).inc();
+                    op_result = Err(FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Fallocate timed out after {:?}", fallocate_timeout)
+                    )));
+                }
+            };
         },
         _ => {}
     }

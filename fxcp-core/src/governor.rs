@@ -9,6 +9,7 @@ use crate::metrics;
 use std::fs;
 use crate::constants;
 use std::thread;
+use std::time::Instant;
 
 /// Detect if running inside a hypervisor (KVM, VMware, Xen, Hyper-V, etc.)
 pub fn detect_hypervisor() -> Option<String> {
@@ -46,6 +47,9 @@ pub struct Governor {
     min_throughput_bytes_sec: AtomicU64,
     #[allow(dead_code)]
     throttled_count: AtomicU64,
+    copy_success_count: AtomicU64,
+    copy_failure_count: AtomicU64,
+    failure_window_start: Mutex<Instant>,
 }
 
 impl Governor {
@@ -155,6 +159,9 @@ impl Governor {
             min_hydration_interval: Duration::from_millis(hydration_delay_ms),
             min_throughput_bytes_sec: AtomicU64::new(0),
             throttled_count: AtomicU64::new(0),
+            copy_success_count: AtomicU64::new(0),
+            copy_failure_count: AtomicU64::new(0),
+            failure_window_start: Mutex::new(Instant::now()),
         }
     }
 
@@ -176,8 +183,52 @@ impl Governor {
         None
     }
 
+    /// Record a copy operation result for failure-rate tracking.
+    pub fn signal_copy_result(&self, success: bool) {
+        if success {
+            self.copy_success_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.copy_failure_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Current failure rate as a fraction [0.0, 1.0].
+    pub fn failure_rate(&self) -> f64 {
+        let success = self.copy_success_count.load(Ordering::Relaxed);
+        let failure = self.copy_failure_count.load(Ordering::Relaxed);
+        let total = success + failure;
+        if total == 0 { return 0.0; }
+        failure as f64 / total as f64
+    }
+
+    /// Reset failure counters (e.g. at the start of a new failure window).
+    pub fn reset_failure_window(&self) {
+        self.copy_success_count.store(0, Ordering::Relaxed);
+        self.copy_failure_count.store(0, Ordering::Relaxed);
+        *self.failure_window_start.lock() = Instant::now();
+    }
+
     pub fn current_stress_score(&self) -> f64 {
-        *self.stress_score.lock()
+        let mut score = *self.stress_score.lock();
+
+        // Boost stress when copy failure rate exceeds threshold
+        let failure_boost = if self.failure_rate() > constants::GOVERNOR_FAILURE_RATE_THRESHOLD {
+            0.3
+        } else {
+            0.0
+        };
+        score += failure_boost;
+
+        // Auto-reset failure window after expiry
+        {
+            let start = self.failure_window_start.lock();
+            if start.elapsed() > Duration::from_secs(constants::GOVERNOR_FAILURE_WINDOW_SECS) {
+                drop(start);
+                self.reset_failure_window();
+            }
+        }
+
+        score
     }
 
     pub fn is_system_stressed(&self) -> bool {

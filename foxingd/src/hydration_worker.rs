@@ -894,6 +894,8 @@ pub async fn run_hydration_worker_loop(
                     skip_fsync
                 ).await {
                     Ok(Some(stats)) => {
+                        metrics::EVENTS_REPAIR_COMPLETED.inc();
+                        source.active_repairs.remove(&job.rel_path);
                         if let Some(senders) = stats_senders.get(&job.target_cfg.path) {
                             if let Some(sender) = senders.choose(&mut rand::rng()) {
                                 let _ = sender.send(stats);
@@ -902,6 +904,8 @@ pub async fn run_hydration_worker_loop(
                     }
                     Ok(None) => {} // Job skipped (dir, non-file, shutdown)
                     Err(e) => {
+                        metrics::EVENTS_REPAIR_FAILED.inc();
+                        source.active_repairs.remove(&job.rel_path);
                         // Log error but continue processing — don't kill the worker
                         warn!("Hydration Worker {}: Job failed for {:?} -> {:?}: {}. Continuing.",
                               worker_id, job.rel_path, job.target_cfg.path, e);
@@ -1055,48 +1059,86 @@ pub async fn process_hydration_job(
                 }
             }
 
-            match std::fs::copy(&current_source_path, &current_target_path) {
-                Ok(bytes) => {
-                    // Apply permissions directly (no spawn_blocking)
-                    let _ = std::fs::set_permissions(&current_target_path, metadata.permissions());
-                    // Preserve timestamps
+            let src_clone = current_source_path.clone();
+            let dst_clone = current_target_path.clone();
+            let perms = metadata.permissions();
+            let atime = metadata.atime();
+            let atime_nsec = metadata.atime_nsec();
+            let mtime = metadata.mtime();
+            let mtime_nsec = metadata.mtime_nsec();
+
+            let copy_start = std::time::Instant::now();
+            match tokio::time::timeout(
+                Duration::from_secs(120),
+                spawn_blocking(move || -> std::result::Result<u64, std::io::Error> {
+                    let bytes = std::fs::copy(&src_clone, &dst_clone)?;
+                    let _ = std::fs::set_permissions(&dst_clone, perms);
                     let times = [
-                        libc::timespec { tv_sec: metadata.atime(), tv_nsec: metadata.atime_nsec() },
-                        libc::timespec { tv_sec: metadata.mtime(), tv_nsec: metadata.mtime_nsec() },
+                        libc::timespec { tv_sec: atime, tv_nsec: atime_nsec },
+                        libc::timespec { tv_sec: mtime, tv_nsec: mtime_nsec },
                     ];
-                    if let Ok(cstr) = std::ffi::CString::new(current_target_path.as_os_str().as_encoded_bytes()) {
+                    if let Ok(cstr) = std::ffi::CString::new(dst_clone.as_os_str().as_encoded_bytes()) {
                         unsafe { libc::utimensat(libc::AT_FDCWD, cstr.as_ptr(), times.as_ptr(), 0) };
                     }
-                    Ok(Some(CopyStats { bytes_processed: bytes, bytes_zeros: 0, io_duration: std::time::Duration::ZERO, ops_count: 1 }))
+                    Ok(bytes)
+                })
+            ).await {
+                Ok(Ok(Ok(bytes))) => {
+                    let copy_duration = copy_start.elapsed();
+                    metrics::HYDRATION_WORKER_BLOCKED_MS
+                        .with_label_values(&["0"])
+                        .inc_by(copy_duration.as_millis() as f64);
+                    Ok(Some(CopyStats { bytes_processed: bytes, bytes_zeros: 0, io_duration: Duration::ZERO, ops_count: 1 }))
                 }
-                Err(e) => Err(FoxingError::Io(e)),
+                Ok(Ok(Err(e))) => Err(FoxingError::Io(e)),
+                Ok(Err(join_err)) => Err(FoxingError::Io(std::io::Error::new(ErrorKind::Other, format!("spawn_blocking join error: {}", join_err)))),
+                Err(_elapsed) => {
+                    warn!("Hydration: Small file copy timed out after 120s for {:?}", current_target_path);
+                    Err(FoxingError::Io(std::io::Error::new(ErrorKind::TimedOut, "Hydration copy timed out")))
+                }
             }
         } else {
             // --- Standard path: large files use io_uring for throughput ---
-            SmartCopier::copy_with_limit(
-                &current_source_path,
-                &current_target_path,
-                ring,
-                buffer_pool,
-                None,
-                async_fd.clone(),
-                target_cfg.vdo_optimization,
-                0,
-                file_size,
-                direct_io_ok,
-                file_size,
-                source_caps,
-                &target_caps,
-                target_cfg.vdo_stall_threshold,
-                target_cfg.source_uncached,
-                target_cfg.target_uncached,
-                &None,
-                Some(governor.clone()),
-                target_cfg.path.to_string_lossy().to_string(),
-                fsync_tracker,
-                buffer_limit,
-                skip_fsync
-            ).await.map(Some).map_err(FoxingError::from)
+            let copy_start = std::time::Instant::now();
+            match tokio::time::timeout(
+                Duration::from_secs(600), // 10 min for large files
+                SmartCopier::copy_with_limit(
+                    &current_source_path,
+                    &current_target_path,
+                    ring,
+                    buffer_pool,
+                    None,
+                    async_fd.clone(),
+                    target_cfg.vdo_optimization,
+                    0,
+                    file_size,
+                    direct_io_ok,
+                    file_size,
+                    source_caps,
+                    &target_caps,
+                    target_cfg.vdo_stall_threshold,
+                    target_cfg.source_uncached,
+                    target_cfg.target_uncached,
+                    &None,
+                    Some(governor.clone()),
+                    target_cfg.path.to_string_lossy().to_string(),
+                    fsync_tracker,
+                    buffer_limit,
+                    skip_fsync
+                )
+            ).await {
+                Ok(inner) => {
+                    let copy_duration = copy_start.elapsed();
+                    metrics::HYDRATION_WORKER_BLOCKED_MS
+                        .with_label_values(&["0"])
+                        .inc_by(copy_duration.as_millis() as f64);
+                    inner.map(Some).map_err(FoxingError::from)
+                },
+                Err(_) => {
+                    warn!("Hydration: Large file copy timed out for {:?}", current_target_path);
+                    Err(FoxingError::Io(std::io::Error::new(ErrorKind::TimedOut, "Large file copy timed out")))
+                }
+            }
         };
 
         match copy_result {

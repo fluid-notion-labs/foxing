@@ -129,6 +129,50 @@ lazy_static! {
 }
 
 lazy_static! {
+    // --- [foxingd] Stall Detection ---
+    pub static ref WORKER_COPY_IN_FLIGHT: GaugeVec = register_gauge_vec!(
+        "foxing_worker_copy_in_flight",
+        "Number of copy operations currently executing per worker",
+        &["target", "worker"]
+    ).unwrap();
+    pub static ref WORKER_LAST_COPY_EPOCH_MS: GaugeVec = register_gauge_vec!(
+        "foxing_worker_last_copy_epoch_ms",
+        "Epoch milliseconds of last successful copy operation (stale = stall)",
+        &["target", "worker"]
+    ).unwrap();
+    pub static ref HYDRATION_WORKER_BLOCKED_MS: CounterVec = register_counter_vec!(
+        "foxing_hydration_worker_blocked_ms_total",
+        "Cumulative milliseconds hydration workers spent in blocking I/O",
+        &["worker"]
+    ).unwrap();
+    pub static ref COPY_TIMEOUT_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_copy_timeout_total",
+        "Copy operations that exceeded timeout",
+        &["target"]
+    ).unwrap();
+}
+
+lazy_static! {
+    // --- [foxingd] Repair & Data Loss Tracking ---
+    pub static ref EVENTS_REPAIR_QUEUED: Counter = register_counter!(
+        "foxing_events_repair_queued_total",
+        "Events routed to repair (full copy) due to target ENOENT"
+    ).unwrap();
+    pub static ref EVENTS_REPAIR_COMPLETED: Counter = register_counter!(
+        "foxing_events_repair_completed_total",
+        "Repair jobs completed successfully"
+    ).unwrap();
+    pub static ref EVENTS_REPAIR_FAILED: Counter = register_counter!(
+        "foxing_events_repair_failed_total",
+        "Repair jobs that failed"
+    ).unwrap();
+    pub static ref EVENTS_SOURCE_GONE: Counter = register_counter!(
+        "foxing_events_source_gone_total",
+        "Events skipped because source file no longer exists"
+    ).unwrap();
+}
+
+lazy_static! {
     // --- [foxingd] Reliability (daemon-plane) ---
     pub static ref POISON_CABINET_ACTIVE: Gauge = register_gauge!(
         "foxing_poison_cabinet_active_inodes",

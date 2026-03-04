@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::error::{FoxingError, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, Duration};
-use tracing::{info, error};
+use tracing::{info, error, debug};
 use crate::tuner::{TunerState, TunerBoard};
 use crate::hydration::HydrationQueue;
 use crate::hydration_worker::{HydrationState, Hydrator, HydrationMode};
@@ -392,12 +392,43 @@ impl Manager {
                     let is_root_request = path == source_root_canonical;
                     
                     if !is_root_request {
-                        if let Some(hydrator) = hydrators_arc.iter().find(|h| path.starts_with(&h.source.path)) {
-                            if let Some(tgt_cfg) = hydrator.targets.iter().next() {
-                                if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
-                                    if let Ok(rel_path) = path.strip_prefix(&hydrator.source.mount) {
-                                        queue.submit_job(rel_path.to_path_buf(), tgt_cfg.clone(), inode_opt);
+                        // Find matching hydrator — support both absolute and relative paths
+                        let matching_hydrator = hydrators_arc.iter().find(|h| {
+                            path.starts_with(&h.source.path) || path.starts_with(&h.source.mount)
+                        });
+
+                        if let Some(hydrator) = matching_hydrator {
+                            if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
+                                // Compute relative path from whichever prefix matches
+                                let rel_path = path.strip_prefix(&hydrator.source.path)
+                                    .or_else(|_| path.strip_prefix(&hydrator.source.mount))
+                                    .unwrap_or(&path)
+                                    .to_path_buf();
+
+                                // Dedup via active_repairs to prevent repair storms
+                                if hydrator.source.active_repairs.insert(rel_path.clone()) {
+                                    // Route to ALL targets (not just first)
+                                    for tgt_cfg in &hydrator.targets {
+                                        queue.submit_job(rel_path.clone(), tgt_cfg.clone(), inode_opt);
                                     }
+                                    debug!("Repair: Submitted job for {:?} to {} targets", rel_path, hydrator.targets.len());
+                                } else {
+                                    debug!("Repair: Skipping duplicate for {:?}", rel_path);
+                                }
+                            }
+                        } else {
+                            // Fallback: try treating path as relative, check against each source
+                            for h in hydrators_arc.iter() {
+                                let candidate = h.source.path.join(&path);
+                                if candidate.exists() || h.source.mount.join(&path).exists() {
+                                    if let Some(queue) = h.source.bulk_job_queue.lock().as_ref() {
+                                        if h.source.active_repairs.insert(path.clone()) {
+                                            for tgt_cfg in &h.targets {
+                                                queue.submit_job(path.clone(), tgt_cfg.clone(), inode_opt);
+                                            }
+                                        }
+                                    }
+                                    break;
                                 }
                             }
                         }

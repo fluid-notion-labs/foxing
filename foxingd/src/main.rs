@@ -815,7 +815,21 @@ async fn run_runtime(
     }
 
     tasks_set.abort_all();
-    while let Some(_) = tasks_set.join_next().await {}
+
+    let shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(
+            shutdown_deadline,
+            tasks_set.join_next()
+        ).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => {
+                warn!("Shutdown: {} tasks still running after 10s. Forcing exit.", tasks_set.len());
+                break;
+            }
+        }
+    }
     
     api_handle.abort();
     info!("Shutdown Complete.");

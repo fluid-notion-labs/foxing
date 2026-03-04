@@ -345,4 +345,10 @@ impl AsyncSidecar {
     pub fn clear_dirty(&self, path: PathBuf) {
         let _ = self.tx.send(SidecarOp::ClearDirty { path });
     }
+
+    /// Called when source file no longer exists — clear dirty flag
+    /// since there's nothing to sync.
+    pub fn clear_dirty_on_skip(&self, target_path: PathBuf) {
+        let _ = self.tx.send(SidecarOp::ClearDirty { path: target_path });
+    }
 }
