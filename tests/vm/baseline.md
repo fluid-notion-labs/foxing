@@ -102,8 +102,38 @@ Each large file (50MB) takes 30-60s to copy. Total estimated time for full
 | Hypervisor detect | kvm (auto 50.0) | kvm (auto 50.0) | Same |
 | CPU idle | 370% | 363% | Same (need P0 fix) |
 
-### Key Observations
-- **NVMe enables real tuner state transitions** (Drain detected on ext4/f2fs)
-- **All data replicated** (300MB/target) but file count stalled (~30% of files)
-- **Hydration queue drain issue persists** — not I/O bound, channel architecture problem
-- **Governor correctly auto-detected KVM** and relaxed PSI thresholds
+### Key Observations (pre-fix)
+- NVMe enables real tuner state transitions (Drain detected on ext4/f2fs)
+- All data replicated (300MB/target) but file count stalled (~30% of files)
+- Root cause: per-file overhead (spawn_blocking, io_uring ring cycle, atomic rename)
+- 2.25 files/sec/worker — 555 × 4KB files took 60s+ when should be <1s
+
+## koero NVMe After Hydration Fix (2026-03-04)
+
+**Commit:** `1c733bc` — small file fast path + inline identity + sync stat
+
+### Hydration (555 files, 302MB, 4 targets)
+
+| Target | Files (30s) | Data (30s) | Complete |
+|--------|------------|-----------|:--------:|
+| XFS | **555/555** | 302MB | **YES** |
+| ext4 | **555/555** | 303MB | **YES** |
+| btrfs | **555/555** | 302MB | **YES** |
+| f2fs | **555/555** | 303MB | **YES** |
+
+### Before vs After
+
+| Metric | Before Fix | After Fix | Improvement |
+|--------|-----------|----------|:-----------:|
+| Files replicated (30s) | 153/555 | **555/555** | **100% complete** |
+| Time to full sync | >5min (never completed) | **<30s** | **>10x** |
+| CPU idle | 363% | **0%** | **Fixed** |
+| Files/sec/worker | 2.25 | **~18** | **8x faster** |
+
+### What Changed
+1. **Small file fast path** (<=256KB): `std::fs::copy` instead of SmartCopier io_uring
+2. **Inline identity resolution**: DashMap lookup directly, no `spawn_blocking` thread
+3. **Synchronous stat**: `std::fs::metadata` instead of `tokio::fs::metadata`
+4. **Inline metadata for small files**: permissions + timestamps via `utimensat`, no thread
+
+Large files (>256KB) still use SmartCopier for io_uring throughput and sparse handling.
