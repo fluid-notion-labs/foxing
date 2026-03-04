@@ -94,6 +94,19 @@ pub fn get_sidecar_path(target_path: &Path) -> Option<PathBuf> {
     Some(target_path.with_file_name(sidecar_name))
 }
 
+/// Return the sidecar path for directory-level metadata.
+///
+/// For directories, metadata is stored INSIDE the directory as `.foxing_dir_meta`
+/// rather than next to it (which is what `get_sidecar_path` would do via
+/// `with_file_name()`). For non-directories, falls back to the regular sidecar path.
+pub fn get_dir_sidecar_path(dir_path: &Path) -> Option<PathBuf> {
+    if dir_path.is_dir() {
+        Some(dir_path.join(".foxing_dir_meta"))
+    } else {
+        get_sidecar_path(dir_path)
+    }
+}
+
 fn lock_file(file: &File, exclusive: bool) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
     let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
@@ -124,33 +137,26 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()>
         if meta.is_symlink() { return Ok(()); }
     } else { return Ok(()); }
     let (trusted_key, user_key) = resolve_key_variants(key);
-    match xattr::set(path, &trusted_key, value) {
-        Ok(_) => {
-            if let Some(sp) = get_sidecar_path(path) {
-                if sp.exists() { let _ = fs::remove_file(sp); }
-            }
-            return Ok(());
-        },
+    // Try trusted xattr first, then user xattr
+    let xattr_ok = match xattr::set(path, &trusted_key, value) {
+        Ok(_) => true,
         Err(e) => {
-            if e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::EOPNOTSUPP) {
-                if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
-                    warn!("Security: 'trusted' xattr namespace unavailable ({:?}). Falling back to 'user' namespace. Anti-tamper protection disabled.", e);
-                }
-                match xattr::set(path, &user_key, value) {
-                    Ok(_) => return Ok(()),
-                    Err(e2) => {
-                        debug!("xattr fallback failed: {}", e2);
-                    }
-                }
-            } else if e.kind() != io::ErrorKind::NotFound && e.kind() != io::ErrorKind::ReadOnlyFilesystem {
-                 if let Some(code) = e.raw_os_error() {
-                    if code != libc::EOPNOTSUPP && code != libc::ENOTSUP && code != libc::ENOSYS && code != libc::EPERM {
-                        return Err(e);
-                    }
-                }
+            if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                warn!("Security: 'trusted' xattr namespace unavailable ({:?}). Falling back to 'user' namespace. Anti-tamper protection disabled.", e);
             }
+            xattr::set(path, &user_key, value).is_ok()
         }
+    };
+
+    if xattr_ok {
+        // Clean up stale sidecar file if xattr succeeded
+        if let Some(sp) = get_sidecar_path(path) {
+            if sp.exists() { let _ = fs::remove_file(sp); }
+        }
+        return Ok(());
     }
+
+    // Both xattr namespaces failed — ALWAYS fall through to sidecar file
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine sidecar path")),
@@ -263,13 +269,33 @@ pub fn get_sync_signature(path: &Path) -> Option<SyncSignature> {
 }
 
 /// Store a directory-level Merkle hash on the target directory.
+///
+/// For directories, writes the 32-byte hash directly into a sidecar file
+/// INSIDE the directory (`.foxing_dir_meta`), avoiding the `with_file_name()`
+/// bug that would place metadata next to the directory instead of inside it.
 pub fn set_dir_hash(path: &Path, hash: &[u8; 32]) -> std::io::Result<()> {
-    set_metadata(path, "dir_hash", hash)
+    let sidecar = match get_dir_sidecar_path(path) {
+        Some(p) => p,
+        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine dir sidecar path")),
+    };
+    match fs::write(&sidecar, hash) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            error!("Failed to write dir hash sidecar {:?}: {}", sidecar, e);
+            Ok(())
+        }
+    }
 }
 
 /// Retrieve a stored directory hash from the target directory.
+///
+/// Reads the 32-byte hash from the sidecar file inside the directory.
 pub fn get_dir_hash(path: &Path) -> Option<[u8; 32]> {
-    let bytes = get_metadata(path, "dir_hash")?;
+    let sidecar = get_dir_sidecar_path(path)?;
+    let bytes = match fs::read(&sidecar) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
     if bytes.len() == 32 {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -280,8 +306,18 @@ pub fn get_dir_hash(path: &Path) -> Option<[u8; 32]> {
 }
 
 /// Clear a stored directory hash (invalidation).
+///
+/// Removes the sidecar file inside the directory.
 pub fn clear_dir_hash(path: &Path) -> std::io::Result<()> {
-    remove_metadata(path, "dir_hash")
+    let sidecar = match get_dir_sidecar_path(path) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    match fs::remove_file(&sidecar) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn set_merkle_signature(path: &Path, sig: &hashing::MerkleSignature) -> std::io::Result<()> {

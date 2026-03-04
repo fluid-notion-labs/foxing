@@ -494,7 +494,9 @@ impl Hydrator {
                 for target in targets_ref {
                     let target_dir = target.path.join(rel_dir);
                     if target_dir.exists() {
-                        let _ = sidecar::set_dir_hash(&target_dir, &hash);
+                        if let Err(e) = sidecar::set_dir_hash(&target_dir, &hash) {
+                            warn!("Hydration: Failed to store dir hash for {:?}: {}", target_dir, e);
+                        }
                     }
                 }
             }
@@ -863,7 +865,32 @@ impl Hydrator {
 
             match hashing::verify_incremental(src_path, &dst_path, src_meta.len()) {
                 Ok(true) => {
-                    let _ = set_sync_signature(&dst_path, &src_sig);
+                    // Lite hash (head+tail) says match — but middle-of-file changes
+                    // are invisible to it. If the target has a stored Merkle signature
+                    // and the source mtime differs from the target mtime, verify the
+                    // full Merkle root to catch chunk-level changes.
+                    if let Some(stored_merkle) = sidecar::get_merkle_signature(&dst_path) {
+                        let dst_mtime = df.metadata().map(|m| m.mtime()).unwrap_or(0);
+                        if src_meta.mtime() != dst_mtime {
+                            match hashing::verify_with_merkle(src_path, &stored_merkle) {
+                                Ok(true) => {
+                                    // Merkle roots match — genuinely unchanged
+                                    if let Err(e) = set_sync_signature(&dst_path, &src_sig) { warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e); }
+                                    return Ok(false);
+                                }
+                                Ok(false) => {
+                                    // Merkle roots differ — middle-of-file change detected
+                                    debug!("Merkle root mismatch for {:?}, forcing delta resync", dst_path);
+                                    return Ok(true);
+                                }
+                                Err(e) => {
+                                    warn!("Merkle verification failed for {:?}: {}, forcing resync", dst_path, e);
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    if let Err(e) = set_sync_signature(&dst_path, &src_sig) { warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e); }
                     Ok(false)
                 },
                 Ok(false) => Ok(true),

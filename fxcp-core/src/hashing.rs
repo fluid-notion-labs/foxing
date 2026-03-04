@@ -294,3 +294,13 @@ impl MerkleSignature {
         self.serialized_size() <= MAX_MERKLE_XATTR_BYTES
     }
 }
+
+/// Compare a source file's Merkle root against a stored signature.
+///
+/// Builds the source Merkle tree using the stored signature's chunk size,
+/// then compares roots. Returns `Ok(true)` if the roots match (file unchanged),
+/// `Ok(false)` if they differ (file needs resync).
+pub fn verify_with_merkle(src: &Path, stored_sig: &MerkleSignature) -> Result<bool> {
+    let src_tree = MerkleTree::from_file(src, stored_sig.chunk_size)?;
+    Ok(src_tree.root.as_bytes() == &stored_sig.root)
+}
