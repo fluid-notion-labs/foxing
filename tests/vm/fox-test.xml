@@ -1,0 +1,66 @@
+<domain type='kvm'>
+  <name>fox-test</name>
+  <memory unit='GiB'>8</memory>
+  <vcpu>8</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <cpu mode='host-passthrough'/>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <clock offset='utc'/>
+  <devices>
+    <!-- OS disk -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='writeback'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-os.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <!-- Source disk (XFS) -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-source.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <!-- Target XFS -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-target-xfs.qcow2'/>
+      <target dev='vdc' bus='virtio'/>
+    </disk>
+    <!-- Target ext4 -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-target-ext4.qcow2'/>
+      <target dev='vdd' bus='virtio'/>
+    </disk>
+    <!-- Target btrfs -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-target-btrfs.qcow2'/>
+      <target dev='vde' bus='virtio'/>
+    </disk>
+    <!-- Target f2fs -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native'/>
+      <source file='/var/home/aenertia/awa/working/foxing/vms/images/fox-test-target-f2fs.qcow2'/>
+      <target dev='vdf' bus='virtio'/>
+    </disk>
+    <!-- Network -->
+    <interface type='network'>
+      <source network='foxing-net'/>
+      <mac address='52:54:00:FE:00:01'/>
+      <model type='virtio'/>
+    </interface>
+    <!-- Console -->
+    <serial type='pty'><target port='0'/></serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+    <!-- RNG for fast boot entropy -->
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>
