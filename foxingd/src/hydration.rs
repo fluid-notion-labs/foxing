@@ -24,7 +24,9 @@ pub struct HydrationJob {
 
 #[derive(Debug)]
 pub struct HydrationQueue {
-    pub sender: Sender<HydrationJob>,
+    /// Per-worker senders — round-robin distribution, no shared receiver mutex
+    senders: Vec<Sender<HydrationJob>>,
+    next_worker: AtomicUsize,
     pub pending_count: Arc<AtomicUsize>,
     pub shutdown: Arc<AtomicBool>,
     #[allow(dead_code)]
@@ -43,16 +45,17 @@ impl HydrationQueue {
     ) -> Self {
         let config_reader = futures::executor::block_on(config.read());
         let queue_capacity = config_reader.queue_max.min(constants::HYDRATION_QUEUE_CAPACITY);
+        let per_worker_capacity = (queue_capacity / worker_count).max(64);
         drop(config_reader);
 
-        let (tx, rx) = mpsc::channel(queue_capacity);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let tracker = Arc::new(DashMap::new());
         let pending_count = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let mut senders = Vec::with_capacity(worker_count);
 
         for id in 0..worker_count {
-            let rx_clone = rx.clone();
+            let (tx, rx) = mpsc::channel(per_worker_capacity);
+            senders.push(tx);
             let source_clone = source.clone();
             let config_clone = config.clone();
             let governor_clone = governor.clone();
@@ -60,10 +63,10 @@ impl HydrationQueue {
             let tracker_clone = tracker.clone();
             let pending_clone = pending_count.clone();
             let stats_senders_clone = stats_senders.clone();
-            
+
             scope.spawn(async move {
                 crate::hydration_worker::run_hydration_worker_loop(
-                    rx_clone, source_clone, config_clone, governor_clone,
+                    rx, source_clone, config_clone, governor_clone,
                     tuner_clone, worker_count, id, tracker_clone, pending_clone,
                     stats_senders_clone
                 ).await
@@ -71,7 +74,8 @@ impl HydrationQueue {
         }
 
         Self {
-            sender: tx,
+            senders,
+            next_worker: AtomicUsize::new(0),
             pending_count,
             shutdown,
             rename_failure_tracker: tracker
@@ -83,31 +87,31 @@ impl HydrationQueue {
     }
 
     pub fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig, inode: Option<u64>) {
-        if self.shutdown.load(Ordering::Relaxed) {
+        if self.shutdown.load(Ordering::Relaxed) || self.senders.is_empty() {
             return;
         }
 
         let job = HydrationJob { rel_path, target_cfg, inode };
         self.pending_count.fetch_add(1, Ordering::SeqCst);
 
-        // FIXED: Use blocking_send with a timeout/check loop to allow Ctrl+C to interrupt
-        // stalling caused by a full queue.
+        // Round-robin across per-worker channels
+        let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        let sender = &self.senders[worker_idx];
+
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 self.pending_count.fetch_sub(1, Ordering::SeqCst);
                 break;
             }
 
-            // Try to send without blocking first
-            match self.sender.try_send(job.clone()) {
+            match sender.try_send(job.clone()) {
                 Ok(_) => return,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Queue full, wait a bit and check shutdown flag again
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 },
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("Hydration Queue Dropped: Receiver closed");
+                    debug!("Hydration Queue Dropped: Worker {} receiver closed", worker_idx);
                     self.pending_count.fetch_sub(1, Ordering::SeqCst);
                     return;
                 }

@@ -744,7 +744,7 @@ impl Hydrator {
 }
 
 pub async fn run_hydration_worker_loop(
-    rx: Arc<tokio::sync::Mutex<Receiver<crate::hydration::HydrationJob>>>,
+    mut rx: Receiver<crate::hydration::HydrationJob>,
     source: Arc<SourceInfo>,
     config: SharedConfig,
     governor: Arc<Governor>,
@@ -814,6 +814,8 @@ pub async fn run_hydration_worker_loop(
         info!("Hydration Worker {}: Running in One-Shot Mode (Fast Sync). Per-file fsync disabled.", worker_id);
     }
 
+    let mut jobs_processed: u64 = 0;
+
     loop {
         // FIXED: Check for shutdown signal in worker loop
         if source.hydration.shutdown_requested.load(Ordering::Relaxed) {
@@ -866,26 +868,17 @@ pub async fn run_hydration_worker_loop(
         }
 
         if buffer_pool.get_ptr(0).is_none() {
-            error!("Hydration Worker Buffer Pool invalid or exhausted. Exiting loop.");
+            error!("Hydration Worker {}: Buffer Pool invalid or exhausted. Exiting loop.", worker_id);
             break;
         }
 
-        let job = {
-            let mut lock = rx.lock().await;
-            // Use try_recv loop to allow checking shutdown flag
-            loop {
-                if source.hydration.shutdown_requested.load(Ordering::Relaxed) {
-                    break None;
-                }
-                match lock.try_recv() {
-                    Ok(j) => break Some(j),
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        drop(lock);
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        lock = rx.lock().await;
-                    },
-                    Err(mpsc::error::TryRecvError::Disconnected) => break None,
-                }
+        // Simple recv — blocks until a job arrives or channel closes.
+        // Shutdown is handled by dropping the Sender (closes channel → recv returns None).
+        let job = match rx.recv().await {
+            Some(j) => Some(j),
+            None => {
+                info!("Hydration Worker {}: Channel closed. Processed {} jobs.", worker_id, jobs_processed);
+                None
             }
         };
 
@@ -914,12 +907,17 @@ pub async fn run_hydration_worker_loop(
                               worker_id, job.rel_path, job.target_cfg.path, e);
                     }
                 }
+                jobs_processed += 1;
                 pending_count.fetch_sub(1, Ordering::SeqCst);
             },
-            None => break,
+            None => {
+                info!("Hydration Worker {}: No more jobs (processed {} total). Exiting.", worker_id, jobs_processed);
+                break;
+            }
         }
     }
 
+    info!("Hydration Worker {}: Exited main loop after {} jobs.", worker_id, jobs_processed);
     let _ = ring.submitter().unregister_buffers();
     Ok(())
 }
