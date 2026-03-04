@@ -401,7 +401,8 @@ pub async fn run_worker(
             }
             
             _ = tune_interval.tick() => {
-                // Just wakes up to check tuning if no events
+                // Yield to other tasks when idle — prevents starving hydration workers
+                tokio::task::yield_now().await;
             }
 
             Some(evt) = event_rx.recv(), if coalescer.len() < 10000 => {
