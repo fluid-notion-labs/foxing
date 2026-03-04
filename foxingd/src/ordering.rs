@@ -301,6 +301,21 @@ impl Coalescer {
             self.accumulated_bytes += event.length;
         }
         self.batch.push(event);
+
+        // P3: Bounded frontier — IVI-inspired width limit
+        // If batch exceeds threshold, apply aggressive pruning to prevent unbounded growth
+        const FRONTIER_WIDTH_LIMIT: usize = 10_000;
+        if self.batch.len() > FRONTIER_WIDTH_LIMIT {
+            // Aggressive: prune ALL transient lifecycles (full batch, not just scan_depth)
+            self.prune_transient_lifecycles(self.batch.len());
+            // If still over limit after pruning, force-coalesce all contiguous writes
+            if self.batch.len() > FRONTIER_WIDTH_LIMIT {
+                while let Some(_) = self.batch.try_coalesce_head(self.batch.len(), u64::MAX) {
+                    if self.batch.len() <= FRONTIER_WIDTH_LIMIT { break; }
+                }
+            }
+        }
+
         metrics::ORDERING_BUF_SIZE.with_label_values(&["worker"]).set((self.batch.len() as i64) as f64);
     }
 

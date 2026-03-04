@@ -2,6 +2,54 @@ use crate::event::{Event, EventType};
 use std::sync::Arc;
 use crate::metrics;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
+
+/// SIMD-accelerated scan: find first index >= start where inodes[i] == target.
+/// Returns None if no match found within range.
+#[inline(always)]
+fn find_inode_match(inodes: &[u64], target: u64, start: usize, end: usize) -> Option<usize> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { find_inode_match_avx2(inodes, target, start, end) };
+        }
+    }
+    // Scalar fallback
+    for i in start..end {
+        if inodes[i] == target { return Some(i); }
+    }
+    None
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn find_inode_match_avx2(inodes: &[u64], target: u64, start: usize, end: usize) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let target_vec = _mm256_set1_epi64x(target as i64);
+    let mut i = start;
+
+    // Process 4 inodes per iteration
+    while i + 4 <= end {
+        let data = _mm256_loadu_si256(inodes[i..].as_ptr() as *const _);
+        let cmp = _mm256_cmpeq_epi64(data, target_vec);
+        let mask = _mm256_movemask_epi8(cmp);
+        if mask != 0 {
+            // Found a match — determine which lane
+            let lane = mask.trailing_zeros() / 8;
+            return Some(i + lane as usize);
+        }
+        i += 4;
+    }
+
+    // Scalar remainder
+    while i < end {
+        if inodes[i] == target { return Some(i); }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
 #[derive(Debug, Default)]
 pub struct EventBatch {
     pub inodes: Vec<u64>,
@@ -102,25 +150,32 @@ impl EventBatch {
         let indices_to_remove = &mut self.workspace;
         let mut merged_count = 0;
         let max_scan = len.min(scan_depth);
-        for i in 1..max_scan {
-            if merged_len >= limit { break; }
-            if self.inodes[i] != head_inode {
-                continue;
-            }
-            let t = self.types[i];
+        // SIMD-accelerated inode scan: skip non-matching inodes in chunks of 4
+        let mut search_start = 1;
+        while search_start < max_scan && merged_len < limit {
+            let match_idx = match find_inode_match(&self.inodes, head_inode, search_start, max_scan) {
+                Some(i) => i,
+                None => break, // No more matches in scan range
+            };
+
+            let t = self.types[match_idx];
             if t != EventType::Write && t != EventType::WriteRange {
+                search_start = match_idx + 1;
                 continue;
             }
-            if self.offsets[i] != current_end_offset {
+            if self.offsets[match_idx] != current_end_offset {
+                search_start = match_idx + 1;
                 continue;
             }
-            if &self.events[i].name != head_name {
+            if &self.events[match_idx].name != head_name {
+                search_start = match_idx + 1;
                 continue;
             }
-            merged_len += self.lengths[i];
-            current_end_offset += self.lengths[i];
-            indices_to_remove.push(i);
+            merged_len += self.lengths[match_idx];
+            current_end_offset += self.lengths[match_idx];
+            indices_to_remove.push(match_idx);
             merged_count += 1;
+            search_start = match_idx + 1;
         }
         if merged_count > 0 {
             for &i in indices_to_remove.iter().rev() {

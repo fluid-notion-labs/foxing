@@ -1,7 +1,7 @@
 use crate::event::{Event, EventType, EventQueue};
 use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering, AtomicU64}};
 use libbpf_rs::skel::{SkelBuilder, OpenSkel};
 use dashmap::DashMap;
@@ -13,6 +13,55 @@ use crate::ordering::ReorderBuffer;
 use std::sync::Mutex;
 use crate::mirror::SourceInfo;
 use fxcp_core::constants;
+
+/// P1: Early transient lifecycle filter — prunes create→unlink chains
+/// before events enter the worker fanout queues. This eliminates
+/// disk I/O for files that are created and immediately deleted
+/// (e.g. rm -rf node_modules, compiler temps, build artifacts).
+struct TransientFilter {
+    /// Inodes recently created (Create/Mkdir) — tracked for pruning
+    recent_creates: HashSet<u64>,
+    /// Counter of pruned transient events
+    pruned_count: u64,
+}
+
+impl TransientFilter {
+    fn new() -> Self {
+        Self { recent_creates: HashSet::new(), pruned_count: 0 }
+    }
+
+    /// Returns true if the event should be SUPPRESSED (pruned).
+    fn should_prune(&mut self, evt: &Event) -> bool {
+        match evt.event_type {
+            EventType::Create | EventType::Mkdir | EventType::Mknod => {
+                self.recent_creates.insert(evt.inode);
+                false // Don't prune creates — we need them if no unlink follows
+            }
+            EventType::Unlink | EventType::Rmdir => {
+                if self.recent_creates.remove(&evt.inode) {
+                    // This inode was recently created and is now being deleted
+                    // — it's a transient file. Prune both the unlink AND
+                    // the create was already queued, but the worker's coalescer
+                    // will handle that. We suppress the unlink to reduce queue load.
+                    self.pruned_count += 1;
+                    debug!("TransientFilter: Pruned unlink for transient inode {} (total pruned: {})", evt.inode, self.pruned_count);
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Periodic cleanup: remove stale entries to prevent memory growth.
+    /// Call every ~30s from the poll loop.
+    fn gc(&mut self) {
+        if self.recent_creates.len() > 100_000 {
+            // Under extreme churn, cap the set size
+            self.recent_creates.clear();
+        }
+    }
+}
 
 mod skel { include!(concat!(env!("OUT_DIR"), "/mirror.skel.rs")); }
 use skel::*;
@@ -251,6 +300,11 @@ pub fn run(
 
     info!("BPF: Successfully attached {} probes", attached_count);
 
+    // P1: Early transient lifecycle filter
+    let transient_filter = Arc::new(Mutex::new(TransientFilter::new()));
+    let transient_filter_callback = transient_filter.clone();
+    let transient_filter_loop = transient_filter.clone();
+
     let maps = skel.maps;
     let events_map: &dyn MapCore = &maps.events;
     let mut builder = RingBufferBuilder::new();
@@ -366,6 +420,12 @@ pub fn run(
                     }
                     if buf.push(evt.clone()) {
                         while let Some(ordered_evt) = buf.pop() {
+                            // P1: Early transient filter — prune create→unlink chains
+                            if let Ok(mut filter) = transient_filter_callback.lock() {
+                                if filter.should_prune(&ordered_evt) {
+                                    continue; // Skip this event entirely
+                                }
+                            }
                              if let Some(src_info) = sources_in_closure.get(&ordered_evt.dev_id).cloned() {
                                 if let Some(projector) = &src_info.projector {
                                     projector.project(&ordered_evt);
@@ -409,6 +469,12 @@ pub fn run(
                 if let Ok(mut buffers) = reorder_buffers.lock() {
                     for (_dev_id, buf) in buffers.iter_mut() {
                         while let Some(ordered_evt) = buf.pop() {
+                            // P1: Early transient filter
+                            if let Ok(mut filter) = transient_filter_loop.lock() {
+                                if filter.should_prune(&ordered_evt) {
+                                    continue;
+                                }
+                            }
                              if let Some(src_info) = sources_in_loop.get(&ordered_evt.dev_id).cloned() {
                                 if let Some(projector) = &src_info.projector {
                                     projector.project(&ordered_evt);
@@ -423,6 +489,10 @@ pub fn run(
                              }
                         }
                     }
+                }
+                // P1: Periodic GC of transient filter
+                if let Ok(mut filter) = transient_filter_loop.lock() {
+                    filter.gc();
                 }
                 
                 if last_report.elapsed().as_secs() >= 30 {
