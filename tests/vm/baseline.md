@@ -241,13 +241,21 @@ partial writes to non-existent target files → ENOENT → retry 10x → dropped
 | `tests/vm/verify-sync.sh` | Source↔target diff | File listing, SHA-256, size comparison |
 | `tests/vm/setup-adversarial.sh` | VM setup | NFS mount, config, perf/bcc-tools install |
 
+### Resolved Issues
+
+1. **Test harness convergence** — `get_copy_count()` now includes `events_repair_completed_total` (`95a2c51`)
+2. **offcputime/nfsslower** — Fixed binary names for Fedora (`/usr/share/bcc/tools/*`), added biolatency/runqlat (`95a2c51`)
+3. **Governor mutex contention** — Replaced `Mutex<f64>` with `AtomicU64`, zero parking_lot contention (`e0aa3b3`)
+4. **Dir Merkle tree pruning** — 556 files skipped, 9 dirs pruned on restart scan (`50eeaff`)
+5. **Hydration gate** — Proactive repair routing eliminates ENOENT→retry churn (`50eeaff`)
+6. **Dirty flag lifecycle** — Unconditional clear on success, hydration clears after copy (`50eeaff`)
+
 ### Remaining Work
 
-1. **Test harness convergence check** counts `copy_method_standard` but repair copies go through hydration path — not counted as convergence
-2. **Phase 3 (rename chains)** — renames for files not yet on NFS target fail; need rename-to-repair fallback
-3. **Phase 4 (NFS drop/resync)** — CircuitBreaker doesn't detect lazy unmount; sidecar resync needs work
-4. **Phase 6 (disk pressure)** — NFS share too large (22TB) for safe fill test; needs smaller test volume
-5. **offcputime/nfsslower** — not capturing data (may need kernel debuginfo or different bcc invocation)
+1. **Phase 3 (rename chains)** — renames for files not yet on NFS target fail; need rename-to-repair fallback
+2. **Phase 4 (NFS drop/resync)** — CircuitBreaker doesn't detect lazy unmount; sidecar resync needs work
+3. **Phase 6 (disk pressure)** — NFS share too large (22TB) for safe fill test; needs smaller test volume
+4. **Delta copy verification** — MerkleTree::diff()→copy_delta() wired but needs targeted test with large modified files
 
 ## Implementation Summary
 
@@ -271,3 +279,8 @@ partial writes to non-existent target files → ENOENT → retry 10x → dropped
 | Tuner zero-sample resilience | `0d4c680` | Forced Startup→Drain on ENOENT storms |
 | Cross-crate CopyErrorKind | `0d4c680` | Shared error classification (fxcp-core) |
 | Governor failure-rate signal | `0d4c680` | Stress boost when copies fail >50% |
+| Governor lock-free | `e0aa3b3` | AtomicU64 replaces Mutex<f64>, zero contention |
+| Dir Merkle tree pruning | `50eeaff` | BLAKE3 dir hashes skip subtrees (556 files→0 on restart) |
+| Chunk-level delta copy | `50eeaff` | MerkleTree::diff()→copy_delta() for files >1MB |
+| Hydration completion gate | `50eeaff` | hydrated_inodes DashSet, proactive repair routing |
+| Dirty flag lifecycle fix | `50eeaff` | Unconditional clear on success across all paths |

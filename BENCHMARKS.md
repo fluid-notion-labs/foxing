@@ -215,6 +215,47 @@ NFS target is healthy — the bottleneck is in foxingd's event processing, not N
 | Log warnings/errors | 15,074 | **4** | 99.97% noise reduction |
 | Retry queue at stall | 1,438 stuck | **0** | No backlog |
 
+### Fast Resume: Directory Merkle Tree Pruning (`50eeaff`)
+
+On daemon restart, `full_scan()` now checks directory-level BLAKE3 hashes before descending into subtrees. If a directory's hash matches the stored value on all targets and no children are dirty, the entire subtree is skipped.
+
+| Metric | Without Pruning | With Pruning | Improvement |
+|--------|----------------|-------------|:-----------:|
+| Files verified on restart | 556 | **0** | **100% skip** |
+| Directories pruned | 0 | **9** | Tree-level skip |
+| Scan method | Per-file BLAKE3 lite | Dir hash comparison | O(dirs) not O(files) |
+
+**How it works:**
+- `compute_dir_hash()` hashes `sorted(child_name : child_stat)` pairs via BLAKE3
+- 32-byte hash stored as xattr (`user.foxing.dir_hash`) on each TARGET directory
+- First scan: no stored hashes → full scan + store hashes
+- Subsequent scans: compare dir hashes, skip matching subtrees
+- Cascading: if parent matches, all descendants automatically pruned
+- Invalidation: any dirty child flag → dir hash considered stale
+
+### Chunk-Level Delta Copy (`50eeaff`)
+
+For files >1MB with stored Merkle signatures, `MerkleTree::diff()` identifies changed 64KB chunks and `SmartCopier::copy_delta()` copies only those ranges instead of the full file.
+
+| Step | Operation |
+|------|-----------|
+| 1 | Load target's stored `MerkleSignature` from xattr/sidecar |
+| 2 | Build source `MerkleTree` (BLAKE3 per 64KB chunk) |
+| 3 | Compare roots — if equal, skip entirely (zero I/O) |
+| 4 | `diff()` → `Vec<DirtyRange>` of changed chunks |
+| 5 | If dirty bytes <50% of file → `copy_delta()` (partial copy) |
+| 6 | Store updated Merkle signature for next delta |
+
+Merkle signatures stored after every full copy, seeding future delta operations.
+
+### Hydration Completion Gate (`50eeaff`)
+
+Proactive routing of BPF events for unhydrated files directly to repair, eliminating the ENOENT→retry→repair churn:
+
+- `hydrated_inodes: DashSet<u64>` tracks files successfully copied to target
+- Worker checks gate before attempting write: if inode not hydrated AND target doesn't exist → route to repair immediately
+- 30s grace period cleanup after hydration completes
+
 ### Stall Diagnostics (perf + bcc-tools)
 
 The adversarial test includes automatic stall diagnosis via `diagnose-stall.sh`:
