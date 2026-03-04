@@ -982,20 +982,13 @@ pub async fn process_hydration_job(
     let mut current_source_path = source.mount.join(&rel_path);
     let mut current_target_path = target_cfg.path.join(&rel_path);
 
+    // Identity resolution: inline (DashMap lookup, no spawn_blocking needed)
     if inode != 0 {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let source_clone = source.clone();
-        
-        spawn_blocking(move || {
-            let res = identity::resolve_and_update_path(&source_clone, inode, 0, 0, 0);
-            let _ = tx.send(res);
-        });
-
-        if let Ok(Ok(new_full_path)) = rx.await.map_err(|e| FoxingError::Io(std::io::Error::new(ErrorKind::BrokenPipe, format!("Oneshot RecvError during path resolution: {}", e)))) {
+        if let Ok(new_full_path) = identity::resolve_and_update_path(source, inode, 0, 0, 0) {
             let new_abs_path = source.mount.join(&new_full_path);
             if new_abs_path != current_source_path {
                 if let Ok(new_rel) = new_abs_path.strip_prefix(&source.mount) {
-                    info!("Hydration Recovery: Path updated for inode {} from {:?} to {:?}.", inode, current_source_path, new_abs_path);
+                    debug!("Hydration: Path updated for inode {} from {:?} to {:?}.", inode, current_source_path, new_abs_path);
                     rel_path = new_rel.to_path_buf();
                     current_source_path = new_abs_path;
                     current_target_path = target_cfg.path.join(&rel_path);
@@ -1015,6 +1008,9 @@ pub async fn process_hydration_job(
         tokio::task::yield_now().await;
     }
 
+    // Small file threshold: files below this use std::fs::copy (no io_uring overhead)
+    const HYDRATION_SMALL_FILE_THRESHOLD: u64 = 256 * 1024; // 256KB
+
     let mut attempts = 0;
     let max_attempts = constants::HYDRATION_COPY_MAX_ATTEMPTS;
     let mut success = false;
@@ -1026,72 +1022,108 @@ pub async fn process_hydration_job(
         }
 
         attempts += 1;
-        
-        let file_size_res = tokio::fs::metadata(&current_source_path).await.map_err(FoxingError::Io);
-        
-        let copy_result: Result<Option<CopyStats>> = match file_size_res {
-            Ok(metadata) => {
-                if metadata.is_dir() {
-                    if !current_target_path.exists() {
-                        let _ = fs::create_dir_all(&current_target_path);
+
+        // Use synchronous stat — avoids tokio::fs::metadata spawn_blocking overhead
+        let metadata = match std::fs::metadata(&current_source_path) {
+            Ok(m) => m,
+            Err(e) => {
+                if attempts >= max_attempts {
+                    return Err(FoxingError::Io(e));
+                }
+                continue;
+            }
+        };
+
+        if metadata.is_dir() {
+            if !current_target_path.exists() {
+                let _ = fs::create_dir_all(&current_target_path);
+            }
+            return Ok(None);
+        }
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+
+        let file_size = metadata.len();
+
+        // --- Fast path: small files use std::fs::copy (no io_uring overhead) ---
+        let copy_result: Result<Option<CopyStats>> = if file_size <= HYDRATION_SMALL_FILE_THRESHOLD {
+            // Ensure parent directory exists
+            if let Some(parent) = current_target_path.parent() {
+                if !parent.exists() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+
+            match std::fs::copy(&current_source_path, &current_target_path) {
+                Ok(bytes) => {
+                    // Apply permissions directly (no spawn_blocking)
+                    let _ = std::fs::set_permissions(&current_target_path, metadata.permissions());
+                    // Preserve timestamps
+                    let times = [
+                        libc::timespec { tv_sec: metadata.atime(), tv_nsec: metadata.atime_nsec() },
+                        libc::timespec { tv_sec: metadata.mtime(), tv_nsec: metadata.mtime_nsec() },
+                    ];
+                    if let Ok(cstr) = std::ffi::CString::new(current_target_path.as_os_str().as_encoded_bytes()) {
+                        unsafe { libc::utimensat(libc::AT_FDCWD, cstr.as_ptr(), times.as_ptr(), 0) };
                     }
-                    return Ok(None);
+                    Ok(Some(CopyStats { bytes_processed: bytes, bytes_zeros: 0, io_duration: std::time::Duration::ZERO, ops_count: 1 }))
                 }
-                if !metadata.is_file() {
-                     return Ok(None);
-                }
-                
-                let file_size = metadata.len();
-                
-                SmartCopier::copy_with_limit(
-                    &current_source_path,
-                    &current_target_path,
-                    ring,
-                    buffer_pool,
-                    None,
-                    async_fd.clone(),
-                    target_cfg.vdo_optimization,
-                    0,
-                    file_size,
-                    direct_io_ok,
-                    file_size,
-                    source_caps,
-                    &target_caps,
-                    target_cfg.vdo_stall_threshold,
-                    target_cfg.source_uncached,
-                    target_cfg.target_uncached,
-                    &None,
-                    Some(governor.clone()),
-                    target_cfg.path.to_string_lossy().to_string(),
-                    fsync_tracker,
-                    buffer_limit,
-                    skip_fsync
-                ).await.map(Some).map_err(FoxingError::from)
-            },
-            Err(e) => Err(e),
+                Err(e) => Err(FoxingError::Io(e)),
+            }
+        } else {
+            // --- Standard path: large files use io_uring for throughput ---
+            SmartCopier::copy_with_limit(
+                &current_source_path,
+                &current_target_path,
+                ring,
+                buffer_pool,
+                None,
+                async_fd.clone(),
+                target_cfg.vdo_optimization,
+                0,
+                file_size,
+                direct_io_ok,
+                file_size,
+                source_caps,
+                &target_caps,
+                target_cfg.vdo_stall_threshold,
+                target_cfg.source_uncached,
+                target_cfg.target_uncached,
+                &None,
+                Some(governor.clone()),
+                target_cfg.path.to_string_lossy().to_string(),
+                fsync_tracker,
+                buffer_limit,
+                skip_fsync
+            ).await.map(Some).map_err(FoxingError::from)
         };
 
         match copy_result {
             Ok(Some(stats)) => {
                 crate::metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
-                
-                let src_path_clone = current_source_path.clone();
-                let dst_path_clone = current_target_path.clone();
-                
-                let metadata_result: std::result::Result<(), FoxingError> = spawn_blocking(move || {
-                    security::sync_xattrs(&src_path_clone, &dst_path_clone);
-                    security::apply_metadata(&src_path_clone, &dst_path_clone)
-                }).await
-                .map_err(FoxingError::Join)
-                .and_then(|inner| inner.map_err(Into::into));
 
-                if metadata_result.is_err() {
-                    warn!("Hydration: Failed to apply metadata/clear state for {:?}. Retrying.", current_target_path);
-                } else {
-                    success = true;
-                    final_stats = Some(stats);
-                    source.hydration.synced.fetch_add(1, Ordering::Relaxed);
+                // Metadata sync: inline for small files (already done above), spawn_blocking for large
+                if file_size > HYDRATION_SMALL_FILE_THRESHOLD {
+                    let src_path_clone = current_source_path.clone();
+                    let dst_path_clone = current_target_path.clone();
+
+                    let metadata_result: std::result::Result<(), FoxingError> = spawn_blocking(move || {
+                        security::sync_xattrs(&src_path_clone, &dst_path_clone);
+                        security::apply_metadata(&src_path_clone, &dst_path_clone)
+                    }).await
+                    .map_err(FoxingError::Join)
+                    .and_then(|inner| inner.map_err(Into::into));
+
+                    if metadata_result.is_err() {
+                        warn!("Hydration: Failed to apply metadata for {:?}. Retrying.", current_target_path);
+                        continue; // retry
+                    }
                 }
+
+                success = true;
+                final_stats = Some(stats);
+                source.hydration.synced.fetch_add(1, Ordering::Relaxed);
             },
             Ok(None) => {
                 success = true;
