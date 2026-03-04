@@ -262,6 +262,28 @@ pub fn get_sync_signature(path: &Path) -> Option<SyncSignature> {
         .and_then(|bytes| SyncSignature::deserialize(&bytes))
 }
 
+/// Store a directory-level Merkle hash on the target directory.
+pub fn set_dir_hash(path: &Path, hash: &[u8; 32]) -> std::io::Result<()> {
+    set_metadata(path, "dir_hash", hash)
+}
+
+/// Retrieve a stored directory hash from the target directory.
+pub fn get_dir_hash(path: &Path) -> Option<[u8; 32]> {
+    let bytes = get_metadata(path, "dir_hash")?;
+    if bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    } else {
+        None
+    }
+}
+
+/// Clear a stored directory hash (invalidation).
+pub fn clear_dir_hash(path: &Path) -> std::io::Result<()> {
+    remove_metadata(path, "dir_hash")
+}
+
 pub fn set_merkle_signature(path: &Path, sig: &hashing::MerkleSignature) -> std::io::Result<()> {
     let data = bincode::serialize(sig)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

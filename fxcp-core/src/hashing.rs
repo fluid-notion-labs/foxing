@@ -93,6 +93,20 @@ pub fn verify_incremental(src: &Path, dst: &Path, size: u64) -> Result<bool> {
     Ok(src_hash == dst_hash)
 }
 
+/// Compute a directory hash from sorted child (name, hash) pairs.
+/// Uses BLAKE3 over concatenation of sorted `name:hash` entries.
+/// Provides a stable, order-independent directory fingerprint.
+pub fn compute_dir_hash(children: &mut Vec<(String, [u8; 32])>) -> [u8; 32] {
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Hasher::new();
+    for (name, hash) in children.iter() {
+        hasher.update(name.as_bytes());
+        hasher.update(b":");
+        hasher.update(hash);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // Merkle Tree Engine — BLAKE3 chunk-level delta detection
 // ---------------------------------------------------------------------------

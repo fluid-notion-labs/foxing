@@ -717,6 +717,22 @@ async fn process_single_event_with_wal(
         }
     }
 
+    // Hydration gate: during initial sync, proactively route events for
+    // unhydrated files to repair instead of attempting (and failing) partial writes
+    if source.hydration.active.load(std::sync::atomic::Ordering::Relaxed)
+        && !source.hydrated_inodes.contains(&event.inode)
+        && matches!(event.event_type,
+            EventType::Write | EventType::WriteRange | EventType::Clone
+            | EventType::Truncate | EventType::Fallocate)
+    {
+        if !target_path.exists() {
+            let abs_path = source.path.join(&event.name);
+            hydration_tx.send_repair_job(abs_path, Some(event.inode)).await;
+            metrics::HYDRATION_GATE_REDIRECTED.inc();
+            return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+        }
+    }
+
     let op_stats = CopyStats::default();
     let mut op_result: Result<CopyStats> = Ok(op_stats);
 
@@ -1156,12 +1172,18 @@ async fn process_single_event_with_wal(
         }).await;
     }
 
-    if dirty_tracker.contains(&event.inode) {
-        let p = target_path.clone();
-        let _ = spawn_blocking(move || {
-            fxcp_core::sidecar::remove_metadata(&p, "user.foxing.dirty")
-        }).await;
+    // Clear dirty flag on successful data operations — catches flags from
+    // any source (hydration, previous sessions, external processes)
+    if op_result.is_ok() && matches!(event.event_type,
+        EventType::Write | EventType::WriteRange | EventType::Clone
+        | EventType::Truncate | EventType::Fallocate
+        | EventType::Create | EventType::Mkdir)
+    {
+        sidecar.clear_dirty(target_path.clone());
         dirty_tracker.remove(&event.inode);
+    } else if dirty_tracker.contains(&event.inode) {
+        // Failed op but we set dirty earlier in this session — leave the xattr
+        // so next attempt knows it's still dirty, but keep tracker in sync
     }
 
     drop(op_guard);

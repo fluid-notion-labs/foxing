@@ -222,6 +222,14 @@ lazy_static! {
         "foxing_hydration_hash_skipped",
         "Files skipped during hydration because size/mtime matched"
     ).unwrap();
+    pub static ref HYDRATION_DIR_PRUNED: Counter = register_counter!(
+        "foxing_hydration_dir_pruned_total",
+        "Directories skipped by tree-level Merkle hash pruning"
+    ).unwrap();
+    pub static ref HYDRATION_GATE_REDIRECTED: Counter = register_counter!(
+        "foxing_hydration_gate_redirected_total",
+        "Events proactively rerouted to repair by hydration gate"
+    ).unwrap();
 
     // --- [foxingd] Capacity ---
     pub static ref TARGET_CAPACITY_BYTES_TOTAL: GaugeVec = register_gauge_vec!(
@@ -233,6 +241,22 @@ lazy_static! {
         "foxing_target_capacity_bytes_available",
         "Available capacity of target filesystem",
         &["target"]
+    ).unwrap();
+}
+
+lazy_static! {
+    // --- [foxingd] Delta Copy (Merkle diff) ---
+    pub static ref DELTA_COPY_ATTEMPTED: Counter = register_counter!(
+        "foxing_delta_copy_attempted_total",
+        "Delta copy attempts using Merkle diff"
+    ).unwrap();
+    pub static ref DELTA_COPY_BYTES_SAVED: Counter = register_counter!(
+        "foxing_delta_copy_bytes_saved_total",
+        "Bytes avoided by delta copy vs full copy"
+    ).unwrap();
+    pub static ref DELTA_COPY_FELL_THROUGH: Counter = register_counter!(
+        "foxing_delta_copy_fell_through_total",
+        "Delta attempts that fell back to full copy"
     ).unwrap();
 }
 

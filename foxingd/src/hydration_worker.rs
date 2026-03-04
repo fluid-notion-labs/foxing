@@ -15,7 +15,7 @@ use crate::error::FoxingError;
 use crate::identity::{self};
 use std::os::unix::io::AsRawFd;
 use tokio::sync::{mpsc};
-use std::collections::{HashMap};
+use std::collections::{HashMap, HashSet};
 use fxcp_core::consistency::SerializationEngine;
 use fxcp_core::sidecar;
 use std::fs::OpenOptions;
@@ -190,6 +190,50 @@ impl Hydrator {
         }
     }
 
+    /// Check if any immediate child in a target directory has a dirty flag.
+    fn any_child_dirty(target_dir: &Path) -> bool {
+        if let Ok(entries) = std::fs::read_dir(target_dir) {
+            for entry in entries.flatten() {
+                if fxcp_core::sidecar::is_dirty(&entry.path()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Compute the current directory hash from immediate children's stat signatures.
+    /// Uses size + mtime + type as per-child input — fast (stat-only, no file I/O).
+    fn compute_current_dir_hash(src_dir: &Path) -> Option<[u8; 32]> {
+        let entries = std::fs::read_dir(src_dir).ok()?;
+        let mut children: Vec<(String, [u8; 32])> = Vec::new();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip sidecar files
+            if name.starts_with('.') && name.ends_with(".foxing_meta") { continue; }
+            // Skip foxing internal files
+            if name.starts_with(".foxing") { continue; }
+
+            let path = entry.path();
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&meta.len().to_le_bytes());
+                hasher.update(&meta.mtime().to_le_bytes());
+                hasher.update(&meta.mtime_nsec().to_le_bytes());
+                if meta.is_dir() {
+                    hasher.update(b"d");
+                } else {
+                    hasher.update(b"f");
+                }
+                children.push((name, *hasher.finalize().as_bytes()));
+            }
+        }
+
+        if children.is_empty() { return None; }
+        Some(fxcp_core::hashing::compute_dir_hash(&mut children))
+    }
+
     pub fn full_scan(&self, enable_watching: bool) {
         self.source.hydration.active.store(true, Ordering::SeqCst);
         info!("Hydration: Starting full scan for {:?} (Mode: {:?}, Enable Watch: {})", 
@@ -289,9 +333,77 @@ impl Hydrator {
             return;
         }
 
-        info!("Hydration: Pre-computing signatures for {} files...", files.len());
-        
-        let verification_results: Vec<(PathBuf, TargetConfig, u64)> = files
+        // --- Tree pruning: skip directories whose hash matches on all targets ---
+        let mut pruned_dirs: HashSet<PathBuf> = HashSet::new();
+
+        for (src_dir, rel_dir) in &dir_mappings {
+            // Skip root directory (always scan)
+            if rel_dir.as_os_str().is_empty() { continue; }
+
+            // Check if parent is already pruned (cascade)
+            if let Some(parent) = rel_dir.parent() {
+                if pruned_dirs.contains(parent) {
+                    pruned_dirs.insert(rel_dir.clone());
+                    continue;
+                }
+            }
+
+            // Compute current source dir hash from stat metadata
+            let src_hash = match Self::compute_current_dir_hash(src_dir) {
+                Some(h) => h,
+                None => continue, // Empty or unreadable — don't prune
+            };
+
+            // Check against all targets
+            let mut all_match = true;
+            for target in targets_ref {
+                let target_dir = target.path.join(rel_dir);
+
+                // If target dir doesn't exist, can't prune
+                if !target_dir.exists() { all_match = false; break; }
+
+                // If any child has a dirty flag, can't prune
+                if Self::any_child_dirty(&target_dir) { all_match = false; break; }
+
+                // Compare stored hash
+                match sidecar::get_dir_hash(&target_dir) {
+                    Some(stored) if stored == src_hash => { /* match — continue checking */ },
+                    _ => { all_match = false; break; }
+                }
+            }
+
+            if all_match {
+                pruned_dirs.insert(rel_dir.clone());
+                metrics::HYDRATION_DIR_PRUNED.inc();
+            }
+        }
+
+        let pruned_count = pruned_dirs.len();
+        if pruned_count > 0 {
+            info!("Hydration: Pruned {} directories via Merkle hash match", pruned_count);
+        }
+
+        // Filter out files in pruned directories
+        let files_to_check: Vec<&PathBuf> = files.iter().filter(|file_path| {
+            if let Ok(rel) = file_path.strip_prefix(source_path)
+                .or_else(|_| file_path.strip_prefix(source_mount)) {
+                // Check if any ancestor directory was pruned
+                let mut current = rel.to_path_buf();
+                while let Some(parent) = current.parent() {
+                    if pruned_dirs.contains(parent) {
+                        return false; // Skip — ancestor was pruned
+                    }
+                    if parent.as_os_str().is_empty() { break; }
+                    current = parent.to_path_buf();
+                }
+            }
+            true // Not pruned — include
+        }).collect();
+
+        info!("Hydration: Pre-computing signatures for {} files ({} skipped by tree pruning)...",
+              files_to_check.len(), files.len() - files_to_check.len());
+
+        let verification_results: Vec<(PathBuf, TargetConfig, u64)> = files_to_check
             .par_iter()
             .flat_map(|path| {
                 if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) { return Vec::new(); }
@@ -319,6 +431,8 @@ impl Hydrator {
                         },
                         Ok(false) => {
                             crate::metrics::HYDRATION_HASH_SKIPPED.inc();
+                            // Already synced — register as hydrated
+                            self.source.hydrated_inodes.insert(ino);
                         },
                         Err(e) => {
                             warn!("Hydration: Verification failed for {:?}: {}. Queuing for retry/copy.", path, e);
@@ -373,9 +487,30 @@ impl Hydrator {
         info!("Hydration: Submitted {} jobs to bulk queue", submitted_count);
         self.flush_buffer(job_buffer);
 
+        // Store dir hashes on targets for future pruning
+        for (src_dir, rel_dir) in &dir_mappings {
+            if pruned_dirs.contains(rel_dir) { continue; } // Already stored
+            if let Some(hash) = Self::compute_current_dir_hash(src_dir) {
+                for target in targets_ref {
+                    let target_dir = target.path.join(rel_dir);
+                    if target_dir.exists() {
+                        let _ = sidecar::set_dir_hash(&target_dir, &hash);
+                    }
+                }
+            }
+        }
+
         self.source.hydration.active.store(false, Ordering::SeqCst);
         info!("Hydration: Full scan complete for {:?}", self.source.path);
-        
+
+        // Clear hydrated_inodes after grace period to free memory
+        let source_cleanup = self.source.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            source_cleanup.hydrated_inodes.clear();
+            debug!("Hydration gate: cleared hydrated_inodes set");
+        });
+
         if !self.source.hydration.shutdown_requested.load(Ordering::Relaxed) {
             self.start_watcher_if_needed(enable_watching);
         }
@@ -1050,6 +1185,91 @@ pub async fn process_hydration_job(
 
         let file_size = metadata.len();
 
+        const MERKLE_DELTA_THRESHOLD: u64 = 1024 * 1024; // 1MB
+
+        // --- Delta copy path: use Merkle diff for large files with stored signatures ---
+        if file_size > MERKLE_DELTA_THRESHOLD {
+            if let Some(target_merkle_sig) = fxcp_core::sidecar::get_merkle_signature(&current_target_path) {
+                // Build source Merkle tree
+                let src_clone = current_source_path.clone();
+                let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
+
+                let src_tree_result = tokio::task::spawn_blocking(move || {
+                    fxcp_core::hashing::MerkleTree::from_file(&src_clone, chunk_size)
+                }).await;
+
+                if let Ok(Ok(src_tree)) = src_tree_result {
+                    // Reconstruct target tree from stored signature
+                    if let Some(tgt_tree) = fxcp_core::hashing::MerkleTree::from_signature(&target_merkle_sig) {
+                        // Fast root comparison — skip if identical
+                        if src_tree.root == tgt_tree.root {
+                            debug!("Hydration: Delta skip — Merkle roots match for {:?}", current_target_path);
+                            return Ok(Some(CopyStats { bytes_processed: 0, bytes_zeros: 0, io_duration: std::time::Duration::ZERO, ops_count: 0 }));
+                        }
+
+                        let dirty_ranges = fxcp_core::hashing::MerkleTree::diff(&src_tree, &tgt_tree);
+                        let total_dirty_bytes: u64 = dirty_ranges.iter().map(|r| r.length).sum();
+
+                        // Only use delta if it saves >=50% of data transfer
+                        if !dirty_ranges.is_empty() && total_dirty_bytes < file_size / 2 {
+                            debug!("Hydration: Delta copy — {}/{} bytes dirty for {:?}",
+                                   total_dirty_bytes, file_size, current_target_path);
+
+                            let mut smart_copier = SmartCopier {
+                                ring: std::mem::replace(ring, io_uring::IoUring::new(64).expect("io_uring fallback")),
+                                buffer_pool: std::mem::replace(buffer_pool, BufferPool::new(1, 4096, 4096).expect("placeholder BufferPool")),
+                                atomic_buffer_pool: None,
+                                async_fd: async_fd.clone(),
+                                vdo_opt: target_cfg.vdo_optimization,
+                                direct_io_ok,
+                                source_caps: source_caps.clone(),
+                                target_caps: target_caps.clone(),
+                                vdo_stall_threshold: target_cfg.vdo_stall_threshold,
+                                barrier_callback: None,
+                                source_uncached: target_cfg.source_uncached,
+                                target_uncached: target_cfg.target_uncached,
+                                governor: Some(governor.clone()),
+                                fsync_tracker: std::mem::take(fsync_tracker),
+                                skip_fsync,
+                            };
+
+                            let delta_result = smart_copier.copy_delta(
+                                &current_source_path, &current_target_path,
+                                &dirty_ranges, file_size, &target_cfg.label.to_string()
+                            ).await;
+
+                            // Restore ring, buffer_pool, fsync_tracker
+                            *ring = smart_copier.ring;
+                            *buffer_pool = smart_copier.buffer_pool;
+                            *fsync_tracker = smart_copier.fsync_tracker;
+
+                            match delta_result {
+                                Ok(stats) => {
+                                    // Store updated Merkle signature
+                                    let new_sig = src_tree.to_signature();
+                                    let dst_clone = current_target_path.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        fxcp_core::sidecar::set_merkle_signature(&dst_clone, &new_sig)
+                                    }).await;
+
+                                    metrics::DELTA_COPY_ATTEMPTED.inc();
+                                    metrics::DELTA_COPY_BYTES_SAVED.inc_by((file_size - total_dirty_bytes) as f64);
+                                    return Ok(Some(stats));
+                                },
+                                Err(e) => {
+                                    warn!("Hydration: Delta copy failed for {:?}: {}. Falling back to full copy.", current_target_path, e);
+                                    metrics::DELTA_COPY_FELL_THROUGH.inc();
+                                    // Fall through to full copy
+                                }
+                            }
+                        } else {
+                            metrics::DELTA_COPY_FELL_THROUGH.inc();
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Fast path: small files use std::fs::copy (no io_uring overhead) ---
         let copy_result: Result<Option<CopyStats>> = if file_size <= HYDRATION_SMALL_FILE_THRESHOLD {
             // Ensure parent directory exists
@@ -1163,9 +1383,26 @@ pub async fn process_hydration_job(
                     }
                 }
 
+                // Store Merkle signature for future delta copies
+                if file_size > MERKLE_DELTA_THRESHOLD {
+                    let src_clone = current_source_path.clone();
+                    let dst_clone = current_target_path.clone();
+                    let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(tree) = fxcp_core::hashing::MerkleTree::from_file(&src_clone, chunk_size) {
+                            let sig = tree.to_signature();
+                            let _ = fxcp_core::sidecar::set_merkle_signature(&dst_clone, &sig);
+                        }
+                    }).await;
+                }
+
                 success = true;
                 final_stats = Some(stats);
                 source.hydration.synced.fetch_add(1, Ordering::Relaxed);
+                // Register as hydrated for the gate check
+                if inode != 0 {
+                    source.hydrated_inodes.insert(inode);
+                }
             },
             Ok(None) => {
                 success = true;
@@ -1211,6 +1448,12 @@ pub async fn process_hydration_job(
     if !success {
         return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hydration job failed repeated attempts")));
     }
+
+    // Clear any pre-existing dirty flag after successful hydration
+    let dst_for_dirty = current_target_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        sidecar::set_dirty_flag(&dst_for_dirty, false, "hydration_complete")
+    }).await;
 
     Ok(final_stats)
 }
