@@ -166,6 +166,97 @@ fxcp vs rsync ratio across development phases (cold copy, >1.0 = fxcp faster):
 
 The ratios vary between runs due to system load and btrfs CoW variance. The key takeaway: fxcp is dramatically faster for large files and sparse data (reflink), competitive on small files, and occasionally slower on trivial workloads (deep_tree with only 50 files) where startup overhead dominates.
 
+## foxingd Adversarial Testing (XFS→NFS, koero VM)
+
+**Date:** 2026-03-05
+**VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
+**Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
+**Target:** `/mnt/target-nfs` (NFS 4.2 → awa.3d.ae.net.nz, HDD-backed 32TB)
+**Config:** Single source → single NFS target, profile=NFS, 4 workers
+
+### Baseline NFS Throughput
+
+| Tool | 111 files (60MB) | Throughput |
+|------|-----------------|-----------|
+| cp | 325ms | **184 MB/s** |
+| rsync | N/A (not installed) | — |
+
+NFS target is healthy — the bottleneck is in foxingd's event processing, not NFS I/O.
+
+### Adversarial Test Phases
+
+| Phase | Test | Duration | Result | Key Signal |
+|-------|------|----------|--------|------------|
+| 0 | Baseline cp/rsync | 1-2s | PASS | cp=184-221 MB/s |
+| 1 | Heavy Hydration (5000 files, 2.8GB) | 80-86s | FAIL→fixed | ENOENT→repair path |
+| 2 | Live Write Storm (fio randwrite 30s) | 38-52s | PASS | Coalescer under back-pressure |
+| 3 | Rename Chain Storm (100 chains a→e) | 37-51s | FAIL | Rename ordering on NFS |
+| 4 | NFS Target Drop + Resync | 77-105s | FAIL | CircuitBreaker + sidecar resync |
+| 5 | Large File Kill/Resume (100MB) | 25s | PASS | Dirty flag resume |
+| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
+
+### Critical Bug Found and Fixed: ENOENT Data Loss
+
+**Bug:** BPF events arrive for files not yet hydrated to the NFS target. Workers attempt partial writes to non-existent target files → ENOENT → retry 10x → event permanently dropped.
+
+**Root cause:** No synchronization between hydration (background) and BPF event dispatch (immediate). The repair channel existed but was broken — workers sent relative paths, consumer expected absolute; and only routed to the first target.
+
+**Fix (`0d4c680`):** ErrorClass dispatch in worker select loop:
+- `TargetNotFound` → route to hydration repair (full file copy) instead of retry
+- `SourceNotFound` → skip (transient lifecycle, file already deleted)
+- `Transient` → retry with backoff (existing behavior)
+- `Permanent` → drop with error log
+
+| Metric | Before Fix | After Fix | Improvement |
+|--------|-----------|----------|:-----------:|
+| Events dropped | 1,437 | **0** | No data loss |
+| Repair jobs completed | 0 | **545** | Repair path working |
+| Source-gone events skipped | 0 | **984** | Correct classification |
+| Log warnings/errors | 15,074 | **4** | 99.97% noise reduction |
+| Retry queue at stall | 1,438 stuck | **0** | No backlog |
+
+### Stall Diagnostics (perf + bcc-tools)
+
+The adversarial test includes automatic stall diagnosis via `diagnose-stall.sh`:
+
+| Diagnostic | Tool | Finding |
+|------------|------|---------|
+| Thread state | `/proc/PID/task/*/wchan` | 34/50 threads in `futex_do_wait` (tokio parked) |
+| io_uring workers | wchan | 6 threads in `io_wq_worker` (idle) |
+| Context switches | `perf stat` | 68,514/5s (high but no useful work) |
+| NFS operations | `nfsslower` | 0 slow ops (workers not reaching NFS) |
+| Copy progress | metrics delta | `copy_method_standard` delta = 0 over 5s |
+
+### foxingd Metrics (Prometheus, port 9100)
+
+New stall detection and repair metrics added:
+
+| Metric | Type | Purpose |
+|--------|------|---------|
+| `foxing_worker_copy_in_flight` | Gauge | Active copy ops per worker (0 = stalled) |
+| `foxing_worker_last_copy_epoch_ms` | Gauge | Last successful copy timestamp |
+| `foxing_hydration_worker_blocked_ms_total` | Counter | Time in blocking I/O |
+| `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
+| `foxing_events_repair_queued_total` | Counter | ENOENT → repair job |
+| `foxing_events_repair_completed_total` | Counter | Successful repairs |
+| `foxing_events_repair_failed_total` | Counter | Failed repairs |
+| `foxing_events_source_gone_total` | Counter | Source file vanished (skip) |
+
+### Running the Adversarial Suite
+
+```bash
+# Setup (installs perf, bcc-tools, mounts NFS)
+ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/setup-adversarial.sh'
+
+# Run all phases
+ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/adversarial.sh'
+
+# Run single phase
+ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/adversarial.sh --phase 1'
+```
+
+Auto-generates markdown report with per-phase results, diagnostic captures, and metrics snapshots.
+
 ## Discussion
 
 ### Where fxcp Wins

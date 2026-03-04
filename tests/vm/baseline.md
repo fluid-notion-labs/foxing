@@ -168,6 +168,87 @@ Large files (>256KB) still use SmartCopier for io_uring throughput and sparse ha
 | Hydration (555 files × 4 targets) | <30s, 0% CPU | <30s, 0% CPU | No regression |
 | Local harness | 10 pass, 6 fail | 10 pass, 6 fail | No regression |
 
+## Adversarial XFS→NFS Testing (2026-03-05)
+
+**Commit:** `0d4c680` — ENOENT fallback + cross-crate error handling refactor
+**Source:** `/mnt/source` (XFS, NVMe-backed virtio-blk)
+**Target:** `/mnt/target-nfs` (NFS 4.2 → awa.3d.ae.net.nz, HDD-backed 32TB)
+**Config:** Single source → NFS target, profile=NFS, 4 workers, initial_sync=true
+**Test:** `tests/vm/adversarial.sh` (7 phases + auto-diagnostics)
+
+### Critical Bug: ENOENT Data Loss Path
+
+BPF events arrive for files not yet hydrated to the NFS target. Workers attempt
+partial writes to non-existent target files → ENOENT → retry 10x → dropped.
+
+**Root cause chain:**
+1. `manager.start()` spawns hydration in background thread (NOT awaited)
+2. BPF thread starts immediately with live event queues
+3. Events dispatched to workers during 51-second hydration scan
+4. First worker error occurs 559ms BEFORE hydration completes
+5. `RetryQueue` treats all errors identically — 10x exponential backoff → drop
+6. `HydrationSender.send_repair_job()` existed but was broken:
+   - Worker sent relative paths, consumer expected absolute
+   - `mirror.rs:396` only routed to first target (`.iter().next()`)
+
+**Fix:** ErrorClass dispatch replaces generic retry:
+- `TargetNotFound` → hydration repair job (full file copy from source)
+- `SourceNotFound` → skip (transient lifecycle)
+- `Transient` → retry with backoff
+- `Permanent` → drop with error log
+
+**Results:**
+
+| Metric | Before Fix | After Fix |
+|--------|-----------|----------|
+| Events dropped | 1,437 | **0** |
+| Repair jobs completed | 0 | **545** |
+| Source-gone skipped | 0 | **984** |
+| Log warnings/errors | 15,074 | **4** |
+| Retry queue at stall | 1,438 stuck | **0** |
+
+### Additional Fixes in `0d4c680`
+
+| Fix | Impact |
+|-----|--------|
+| Copy timeouts (adaptive 60-300s) | All 6 op types: Clone, Write, Rename, RenameIncomplete, Truncate, Fallocate |
+| Hydration `spawn_blocking` | `std::fs::copy` no longer blocks tokio runtime on NFS |
+| Retry batch drain `pop_ready_batch(16)` | 16x faster drain: 72s → ~5s for 1438 events |
+| Coalescer pressure flush | Force-flush when retry_queue > 100 |
+| Shutdown 10s timeout + SIGKILL | Prevents SIGTERM hang on blocking NFS I/O |
+| Tuner forced Startup→Drain | `startup_limit * 3` prevents zero-sample stall |
+| Mirror repair consumer fix | Absolute+relative paths, multi-target, DashSet dedup |
+
+### Cross-Crate Improvements (fxcp-core + fxcp)
+
+| Change | File | Impact |
+|--------|------|--------|
+| `CopyErrorKind` enum | `error.rs` | Shared classification for foxingd + fxcp |
+| Source pre-check | `operations.rs` | Avoids io_uring setup for vanished files |
+| `prepare_target_parent()` | `operations.rs` | Auto-create missing parent dirs |
+| Governor failure-rate tracking | `governor.rs` | Stress boost when >50% copies fail |
+| ENOENT-safe hash verification | `hashing.rs` | Vanished files skip verification gracefully |
+| `clear_dirty_on_skip()` | `sidecar.rs` | Clean dirty flag when source deleted |
+| fxcp error dispatch | `main.rs` | `CopyErrorKind`-based handling, skip vanished sources |
+
+### Diagnostic Infrastructure
+
+| Tool | Script | Purpose |
+|------|--------|---------|
+| `tests/vm/adversarial.sh` | 7-phase adversarial test | BBR tuner, coalescer, CircuitBreaker, sidecar |
+| `tests/vm/diagnose-stall.sh` | Auto-capture on stall | perf stat, offcputime, nfsslower, thread wchan |
+| `tests/vm/collect-metrics.sh` | Prometheus scraper | Filtered key metrics + stall detection section |
+| `tests/vm/verify-sync.sh` | Source↔target diff | File listing, SHA-256, size comparison |
+| `tests/vm/setup-adversarial.sh` | VM setup | NFS mount, config, perf/bcc-tools install |
+
+### Remaining Work
+
+1. **Test harness convergence check** counts `copy_method_standard` but repair copies go through hydration path — not counted as convergence
+2. **Phase 3 (rename chains)** — renames for files not yet on NFS target fail; need rename-to-repair fallback
+3. **Phase 4 (NFS drop/resync)** — CircuitBreaker doesn't detect lazy unmount; sidecar resync needs work
+4. **Phase 6 (disk pressure)** — NFS share too large (22TB) for safe fill test; needs smaller test volume
+5. **offcputime/nfsslower** — not capturing data (may need kernel debuginfo or different bcc invocation)
+
 ## Implementation Summary
 
 | Optimization | Commit | Impact |
@@ -181,3 +262,12 @@ Large files (>256KB) still use SmartCopier for io_uring throughput and sparse ha
 | P1: Early transient filter | `3e651bb` | Prunes create→unlink before worker queues |
 | P2: SIMD columnar scan | `3e651bb` | 4x coalescer throughput (AVX2) |
 | P3: Bounded frontier | `3e651bb` | Memory safety under event bursts |
+| ENOENT→repair fallback | `0d4c680` | Eliminates data loss on unhydrated targets |
+| Error classification | `0d4c680` | TargetNotFound/SourceNotFound/Transient/Permanent |
+| Copy timeouts (all ops) | `0d4c680` | Adaptive 60-300s, prevents indefinite hang |
+| Hydration spawn_blocking | `0d4c680` | Unblocks tokio runtime on NFS targets |
+| Retry batch drain | `0d4c680` | 16x faster retry processing |
+| Shutdown timeout | `0d4c680` | 10s deadline + SIGKILL fallback |
+| Tuner zero-sample resilience | `0d4c680` | Forced Startup→Drain on ENOENT storms |
+| Cross-crate CopyErrorKind | `0d4c680` | Shared error classification (fxcp-core) |
+| Governor failure-rate signal | `0d4c680` | Stress boost when copies fail >50% |

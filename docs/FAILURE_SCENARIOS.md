@@ -114,3 +114,67 @@ This document outlines how `foxing` handles common operational failure modes, ra
 **Result:** **SUCCESS.** VDO effectively absorbs the metadata overhead and version history.
 
 **Warning:** If the data is *incompressible* (e.g., encrypted video), VDO adds overhead without gain, causing the target to fail *sooner* than in Story 5. Monitor `foxing_target_capacity_bytes_available`.
+
+---
+
+## Story 7: The "Hydration Race" (BPF Events During Initial Sync)
+**Scenario:** foxingd starts with `initial_sync = true` on a source directory containing 5,000 files. The source is actively being written to (CI pipeline, build system) while hydration copies files to the NFS target. BPF captures write events for files that haven't been copied to the target yet.
+
+### System Response
+1.  **Hydration Phase:**
+    * The hydration scanner identifies 5,000 files and submits them as bulk jobs.
+    * Hydration workers begin copying files to the NFS target (4 workers, round-robin).
+    * Hydration takes ~30-60 seconds for 5,000 files on a slow NFS target.
+2.  **Concurrent BPF Events:**
+    * BPF probes capture `WriteRange` events for files being modified on the source.
+    * Events are dispatched to workers immediately — no synchronization with hydration.
+    * Workers attempt `optimized_copy_range()` on target paths that don't exist yet.
+3.  **Error Classification:**
+    * **`ErrorClass::TargetNotFound`:** Worker detects `ENOENT` (NotFound) on a data operation (Write, WriteRange, Clone, Truncate, Fallocate). Instead of retrying, it sends an absolute-path repair job via `hydration_tx.send_repair_job()`.
+    * **`ErrorClass::SourceNotFound`:** If the source file was deleted (transient lifecycle — temp files, build artifacts), the event is skipped and `foxing_events_source_gone_total` incremented.
+    * Repair jobs are deduplicated via `source.active_repairs` (DashSet) to prevent storms when many WriteRange events arrive for the same unhydrated file.
+4.  **Repair Execution:**
+    * The repair channel consumer in `mirror.rs` matches the absolute source path against the source mount, computes the relative path, and submits a `HydrationJob` to ALL configured targets.
+    * The hydration worker performs a full file copy (source → target), creating the file on the NFS target.
+    * On completion, `foxing_events_repair_completed_total` increments and the path is removed from `active_repairs`.
+5.  **BBR Tuner Resilience:**
+    * Even when all copies fail (ENOENT storm), the tuner receives failure latency samples to prevent starvation.
+    * If stuck in `Startup` state for `startup_limit * 3` (6 seconds default) without bandwidth data, the tuner forces a transition to `Drain`.
+
+**Result:** Zero data loss. Files created during the hydration window are correctly repaired via full-copy fallback. The `foxing_events_repair_queued_total` metric tracks how many events took this path. The `foxing_events_dropped` counter stays at 0.
+
+**Metrics to monitor:**
+- `foxing_events_repair_queued_total` — should be non-zero during initial sync with active writes
+- `foxing_events_repair_completed_total` — should match queued count after sync settles
+- `foxing_events_source_gone_total` — counts transient files correctly skipped
+- `foxing_events_dropped` — should remain 0 (data loss indicator)
+
+---
+
+## Story 8: The "Slow NFS Target" (Source/Target Performance Decoupling)
+**Scenario:** A high-performance NVMe source (XFS, 3GB/s) replicates to a remote HDD-backed NFS target (100MB/s). Hundreds of files are written per second on the source while the target can only absorb a fraction of that throughput.
+
+### System Response
+1.  **BBR Auto-Tuning:**
+    * The `BbrTuner` detects NFS latency (>5ms) and classifies storage as HDD/Network.
+    * Transitions through `Startup` → `Drain` → `ProbeBW` based on measured throughput.
+    * `current_batch_size` and `current_coalesce_bytes` adapt to NFS round-trip time.
+    * Flush interval multiplier set to 8-16x base (vs 1-2x for NVMe).
+2.  **Write Coalescing:**
+    * The `Coalescer` merges multiple writes to the same inode into a single larger I/O.
+    * Under back-pressure (retry queue growing), the coalescer pressure flush kicks in, draining events before they stagnate.
+3.  **Governor Failure-Rate Signal:**
+    * If >50% of copies fail (NFS timeouts during congestion), `Governor.signal_copy_result(false)` boosts `stress_score` by 0.3.
+    * This triggers worker backoff — pacing target writes to avoid overwhelming the NFS connection.
+    * Source filesystem performance is unaffected — the Governor only throttles target-bound operations.
+4.  **Copy Timeouts:**
+    * All copy operations are wrapped in adaptive timeouts (60-300s based on file size).
+    * Timed-out copies increment `foxing_copy_timeout_total` and are retried.
+    * Prevents indefinite hangs when NFS becomes unresponsive.
+5.  **Retry Batch Drain:**
+    * `pop_ready_batch(16)` drains up to 16 retry events per tick (vs 1 previously).
+    * 1,438 queued events drain in ~5 seconds instead of ~72 seconds.
+
+**Result:** Source write performance remains at native NVMe speed. Target receives a throttled, coalesced stream adapted to its throughput capacity. No event loss — retries and repairs ensure eventual consistency.
+
+**Key design principle:** The CQRS event architecture decouples source capture (BPF ring buffer) from target application (worker select loop). The BBR tuner adapts the worker's output rate to match the target's absorption capacity, while the Governor prevents system-wide stress from target-induced backpressure.
