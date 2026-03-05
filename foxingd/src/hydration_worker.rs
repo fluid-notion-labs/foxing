@@ -340,13 +340,9 @@ impl Hydrator {
             // Skip root directory (always scan)
             if rel_dir.as_os_str().is_empty() { continue; }
 
-            // Check if parent is already pruned (cascade)
-            if let Some(parent) = rel_dir.parent() {
-                if pruned_dirs.contains(parent) {
-                    pruned_dirs.insert(rel_dir.clone());
-                    continue;
-                }
-            }
+            // No cascade — each directory must independently verify its hash.
+            // File modifications inside subdirectories don't update parent dir mtime,
+            // so cascading from parent to child would miss changes.
 
             // Compute current source dir hash from stat metadata
             let src_hash = match Self::compute_current_dir_hash(src_dir) {
@@ -368,7 +364,7 @@ impl Hydrator {
                 // Compare stored hash
                 match sidecar::get_dir_hash(&target_dir) {
                     Some(stored) if stored == src_hash => {
-                        debug!("Dir hash MATCH for {:?} (prunable)", rel_dir);
+                        info!("Dir hash MATCH for {:?} (prunable) hash={}", rel_dir, hex::encode(&src_hash[..8]));
                     },
                     Some(stored) => {
                         info!("Dir hash MISMATCH for {:?}: src={} stored={}", rel_dir,
@@ -385,6 +381,17 @@ impl Hydrator {
             if all_match {
                 pruned_dirs.insert(rel_dir.clone());
                 metrics::HYDRATION_DIR_PRUNED.inc();
+            } else {
+                // This dir has changes — remove any ancestor from pruned set
+                // to prevent cascading prune from skipping modified children
+                let mut ancestor = rel_dir.to_path_buf();
+                while let Some(parent) = ancestor.parent() {
+                    if parent.as_os_str().is_empty() { break; }
+                    if pruned_dirs.remove(parent) {
+                        info!("Unpruned ancestor {:?} due to mismatch in {:?}", parent, rel_dir);
+                    }
+                    ancestor = parent.to_path_buf();
+                }
             }
         }
 

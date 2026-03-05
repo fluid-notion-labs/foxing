@@ -1559,6 +1559,9 @@ phase9() {
         return
     fi
 
+    # Ensure modifications get a different mtime than creation
+    sleep 2
+
     # Modify: large-modify 1 chunk/file, mixed 1 small + 1 large chunk
     log "Applying targeted modifications..."
 
