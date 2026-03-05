@@ -77,10 +77,18 @@ impl SyncSignature {
     
     pub fn matches(&self, other: &Self) -> bool {
         if self.size != other.size { return false; }
+
+        // Compare full file hash (merkle_root) FIRST — catches ALL changes
+        // including middle-of-file modifications invisible to lite hash
+        match (&self.merkle_root, &other.merkle_root) {
+            (Some(a), Some(b)) => return a == b, // Definitive answer
+            _ => {} // One or both lack full hash — fall through to mtime+lite
+        }
+
         if self.mtime_sec != other.mtime_sec || self.mtime_nsec != other.mtime_nsec {
             return false;
         }
-        
+
         match (&self.hash, &other.hash) {
             (Some(a), Some(b)) => a == b,
             _ => true, // If either side lacks hash, trust mtime
@@ -179,11 +187,17 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
         if meta.is_symlink() { return None; }
     } else { return None; }
     let (trusted_key, user_key) = resolve_key_variants(key);
-    if let Ok(Some(val)) = xattr::get(path, &trusted_key) {
-        return Some(val);
+    match xattr::get(path, &trusted_key) {
+        Ok(Some(val)) => return Some(val),
+        Ok(None) => {},
+        Err(_) => {} // Expected on NFS (EOPNOTSUPP for trusted namespace)
     }
-    if let Ok(Some(val)) = xattr::get(path, &user_key) {
-        return Some(val);
+    match xattr::get(path, &user_key) {
+        Ok(Some(val)) => return Some(val),
+        Ok(None) => {},
+        Err(e) => {
+            tracing::warn!("xattr get {:?} key={}: {:?}", path, user_key, e);
+        }
     }
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {

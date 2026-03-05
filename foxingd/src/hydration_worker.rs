@@ -844,8 +844,15 @@ impl Hydrator {
             }
         };
 
-        if let Some(dst_sig) = get_sync_signature(&dst_path) {
-            if src_sig.matches(&dst_sig) {
+        let dst_sig_opt = get_sync_signature(&dst_path);
+        warn!("TRACE sync_file_needed {:?}: has_cached_sig={}", dst_path, dst_sig_opt.is_some());
+        if let Some(dst_sig) = dst_sig_opt {
+            let sig_match = src_sig.matches(&dst_sig);
+            warn!("TRACE   matches={} size={}vs{} mtime={}vs{} merkle_root={}vs{}",
+                  sig_match, src_sig.size, dst_sig.size, src_sig.mtime_sec, dst_sig.mtime_sec,
+                  src_sig.merkle_root.as_deref().unwrap_or("none")[..8].to_string(),
+                  dst_sig.merkle_root.as_deref().unwrap_or("none")[..8].to_string());
+            if sig_match {
                 metrics::HASH_CACHE_HITS.inc();
                 return Ok(false);
             }
@@ -866,31 +873,35 @@ impl Hydrator {
             match hashing::verify_incremental(src_path, &dst_path, src_meta.len()) {
                 Ok(true) => {
                     // Lite hash (head+tail) says match — but middle-of-file changes
-                    // are invisible to it. If the target has a stored Merkle signature
-                    // and the source mtime differs from the target mtime, verify the
-                    // full Merkle root to catch chunk-level changes.
-                    if let Some(stored_merkle) = sidecar::get_merkle_signature(&dst_path) {
-                        let dst_mtime = df.metadata().map(|m| m.mtime()).unwrap_or(0);
-                        if src_meta.mtime() != dst_mtime {
-                            match hashing::verify_with_merkle(src_path, &stored_merkle) {
-                                Ok(true) => {
-                                    // Merkle roots match — genuinely unchanged
-                                    if let Err(e) = set_sync_signature(&dst_path, &src_sig) { warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e); }
-                                    return Ok(false);
+                    // are invisible to it. If the target has a stored Merkle signature,
+                    // ALWAYS compare roots to catch chunk-level changes.
+                    let merkle_result = sidecar::get_merkle_signature(&dst_path);
+                    warn!("TRACE sync_file_needed {:?}: get_merkle_signature={}", dst_path, merkle_result.is_some());
+                    if let Some(stored_merkle) = merkle_result {
+                        match hashing::verify_with_merkle(src_path, &stored_merkle) {
+                            Ok(true) => {
+                                // Merkle roots match — genuinely unchanged, safe to cache signature
+                                info!("sync_file_needed {:?}: lite+merkle both match — skip", dst_path);
+                                if let Err(e) = set_sync_signature(&dst_path, &src_sig) {
+                                    warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e);
                                 }
-                                Ok(false) => {
-                                    // Merkle roots differ — middle-of-file change detected
-                                    debug!("Merkle root mismatch for {:?}, forcing delta resync", dst_path);
-                                    return Ok(true);
-                                }
-                                Err(e) => {
-                                    warn!("Merkle verification failed for {:?}: {}, forcing resync", dst_path, e);
-                                    return Ok(true);
-                                }
+                                return Ok(false);
+                            }
+                            Ok(false) => {
+                                // Merkle roots differ — middle-of-file change detected
+                                info!("sync_file_needed {:?}: MERKLE ROOT MISMATCH — forcing delta resync", dst_path);
+                                return Ok(true);
+                            }
+                            Err(e) => {
+                                warn!("Merkle verification failed for {:?}: {}, forcing resync", dst_path, e);
+                                return Ok(true);
                             }
                         }
                     }
-                    if let Err(e) = set_sync_signature(&dst_path, &src_sig) { warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e); }
+                    // No Merkle signature stored — trust lite hash, cache signature
+                    if let Err(e) = set_sync_signature(&dst_path, &src_sig) {
+                        warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e);
+                    }
                     Ok(false)
                 },
                 Ok(false) => Ok(true),
@@ -1418,7 +1429,10 @@ pub async fn process_hydration_job(
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Ok(tree) = fxcp_core::hashing::MerkleTree::from_file(&src_clone, chunk_size) {
                             let sig = tree.to_signature();
-                            let _ = fxcp_core::sidecar::set_merkle_signature(&dst_clone, &sig);
+                            match fxcp_core::sidecar::set_merkle_signature(&dst_clone, &sig) {
+                                Ok(_) => info!("Stored Merkle signature ({} leaves) for {:?}", sig.leaf_hashes.len(), dst_clone),
+                                Err(e) => warn!("Failed to store Merkle signature for {:?}: {}", dst_clone, e),
+                            }
                         }
                     }).await;
                 }

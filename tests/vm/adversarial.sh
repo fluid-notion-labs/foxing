@@ -155,7 +155,7 @@ start_foxingd() {
     log "Starting foxingd..."
     pkill -x foxingd 2>/dev/null || true
     sleep 1
-    "$FOXINGD" daemon -c "$CONFIG" > "$REPORT_DIR/foxingd.log" 2>&1 &
+    "$FOXINGD" daemon -c "$CONFIG" >> "$REPORT_DIR/foxingd.log" 2>&1 &
     FOXINGD_PID=$!
     log "foxingd PID=$FOXINGD_PID"
 
@@ -1082,6 +1082,11 @@ phase7() {
     collect_metrics "phase7-post-initial"
     stop_foxingd
 
+    # Flush NFS attribute cache so second foxingd instance sees stored xattrs
+    # NFS caches xattr state; without this, get_metadata() returns None
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
     # Verify initial sync worked
     local initial_tgt
     initial_tgt=$(find "$TARGET/adversarial-delta" -type f 2>/dev/null | wc -l)
@@ -1144,11 +1149,12 @@ phase7() {
     local delta_saved
     delta_saved=$(get_metric "foxing_delta_copy_bytes_saved_total")
 
-    # foxingd is stopped — metrics endpoint gone, use last collected values
-    # Re-read from collected snapshot if available
-    if [[ -f "$REPORT_DIR/phase7-post.txt" ]]; then
-        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$REPORT_DIR/phase7-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
-        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$REPORT_DIR/phase7-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    # foxingd is stopped — metrics endpoint gone, use last collected snapshot
+    local snap_file
+    snap_file=$(ls -t "$REPORT_DIR"/metrics_phase7-post_*.txt 2>/dev/null | head -1)
+    if [[ -n "$snap_file" ]]; then
+        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
+        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
     fi
 
     if [[ "${delta_attempted:-0}" == "0" ]]; then
@@ -1255,6 +1261,10 @@ phase8() {
     collect_metrics "phase8-post-initial"
     stop_foxingd
 
+    # Flush NFS attribute cache
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
     # Verify initial sync
     local initial_tgt
     initial_tgt=$(find "$TARGET/adversarial-dirprune" -type f 2>/dev/null | wc -l)
@@ -1354,8 +1364,10 @@ phase8() {
     # Read pruning metric from snapshot
     local dir_pruned
     dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
-    if [[ -f "$REPORT_DIR/phase8-post.txt" ]]; then
-        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$REPORT_DIR/phase8-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    local snap8
+    snap8=$(ls -t "$REPORT_DIR"/metrics_phase8-post_*.txt 2>/dev/null | head -1)
+    if [[ -n "$snap8" ]]; then
+        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$snap8" 2>/dev/null | tail -1 | awk '{print $2}')
     fi
 
     # Verify dir_pruned >= 3 (stable-a, stable-b, stable-c should be pruned)
@@ -1521,6 +1533,10 @@ phase9() {
     collect_metrics "phase9-post-initial"
     stop_foxingd
 
+    # Flush NFS attribute cache
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
     # Verify initial sync
     local initial_tgt
     initial_tgt=$(find "$TARGET/adversarial-combined" -type f 2>/dev/null | wc -l)
@@ -1601,10 +1617,12 @@ phase9() {
 
     # Read final metrics from snapshot
     local delta_attempted dir_pruned delta_saved
-    if [[ -f "$REPORT_DIR/phase9-post.txt" ]]; then
-        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
-        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
-        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$REPORT_DIR/phase9-post.txt" 2>/dev/null | tail -1 | awk '{print $2}')
+    local snap9
+    snap9=$(ls -t "$REPORT_DIR"/metrics_phase9-post_*.txt 2>/dev/null | head -1)
+    if [[ -n "$snap9" ]]; then
+        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$snap9" 2>/dev/null | tail -1 | awk '{print $2}')
+        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$snap9" 2>/dev/null | tail -1 | awk '{print $2}')
+        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$snap9" 2>/dev/null | tail -1 | awk '{print $2}')
     fi
 
     # Verify both mechanisms activated
