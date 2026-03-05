@@ -256,6 +256,35 @@ Proactive routing of BPF events for unhydrated files directly to repair, elimina
 - Worker checks gate before attempting write: if inode not hydrated AND target doesn't exist → route to repair immediately
 - 30s grace period cleanup after hydration completes
 
+### Full Adversarial Suite Results (9 phases, `97f0f0b`)
+
+| Phase | Test | Result | Duration | Signals |
+|-------|------|--------|----------|---------|
+| 0 | Baseline NFS Throughput | **PASS** | 2s | cp=194MB/s rsync=116MB/s |
+| 1 | Heavy Initial Hydration (5000 files) | FAIL | 119s | STALLED (event/hydration race) |
+| 2 | Live Write Storm (fio 30s) | **PASS** | 75s | Coalescer under back-pressure |
+| 3 | Rename Chain Storm (100 chains) | FAIL | 74s | Rename ordering on NFS |
+| 4 | NFS Target Drop + Resync | FAIL | 154s | CircuitBreaker + sidecar |
+| 5 | Large File Kill/Resume (100MB) | **PASS** | 25s | Dirty flag resume |
+| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
+| 7 | BLAKE3 Delta Copy | **PASS** | 49s | Chunk-level resync |
+| 8 | Directory Merkle Pruning | **PASS** | 51s | Stable dirs pruned |
+| 9 | Combined Delta + Pruning | **PASS** | 53s | Both paths active |
+
+**Total:** 6 PASS / 3 FAIL / 1 SKIP — **603 seconds** (10 min)
+
+### Copy Time to Target / Source-Target Consistency
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **NFS baseline throughput** | cp=194MB/s, rsync=116MB/s | HDD-backed 32TB NFS 4.2 target |
+| **Initial hydration (555 files, 302MB)** | <30s (local XFS targets) | 4 targets × 555 files = 2220 copies |
+| **Fast resume (no changes)** | <1s | 9 dirs pruned, 575 files skipped by hash |
+| **Delta resync (2MB file, 1 chunk modified)** | ~49s total for 20 files | Only changed 64KB chunks transferred |
+| **Source→target latency** | 0 events dropped | BPF events processed during hydration via repair |
+| **Source performance impact** | 0% | Governor + BBR decouple source from target |
+| **Convergence after modification** | 5-10 modified files synced in <15s | Merkle root mismatch → delta copy path |
+
 ### Adversarial Test Phases 7-9 Results (`1e8a11c`)
 
 | Phase | Test | Result | Duration | Key Verification |
