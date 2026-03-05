@@ -137,7 +137,10 @@ fn calculate_hydration_allocation(
     let chunk_size_bytes = (cfg.io_buffer_size_mib * 1024 * 1024).max(4096) as usize;
     let min_buffers = 2;
     let max_buffers = per_worker_budget / chunk_size_bytes as u64;
-    let buffers_per_ring = max_buffers.max(min_buffers as u64) as usize;
+    // Cap hydration worker buffers — 716MB per worker is excessive.
+    // Small files use std::fs::copy (no buffers). Large files need at most
+    // 32 buffers for io_uring depth. This cuts 2.8GB → 128MB total.
+    let buffers_per_ring = max_buffers.max(min_buffers as u64).min(32) as usize;
 
     HydrationAllocation {
         chunk_size_bytes,
@@ -460,6 +463,16 @@ impl Hydrator {
                 jobs
             })
             .collect();
+
+        // Sort by file size ascending — small files first for fast throughput.
+        // Large files on NFS can take 30+ seconds each; processing them first
+        // causes all workers to stall while thousands of small files wait.
+        let mut verification_results = verification_results;
+        verification_results.sort_by_key(|(rel_path, _, _)| {
+            fs::metadata(source_path.join(rel_path))
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX)
+        });
 
         info!("Hydration: {} files require synchronization", verification_results.len());
 
@@ -862,12 +875,12 @@ impl Hydrator {
         };
 
         let dst_sig_opt = get_sync_signature(&dst_path);
-        warn!("TRACE sync_file_needed {:?}: has_cached_sig={}", dst_path, dst_sig_opt.is_some());
+        debug!("sync_file_needed {:?}: has_cached_sig={}", dst_path, dst_sig_opt.is_some());
         if let Some(dst_sig) = dst_sig_opt {
             let sig_match = src_sig.matches(&dst_sig);
             let src_mr = src_sig.merkle_root.as_deref().unwrap_or("none");
             let dst_mr = dst_sig.merkle_root.as_deref().unwrap_or("none");
-            warn!("TRACE   matches={} size={}vs{} mtime={}vs{} merkle_root={}vs{}",
+            debug!("  sig matches={} size={}vs{} mtime={}vs{} merkle_root={}vs{}",
                   sig_match, src_sig.size, dst_sig.size, src_sig.mtime_sec, dst_sig.mtime_sec,
                   &src_mr[..src_mr.len().min(8)], &dst_mr[..dst_mr.len().min(8)]);
             if sig_match {
@@ -894,7 +907,7 @@ impl Hydrator {
                     // are invisible to it. If the target has a stored Merkle signature,
                     // ALWAYS compare roots to catch chunk-level changes.
                     let merkle_result = sidecar::get_merkle_signature(&dst_path);
-                    warn!("TRACE sync_file_needed {:?}: get_merkle_signature={}", dst_path, merkle_result.is_some());
+                    debug!("sync_file_needed {:?}: get_merkle_signature={}", dst_path, merkle_result.is_some());
                     if let Some(stored_merkle) = merkle_result {
                         match hashing::verify_with_merkle(src_path, &stored_merkle) {
                             Ok(true) => {
@@ -1015,11 +1028,16 @@ pub async fn run_hydration_worker_loop(
     }
 
     let mut jobs_processed: u64 = 0;
+    let mut jobs_skipped: u64 = 0;
+    let mut jobs_failed: u64 = 0;
+    // Cache probe_capabilities per target path — avoids 5000 NFS stat+ioctl for same target
+    let mut caps_cache: HashMap<PathBuf, Arc<fxcp_core::operations::Capabilities>> = HashMap::new();
 
     loop {
         // FIXED: Check for shutdown signal in worker loop
         if source.hydration.shutdown_requested.load(Ordering::Relaxed) {
-            info!("Hydration Worker {}: Shutdown requested.", worker_id);
+            info!("Hydration Worker {}: Shutdown requested. Processed={}, skipped={}, failed={}",
+                  worker_id, jobs_processed, jobs_skipped, jobs_failed);
             break;
         }
 
@@ -1072,12 +1090,22 @@ pub async fn run_hydration_worker_loop(
             break;
         }
 
-        // Simple recv — blocks until a job arrives or channel closes.
-        // Shutdown is handled by dropping the Sender (closes channel → recv returns None).
+        // Log first iteration and every 100 jobs to track worker liveness
+        if jobs_processed == 0 || jobs_processed % 100 == 0 {
+            info!("Hydration Worker {}: Waiting for job (processed={}, channel_len={})",
+                  worker_id, jobs_processed, rx.len());
+        }
+
         let job = match rx.recv().await {
-            Some(j) => Some(j),
+            Some(j) => {
+                if jobs_processed < 3 {
+                    info!("Hydration Worker {}: Received job {:?}", worker_id, j.rel_path);
+                }
+                Some(j)
+            },
             None => {
-                info!("Hydration Worker {}: Channel closed. Processed {} jobs.", worker_id, jobs_processed);
+                info!("Hydration Worker {}: Channel closed. Processed={}, skipped={}, failed={}",
+                      worker_id, jobs_processed, jobs_skipped, jobs_failed);
                 None
             }
         };
@@ -1085,7 +1113,9 @@ pub async fn run_hydration_worker_loop(
         match job {
             Some(job) => {
                 let target_path_root = job.target_cfg.path.clone();
-                let target_caps = probe_capabilities(&target_path_root);
+                let target_caps = caps_cache.entry(target_path_root.clone())
+                    .or_insert_with(|| probe_capabilities(&target_path_root))
+                    .clone();
 
                 match process_hydration_job(
                     job.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool,
@@ -1102,17 +1132,26 @@ pub async fn run_hydration_worker_loop(
                             }
                         }
                     }
-                    Ok(None) => {} // Job skipped (dir, non-file, shutdown)
+                    Ok(None) => {
+                        jobs_skipped += 1;
+                    }
                     Err(e) => {
                         metrics::EVENTS_REPAIR_FAILED.inc();
                         source.active_repairs.remove(&job.rel_path);
-                        // Log error but continue processing — don't kill the worker
+                        jobs_failed += 1;
                         warn!("Hydration Worker {}: Job failed for {:?} -> {:?}: {}. Continuing.",
                               worker_id, job.rel_path, job.target_cfg.path, e);
                     }
                 }
                 jobs_processed += 1;
                 pending_count.fetch_sub(1, Ordering::SeqCst);
+
+                // Log progress every 500 jobs
+                if jobs_processed % 500 == 0 {
+                    info!("Hydration Worker {}: Progress: processed={}, completed={}, skipped={}, failed={}, channel_len={}",
+                          worker_id, jobs_processed, jobs_processed - jobs_skipped - jobs_failed,
+                          jobs_skipped, jobs_failed, rx.len());
+                }
             },
             None => {
                 info!("Hydration Worker {}: No more jobs (processed {} total). Exiting.", worker_id, jobs_processed);
@@ -1121,7 +1160,8 @@ pub async fn run_hydration_worker_loop(
         }
     }
 
-    info!("Hydration Worker {}: Exited main loop after {} jobs.", worker_id, jobs_processed);
+    info!("Hydration Worker {}: Exited main loop. processed={}, completed={}, skipped={}, failed={}",
+          worker_id, jobs_processed, jobs_processed - jobs_skipped - jobs_failed, jobs_skipped, jobs_failed);
     let _ = ring.submitter().unregister_buffers();
     Ok(())
 }
@@ -1430,51 +1470,112 @@ pub async fn process_hydration_job(
             Ok(Some(stats)) => {
                 crate::metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
 
-                // Metadata sync: inline for small files (already done above), spawn_blocking for large
-                if file_size > HYDRATION_SMALL_FILE_THRESHOLD {
-                    let src_path_clone = current_source_path.clone();
-                    let dst_path_clone = current_target_path.clone();
+                // Consolidated post-copy: single spawn_blocking for ALL metadata + hashing.
+                // WI-1: Compute Merkle from TARGET (in page cache from write) — eliminates
+                //        2 redundant source file reads. Merkle root IS the full hash.
+                // WI-4: One spawn_blocking instead of 3-5 separate ones.
+                // WI-5: Skip sync_xattrs when source has no user.* xattrs.
+                let src_post = current_source_path.clone();
+                let dst_post = current_target_path.clone();
+                let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
+                let is_large = file_size > HYDRATION_SMALL_FILE_THRESHOLD;
+                let needs_merkle = file_size > MERKLE_DELTA_THRESHOLD;
 
-                    let metadata_result: std::result::Result<(), FoxingError> = spawn_blocking(move || {
-                        security::sync_xattrs(&src_path_clone, &dst_path_clone);
-                        security::apply_metadata(&src_path_clone, &dst_path_clone)
-                    }).await
-                    .map_err(FoxingError::Join)
-                    .and_then(|inner| inner.map_err(Into::into));
+                let postcopy_result = spawn_blocking(move || -> std::result::Result<(), FoxingError> {
+                    // 1. Apply ownership/permissions/timestamps (large files only — small files done inline)
+                    if is_large {
+                        // WI-5: Only sync user.* xattrs, skip if none exist
+                        let has_user_xattrs = xattr::list(&src_post)
+                            .map(|attrs| attrs.into_iter().any(|a| a.to_string_lossy().starts_with("user.")))
+                            .unwrap_or(false);
+                        if has_user_xattrs {
+                            security::sync_xattrs(&src_post, &dst_post);
+                        }
+                        security::apply_metadata(&src_post, &dst_post)?;
+                    }
 
-                    if metadata_result.is_err() {
-                        warn!("Hydration: Failed to apply metadata for {:?}. Retrying.", current_target_path);
+                    // 2. Compute Merkle tree from TARGET file (in page cache from write)
+                    //    and build SyncSignature — one read instead of three.
+                    let src_meta = std::fs::metadata(&src_post)?;
+                    let src_size = src_meta.len();
+
+                    let (merkle_root, merkle_sig) = if needs_merkle {
+                        match fxcp_core::hashing::MerkleTree::from_file(&dst_post, chunk_size) {
+                            Ok(tree) => {
+                                let root_hex = hex::encode(tree.root.as_bytes());
+                                let sig = tree.to_signature();
+                                (Some(root_hex), Some(sig))
+                            }
+                            Err(e) => {
+                                warn!("Hydration: Failed to compute Merkle from target {:?}: {}", dst_post, e);
+                                (None, None)
+                            }
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                    // 3. Compute lite hash (cheap — only reads head+tail of source)
+                    let lite_hash = if hashing::is_hashing_enabled() && src_size >= hashing::get_lite_threshold_bytes() {
+                        hashing::hash_file_lite(&src_post, src_size)
+                            .ok()
+                            .flatten()
+                            .map(|h| h.to_hex().to_string())
+                    } else {
+                        None
+                    };
+
+                    // 4. Build SyncSignature using Merkle root as full hash (no hash_file_full needed)
+                    let sig = SyncSignature {
+                        size: src_size,
+                        mtime_sec: src_meta.mtime(),
+                        mtime_nsec: src_meta.mtime_nsec(),
+                        hash: lite_hash,
+                        merkle_root,
+                        chunk_size: Some(chunk_size),
+                        leaf_count: merkle_sig.as_ref().map(|s| s.leaf_hashes.len() as u32),
+                        version: SyncSignature::CURRENT_VERSION,
+                    };
+
+                    // 5. WI-3: Batch write sig + merkle in single sidecar open/lock/write cycle
+                    let sig_bytes = sig.serialize();
+                    if let Some(ref msig) = merkle_sig {
+                        if let Ok(merkle_bytes) = bincode::serialize(msig) {
+                            if merkle_bytes.len() <= 64 * 1024 {
+                                if let Err(e) = sidecar::set_metadata_batch(&dst_post, &[
+                                    ("sig", &sig_bytes),
+                                    ("merkle", &merkle_bytes),
+                                ]) {
+                                    warn!("Hydration: Failed to batch-write metadata for {:?}: {}", dst_post, e);
+                                }
+                            } else {
+                                // Merkle too large for batch, write sig only
+                                if let Err(e) = set_sync_signature(&dst_post, &sig) {
+                                    warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_post, e);
+                                }
+                            }
+                        }
+                    } else {
+                        if let Err(e) = set_sync_signature(&dst_post, &sig) {
+                            warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_post, e);
+                        }
+                    }
+
+                    // 6. Clear dirty flag
+                    let _ = sidecar::set_dirty_flag(&dst_post, false, "hydration_complete");
+
+                    Ok(())
+                }).await
+                .map_err(FoxingError::Join)
+                .and_then(|inner| inner);
+
+                if let Err(e) = postcopy_result {
+                    if is_large {
+                        warn!("Hydration: Post-copy failed for {:?}: {}. Retrying.", current_target_path, e);
                         continue; // retry
                     }
-                }
-
-                // Store Merkle signature for future delta copies
-                if file_size > MERKLE_DELTA_THRESHOLD {
-                    let src_clone = current_source_path.clone();
-                    let dst_clone = current_target_path.clone();
-                    let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(tree) = fxcp_core::hashing::MerkleTree::from_file(&src_clone, chunk_size) {
-                            let sig = tree.to_signature();
-                            match fxcp_core::sidecar::set_merkle_signature(&dst_clone, &sig) {
-                                Ok(_) => info!("Stored Merkle signature ({} leaves) for {:?}", sig.leaf_hashes.len(), dst_clone),
-                                Err(e) => warn!("Failed to store Merkle signature for {:?}: {}", dst_clone, e),
-                            }
-                        }
-                    }).await;
-                }
-
-                // Store SyncSignature so sync_file_needed() can detect changes on next scan
-                {
-                    let src_for_sig = current_source_path.clone();
-                    let dst_for_sig = current_target_path.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(sig) = SyncSignature::compute(&src_for_sig) {
-                            if let Err(e) = set_sync_signature(&dst_for_sig, &sig) {
-                                warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_for_sig, e);
-                            }
-                        }
-                    }).await;
+                    // For small files, metadata failure is non-fatal
+                    warn!("Hydration: Post-copy metadata failed for {:?}: {} (non-fatal)", current_target_path, e);
                 }
 
                 success = true;
@@ -1530,11 +1631,6 @@ pub async fn process_hydration_job(
         return Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hydration job failed repeated attempts")));
     }
 
-    // Clear any pre-existing dirty flag after successful hydration
-    let dst_for_dirty = current_target_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        sidecar::set_dirty_flag(&dst_for_dirty, false, "hydration_complete")
-    }).await;
-
+    // Dirty flag is now cleared inside the consolidated post-copy spawn_blocking above.
     Ok(final_stats)
 }

@@ -243,6 +243,11 @@ impl Governor {
 
     pub fn pace_hydration(&self) {
         let score = self.current_stress_score();
+
+        // Skip pacing entirely when system is not stressed — during initial
+        // hydration on NVMe source there's no contention worth throttling for.
+        if score < 0.1 { return; }
+
         let is_one_shot = constants::ONE_SHOT_MODE.load(Ordering::Relaxed);
         let throttle_threshold = if is_one_shot { 1.5 } else { 0.8 };
 
