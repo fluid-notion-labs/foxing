@@ -156,15 +156,9 @@ pub fn set_metadata(path: &Path, key: &str, value: &[u8]) -> std::io::Result<()>
         }
     };
 
-    if xattr_ok {
-        // Clean up stale sidecar file if xattr succeeded
-        if let Some(sp) = get_sidecar_path(path) {
-            if sp.exists() { let _ = fs::remove_file(sp); }
-        }
-        return Ok(());
-    }
-
-    // Both xattr namespaces failed — ALWAYS fall through to sidecar file
+    // Always write sidecar file as well — xattr crate has reliability
+    // issues on NFSv4.2 where writes succeed but reads return None
+    // on subsequent process invocations. Sidecar is the reliable path.
     let sp = match get_sidecar_path(path) {
         Some(p) => p,
         None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine sidecar path")),
@@ -187,17 +181,41 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
         if meta.is_symlink() { return None; }
     } else { return None; }
     let (trusted_key, user_key) = resolve_key_variants(key);
+
+    // Try sidecar file FIRST — reliable across NFS, containers, all filesystems.
+    // xattr crate has reliability issues on NFSv4.2 (cross-process visibility).
+    if let Some(sp) = get_sidecar_path(path) {
+        if sp.exists() {
+            if let Ok(file) = File::open(&sp) {
+                if lock_file(&file, false).is_ok() {
+                    let map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
+                    let _ = unlock_file(&file);
+                    if let Some(val_str) = map.get(&trusted_key).or_else(|| map.get(&user_key)) {
+                        if let Ok(val) = hex::decode(val_str) {
+                            return Some(val);
+                        }
+                    } else {
+                        tracing::warn!("get_metadata sidecar {:?}: key {}|{} not found in {:?}", path, trusted_key, user_key, map.keys().collect::<Vec<_>>());
+                    }
+                } else {
+                    tracing::warn!("get_metadata sidecar {:?}: lock failed", path);
+                }
+            } else {
+                tracing::warn!("get_metadata sidecar {:?}: open failed", path);
+            }
+        }
+    }
+
+    // Fallback to xattr (works on local filesystems with xattr support)
     match xattr::get(path, &trusted_key) {
         Ok(Some(val)) => return Some(val),
         Ok(None) => {},
-        Err(_) => {} // Expected on NFS (EOPNOTSUPP for trusted namespace)
+        Err(_) => {}
     }
     match xattr::get(path, &user_key) {
         Ok(Some(val)) => return Some(val),
         Ok(None) => {},
-        Err(e) => {
-            tracing::warn!("xattr get {:?} key={}: {:?}", path, user_key, e);
-        }
+        Err(_) => {}
     }
     if let Some(sp) = get_sidecar_path(path) {
         if sp.exists() {
