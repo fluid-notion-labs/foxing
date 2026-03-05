@@ -30,7 +30,7 @@ if mountpoint -q "$NFS_MOUNT" 2>/dev/null; then
 else
     echo "Mounting NFS: $NFS_SERVER:$NFS_EXPORT -> $NFS_MOUNT"
     # soft mount with short timeout — we intentionally stress this
-    mount -t nfs -o soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576 \
+    mount -t nfs -o soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576,lookupcache=none,actimeo=0 \
         "$NFS_SERVER:$NFS_EXPORT" "$NFS_MOUNT"
     echo "OK: NFS mounted"
 fi

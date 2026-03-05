@@ -1437,6 +1437,19 @@ pub async fn process_hydration_job(
                     }).await;
                 }
 
+                // Store SyncSignature so sync_file_needed() can detect changes on next scan
+                {
+                    let src_for_sig = current_source_path.clone();
+                    let dst_for_sig = current_target_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(sig) = SyncSignature::compute(&src_for_sig) {
+                            if let Err(e) = set_sync_signature(&dst_for_sig, &sig) {
+                                warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_for_sig, e);
+                            }
+                        }
+                    }).await;
+                }
+
                 success = true;
                 final_stats = Some(stats);
                 source.hydration.synced.fetch_add(1, Ordering::Relaxed);

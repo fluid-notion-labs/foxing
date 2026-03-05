@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # NFS mount info for Phase 4 remount
 NFS_SERVER="awa.3d.ae.net.nz"
 NFS_EXPORT="/nfs_final/working/foxing/test-target"
-NFS_OPTS="soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576"
+NFS_OPTS="soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576,lookupcache=none,actimeo=0"
 
 # Timing — stall detection means we break early, these are hard limits
 STALL_TIMEOUT=30            # No progress for 30s = stall, abort wait
