@@ -1323,6 +1323,8 @@ phase8() {
     elapsed=0
     stall_elapsed=0
     local last_pruned=0
+    local last_copies=0
+    local last_count=0
     while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
@@ -1336,14 +1338,16 @@ phase8() {
         tgt_count=$(find "$TARGET/adversarial-dirprune" -type f 2>/dev/null | wc -l)
         log "  t+${elapsed}s: dir_pruned=${dir_pruned:-0} target=${tgt_count}/${post_mod_src} copies=${copies} repairs=${repair:-0}"
 
-        # Break when activity settles (pruning done + target converged)
-        if [[ $tgt_count -ge $post_mod_src ]]; then
-            log "  Target converged"
+        # Break when new files appear and copies settle
+        # Can't compare total counts because hydration doesn't delete
+        local copies_delta=$((${copies:-0} - ${last_copies:-0}))
+        if [[ $tgt_count -gt 0 ]] && [[ "${copies_delta:-0}" == "0" ]] && [[ $stall_elapsed -ge 10 ]]; then
+            log "  Activity settled (copies stable)"
             break
         fi
 
-        # Stall detection
-        if [[ $tgt_count -eq $last_count ]] && [[ "${dir_pruned:-0}" == "${last_pruned}" ]]; then
+        # Stall detection — use file count AND copies
+        if [[ $tgt_count -eq $last_count ]] && [[ "${copies:-0}" == "${last_copies:-0}" ]]; then
             stall_elapsed=$((stall_elapsed + 5))
             if [[ $stall_elapsed -ge $STALL_TIMEOUT ]]; then
                 signal "STALL: no progress for ${STALL_TIMEOUT}s"
@@ -1356,7 +1360,11 @@ phase8() {
         fi
         last_count=$tgt_count
         last_pruned=${dir_pruned:-0}
+        last_copies=${copies:-0}
     done
+
+    # Give hydration workers time to finish outstanding copies on NFS
+    sleep 5
 
     collect_metrics "phase8-post"
     stop_foxingd
@@ -1399,17 +1407,21 @@ phase8() {
         pass "modify-d: all 5 modified files synced"
     fi
 
-    # Verify modify-e: deleted files removed, new files present
-    local mod_e_tgt
-    mod_e_tgt=$(find "$TARGET/adversarial-dirprune/modify-e" -type f 2>/dev/null | wc -l)
-    local mod_e_src
-    mod_e_src=$(find "$test_dir/modify-e" -type f 2>/dev/null | wc -l)
-    if [[ $mod_e_tgt -ne $mod_e_src ]]; then
-        fail "modify-e: target has $mod_e_tgt files, source has $mod_e_src"
-        signals="${signals}modify_e_count_mismatch "
+    # Verify modify-e: new files present on target
+    # Note: hydration does NOT delete files from target — deleted source files
+    # remain on target until manual cleanup or sync --delete. Only check new files.
+    local mod_e_new=0
+    for i in 21 22; do
+        if [[ -f "$TARGET/adversarial-dirprune/modify-e/file_${i}.dat" ]]; then
+            mod_e_new=$((mod_e_new + 1))
+        fi
+    done
+    if [[ $mod_e_new -lt 2 ]]; then
+        fail "modify-e: only $mod_e_new/2 new files on target"
+        signals="${signals}modify_e_new_missing "
         result="FAIL"
     else
-        pass "modify-e: file count matches ($mod_e_src files)"
+        pass "modify-e: both new files present on target"
     fi
 
     # Verify inject-f has all 30 files on target
@@ -1573,7 +1585,7 @@ phase9() {
     # Monitor both delta and pruning metrics
     elapsed=0
     stall_elapsed=0
-    local last_delta=0 last_pruned=0
+    local last_delta=0 last_pruned=0 last_copies=0
     while [[ $elapsed -lt $HYDRATION_TIMEOUT ]]; do
         sleep 5
         elapsed=$((elapsed + 5))
@@ -1589,10 +1601,10 @@ phase9() {
         repair=$(get_metric "foxing_events_repair_completed_total")
         log "  t+${elapsed}s: delta=${delta_attempted:-0} saved=${delta_saved:-0} pruned=${dir_pruned:-0} copies=${copies} repairs=${repair:-0}"
 
-        # Break when both metrics settle
+        # Break when both metrics settle AND copies are done
         local current_delta=${delta_attempted:-0}
         local current_pruned=${dir_pruned:-0}
-        if [[ "$current_delta" == "$last_delta" ]] && [[ "$current_pruned" == "$last_pruned" ]]; then
+        if [[ "$current_delta" == "$last_delta" ]] && [[ "$current_pruned" == "$last_pruned" ]] && [[ "${copies:-0}" == "${last_copies:-0}" ]]; then
             stall_elapsed=$((stall_elapsed + 5))
             # Wait for at least some activity before declaring settled
             if [[ $stall_elapsed -ge 15 ]] && { [[ "$current_delta" != "0" ]] || [[ "$current_pruned" != "0" ]]; }; then
@@ -1610,7 +1622,11 @@ phase9() {
         fi
         last_delta=$current_delta
         last_pruned=$current_pruned
+        last_copies=${copies:-0}
     done
+
+    # Give hydration workers time to finish
+    sleep 5
 
     collect_metrics "phase9-post"
     stop_foxingd

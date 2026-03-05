@@ -858,10 +858,11 @@ impl Hydrator {
         warn!("TRACE sync_file_needed {:?}: has_cached_sig={}", dst_path, dst_sig_opt.is_some());
         if let Some(dst_sig) = dst_sig_opt {
             let sig_match = src_sig.matches(&dst_sig);
+            let src_mr = src_sig.merkle_root.as_deref().unwrap_or("none");
+            let dst_mr = dst_sig.merkle_root.as_deref().unwrap_or("none");
             warn!("TRACE   matches={} size={}vs{} mtime={}vs{} merkle_root={}vs{}",
                   sig_match, src_sig.size, dst_sig.size, src_sig.mtime_sec, dst_sig.mtime_sec,
-                  src_sig.merkle_root.as_deref().unwrap_or("none")[..8].to_string(),
-                  dst_sig.merkle_root.as_deref().unwrap_or("none")[..8].to_string());
+                  &src_mr[..src_mr.len().min(8)], &dst_mr[..dst_mr.len().min(8)]);
             if sig_match {
                 metrics::HASH_CACHE_HITS.inc();
                 return Ok(false);
@@ -908,7 +909,16 @@ impl Hydrator {
                             }
                         }
                     }
-                    // No Merkle signature stored — trust lite hash, cache signature
+                    // No Merkle signature stored.
+                    // For small files below hash threshold, verify_incremental
+                    // doesn't actually hash — it returns Ok(true) immediately.
+                    // Fall back to size+mtime comparison.
+                    let dm = df.metadata()?;
+                    if dm.len() != src_meta.len() || dm.mtime() != src_meta.mtime() {
+                        info!("sync_file_needed {:?}: size/mtime mismatch (src={}:{} dst={}:{}) — forcing resync",
+                              dst_path, src_meta.len(), src_meta.mtime(), dm.len(), dm.mtime());
+                        return Ok(true);
+                    }
                     if let Err(e) = set_sync_signature(&dst_path, &src_sig) {
                         warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_path, e);
                     }
