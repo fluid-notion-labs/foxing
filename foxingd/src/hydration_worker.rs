@@ -367,8 +367,18 @@ impl Hydrator {
 
                 // Compare stored hash
                 match sidecar::get_dir_hash(&target_dir) {
-                    Some(stored) if stored == src_hash => { /* match — continue checking */ },
-                    _ => { all_match = false; break; }
+                    Some(stored) if stored == src_hash => {
+                        debug!("Dir hash MATCH for {:?} (prunable)", rel_dir);
+                    },
+                    Some(stored) => {
+                        info!("Dir hash MISMATCH for {:?}: src={} stored={}", rel_dir,
+                              hex::encode(&src_hash[..8]), hex::encode(&stored[..8]));
+                        all_match = false; break;
+                    },
+                    None => {
+                        debug!("Dir hash ABSENT for {:?}", rel_dir);
+                        all_match = false; break;
+                    }
                 }
             }
 

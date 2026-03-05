@@ -69,10 +69,9 @@ impl SyncSignature {
     }
     
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        use bincode::Options;
-        bincode::DefaultOptions::new()
-            .with_limit(16 * 1024 * 1024) // 16MB max payload
-            .deserialize(data).ok()
+        // Must match serialize() which uses bincode::serialize (legacy fixint config).
+        // Previously used DefaultOptions (varint) which caused deserialization failures.
+        bincode::deserialize(data).ok()
     }
     
     pub fn matches(&self, other: &Self) -> bool {
@@ -185,23 +184,37 @@ pub fn get_metadata(path: &Path, key: &str) -> Option<Vec<u8>> {
     // Try sidecar file FIRST — reliable across NFS, containers, all filesystems.
     // xattr crate has reliability issues on NFSv4.2 (cross-process visibility).
     if let Some(sp) = get_sidecar_path(path) {
-        if sp.exists() {
-            if let Ok(file) = File::open(&sp) {
-                if lock_file(&file, false).is_ok() {
-                    let map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
-                    let _ = unlock_file(&file);
-                    if let Some(val_str) = map.get(&trusted_key).or_else(|| map.get(&user_key)) {
-                        if let Ok(val) = hex::decode(val_str) {
-                            return Some(val);
+        let sp_exists = sp.exists();
+        if sp_exists {
+            match File::open(&sp) {
+                Ok(file) => {
+                    if lock_file(&file, false).is_ok() {
+                        let map: HashMap<String, String> = serde_json::from_reader(&file).unwrap_or_default();
+                        let _ = unlock_file(&file);
+                        if let Some(val_str) = map.get(&trusted_key).or_else(|| map.get(&user_key)) {
+                            if let Ok(val) = hex::decode(val_str) {
+                                return Some(val);
+                            }
+                        } else if key == "sig" || key == "merkle" {
+                            tracing::warn!("get_metadata sidecar {:?}: key {}|{} not found in {:?}", sp, trusted_key, user_key, map.keys().collect::<Vec<_>>());
                         }
                     } else {
-                        tracing::warn!("get_metadata sidecar {:?}: key {}|{} not found in {:?}", path, trusted_key, user_key, map.keys().collect::<Vec<_>>());
+                        tracing::warn!("get_metadata sidecar {:?}: lock failed", sp);
                     }
-                } else {
-                    tracing::warn!("get_metadata sidecar {:?}: lock failed", path);
                 }
-            } else {
-                tracing::warn!("get_metadata sidecar {:?}: open failed", path);
+                Err(e) => {
+                    tracing::warn!("get_metadata sidecar {:?}: open failed: {}", sp, e);
+                }
+            }
+        } else if key == "sig" || key == "merkle" {
+            // Also check parent dir listing to see if NFS cached it
+            if let Some(parent) = sp.parent() {
+                let listing: Vec<_> = std::fs::read_dir(parent)
+                    .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+                        .filter(|n| n.contains("foxing_meta"))
+                        .collect())
+                    .unwrap_or_default();
+                tracing::warn!("get_metadata sidecar {:?}: file does NOT exist, key={}, foxing_meta files in parent: {:?}", sp, key, listing);
             }
         }
     }
@@ -296,8 +309,20 @@ pub fn set_sync_signature(path: &Path, sig: &SyncSignature) -> std::io::Result<(
 }
 
 pub fn get_sync_signature(path: &Path) -> Option<SyncSignature> {
-    get_metadata(path, "sig")
-        .and_then(|bytes| SyncSignature::deserialize(&bytes))
+    let raw = get_metadata(path, "sig");
+    match &raw {
+        Some(bytes) => {
+            let result = SyncSignature::deserialize(bytes);
+            if result.is_none() {
+                tracing::warn!("get_sync_signature {:?}: get_metadata returned {} bytes but deserialize FAILED", path, bytes.len());
+            }
+            result
+        }
+        None => {
+            tracing::warn!("get_sync_signature {:?}: get_metadata returned None", path);
+            None
+        }
+    }
 }
 
 /// Store a directory-level Merkle hash on the target directory.
@@ -366,10 +391,8 @@ pub fn set_merkle_signature(path: &Path, sig: &hashing::MerkleSignature) -> std:
 
 pub fn get_merkle_signature(path: &Path) -> Option<hashing::MerkleSignature> {
     let bytes = get_metadata(path, "merkle")?;
-    use bincode::Options;
-    let sig: hashing::MerkleSignature = bincode::DefaultOptions::new()
-        .with_limit(64 * 1024) // 64KB max (xattr limit)
-        .deserialize(&bytes).ok()?;
+    // Must match set_merkle_signature which uses bincode::serialize (legacy fixint config).
+    let sig: hashing::MerkleSignature = bincode::deserialize(&bytes).ok()?;
     // Bounds check
     if sig.chunk_size == 0 { return None; }
     let expected_max = sig.file_size / sig.chunk_size + 2;
