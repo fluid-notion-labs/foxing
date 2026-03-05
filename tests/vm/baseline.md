@@ -250,12 +250,21 @@ partial writes to non-existent target files → ENOENT → retry 10x → dropped
 5. **Hydration gate** — Proactive repair routing eliminates ENOENT→retry churn (`50eeaff`)
 6. **Dirty flag lifecycle** — Unconditional clear on success, hydration clears after copy (`50eeaff`)
 
+### Resolved Issues (continued)
+
+7. **Bincode encode/decode mismatch** — `serialize()` used fixint, `DefaultOptions::new().deserialize()` used varint. ALL sidecar reads silently failed. Fixed (`1aaad7b`)
+8. **Dir pruning cascade** — parent dir prune hid child mismatches (file mods don't update parent mtime). Removed cascade, added ancestor unprune (`1e8a11c`)
+9. **Small file verification** — `verify_incremental()` skipped files <128KB. Added size+mtime fallback (`556590c`)
+10. **Phase 7 (delta copy)** — PASS: BLAKE3 Merkle root comparison detects middle-of-file changes, delta copy transfers only modified 64KB chunks
+11. **Phase 8 (dir pruning)** — PASS: stable dirs pruned, modified/injected files correctly synced
+12. **Phase 9 (combined)** — PASS: both delta copy and dir pruning work simultaneously
+
 ### Remaining Work
 
-1. **Phase 3 (rename chains)** — renames for files not yet on NFS target fail; need rename-to-repair fallback
-2. **Phase 4 (NFS drop/resync)** — CircuitBreaker doesn't detect lazy unmount; sidecar resync needs work
-3. **Phase 6 (disk pressure)** — NFS share too large (22TB) for safe fill test; needs smaller test volume
-4. **Delta copy verification** — MerkleTree::diff()→copy_delta() wired but needs targeted test with large modified files
+1. **Phase 1 (hydration stall)** — BPF events during hydration cause ENOENT→repair churn; repair works but test shows stall signal
+2. **Phase 3 (rename chains)** — renames for files not yet on NFS target fail; need rename-to-repair fallback
+3. **Phase 4 (NFS drop/resync)** — CircuitBreaker doesn't detect lazy unmount; sidecar resync needs work
+4. **Phase 6 (disk pressure)** — NFS share too large (22TB) for safe fill test; needs smaller test volume
 
 ## Implementation Summary
 
@@ -284,3 +293,7 @@ partial writes to non-existent target files → ENOENT → retry 10x → dropped
 | Chunk-level delta copy | `50eeaff` | MerkleTree::diff()→copy_delta() for files >1MB |
 | Hydration completion gate | `50eeaff` | hydrated_inodes DashSet, proactive repair routing |
 | Dirty flag lifecycle fix | `50eeaff` | Unconditional clear on success across all paths |
+| Sidecar dual-write + read-first | `01c4977` | Always write both xattr AND sidecar; read sidecar first |
+| Bincode serialize/deserialize fix | `1aaad7b` | Match fixint encoding in both directions |
+| Small file size/mtime fallback | `556590c` | Catch changes to files below 128KB hash threshold |
+| Dir pruning ancestor unprune | `1e8a11c` | Remove parent from pruned set when child has mismatch |

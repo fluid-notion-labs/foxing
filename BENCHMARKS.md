@@ -256,6 +256,20 @@ Proactive routing of BPF events for unhydrated files directly to repair, elimina
 - Worker checks gate before attempting write: if inode not hydrated AND target doesn't exist → route to repair immediately
 - 30s grace period cleanup after hydration completes
 
+### Adversarial Test Phases 7-9 Results (`1e8a11c`)
+
+| Phase | Test | Result | Duration | Key Verification |
+|-------|------|--------|----------|-----------------|
+| 7 | BLAKE3 Delta Copy | **PASS** | 46s | SHA-256 match after chunk-level resync |
+| 8 | Directory Merkle Pruning | **PASS** | 51s | 3+ stable dirs pruned, modified dirs resynced |
+| 9 | Combined Delta + Pruning | **PASS** | 53s | Both delta and pruning active simultaneously |
+
+**Bugs found and fixed during testing:**
+- `bincode::serialize()` (fixint) vs `DefaultOptions::new().deserialize()` (varint) mismatch — ALL signature reads silently failed
+- Dir pruning cascade from parent to child hid file modifications (parent mtime unchanged by child file edits)
+- `verify_incremental()` returned Ok(true) for files <128KB without actually comparing — missed appended data
+- Ancestor unprune: when child dir has mismatch, parent must be removed from pruned set
+
 ### Stall Diagnostics (perf + bcc-tools)
 
 The adversarial test includes automatic stall diagnosis via `diagnose-stall.sh`:
