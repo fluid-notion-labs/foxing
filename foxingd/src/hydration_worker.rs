@@ -82,7 +82,10 @@ pub struct HydrationState {
     pub active: AtomicBool,
     pub scanned: AtomicU64,
     pub synced: AtomicU64,
-    pub shutdown_requested: AtomicBool, // Added shutdown flag
+    pub shutdown_requested: AtomicBool,
+    /// Set by workers after detecting target reconnection — triggers full rescan
+    /// to discover files created during outage.
+    pub request_rescan: AtomicBool,
 }
 
 impl Default for HydrationState {
@@ -92,6 +95,7 @@ impl Default for HydrationState {
             scanned: AtomicU64::new(0),
             synced: AtomicU64::new(0),
             shutdown_requested: AtomicBool::new(false),
+            request_rescan: AtomicBool::new(false),
         }
     }
 }
@@ -1133,6 +1137,12 @@ pub async fn run_hydration_worker_loop(
                             if let Some(sender) = senders.choose(&mut rand::rng()) {
                                 let _ = sender.send(stats);
                             }
+                        }
+                        // Detect target recovery: success after failure streak
+                        if jobs_failed > 5 && !source.hydration.request_rescan.load(Ordering::Relaxed) {
+                            info!("Hydration Worker {}: Target recovered after {} failures — requesting rescan",
+                                  worker_id, jobs_failed);
+                            source.hydration.request_rescan.store(true, Ordering::SeqCst);
                         }
                     }
                     Ok(None) => {

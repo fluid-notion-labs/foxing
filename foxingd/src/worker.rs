@@ -195,6 +195,9 @@ pub async fn run_worker(
     );
 
     let mut coalescer = Coalescer::new(target_cfg.ordering_scan_depth);
+    // Track consecutive target errors — when streak drops to 0, target recovered
+    // and we should request a rescan to discover files written during outage.
+    let mut target_error_streak: u32 = 0;
     let mut retry_queue = RetryQueue::new(
         constants::WORKER_RETRY_QUEUE_MAX_RETRIES,
         constants::WORKER_RETRY_QUEUE_BASE_BACKOFF_MS,
@@ -371,11 +374,19 @@ pub async fn run_worker(
                             accumulated_latency += duration;
                             if duration > max_latency_in_window { max_latency_in_window = duration; }
                             latency_samples_count += 1;
+                            // Detect target recovery: success after error streak
+                            if target_error_streak > 5 {
+                                info!("Worker {}: Target recovered after {} errors — requesting rescan",
+                                      worker_id, target_error_streak);
+                                source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                            }
+                            target_error_streak = 0;
                         },
                         Err(e) => {
                             accumulated_latency += duration;
                             if duration > max_latency_in_window { max_latency_in_window = duration; }
                             latency_samples_count += 1;
+                            target_error_streak += 1;
 
                             match classify_error(&e, &evt.event_type) {
                                 ErrorClass::TargetNotFound => {
@@ -925,15 +936,16 @@ async fn process_single_event_with_wal(
                         }
                     };
 
-                    // Update identity map if directory
-                    if event.mode & libc::S_IFDIR as u32 != 0 {
-                        if let Some(new_name) = &event.new_name {
-                            if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
-                                identity::update_map_after_rename(
-                                    &source.inode_map, &source.dir_map, event.dev_id, event.inode,
-                                    new_rel.clone(), event.generation, true, event.timestamp_ns, event.seq_num
-                                );
-                            }
+                    // Update identity map for ALL renames (not just directories).
+                    // File rename chains (a→b→c→d) need the identity map updated
+                    // after each step so the next rename can resolve the source path.
+                    if let Some(new_name) = &event.new_name {
+                        if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                            let is_dir = event.mode & libc::S_IFDIR as u32 != 0;
+                            identity::update_map_after_rename(
+                                &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                new_rel.clone(), event.generation, is_dir, event.timestamp_ns, event.seq_num
+                            );
                         }
                     }
                 },

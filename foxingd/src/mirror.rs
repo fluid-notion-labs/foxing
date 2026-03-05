@@ -378,9 +378,27 @@ impl Manager {
             let mut batch_buffer: Vec<(PathBuf, Option<u64>)> = Vec::with_capacity(100);
 
             loop {
+                // Check if any source requested a rescan (e.g. after target recovery)
+                // or if the rescan flag was set by worker error streak detection.
+                for h in hydrators_arc.iter() {
+                    if h.source.hydration.request_rescan.swap(false, Ordering::SeqCst) {
+                        let now = Instant::now();
+                        if now.duration_since(last_full_scan) > Duration::from_secs(5) {
+                            last_full_scan = now;
+                            info!("Hydration: Rescan triggered for {:?}", h.source.path);
+                            let h_clone = h.clone();
+                            h.source.hydration.active.store(true, Ordering::SeqCst);
+                            std::thread::spawn(move || {
+                                let _ = h_clone.full_scan(false);
+                                Ok::<(), FoxingError>(())
+                            });
+                        }
+                    }
+                }
+
                 let first_item = hydration_rx_task.recv().await;
                 if first_item.is_none() { break; }
-                
+
                 batch_buffer.push(first_item.unwrap());
                 while batch_buffer.len() < 100 {
                      match hydration_rx_task.try_recv() {
