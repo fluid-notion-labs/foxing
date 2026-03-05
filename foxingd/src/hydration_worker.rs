@@ -464,14 +464,15 @@ impl Hydrator {
             })
             .collect();
 
-        // Sort by file size ascending — small files first for fast throughput.
-        // Large files on NFS can take 30+ seconds each; processing them first
-        // causes all workers to stall while thousands of small files wait.
+        // Sort by (tier_priority, file_size) — fast targets first within each file,
+        // small files first overall. This ensures the signature cache is populated
+        // by fast local targets before slow NFS targets need the same signatures.
         let mut verification_results = verification_results;
-        verification_results.sort_by_key(|(rel_path, _, _)| {
-            fs::metadata(source_path.join(rel_path))
+        verification_results.sort_by_key(|(rel_path, target_cfg, _)| {
+            let size = fs::metadata(source_path.join(rel_path))
                 .map(|m| m.len())
-                .unwrap_or(u64::MAX)
+                .unwrap_or(u64::MAX);
+            (size, target_cfg.profile.tier_priority())
         });
 
         info!("Hydration: {} files require synchronization", verification_results.len());
@@ -967,6 +968,7 @@ pub async fn run_hydration_worker_loop(
     tracker: Arc<DashMap<u64, (u32, std::time::Instant)>>,
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     stats_senders: Arc<HashMap<PathBuf, Vec<UnboundedSender<CopyStats>>>>,
+    sig_cache: SignatureCache,
 ) -> Result<()> {
     
     use fxcp_core::operations::FsyncLatencyTracker;
@@ -1121,7 +1123,8 @@ pub async fn run_hydration_worker_loop(
                     job.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool,
                     async_fd.clone(), &source_caps, &target_caps, &tracker, &mut fsync_tracker,
                     current_limit,
-                    skip_fsync
+                    skip_fsync,
+                    &sig_cache
                 ).await {
                     Ok(Some(stats)) => {
                         metrics::EVENTS_REPAIR_COMPLETED.inc();
@@ -1188,6 +1191,17 @@ fn is_disconnect_error(err: &FoxingError) -> bool {
     false
 }
 
+/// Cached signatures from a previous target's post-copy computation.
+/// Shared across all hydration workers so the first target to complete
+/// a file's copy caches the result, and subsequent targets skip Merkle.
+pub type SignatureCache = Arc<DashMap<PathBuf, CachedSignatures>>;
+
+#[derive(Clone, Debug)]
+pub struct CachedSignatures {
+    pub sync_sig: SyncSignature,
+    pub merkle_bytes: Option<Vec<u8>>,
+}
+
 pub async fn process_hydration_job(
     job: crate::hydration::HydrationJob,
     source: &Arc<SourceInfo>,
@@ -1202,6 +1216,7 @@ pub async fn process_hydration_job(
     fsync_tracker: &mut fxcp_core::operations::FsyncLatencyTracker,
     buffer_limit: Option<usize>,
     skip_fsync: bool,
+    sig_cache: &SignatureCache,
 ) -> Result<Option<CopyStats>> {
     use tokio::task::spawn_blocking;
     use fxcp_core::operations::{SmartCopier};
@@ -1481,6 +1496,12 @@ pub async fn process_hydration_job(
                 let is_large = file_size > HYDRATION_SMALL_FILE_THRESHOLD;
                 let needs_merkle = file_size > MERKLE_DELTA_THRESHOLD;
 
+                // Check signature cache — if another target already computed
+                // signatures for this file, reuse them (tiered cloning).
+                let cached = sig_cache.get(&rel_path).map(|r| r.clone());
+                let sig_cache_ref = sig_cache.clone();
+                let rel_path_for_cache = rel_path.clone();
+
                 let postcopy_result = spawn_blocking(move || -> std::result::Result<(), FoxingError> {
                     // 1. Apply ownership/permissions/timestamps (large files only — small files done inline)
                     if is_large {
@@ -1494,66 +1515,72 @@ pub async fn process_hydration_job(
                         security::apply_metadata(&src_post, &dst_post)?;
                     }
 
-                    // 2. Compute Merkle tree from TARGET file (in page cache from write)
-                    //    and build SyncSignature — one read instead of three.
-                    let src_meta = std::fs::metadata(&src_post)?;
-                    let src_size = src_meta.len();
-
-                    let (merkle_root, merkle_sig) = if needs_merkle {
-                        match fxcp_core::hashing::MerkleTree::from_file(&dst_post, chunk_size) {
-                            Ok(tree) => {
-                                let root_hex = hex::encode(tree.root.as_bytes());
-                                let sig = tree.to_signature();
-                                (Some(root_hex), Some(sig))
-                            }
-                            Err(e) => {
-                                warn!("Hydration: Failed to compute Merkle from target {:?}: {}", dst_post, e);
-                                (None, None)
-                            }
-                        }
+                    // 2. Check if another target already computed signatures for this file
+                    let (sig, merkle_bytes_opt) = if let Some(cached_sigs) = cached {
+                        debug!("Hydration: Reusing cached signatures for {:?} (tiered)", dst_post);
+                        (cached_sigs.sync_sig, cached_sigs.merkle_bytes)
                     } else {
-                        (None, None)
+                        // Compute fresh: Merkle tree from TARGET + SyncSignature
+                        let src_meta = std::fs::metadata(&src_post)?;
+                        let src_size = src_meta.len();
+
+                        let (merkle_root, merkle_sig) = if needs_merkle {
+                            match fxcp_core::hashing::MerkleTree::from_file(&dst_post, chunk_size) {
+                                Ok(tree) => {
+                                    let root_hex = hex::encode(tree.root.as_bytes());
+                                    let sig = tree.to_signature();
+                                    (Some(root_hex), Some(sig))
+                                }
+                                Err(e) => {
+                                    warn!("Hydration: Failed to compute Merkle from target {:?}: {}", dst_post, e);
+                                    (None, None)
+                                }
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                        let lite_hash = if hashing::is_hashing_enabled() && src_size >= hashing::get_lite_threshold_bytes() {
+                            hashing::hash_file_lite(&src_post, src_size)
+                                .ok()
+                                .flatten()
+                                .map(|h| h.to_hex().to_string())
+                        } else {
+                            None
+                        };
+
+                        let sig = SyncSignature {
+                            size: src_size,
+                            mtime_sec: src_meta.mtime(),
+                            mtime_nsec: src_meta.mtime_nsec(),
+                            hash: lite_hash,
+                            merkle_root,
+                            chunk_size: Some(chunk_size),
+                            leaf_count: merkle_sig.as_ref().map(|s| s.leaf_hashes.len() as u32),
+                            version: SyncSignature::CURRENT_VERSION,
+                        };
+
+                        let merkle_bytes_opt = merkle_sig.as_ref()
+                            .and_then(|msig| bincode::serialize(msig).ok())
+                            .filter(|b| b.len() <= 64 * 1024);
+
+                        // Cache for reuse by other targets (tiered cloning)
+                        sig_cache_ref.insert(rel_path_for_cache, CachedSignatures {
+                            sync_sig: sig.clone(),
+                            merkle_bytes: merkle_bytes_opt.clone(),
+                        });
+
+                        (sig, merkle_bytes_opt)
                     };
 
-                    // 3. Compute lite hash (cheap — only reads head+tail of source)
-                    let lite_hash = if hashing::is_hashing_enabled() && src_size >= hashing::get_lite_threshold_bytes() {
-                        hashing::hash_file_lite(&src_post, src_size)
-                            .ok()
-                            .flatten()
-                            .map(|h| h.to_hex().to_string())
-                    } else {
-                        None
-                    };
-
-                    // 4. Build SyncSignature using Merkle root as full hash (no hash_file_full needed)
-                    let sig = SyncSignature {
-                        size: src_size,
-                        mtime_sec: src_meta.mtime(),
-                        mtime_nsec: src_meta.mtime_nsec(),
-                        hash: lite_hash,
-                        merkle_root,
-                        chunk_size: Some(chunk_size),
-                        leaf_count: merkle_sig.as_ref().map(|s| s.leaf_hashes.len() as u32),
-                        version: SyncSignature::CURRENT_VERSION,
-                    };
-
-                    // 5. WI-3: Batch write sig + merkle in single sidecar open/lock/write cycle
+                    // 3. Write signatures to this target's xattrs
                     let sig_bytes = sig.serialize();
-                    if let Some(ref msig) = merkle_sig {
-                        if let Ok(merkle_bytes) = bincode::serialize(msig) {
-                            if merkle_bytes.len() <= 64 * 1024 {
-                                if let Err(e) = sidecar::set_metadata_batch(&dst_post, &[
-                                    ("sig", &sig_bytes),
-                                    ("merkle", &merkle_bytes),
-                                ]) {
-                                    warn!("Hydration: Failed to batch-write metadata for {:?}: {}", dst_post, e);
-                                }
-                            } else {
-                                // Merkle too large for batch, write sig only
-                                if let Err(e) = set_sync_signature(&dst_post, &sig) {
-                                    warn!("Hydration: Failed to store sync signature for {:?}: {}", dst_post, e);
-                                }
-                            }
+                    if let Some(ref merkle_bytes) = merkle_bytes_opt {
+                        if let Err(e) = sidecar::set_metadata_batch(&dst_post, &[
+                            ("sig", &sig_bytes),
+                            ("merkle", merkle_bytes),
+                        ]) {
+                            warn!("Hydration: Failed to batch-write metadata for {:?}: {}", dst_post, e);
                         }
                     } else {
                         if let Err(e) = set_sync_signature(&dst_post, &sig) {
@@ -1561,7 +1588,7 @@ pub async fn process_hydration_job(
                         }
                     }
 
-                    // 6. Clear dirty flag
+                    // 4. Clear dirty flag
                     let _ = sidecar::set_dirty_flag(&dst_post, false, "hydration_complete");
 
                     Ok(())

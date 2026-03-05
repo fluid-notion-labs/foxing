@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering, AtomicBool};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use fxcp_core::operations::CopyStats;
+use crate::hydration_worker::SignatureCache;
 
 #[derive(Debug, Clone)]
 pub struct HydrationJob {
@@ -52,6 +53,9 @@ impl HydrationQueue {
         let pending_count = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut senders = Vec::with_capacity(worker_count);
+        // Shared signature cache for tiered cloning — first target to complete
+        // a file caches its Merkle/SyncSignature, subsequent targets reuse it.
+        let sig_cache: SignatureCache = Arc::new(DashMap::new());
 
         for id in 0..worker_count {
             let (tx, rx) = mpsc::channel(per_worker_capacity);
@@ -63,12 +67,13 @@ impl HydrationQueue {
             let tracker_clone = tracker.clone();
             let pending_clone = pending_count.clone();
             let stats_senders_clone = stats_senders.clone();
+            let sig_cache_clone = sig_cache.clone();
 
             scope.spawn(async move {
                 crate::hydration_worker::run_hydration_worker_loop(
                     rx, source_clone, config_clone, governor_clone,
                     tuner_clone, worker_count, id, tracker_clone, pending_clone,
-                    stats_senders_clone
+                    stats_senders_clone, sig_cache_clone
                 ).await
             });
         }

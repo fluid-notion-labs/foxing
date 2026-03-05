@@ -91,6 +91,23 @@ pub enum TargetProfile {
     Auto,
 }
 
+impl TargetProfile {
+    /// Lower = faster = primary candidate for tiered cloning.
+    /// When multiple targets exist, the fastest target computes Merkle/signatures
+    /// first and caches them for reuse by slower targets.
+    pub fn tier_priority(&self) -> u8 {
+        match self {
+            Self::NVMe => 0,
+            Self::SSD => 1,
+            Self::HDD => 2,
+            Self::SdCard => 3,
+            Self::Network => 4,
+            Self::NFS => 5,
+            Self::Auto => 2,
+        }
+    }
+}
+
 pub fn get_flush_multiplier_bounds(profile: &TargetProfile) -> (u32, u32) {
     match profile {
         TargetProfile::NVMe => (1, 2),
