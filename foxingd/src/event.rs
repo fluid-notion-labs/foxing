@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use serde::{Serialize, Deserialize};
 use std::time::Instant;
+use std::sync::atomic::Ordering;
 
 pub const RENAME_NOREPLACE: u32 = 1 << 0;
 pub const RENAME_EXCHANGE: u32 = 1 << 1;
@@ -43,6 +44,33 @@ impl From<u8> for EventType {
     }
 }
 
+/// CAKE-inspired priority tin classification for events.
+/// Events are classified into 4 tins with independent queues.
+/// Higher-priority tins are always drained before lower ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EventTin {
+    /// Ordering barriers, sequence gaps, fsync — must always flow
+    Control = 0,
+    /// Create, Mkdir, Rename, Unlink — filesystem structure, never drop
+    Structural = 1,
+    /// Chmod, Chown, Utimes, xattr — metadata, lower urgency
+    Metadata = 2,
+    /// Write, WriteRange, Clone, Truncate — bulk data, coalesced, droppable
+    Bulk = 3,
+}
+
+impl EventTin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Structural => "structural",
+            Self::Metadata => "metadata",
+            Self::Bulk => "bulk",
+        }
+    }
+}
+
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -60,6 +88,20 @@ impl EventType {
             Self::Unknown => "unknown"
         }
     }
+
+    /// Classify event into a CAKE-style priority tin.
+    pub fn tin(&self) -> EventTin {
+        match self {
+            Self::Barrier | Self::SequenceGap | Self::Fsync => EventTin::Control,
+            Self::Create | Self::Mkdir | Self::Rename | Self::Unlink
+            | Self::Rmdir | Self::Link | Self::Symlink | Self::Mknod
+            | Self::RenameIncomplete => EventTin::Structural,
+            Self::Chmod | Self::Chown | Self::Utimes | Self::SetXattr
+            | Self::RemoveXattr | Self::SetFlags | Self::Lock | Self::Flock => EventTin::Metadata,
+            _ => EventTin::Bulk,
+        }
+    }
+
     pub fn is_structural_metadata(&self) -> bool {
         matches!(self,
             Self::Mkdir | Self::Rmdir | Self::Unlink |
@@ -82,22 +124,35 @@ impl EventType {
     }
 }
 
+/// Per-worker tinned receiver set. Workers drain tins in priority order
+/// using biased select: control > structural > metadata > bulk.
+pub struct TinnedReceiver {
+    pub control: mpsc::UnboundedReceiver<Arc<Event>>,
+    pub structural: mpsc::Receiver<Arc<Event>>,
+    pub metadata: mpsc::Receiver<Arc<Event>>,
+    pub bulk: mpsc::Receiver<Arc<Event>>,
+}
+
+/// CAKE-inspired multi-tin event queue. Events are classified by type
+/// and routed to priority-separated channels per worker.
 #[derive(Debug)]
 pub struct EventQueue {
-    pub senders: Vec<mpsc::Sender<Arc<Event>>>
+    control: Vec<mpsc::UnboundedSender<Arc<Event>>>,
+    structural: Vec<mpsc::Sender<Arc<Event>>>,
+    metadata: Vec<mpsc::Sender<Arc<Event>>>,
+    bulk: Vec<mpsc::Sender<Arc<Event>>>,
+    worker_count: usize,
 }
 
 impl EventQueue {
-    pub fn new(senders: Vec<mpsc::Sender<Arc<Event>>>) -> Self {
-        Self { senders }
-    }
     pub fn push(&self, e: Arc<Event>) -> bool {
         if e.is_internal_traffic() {
             return true;
         }
         metrics::EVENTS_TOTAL.with_label_values(&[e.event_type.as_str()]).inc();
-        if self.senders.is_empty() { return false; }
-        let pool_size = self.senders.len();
+        if self.worker_count == 0 { return false; }
+
+        let pool_size = self.worker_count;
         let target_idx = if pool_size <= 1 {
             0
         } else if e.event_type.is_control_plane() {
@@ -113,22 +168,53 @@ impl EventQueue {
             let data_worker_count = pool_size - 1;
             1 + (hash as usize % data_worker_count)
         };
-        match self.senders[target_idx].try_send(e.clone()) {
-            Ok(_) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Channel full — try other workers before dropping
-                for offset in 1..pool_size {
-                    let alt_idx = (target_idx + offset) % pool_size;
-                    if self.senders[alt_idx].try_send(e.clone()).is_ok() {
-                        return true;
-                    }
-                }
-                metrics::EVENTS_DROPPED.inc();
-                false
+
+        let tin = e.event_type.tin();
+        match tin {
+            EventTin::Control => {
+                // Control: unbounded, never drop
+                let _ = self.control[target_idx].send(e);
+                true
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                metrics::EVENTS_DROPPED.inc();
-                false
+            EventTin::Structural => {
+                // Structural: try target worker, then all others, then blocking_send
+                match self.structural[target_idx].try_send(e.clone()) {
+                    Ok(_) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        for offset in 1..pool_size {
+                            let alt = (target_idx + offset) % pool_size;
+                            if self.structural[alt].try_send(e.clone()).is_ok() {
+                                return true;
+                            }
+                        }
+                        // NEVER drop structural — block BPF thread briefly
+                        let _ = self.structural[0].blocking_send(e);
+                        true
+                    }
+                    Err(_) => { metrics::EVENTS_DROPPED.inc(); false }
+                }
+            }
+            EventTin::Metadata => {
+                match self.metadata[target_idx].try_send(e) {
+                    Ok(_) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        metrics::EVENTS_DROPPED.inc();
+                        false
+                    }
+                    Err(_) => { metrics::EVENTS_DROPPED.inc(); false }
+                }
+            }
+            EventTin::Bulk => {
+                match self.bulk[target_idx].try_send(e) {
+                    Ok(_) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Bulk events: drop freely under pressure.
+                        // Hydration scan catches missed writes.
+                        metrics::EVENTS_DROPPED.inc();
+                        false
+                    }
+                    Err(_) => { metrics::EVENTS_DROPPED.inc(); false }
+                }
             }
         }
     }
@@ -149,8 +235,8 @@ pub struct Event {
     pub new_name: Option<String>,
     pub generation: u32,
     pub projid: u32,
-    pub uid: u32, // Added for ownership preservation
-    pub gid: u32, // Added for ownership preservation
+    pub uid: u32,
+    pub gid: u32,
     pub mode: u32,
     pub flags: u32,
     pub nlink: u32,
@@ -172,13 +258,42 @@ impl Event {
     }
 }
 
-pub fn create_fanout(cap: usize, workers: usize) -> (EventQueue, Vec<mpsc::Receiver<Arc<Event>>>) {
+/// Create a tinned fanout: per-worker 4-tin channel set.
+/// Returns the EventQueue (sender side) and per-worker TinnedReceiver (receiver side).
+pub fn create_fanout(_cap: usize, workers: usize) -> (EventQueue, Vec<TinnedReceiver>) {
     let actual_workers = workers.max(1);
-    let (mut txs, mut rxs) = (Vec::new(), Vec::new());
+    let mut control_txs = Vec::with_capacity(actual_workers);
+    let mut structural_txs = Vec::with_capacity(actual_workers);
+    let mut metadata_txs = Vec::with_capacity(actual_workers);
+    let mut bulk_txs = Vec::with_capacity(actual_workers);
+    let mut receivers = Vec::with_capacity(actual_workers);
+
     for _ in 0..actual_workers {
-        let (t, r) = mpsc::channel(cap);
-        txs.push(t);
-        rxs.push(r);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let (str_tx, str_rx) = mpsc::channel(4096);
+        let (met_tx, met_rx) = mpsc::channel(1024);
+        let (blk_tx, blk_rx) = mpsc::channel(64);
+
+        control_txs.push(ctl_tx);
+        structural_txs.push(str_tx);
+        metadata_txs.push(met_tx);
+        bulk_txs.push(blk_tx);
+
+        receivers.push(TinnedReceiver {
+            control: ctl_rx,
+            structural: str_rx,
+            metadata: met_rx,
+            bulk: blk_rx,
+        });
     }
-    (EventQueue::new(txs), rxs)
+
+    let queue = EventQueue {
+        control: control_txs,
+        structural: structural_txs,
+        metadata: metadata_txs,
+        bulk: bulk_txs,
+        worker_count: actual_workers,
+    };
+
+    (queue, receivers)
 }

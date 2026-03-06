@@ -164,7 +164,7 @@ impl RetryQueue {
 }
 
 pub async fn run_worker(
-    mut event_rx: mpsc::Receiver<Arc<Event>>,
+    mut tinned_rx: crate::event::TinnedReceiver,
     source: Arc<SourceInfo>,
     target_cfg: TargetConfig,
     config: SharedConfig,
@@ -419,7 +419,8 @@ pub async fn run_worker(
 
                             match classify_error(&e, &evt.event_type) {
                                 ErrorClass::TargetNotFound => {
-                                    let abs_path = source.path.join(&evt.name);
+                                    let repair_rel = resolve_event_path(&source, evt.parent_inode, &evt.name).await.unwrap_or_else(|_| PathBuf::from(&evt.name));
+                                    let abs_path = source.mount.join(&repair_rel);
                                     hydration_tx.send_repair_job(abs_path, Some(evt.inode)).await;
                                     metrics::EVENTS_REPAIR_QUEUED.inc();
                                 },
@@ -443,7 +444,10 @@ pub async fn run_worker(
             }
         }
 
+        let mut received_event: Option<Arc<Event>> = None;
+
         tokio::select! {
+            biased;  // Control > Structural > Metadata > Bulk
 
             _ = shutdown_rx.recv() => {
                 info!("Worker {}: Shutdown signal received.", worker_id);
@@ -541,7 +545,8 @@ pub async fn run_worker(
 
                             match classify_error(&e, &evt.event_type) {
                                 ErrorClass::TargetNotFound => {
-                                    let abs_path = source.path.join(&evt.name);
+                                    let repair_rel = resolve_event_path(&source, evt.parent_inode, &evt.name).await.unwrap_or_else(|_| PathBuf::from(&evt.name));
+                                    let abs_path = source.mount.join(&repair_rel);
                                     hydration_tx.send_repair_job(abs_path, Some(evt.inode)).await;
                                     metrics::EVENTS_REPAIR_QUEUED.inc();
                                 },
@@ -633,63 +638,89 @@ pub async fn run_worker(
             // The event_rx.recv() below will properly wake when events arrive.
             _ = tune_interval.tick(), if !coalescer.is_empty() || !retry_queue.is_empty() => {}
 
-            Some(evt) = event_rx.recv(), if coalescer.len() < 10000 => {
-                metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+            // CAKE-inspired tinned dispatch: control > structural > metadata > bulk.
+            // biased select ensures control always drains first.
+            // Control/structural/metadata process immediately.
+            // Bulk goes through the coalescer for write aggregation.
+            Some(evt) = tinned_rx.control.recv() => {
+                received_event = Some(evt);
+            }
+            Some(evt) = tinned_rx.structural.recv() => {
+                received_event = Some(evt);
+            }
+            Some(evt) = tinned_rx.metadata.recv() => {
+                received_event = Some(evt);
+            }
+            Some(evt) = tinned_rx.bulk.recv() => {
+                // Bulk events go through coalescer
                 coalescer.push(evt);
                 if coalescer.len() > peak_coalescer_len { peak_coalescer_len = coalescer.len(); }
-                
-                if let Some(batch_evt) = coalescer.pop_batch(tuner.current_coalesce_bytes, Duration::from_micros(tuner.current_flush_us), true) {
-                    let start_time = Instant::now();
-                    let (res, sc, dt) = process_single_event_with_wal(
-                        batch_evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
-                        poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
-                        smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
-                    ).await;
-                    
-                    smart_copier = sc;
-                    dirty_tracker = dt;
-                    let duration = start_time.elapsed();
+                if let Some(coalesced) = coalescer.pop_batch(tuner.current_coalesce_bytes, Duration::from_micros(tuner.current_flush_us), true) {
+                    received_event = Some(coalesced);
+                }
+            }
+        }
 
-                    match res {
-                        Ok(stats) => {
-                            bytes_since_tune += stats.bytes_processed;
-                            ops_since_tune += stats.ops_count.max(1);
-                            accumulated_latency += duration;
-                            if duration > max_latency_in_window { max_latency_in_window = duration; }
-                            latency_samples_count += 1;
-                            let e2e = batch_evt.created_at.elapsed().as_secs_f64();
-                            metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(e2e);
-                            let epoch_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as f64;
-                            metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
+        // Process any event received from the tinned dispatch
+        if let Some(batch_evt) = received_event.take() {
+            let start_time = Instant::now();
+            let sojourn = batch_evt.created_at.elapsed();
+            metrics::REPLICATION_LATENCY.with_label_values(&[path_label]).observe(sojourn.as_secs_f64());
+
+            let (res, sc, dt) = process_single_event_with_wal(
+                batch_evt.clone(), source.clone(), target_cfg.clone(), wal.clone(),
+                poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
+                smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
+            ).await;
+
+            smart_copier = sc;
+            dirty_tracker = dt;
+            let duration = start_time.elapsed();
+
+            match res {
+                Ok(stats) => {
+                    bytes_since_tune += stats.bytes_processed;
+                    ops_since_tune += stats.ops_count.max(1);
+                    accumulated_latency += duration;
+                    if duration > max_latency_in_window { max_latency_in_window = duration; }
+                    latency_samples_count += 1;
+                    let epoch_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as f64;
+                    metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
+                    if target_error_streak > 5 {
+                        info!("Worker {}: Target recovered after {} errors — requesting rescan",
+                              worker_id, target_error_streak);
+                        source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                    }
+                    target_error_streak = 0;
+                },
+                Err(e) => {
+                    accumulated_latency += duration;
+                    if duration > max_latency_in_window { max_latency_in_window = duration; }
+                    latency_samples_count += 1;
+                    target_error_streak += 1;
+
+                    match classify_error(&e, &batch_evt.event_type) {
+                        ErrorClass::TargetNotFound => {
+                            let repair_rel = resolve_event_path(&source, batch_evt.parent_inode, &batch_evt.name).await.unwrap_or_else(|_| PathBuf::from(&batch_evt.name));
+                            let abs_path = source.mount.join(&repair_rel);
+                            hydration_tx.send_repair_job(abs_path, Some(batch_evt.inode)).await;
+                            metrics::EVENTS_REPAIR_QUEUED.inc();
                         },
-                        Err(e) => {
-                            accumulated_latency += duration;
-                            if duration > max_latency_in_window { max_latency_in_window = duration; }
-                            latency_samples_count += 1;
-
-                            match classify_error(&e, &batch_evt.event_type) {
-                                ErrorClass::TargetNotFound => {
-                                    let abs_path = source.path.join(&batch_evt.name);
-                                    hydration_tx.send_repair_job(abs_path, Some(batch_evt.inode)).await;
-                                    metrics::EVENTS_REPAIR_QUEUED.inc();
-                                },
-                                ErrorClass::SourceNotFound => {
-                                    debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, batch_evt.inode);
-                                    metrics::EVENTS_SOURCE_GONE.inc();
-                                },
-                                ErrorClass::Transient => {
-                                    warn!("Worker {}: Batch failed: {:?}", worker_id, e);
-                                    retry_queue.push(batch_evt, 0);
-                                },
-                                ErrorClass::Permanent => {
-                                    error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, batch_evt.inode, e);
-                                    metrics::EVENTS_DROPPED.inc();
-                                },
-                            }
-                        }
+                        ErrorClass::SourceNotFound => {
+                            debug!("Worker {}: Source gone for inode {} (transient lifecycle)", worker_id, batch_evt.inode);
+                            metrics::EVENTS_SOURCE_GONE.inc();
+                        },
+                        ErrorClass::Transient => {
+                            warn!("Worker {}: Event failed: {:?}", worker_id, e);
+                            retry_queue.push(batch_evt, 0);
+                        },
+                        ErrorClass::Permanent => {
+                            error!("Worker {}: Permanent error for inode {}: {:?}", worker_id, batch_evt.inode, e);
+                            metrics::EVENTS_DROPPED.inc();
+                        },
                     }
                 }
             }
@@ -792,7 +823,8 @@ async fn process_single_event_with_wal(
             | EventType::Truncate | EventType::Fallocate)
     {
         if !target_path.exists() {
-            let abs_path = source.path.join(&event.name);
+            let repair_rel = resolve_event_path(&source, event.parent_inode, &event.name).await.unwrap_or_else(|_| PathBuf::from(&event.name));
+            let abs_path = source.mount.join(&repair_rel);
             hydration_tx.send_repair_job(abs_path, Some(event.inode)).await;
             metrics::HYDRATION_GATE_REDIRECTED.inc();
             return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
