@@ -441,7 +441,6 @@ pub async fn run_worker(
         }
 
         tokio::select! {
-            biased;
 
             _ = shutdown_rx.recv() => {
                 info!("Worker {}: Shutdown signal received.", worker_id);
@@ -562,14 +561,17 @@ pub async fn run_worker(
             }
 
             _ = flush_interval.tick(), if !coalescer.is_empty() => {
-                if let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
+                // Drain ALL pending events from coalescer (not just one per tick)
+                let mut flush_count = 0;
+                while let Some(evt) = coalescer.pop_batch(0, Duration::ZERO, false) {
+                    flush_count += 1;
                     let start_time = Instant::now();
                     let (res, sc, dt) = process_single_event_with_wal(
-                        evt.clone(), source.clone(), target_cfg.clone(), wal.clone(), 
+                        evt.clone(), source.clone(), target_cfg.clone(), wal.clone(),
                         poison_cabinet.clone(), circuit_breaker.clone(), daemon_id.clone(),
                         smart_copier, sidecar.clone(), dirty_tracker, worker_id, hydration_tx.clone(), 0
                     ).await;
-                    
+
                     smart_copier = sc;
                     dirty_tracker = dt;
                     let duration = start_time.elapsed();
@@ -587,10 +589,17 @@ pub async fn run_worker(
                             .unwrap_or_default()
                             .as_millis() as f64;
                         metrics::WORKER_LAST_COPY_EPOCH_MS.with_label_values(&[path_label, &worker_id_str]).set(epoch_ms);
+                        if target_error_streak > 5 {
+                            info!("Worker {}: Target recovered after {} errors — requesting rescan",
+                                  worker_id, target_error_streak);
+                            source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                        }
+                        target_error_streak = 0;
                     } else if let Err(e) = res {
                         accumulated_latency += duration;
                         if duration > max_latency_in_window { max_latency_in_window = duration; }
                         latency_samples_count += 1;
+                        target_error_streak += 1;
 
                         match classify_error(&e, &evt.event_type) {
                             ErrorClass::TargetNotFound => {
@@ -612,6 +621,8 @@ pub async fn run_worker(
                             },
                         }
                     }
+                    // Cap per-tick drain to prevent unbounded processing
+                    if flush_count >= 256 { break; }
                 }
             }
             
@@ -746,7 +757,13 @@ async fn process_single_event_with_wal(
 
     let target_path_res = identity::resolve_target(&source.inode_map, &source.dir_map, &event, &target_cfg.path);
     let target_path = match target_path_res {
-        ResolveResult::Success(p, _, _) => p,
+        ResolveResult::Success(p, is_fallback, _) => {
+            if is_fallback {
+                debug!("Worker {}: resolve_target FALLBACK for {:?} inode={} p_ino={} → {:?}",
+                       worker_id, event.event_type, event.inode, event.parent_inode, p);
+            }
+            p
+        },
         ResolveResult::NeedsRepair(p) => p,
         ResolveResult::SecurityBlock => {
             error!("Worker: Security Policy Violation - Access denied for inode {} (Path Traversal/Symlink Race)", event.inode);
@@ -1101,14 +1118,36 @@ async fn process_single_event_with_wal(
             }
         },
         EventType::Mkdir | EventType::Create | EventType::Mknod => {
+             // For regular file creates, route to hydration for a full copy
+             // (not just an empty file) — the source file likely has data already.
+             if event.event_type == EventType::Create {
+                 let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                 let abs_path = source.mount.join(rel);
+                 if abs_path.exists() {
+                     // Full copy via hydration repair pipeline
+                     hydration_tx.send_repair_job(abs_path, Some(event.inode)).await;
+                     metrics::EVENTS_REPAIR_QUEUED.inc();
+                     // Update identity map so renames can find this inode
+                     if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
+                         identity::update_map(
+                             &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                             r.to_path_buf(), event.generation, false, false,
+                             event.timestamp_ns, event.seq_num
+                         );
+                     }
+                     metrics::LIVE_ADDITIONS.inc();
+                     return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                 }
+             }
+
              let target_path_clone = target_path.clone();
              let event_clone = event.clone();
-             
+
              let fs_res = spawn_blocking(move || {
                  if let Some(parent) = target_path_clone.parent() {
                      let _ = std::fs::create_dir_all(parent);
                  }
-                 
+
                  if event_clone.event_type == EventType::Mkdir {
                      let _ = std::fs::create_dir_all(&target_path_clone);
                  } else if event_clone.event_type == EventType::Mknod {
@@ -1116,7 +1155,7 @@ async fn process_single_event_with_wal(
                  } else {
                      let _ = std::fs::File::create(&target_path_clone);
                  }
-                 
+
                  security::set_ownership(&target_path_clone, event_clone.uid, event_clone.gid)?;
                  Ok::<(), FoxingError>(())
              }).await.map_err(FoxingError::Join);

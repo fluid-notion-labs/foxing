@@ -77,11 +77,13 @@ impl EventType {
     pub fn is_control_plane(&self) -> bool {
         matches!(self,
             Self::Rename |
+            Self::Create |
             Self::Mkdir |
             Self::Rmdir |
             Self::Link |
             Self::Symlink |
             Self::Unlink |
+            Self::Mknod |
             Self::RenameIncomplete
         )
     }

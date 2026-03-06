@@ -165,9 +165,16 @@ pub fn resolve_target(
             (ResolveResult::Success(primary, false, false), Some(entry.primary_path()))
         }
     } else {
-        // Inode not in map — resolve path via parent_inode + name from dir_map
+        // Inode not in map — resolve path via parent_inode + name from dir_map.
+        // If parent not in dir_map, try to resolve it from the inode_map
+        // (the Mkdir event may have populated it there).
         let rel_path = if event.parent_inode != 0 && !event.name.is_empty() {
             if let Some(parent_path) = dir_map.get(&event.parent_inode) {
+                parent_path.join(&event.name)
+            } else if let Some(parent_entry) = inode_map.get(&event.parent_inode) {
+                // Parent is in inode_map but not dir_map — add it to dir_map
+                let parent_path = parent_entry.primary_path();
+                dir_map.insert(event.parent_inode, parent_path.clone());
                 parent_path.join(&event.name)
             } else {
                 PathBuf::from(&event.name)
