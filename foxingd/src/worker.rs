@@ -25,7 +25,7 @@ use fxcp_core::constants;
 use tokio::io::unix::AsyncFd;
 use tokio::task::spawn_blocking;
 use fxcp_core::security;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use crate::metrics;
 
 const STATIC_RING_DEPTH: u32 = 4096;
@@ -133,18 +133,6 @@ impl RetryQueue {
         
         debug!("RetryQueue: Scheduling retry #{} for inode {} in {:?}", attempts + 1, event.inode, backoff);
         self.queue.push_back((event, next_attempt, attempts + 1));
-    }
-
-    #[allow(dead_code)]
-    fn pop_ready(&mut self) -> Option<(Arc<Event>, u32)> {
-        if let Some((_, time, _)) = self.queue.front() {
-            if Instant::now() >= *time {
-                if let Some((evt, _, attempts)) = self.queue.pop_front() {
-                    return Some((evt, attempts));
-                }
-            }
-        }
-        None
     }
 
     fn pop_ready_batch(&mut self, max: usize) -> Vec<(Arc<Event>, u32)> {
@@ -646,6 +634,7 @@ pub async fn run_worker(
             _ = tune_interval.tick(), if !coalescer.is_empty() || !retry_queue.is_empty() => {}
 
             Some(evt) = event_rx.recv(), if coalescer.len() < 10000 => {
+                metrics::GLOBAL_BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
                 coalescer.push(evt);
                 if coalescer.len() > peak_coalescer_len { peak_coalescer_len = coalescer.len(); }
                 
@@ -1331,6 +1320,107 @@ async fn process_single_event_with_wal(
                     )));
                 }
             };
+        },
+        EventType::Symlink => {
+            let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+            let source_path = source.mount.join(rel);
+            let target_path_clone = target_path.clone();
+            let event_uid = event.uid;
+            let event_gid = event.gid;
+
+            let symlink_res = spawn_blocking(move || {
+                let link_target = std::fs::read_link(&source_path)
+                    .map_err(FoxingError::Io)?;
+
+                if let Some(parent) = target_path_clone.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                // Remove existing entry at target path if present
+                let _ = std::fs::remove_file(&target_path_clone);
+
+                std::os::unix::fs::symlink(&link_target, &target_path_clone)
+                    .map_err(FoxingError::Io)?;
+
+                // Apply ownership via lchown (don't follow the symlink)
+                let cpath = std::ffi::CString::new(target_path_clone.to_string_lossy().as_bytes())
+                    .map_err(|_| FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput, "Invalid path for lchown"
+                    )))?;
+                let rc = unsafe { libc::lchown(cpath.as_ptr(), event_uid, event_gid) };
+                if rc != 0 {
+                    let e = std::io::Error::last_os_error();
+                    warn!("lchown failed for symlink {:?}: {}", target_path_clone, e);
+                }
+
+                Ok::<(), FoxingError>(())
+            }).await.map_err(FoxingError::Join);
+
+            match symlink_res {
+                Ok(Ok(_)) => {
+                    if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                        identity::update_map(
+                            &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                            rel.to_path_buf(), event.generation, false, false,
+                            event.timestamp_ns, event.seq_num
+                        );
+                    }
+                },
+                Ok(Err(e)) => op_result = Err(e),
+                Err(e) => op_result = Err(e.into()),
+            }
+        },
+        EventType::Chmod => {
+            let target_path_clone = target_path.clone();
+            let mode = event.mode;
+
+            let chmod_res = spawn_blocking(move || {
+                let perms = std::fs::Permissions::from_mode(mode);
+                std::fs::set_permissions(&target_path_clone, perms)
+                    .map_err(FoxingError::Io)
+            }).await.map_err(FoxingError::Join);
+
+            match chmod_res {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => op_result = Err(e),
+                Err(e) => op_result = Err(e.into()),
+            }
+        },
+        EventType::Chown => {
+            let target_path_clone = target_path.clone();
+            let uid = event.uid;
+            let gid = event.gid;
+
+            let chown_res = spawn_blocking(move || {
+                security::set_ownership(&target_path_clone, uid, gid)
+                    .map_err(|e| FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other, e.to_string()
+                    )))
+            }).await.map_err(FoxingError::Join);
+
+            match chown_res {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => op_result = Err(e),
+                Err(e) => op_result = Err(e.into()),
+            }
+        },
+        EventType::Utimes => {
+            let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+            let source_path = source.mount.join(rel);
+            let target_path_clone = target_path.clone();
+
+            let utimes_res = spawn_blocking(move || {
+                security::apply_metadata(&source_path, &target_path_clone)
+                    .map_err(|e| FoxingError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other, e.to_string()
+                    )))
+            }).await.map_err(FoxingError::Join);
+
+            match utimes_res {
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => op_result = Err(e),
+                Err(e) => op_result = Err(e.into()),
+            }
         },
         _ => {}
     }

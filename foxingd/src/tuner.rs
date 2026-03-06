@@ -161,15 +161,6 @@ impl<T: PartialOrd + Copy + std::fmt::Display> WindowedFilter<T> {
 }
 
 #[derive(Debug, Default)]
-struct LastTuneInputs {
-    _elapsed_secs: f64,
-    _bytes_processed: u64,
-    _latency_sample_ms: f64,
-    _pending_len: usize,
-    _stress_score: f64,
-}
-
-#[derive(Debug, Default)]
 struct AggregatedSample {
     bytes: u64,
     ops: u64,
@@ -199,16 +190,12 @@ pub struct BbrTuner {
     max_burst_coalesce_bytes: u64,
     last_cycle: Instant,
     last_data_seen: Instant,
-    #[allow(dead_code)]
-    config_flush_us: u64,
     target_bw_bytes: Option<u64>,
     target_iops: Option<u64>,
     profile: TargetProfile,
     global_memory_limit_bytes: u64,
     is_conservative: bool,
     pending_sample: AggregatedSample,
-    #[allow(dead_code)]
-    last_inputs: LastTuneInputs,
     last_rt_prop: f64,
 }
 
@@ -268,14 +255,12 @@ impl BbrTuner {
             max_burst_coalesce_bytes: max_burst,
             last_cycle: Instant::now(),
             last_data_seen: Instant::now(),
-            config_flush_us: cfg.worker_flush_interval_us,
             target_bw_bytes,
             target_iops: cfg.target_iops,
             profile: cfg.profile,
             global_memory_limit_bytes,
             is_conservative: conservative,
             pending_sample: AggregatedSample::default(),
-            last_inputs: LastTuneInputs::default(),
             last_rt_prop: rtt_secs.max(0.000001),
         }
     }
@@ -331,15 +316,6 @@ impl BbrTuner {
         avg_event_size: u64,
         quotas_active: bool,
     ) -> TunerOutput {
-        let rtt_ms = latency_sample.as_secs_f64() * 1000.0;
-        self.last_inputs = LastTuneInputs {
-            _elapsed_secs: elapsed_secs,
-            _bytes_processed: bytes_processed,
-            _latency_sample_ms: rtt_ms,
-            _pending_len: pending_len,
-            _stress_score: stress_score,
-        };
-
         let now = Instant::now();
 
         if self.is_conservative && self.last_probe.elapsed() > Duration::from_secs(300) {

@@ -377,6 +377,17 @@ impl Manager {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut batch_buffer: Vec<(PathBuf, Option<u64>)> = Vec::with_capacity(100);
 
+            // Target health probe: track availability of each target path
+            let mut target_available: HashMap<PathBuf, bool> = HashMap::new();
+            // Initialize all targets as available
+            for h in hydrators_arc.iter() {
+                for tgt_cfg in &h.targets {
+                    target_available.insert(tgt_cfg.path.clone(), true);
+                }
+            }
+            let mut health_interval = tokio::time::interval(Duration::from_secs(30));
+            health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
                 // Check if any source requested a rescan (e.g. after target recovery)
                 // or if the rescan flag was set by worker error streak detection.
@@ -396,7 +407,27 @@ impl Manager {
                     }
                 }
 
-                let first_item = hydration_rx_task.recv().await;
+                let first_item = tokio::select! {
+                    item = hydration_rx_task.recv() => item,
+                    _ = health_interval.tick() => {
+                        // Periodic target health probe
+                        for h in hydrators_arc.iter() {
+                            for tgt_cfg in &h.targets {
+                                let reachable = tokio::fs::metadata(&tgt_cfg.path).await.is_ok();
+                                let was_available = target_available.get(&tgt_cfg.path).copied().unwrap_or(true);
+                                if reachable && !was_available {
+                                    info!("Target {:?} recovered — requesting rescan", tgt_cfg.path);
+                                    h.source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                                }
+                                if !reachable && was_available {
+                                    info!("Target {:?} became unavailable", tgt_cfg.path);
+                                }
+                                target_available.insert(tgt_cfg.path.clone(), reachable);
+                            }
+                        }
+                        continue;
+                    }
+                };
                 if first_item.is_none() { break; }
 
                 batch_buffer.push(first_item.unwrap());

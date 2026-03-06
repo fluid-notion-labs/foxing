@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf, Component};
 use crate::error::{FoxingError, Result};
 use std::sync::atomic::{Ordering, AtomicU64};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 use dashmap::DashMap;
@@ -9,11 +9,6 @@ use std::sync::Arc;
 use crate::event::Event;
 use crate::metrics;
 use fxcp_core::constants;
-
-#[allow(dead_code)]
-fn current_time_sec() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
 
 #[derive(Debug)]
 pub struct IdentityEntry {

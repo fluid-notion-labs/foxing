@@ -10,11 +10,6 @@ pub const RENAME_NOREPLACE: u32 = 1 << 0;
 pub const RENAME_EXCHANGE: u32 = 1 << 1;
 pub const RENAME_WHITEOUT: u32 = 1 << 2;
 
-#[allow(dead_code)]
-const S_IFMT: u32 = 0o170000;
-#[allow(dead_code)]
-const S_IFDIR: u32 = 0o040000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EventType {

@@ -50,8 +50,6 @@ pub struct Governor {
     memory_usage_pct: Arc<AtomicU64>,
     min_hydration_interval: Duration,
     min_throughput_bytes_sec: AtomicU64,
-    #[allow(dead_code)]
-    throttled_count: AtomicU64,
     copy_success_count: AtomicU64,
     copy_failure_count: AtomicU64,
     /// Epoch millis of failure window start — atomic, no mutex
@@ -159,7 +157,6 @@ impl Governor {
             memory_usage_pct,
             min_hydration_interval: Duration::from_millis(hydration_delay_ms),
             min_throughput_bytes_sec: AtomicU64::new(0),
-            throttled_count: AtomicU64::new(0),
             copy_success_count: AtomicU64::new(0),
             copy_failure_count: AtomicU64::new(0),
             failure_window_start_ms: AtomicU64::new(

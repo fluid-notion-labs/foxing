@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 use dashmap::DashMap;
 use fxcp_core::constants;
 use std::sync::atomic::{AtomicUsize, Ordering, AtomicBool};
-use std::time::{Instant, Duration};
+use std::time::Duration;
 use std::collections::HashMap;
 use fxcp_core::operations::CopyStats;
 use crate::hydration_worker::SignatureCache;
@@ -30,8 +30,6 @@ pub struct HydrationQueue {
     next_worker: Arc<AtomicUsize>,
     pub pending_count: Arc<AtomicUsize>,
     pub shutdown: Arc<AtomicBool>,
-    #[allow(dead_code)]
-    rename_failure_tracker: Arc<DashMap<u64, (u32, Instant)>>,
 }
 
 impl HydrationQueue {
@@ -83,7 +81,6 @@ impl HydrationQueue {
             next_worker: Arc::new(AtomicUsize::new(0)),
             pending_count,
             shutdown,
-            rename_failure_tracker: tracker
         }
     }
 
