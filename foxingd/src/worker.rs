@@ -221,6 +221,23 @@ pub async fn run_worker(
 
     let skip_fsync = constants::ONE_SHOT_MODE.load(Ordering::Relaxed);
 
+    // Look up adaptive timeouts from tuner
+    let (adaptive_stall, adaptive_overall) = {
+        #[allow(deprecated)]
+        let mut stall = fxcp_core::constants::PROCESS_SEGMENT_STALL_SECS;
+        #[allow(deprecated)]
+        let mut overall = fxcp_core::constants::PROCESS_SEGMENT_TIMEOUT_SECS;
+        let target_label = target_cfg.label.to_string();
+        for r in GLOBAL_TUNER_REGISTRY.iter() {
+            if r.key().0 == target_label {
+                stall = r.value().segment_stall_timeout_secs;
+                overall = r.value().segment_overall_timeout_secs;
+                break;
+            }
+        }
+        (stall, overall)
+    };
+
     let mut smart_copier = SmartCopier {
         ring,
         buffer_pool,
@@ -237,6 +254,8 @@ pub async fn run_worker(
         governor: Some(governor.clone()),
         fsync_tracker: FsyncLatencyTracker::default(),
         skip_fsync,
+        segment_stall_timeout_secs: adaptive_stall,
+        segment_overall_timeout_secs: adaptive_overall,
     };
 
     let mut dirty_tracker: HashSet<u64> = HashSet::new();
@@ -282,7 +301,10 @@ pub async fn run_worker(
                         metrics::TUNER_STATE.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.state as i64 as f64);
                         metrics::TARGET_FLUSH_INTERVAL_MS.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.flush_us as f64 / 1000.0);
                         metrics::TARGET_STORAGE_CLASS.with_label_values(&[&path_label_clone, &worker_id_label]).set(output.storage_class as i64 as f64);
-                        
+                        metrics::ADAPTIVE_TIMEOUT_SEGMENT_STALL_SECS.with_label_values(&[&path_label_clone]).set(output.segment_stall_timeout_secs as f64);
+                        metrics::ADAPTIVE_TIMEOUT_SEGMENT_OVERALL_SECS.with_label_values(&[&path_label_clone]).set(output.segment_overall_timeout_secs as f64);
+                        metrics::ADAPTIVE_TIMEOUT_POSTCOPY_SECS.with_label_values(&[&path_label_clone]).set(output.postcopy_timeout_secs as f64);
+
                         last_update = Instant::now();
                     }
                 }
@@ -327,6 +349,10 @@ pub async fn run_worker(
             
             let flush_micros = output.flush_us;
             flush_interval = tokio::time::interval(Duration::from_micros(flush_micros));
+
+            // Update adaptive timeouts from tuner
+            smart_copier.segment_stall_timeout_secs = output.segment_stall_timeout_secs;
+            smart_copier.segment_overall_timeout_secs = output.segment_overall_timeout_secs;
             
             let util_pct = (peak_coalescer_len as f64 / 10_000.0).clamp(0.0, 1.0);
             metrics::WORKER_BUFFER_UTILIZATION.with_label_values(&[path_label, &worker_id_str]).set(util_pct);
@@ -685,16 +711,24 @@ async fn process_single_event_with_wal(
 ) -> (Result<CopyStats>, SmartCopier, HashSet<u64>) {
     let target_label = target_cfg.label.to_string();
     
-    // Validate generation to prevent recycled inode corruption
+    // Handle inode generation changes (recycled inodes after delete+create).
+    // Update the stored generation rather than retrying forever — the old file
+    // is gone and the new one with this inode number is the current reality.
     if event.generation != std::u32::MAX {
         if let Some(entry) = source.inode_map.get(&event.inode) {
             let stored_gen = *entry.generation.read();
             if stored_gen != std::u32::MAX && stored_gen != event.generation {
-                return (
-                    Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Generation mismatch - retry"))),
-                    smart_copier,
-                    dirty_tracker
-                );
+                debug!("Worker {}: Inode {} generation changed ({} → {}), updating map",
+                       worker_id, event.inode, stored_gen, event.generation);
+                *entry.generation.write() = event.generation;
+                metrics::GENERATION_MISMATCHES.inc();
+                // Clear stale paths — the inode now represents a different file
+                entry.paths.write().clear();
+                if event.parent_inode != 0 && !event.name.is_empty() {
+                    if let Some(parent_path) = source.dir_map.get(&event.parent_inode) {
+                        entry.add_path(parent_path.join(&event.name));
+                    }
+                }
             }
         }
     }
@@ -917,14 +951,43 @@ async fn process_single_event_with_wal(
             match old_rel_res {
                 Ok(old_rel) => {
                     let old_path = target_cfg.path.join(old_rel);
-                    
-                    if let Some(parent) = target_path.parent() {
+
+                    // Construct the NEW path from new_parent_inode + new_name,
+                    // not from resolve_target (which resolves from the inode's stored old path).
+                    let rename_dest = if let Some(new_name) = &event.new_name {
+                        if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                            target_cfg.path.join(new_rel)
+                        } else {
+                            target_path.clone()
+                        }
+                    } else {
+                        target_path.clone()
+                    };
+
+                    if let Some(parent) = rename_dest.parent() {
                         if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
                     }
-                    
+
+                    // Strip RENAME_NOREPLACE on target — we're mirroring source state,
+                    // so if source succeeded with this rename, target should too.
+                    let target_flags = event.flags & !(libc::RENAME_NOREPLACE as u32);
+
                     let rename_timeout = std::time::Duration::from_secs(60);
-                    match tokio::time::timeout(rename_timeout, smart_copier.optimized_rename(old_path.clone(), target_path.clone(), event.flags)).await {
-                        Ok(inner) => { op_result = inner.map_err(Into::into); }
+                    match tokio::time::timeout(rename_timeout, smart_copier.optimized_rename(old_path.clone(), rename_dest.clone(), target_flags)).await {
+                        Ok(inner) => {
+                            match &inner {
+                                Err(e) if e.to_string().contains("File exists") || e.to_string().contains("os error 17") => {
+                                    // EEXIST on rename: destination already exists on target.
+                                    // Remove it and retry — we're mirroring the source state.
+                                    let _ = std::fs::remove_file(&rename_dest);
+                                    match tokio::time::timeout(rename_timeout, smart_copier.optimized_rename(old_path.clone(), rename_dest.clone(), 0)).await {
+                                        Ok(retry_inner) => { op_result = retry_inner.map_err(Into::into); }
+                                        Err(_) => { op_result = inner.map_err(Into::into); }
+                                    }
+                                }
+                                _ => { op_result = inner.map_err(Into::into); }
+                            }
+                        }
                         Err(_elapsed) => {
                             warn!("Worker {}: Rename timed out after {:?} for inode {}",
                                   worker_id, rename_timeout, event.inode);

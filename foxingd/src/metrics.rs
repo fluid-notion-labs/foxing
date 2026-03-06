@@ -150,6 +150,56 @@ lazy_static! {
         "Copy operations that exceeded timeout",
         &["target"]
     ).unwrap();
+
+    // --- [foxingd] Stall Detection & Recovery Metrics ---
+    pub static ref POSTCOPY_TIMEOUT_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_postcopy_timeout_total",
+        "Post-copy metadata operations that timed out",
+        &["target"]
+    ).unwrap();
+    pub static ref SEGMENT_TIMEOUT_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_segment_timeout_total",
+        "Data segment operations that timed out",
+        &["target"]
+    ).unwrap();
+    pub static ref SEGMENT_STALL_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_segment_stall_total",
+        "Data segment stalls detected (no progress)",
+        &["target"]
+    ).unwrap();
+    pub static ref WORKER_STALL_DETECTED: CounterVec = register_counter_vec!(
+        "foxing_worker_stall_detected_total",
+        "Workers detected as stalled by watchdog",
+        &["worker"]
+    ).unwrap();
+    pub static ref HYDRATION_QUEUE_STALL_CRITICAL: Gauge = register_gauge!(
+        "foxing_hydration_queue_stall_critical",
+        "1 if hydration queue is critically stalled (not draining)"
+    ).unwrap();
+    pub static ref RETRY_QUEUE_FORCED_DRAIN_TOTAL: CounterVec = register_counter_vec!(
+        "foxing_retry_queue_forced_drain_total",
+        "Forced retry queue drains triggered",
+        &["target", "worker"]
+    ).unwrap();
+}
+
+lazy_static! {
+    // --- [foxingd] Adaptive Timeout Metrics ---
+    pub static ref ADAPTIVE_TIMEOUT_SEGMENT_STALL_SECS: GaugeVec = register_gauge_vec!(
+        "foxing_adaptive_timeout_segment_stall_secs",
+        "Current adaptive segment stall timeout in seconds",
+        &["target"]
+    ).unwrap();
+    pub static ref ADAPTIVE_TIMEOUT_SEGMENT_OVERALL_SECS: GaugeVec = register_gauge_vec!(
+        "foxing_adaptive_timeout_segment_overall_secs",
+        "Current adaptive segment overall timeout in seconds",
+        &["target"]
+    ).unwrap();
+    pub static ref ADAPTIVE_TIMEOUT_POSTCOPY_SECS: GaugeVec = register_gauge_vec!(
+        "foxing_adaptive_timeout_postcopy_secs",
+        "Current adaptive post-copy timeout in seconds",
+        &["target"]
+    ).unwrap();
 }
 
 lazy_static! {

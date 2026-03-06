@@ -340,6 +340,15 @@ pub struct TargetConfig {
     pub source_uncached: bool,
     #[serde(default = "TargetConfig::default_target_uncached")]
     pub target_uncached: bool,
+    /// Override adaptive segment stall timeout (seconds). None = use adaptive value.
+    #[serde(default)]
+    pub segment_stall_timeout_override: Option<u64>,
+    /// Override adaptive segment overall timeout (seconds). None = use adaptive value.
+    #[serde(default)]
+    pub segment_overall_timeout_override: Option<u64>,
+    /// Override adaptive post-copy timeout (seconds). None = use adaptive value.
+    #[serde(default)]
+    pub postcopy_timeout_override: Option<u64>,
     #[serde(skip, default)]
     pub xattr_supported: Arc<AtomicBool>,
     #[serde(skip, default)]
@@ -388,6 +397,9 @@ impl Default for TargetConfig {
             atomic_writes: TargetConfig::default_atomic_writes(),
             source_uncached: TargetConfig::default_source_uncached(),
             target_uncached: TargetConfig::default_target_uncached(),
+            segment_stall_timeout_override: None,
+            segment_overall_timeout_override: None,
+            postcopy_timeout_override: None,
             xattr_supported: Arc::new(AtomicBool::new(false)),
             direct_io_ok: Arc::new(AtomicBool::new(false)),
             rwf_uncached_ok: Arc::new(AtomicBool::new(false)),

@@ -71,6 +71,9 @@ pub struct TunerOutput {
     pub storage_class: StorageClass,
     pub bdp_bytes: u64,
     pub estimated_bw: u64,
+    pub segment_stall_timeout_secs: u64,
+    pub segment_overall_timeout_secs: u64,
+    pub postcopy_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -664,6 +667,9 @@ impl BbrTuner {
             .max(constants::TUNER_MIN_FLUSH_US)
             .min(constants::TUNER_MAX_FLUSH_US);
 
+        let (stall_timeout, overall_timeout, postcopy_timeout) =
+            self.compute_adaptive_timeouts(smooth_rtt, effective_bw);
+
         TunerOutput {
             batch_size: self.current_batch_size,
             coalesce_bytes: self.current_coalesce_bytes,
@@ -672,6 +678,48 @@ impl BbrTuner {
             storage_class: self.storage_class,
             bdp_bytes: target_inflight_bytes,
             estimated_bw: effective_bw as u64,
+            segment_stall_timeout_secs: stall_timeout,
+            segment_overall_timeout_secs: overall_timeout,
+            postcopy_timeout_secs: postcopy_timeout,
         }
+    }
+
+    fn compute_adaptive_timeouts(&self, smooth_rtt: f64, effective_bw: f64) -> (u64, u64, u64) {
+        // Segment stall timeout: base + rtt_multiplier * smooth_rtt
+        let (base_stall, rtt_mult_stall) = match self.storage_class {
+            StorageClass::NVMe => (5u64, 10_000u64),
+            StorageClass::SataSsd => (15, 5_000),
+            StorageClass::HDD => (30, 2_000),
+            StorageClass::ThrottledNVMe => (30, 10_000),
+            StorageClass::Unknown => (60, 1_000),
+        };
+        let segment_stall = (base_stall as f64 + rtt_mult_stall as f64 * smooth_rtt)
+            .clamp(10.0, 300.0) as u64;
+
+        // Segment overall timeout: BDP-based with storage class max
+        let max_overall = match self.storage_class {
+            StorageClass::NVMe => 120u64,
+            StorageClass::SataSsd => 300,
+            StorageClass::HDD => 600,
+            StorageClass::ThrottledNVMe => 300,
+            StorageClass::Unknown => 600,
+        };
+        let bdp = effective_bw * smooth_rtt;
+        let bw_safe = effective_bw.max(1.0);
+        let segment_overall = (bdp / bw_safe * 10.0)
+            .clamp(segment_stall as f64 * 3.0, max_overall as f64) as u64;
+
+        // Post-copy metadata timeout: higher multiplier for Merkle computation
+        let (base_post, rtt_mult_post) = match self.storage_class {
+            StorageClass::NVMe => (10u64, 50_000u64),
+            StorageClass::SataSsd => (30, 50_000),
+            StorageClass::HDD => (60, 50_000),
+            StorageClass::ThrottledNVMe => (60, 50_000),
+            StorageClass::Unknown => (300, 10_000),
+        };
+        let postcopy = (base_post as f64 + rtt_mult_post as f64 * smooth_rtt)
+            .clamp(10.0, 600.0) as u64;
+
+        (segment_stall, segment_overall, postcopy)
     }
 }

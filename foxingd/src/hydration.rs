@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{self, Sender, UnboundedSender};
-use tracing::debug;
+use tracing::{debug, warn};
 use crate::error::Result;
 use crate::mirror::{SourceInfo, SharedConfig};
 use crate::config::TargetConfig;
@@ -23,11 +23,11 @@ pub struct HydrationJob {
     pub inode: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HydrationQueue {
     /// Per-worker senders — round-robin distribution, no shared receiver mutex
     senders: Vec<Sender<HydrationJob>>,
-    next_worker: AtomicUsize,
+    next_worker: Arc<AtomicUsize>,
     pub pending_count: Arc<AtomicUsize>,
     pub shutdown: Arc<AtomicBool>,
     #[allow(dead_code)]
@@ -80,7 +80,7 @@ impl HydrationQueue {
 
         Self {
             senders,
-            next_worker: AtomicUsize::new(0),
+            next_worker: Arc::new(AtomicUsize::new(0)),
             pending_count,
             shutdown,
             rename_failure_tracker: tracker
@@ -91,7 +91,7 @@ impl HydrationQueue {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    pub fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig, inode: Option<u64>) {
+    pub async fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig, inode: Option<u64>) {
         if self.shutdown.load(Ordering::Relaxed) || self.senders.is_empty() {
             return;
         }
@@ -104,6 +104,8 @@ impl HydrationQueue {
         let sender = &self.senders[worker_idx];
         let capacity = sender.capacity();
         let max_cap = sender.max_capacity();
+
+        let mut attempts = 0;
 
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -118,8 +120,17 @@ impl HydrationQueue {
                     return;
                 },
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!("submit_job: worker={} FULL (capacity={}/{})", worker_idx, capacity, max_cap);
-                    std::thread::sleep(Duration::from_millis(50));
+                    attempts += 1;
+                    if attempts >= fxcp_core::constants::HYDRATION_BACKPRESSURE_TIMEOUT_ATTEMPTS {
+                        warn!("Hydration Queue: Backpressure timeout after {} attempts - dropping job {:?}",
+                              attempts, job.rel_path);
+                        crate::metrics::EVENTS_DROPPED.inc();
+                        self.pending_count.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+                    debug!("submit_job: worker={} FULL (capacity={}/{}) attempt {}/{}",
+                           worker_idx, capacity, max_cap, attempts, fxcp_core::constants::HYDRATION_BACKPRESSURE_TIMEOUT_ATTEMPTS);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 },
                 Err(mpsc::error::TrySendError::Closed(_)) => {

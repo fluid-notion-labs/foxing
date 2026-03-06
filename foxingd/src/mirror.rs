@@ -418,7 +418,9 @@ impl Manager {
                         });
 
                         if let Some(hydrator) = matching_hydrator {
-                            if let Some(queue) = hydrator.source.bulk_job_queue.lock().as_ref() {
+                            // Clone queue to avoid holding lock across await
+                            let queue_opt = hydrator.source.bulk_job_queue.lock().as_ref().cloned();
+                            if let Some(queue) = queue_opt {
                                 // Compute relative path from whichever prefix matches
                                 let rel_path = path.strip_prefix(&hydrator.source.path)
                                     .or_else(|_| path.strip_prefix(&hydrator.source.mount))
@@ -429,7 +431,7 @@ impl Manager {
                                 if hydrator.source.active_repairs.insert(rel_path.clone()) {
                                     // Route to ALL targets (not just first)
                                     for tgt_cfg in &hydrator.targets {
-                                        queue.submit_job(rel_path.clone(), tgt_cfg.clone(), inode_opt);
+                                        queue.submit_job(rel_path.clone(), tgt_cfg.clone(), inode_opt).await;
                                     }
                                     debug!("Repair: Submitted job for {:?} to {} targets", rel_path, hydrator.targets.len());
                                 } else {
@@ -441,10 +443,12 @@ impl Manager {
                             for h in hydrators_arc.iter() {
                                 let candidate = h.source.path.join(&path);
                                 if candidate.exists() || h.source.mount.join(&path).exists() {
-                                    if let Some(queue) = h.source.bulk_job_queue.lock().as_ref() {
+                                    // Clone queue to avoid holding lock across await
+                                    let queue_opt = h.source.bulk_job_queue.lock().as_ref().cloned();
+                                    if let Some(queue) = queue_opt {
                                         if h.source.active_repairs.insert(path.clone()) {
                                             for tgt_cfg in &h.targets {
-                                                queue.submit_job(path.clone(), tgt_cfg.clone(), inode_opt);
+                                                queue.submit_job(path.clone(), tgt_cfg.clone(), inode_opt).await;
                                             }
                                         }
                                     }

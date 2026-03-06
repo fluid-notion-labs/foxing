@@ -982,41 +982,43 @@ pub struct SmartCopier {
     pub governor: Option<Arc<Governor>>,
     pub fsync_tracker: FsyncLatencyTracker,
     pub skip_fsync: bool, // NEW: Optimization flag
+    pub segment_stall_timeout_secs: u64,
+    pub segment_overall_timeout_secs: u64,
 }
 
 impl OptimizedFs for SmartCopier {
     fn optimized_copy(&mut self, src: PathBuf, dst: PathBuf, src_file_size: u64, target_label: String, buffer_limit: Option<usize>, skip_fsync: bool) -> impl std::future::Future<Output = Result<CopyStats>> + Send {
         async move {
             let op = Operation::CopyFile { src, dst, src_file_size, target_label };
-            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, buffer_limit, skip_fsync).await
+            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, buffer_limit, skip_fsync, self.segment_stall_timeout_secs, self.segment_overall_timeout_secs).await
         }
     }
 
     fn optimized_rename(&mut self, src: PathBuf, dst: PathBuf, flags: u32) -> impl std::future::Future<Output = Result<CopyStats>> + Send {
         async move {
             let op = Operation::Rename { src, dst, flags };
-            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false).await
+            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false, 60, 600).await
         }
     }
 
     fn optimized_copy_range(&mut self, src: PathBuf, dst: PathBuf, offset: u64, length: u64, src_file_size: u64, target_label: String, buffer_limit: Option<usize>, skip_fsync: bool) -> impl std::future::Future<Output = Result<CopyStats>> + Send {
         async move {
             let op = Operation::CopyRange { src, dst, offset, length, src_file_size, target_label };
-            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, buffer_limit, skip_fsync).await
+            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, buffer_limit, skip_fsync, self.segment_stall_timeout_secs, self.segment_overall_timeout_secs).await
         }
     }
 
     fn optimized_truncate(&mut self, dst: PathBuf, size: u64) -> impl std::future::Future<Output = Result<CopyStats>> + Send {
         async move {
             let op = Operation::Truncate { dst, size };
-            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false).await
+            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false, 60, 600).await
         }
     }
 
     fn optimized_fallocate(&mut self, dst: PathBuf, mode: i32, offset: u64, length: u64) -> impl std::future::Future<Output = Result<CopyStats>> + Send {
         async move {
             let op = Operation::Fallocate { dst, mode, offset, length };
-            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false).await
+            Self::dispatch(op, &mut self.ring, &mut self.buffer_pool, self.atomic_buffer_pool.as_mut(), self.async_fd.clone(), self.vdo_opt, self.direct_io_ok, &self.source_caps, &self.target_caps, self.vdo_stall_threshold, &self.barrier_callback, self.source_uncached, self.target_uncached, self.governor.clone(), &mut self.fsync_tracker, None, false, 60, 600).await
         }
     }
 }
@@ -1076,8 +1078,10 @@ impl SmartCopier {
         target_label: String,
         fsync_tracker: &mut FsyncLatencyTracker,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
-        Self::copy_with_limit(src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, offset, length, direct_io_ok, src_file_size, source_caps, target_caps, vdo_stall_threshold, source_uncached, target_uncached, barrier_callback, governor, target_label, fsync_tracker, None, skip_fsync).await
+        Self::copy_with_limit(src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, offset, length, direct_io_ok, src_file_size, source_caps, target_caps, vdo_stall_threshold, source_uncached, target_uncached, barrier_callback, governor, target_label, fsync_tracker, None, skip_fsync, segment_stall_timeout_secs, segment_overall_timeout_secs).await
     }
 
     pub async fn copy_with_limit(
@@ -1103,6 +1107,8 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         // Early source existence check — avoid io_uring setup for vanished files
         if !src.exists() {
@@ -1117,14 +1123,16 @@ impl SmartCopier {
                 src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, direct_io_ok,
                 source_caps, target_caps, src_file_size, vdo_stall_threshold,
                 barrier_callback, source_uncached, target_uncached, governor,
-                target_label, fsync_tracker, buffer_limit, skip_fsync
+                target_label, fsync_tracker, buffer_limit, skip_fsync,
+                segment_stall_timeout_secs, segment_overall_timeout_secs
              ).await
         } else {
              Self::execute_copy_range(
                 src, dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, offset, length,
                 direct_io_ok, src_file_size, source_caps, target_caps,
-                vdo_stall_threshold, source_uncached, target_uncached, governor, 
-                target_label, fsync_tracker, buffer_limit, skip_fsync
+                vdo_stall_threshold, source_uncached, target_uncached, governor,
+                target_label, fsync_tracker, buffer_limit, skip_fsync,
+                segment_stall_timeout_secs, segment_overall_timeout_secs
              ).await
         }
     }
@@ -1147,24 +1155,28 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         match op {
             Operation::CopyFile { src, dst, src_file_size, target_label } => {
                 Self::execute_copy_file(
-                    &src, &dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, 
-                    direct_io_ok, source_caps, target_caps, 
-                    src_file_size, vdo_stall_threshold, barrier_callback, 
-                    source_uncached, target_uncached, governor, 
-                    target_label, fsync_tracker, buffer_limit, skip_fsync
+                    &src, &dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt,
+                    direct_io_ok, source_caps, target_caps,
+                    src_file_size, vdo_stall_threshold, barrier_callback,
+                    source_uncached, target_uncached, governor,
+                    target_label, fsync_tracker, buffer_limit, skip_fsync,
+                    segment_stall_timeout_secs, segment_overall_timeout_secs
                 ).await
             },
             Operation::CopyRange { src, dst, offset, length, src_file_size, target_label } => {
                 Self::execute_copy_range(
-                    &src, &dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, 
-                    offset, length, direct_io_ok, src_file_size, 
-                    source_caps, target_caps, vdo_stall_threshold, 
-                    source_uncached, target_uncached, governor, 
-                    target_label, fsync_tracker, buffer_limit, skip_fsync
+                    &src, &dst, ring, buffer_pool, atomic_pool, async_fd, vdo_opt,
+                    offset, length, direct_io_ok, src_file_size,
+                    source_caps, target_caps, vdo_stall_threshold,
+                    source_uncached, target_uncached, governor,
+                    target_label, fsync_tracker, buffer_limit, skip_fsync,
+                    segment_stall_timeout_secs, segment_overall_timeout_secs
                 ).await
             },
             Operation::Truncate { dst, size } => {
@@ -1252,15 +1264,18 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         let target_path = dst.with_extension(format!("tmp.{}", Uuid::new_v4()));
         debug!("execute_copy_file: {:?} -> {:?}", src, target_path);
 
         let res = Self::execute_full_copy_logic(
-            src, &target_path, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, direct_io_ok, 
-            source_caps, target_caps, false, src_file_size, vdo_stall_threshold, 
-            barrier_callback, source_uncached, target_uncached, governor, 
-            target_label, fsync_tracker, buffer_limit, skip_fsync
+            src, &target_path, ring, buffer_pool, atomic_pool, async_fd, vdo_opt, direct_io_ok,
+            source_caps, target_caps, false, src_file_size, vdo_stall_threshold,
+            barrier_callback, source_uncached, target_uncached, governor,
+            target_label, fsync_tracker, buffer_limit, skip_fsync,
+            segment_stall_timeout_secs, segment_overall_timeout_secs
         ).await?;
 
         match res {
@@ -1361,16 +1376,18 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         let src_meta = std::fs::metadata(src).map_err(FxcpError::Io)?;
         let strategy = determine_copy_strategy(src, dst, &src_meta, target_caps);
-        
+
         let sf = Self::open_source_noatime(src).await?;
         let sfd = sf.as_raw_fd();
-        
+
         let mut open_opts = tokio::fs::OpenOptions::new();
         open_opts.read(true).write(true).create(false);
-        
+
         let mut use_direct_io = direct_io_ok;
         if use_direct_io && (length % 4096 != 0 || offset % 4096 != 0) {
             use_direct_io = false;
@@ -1390,9 +1407,10 @@ impl SmartCopier {
 
         let res = if reflink_done { Ok(stats) } else {
             Self::perform_delta_uring_pipelined(
-                ring, sfd, dfd, offset, length, vdo_opt, buffer_pool, atomic_pool, async_fd, 
-                dst.to_path_buf(), source_caps, target_caps, false, vdo_stall_threshold, 
-                source_uncached, target_uncached, governor, target_label, fsync_tracker, buffer_limit, skip_fsync
+                ring, sfd, dfd, offset, length, vdo_opt, buffer_pool, atomic_pool, async_fd,
+                dst.to_path_buf(), source_caps, target_caps, false, vdo_stall_threshold,
+                source_uncached, target_uncached, governor, target_label, fsync_tracker, buffer_limit, skip_fsync,
+                segment_stall_timeout_secs, segment_overall_timeout_secs
             ).await
         };
         
@@ -1422,6 +1440,8 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<std::result::Result<CopyStats, FxcpError>> {
         debug!("execute_full_copy_logic: Start {:?} -> {:?}", src, target_path);
 
@@ -1474,10 +1494,11 @@ impl SmartCopier {
         if !transfer_done {
             debug!("execute_full_copy_logic: Starting io_uring pipeline...");
             let res = Self::perform_delta_uring_pipelined(
-                ring, sfd, dfd, 0, src_file_size, vdo_opt, buffer_pool, atomic_pool, async_fd, 
-                target_path.to_path_buf(), source_caps, target_caps, use_atomic, 
-                vdo_stall_threshold, source_uncached, target_uncached, governor, 
-                target_label, fsync_tracker, buffer_limit, skip_fsync
+                ring, sfd, dfd, 0, src_file_size, vdo_opt, buffer_pool, atomic_pool, async_fd,
+                target_path.to_path_buf(), source_caps, target_caps, use_atomic,
+                vdo_stall_threshold, source_uncached, target_uncached, governor,
+                target_label, fsync_tracker, buffer_limit, skip_fsync,
+                segment_stall_timeout_secs, segment_overall_timeout_secs
             ).await;
             result_val = res;
         }
@@ -1694,6 +1715,8 @@ impl SmartCopier {
         fsync_tracker: &mut FsyncLatencyTracker,
         buffer_limit: Option<usize>,
         skip_fsync: bool, // NEW: Optimization flag
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         debug!("perform_delta_uring_pipelined: Start offset={} len={}", offset, length);
         let mut stats = CopyStats::default();
@@ -1750,10 +1773,11 @@ impl SmartCopier {
                     FileSegment::Data { offset, len } => {
                         let atomic_pool_ref = atomic_pool.as_mut().map(|p| &mut **p);
                         let seg_stats = Self::process_data_segment(
-                            ring, sfd, dfd, offset, len, vdo_opt, buffer_pool, atomic_pool_ref, async_fd.clone(), 
-                            source_caps, target_caps, use_atomic, 
+                            ring, sfd, dfd, offset, len, vdo_opt, buffer_pool, atomic_pool_ref, async_fd.clone(),
+                            source_caps, target_caps, use_atomic,
                             source_uncached, target_uncached, &governor,
-                            &_target_label, buffer_limit
+                            &_target_label, buffer_limit,
+                            segment_stall_timeout_secs, segment_overall_timeout_secs
                         ).await?;
                         stats.bytes_processed += seg_stats.bytes_processed;
                         stats.bytes_zeros += seg_stats.bytes_zeros;
@@ -1763,10 +1787,11 @@ impl SmartCopier {
             }
         } else {
             let segment_stats = Self::process_data_segment(
-                ring, sfd, dfd, offset, length, vdo_opt, buffer_pool, atomic_pool, async_fd.clone(), 
-                source_caps, target_caps, use_atomic, 
+                ring, sfd, dfd, offset, length, vdo_opt, buffer_pool, atomic_pool, async_fd.clone(),
+                source_caps, target_caps, use_atomic,
                 source_uncached, target_uncached, &governor,
-                &_target_label, buffer_limit
+                &_target_label, buffer_limit,
+                segment_stall_timeout_secs, segment_overall_timeout_secs
             ).await?;
             stats.bytes_processed += segment_stats.bytes_processed;
             stats.bytes_zeros += segment_stats.bytes_zeros;
@@ -1885,6 +1910,8 @@ impl SmartCopier {
         governor: &Option<Arc<Governor>>,
         _target_label: &String,
         buffer_limit: Option<usize>,
+        segment_stall_timeout_secs: u64,
+        segment_overall_timeout_secs: u64,
     ) -> Result<CopyStats> {
         debug!("process_data_segment ENTRY: offset={}, len={}", start_offset, total_len);
         
@@ -1920,7 +1947,38 @@ impl SmartCopier {
 
         let use_linked_sqe = !vdo_opt && !use_atomic;
 
+        // Stall detection
+        let loop_start = std::time::Instant::now();
+        let mut last_progress = std::time::Instant::now();
+        let mut last_bytes_processed = 0u64;
+
         while length > 0 || inflight_ops > 0 {
+            // Check overall timeout
+            if loop_start.elapsed() > std::time::Duration::from_secs(segment_overall_timeout_secs) {
+                error!("process_data_segment: Segment timeout after {}s (offset={}, len={}, inflight={})",
+                       segment_overall_timeout_secs, offset, length, inflight_ops);
+                return Err(FxcpError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Segment timeout: {}s with {} ops in flight", segment_overall_timeout_secs, inflight_ops)
+                )));
+            }
+
+            // Check for progress stall — only when ops ARE in flight but not completing.
+            // When inflight_ops == 0, submissions may be delayed (NFS create latency,
+            // sparse mapping, etc.) — the overall timeout handles that case.
+            if bytes_processed > last_bytes_processed {
+                last_progress = std::time::Instant::now();
+                last_bytes_processed = bytes_processed;
+            } else if inflight_ops > 0 && last_progress.elapsed() > std::time::Duration::from_secs(segment_stall_timeout_secs) {
+                error!("process_data_segment: STALL detected - no progress for {}s (inflight={}, free_buffers={}, sq_capacity={})",
+                       segment_stall_timeout_secs, inflight_ops, active_pool.free_count(), ring.submission().capacity());
+                return Err(FxcpError::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Stall: no progress for {}s (inflight={}, free={})",
+                            segment_stall_timeout_secs, inflight_ops, active_pool.free_count())
+                )));
+            }
+
             if let Some(gov) = &governor {
                 if gov.current_memory_usage_pct() > 0.90 { tokio::task::yield_now().await; }
             }
@@ -2072,16 +2130,31 @@ impl SmartCopier {
                     }
                     
                     if inflight_ops > 0 {
-                        // Must wait
+                        // Must wait - track timeout streaks to detect io_uring hangs
+                        static TIMEOUT_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
                         match tokio::time::timeout(Duration::from_millis(100), async_fd.readable()).await {
                             Ok(Ok(mut guard)) => {
+                                TIMEOUT_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
                                 let mut buf = [0u8; 8];
                                 let _ = unsafe { libc::read(async_fd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
                                 guard.clear_ready();
                                 if let Some(c) = ring.completion().next() { c } else { continue; }
                             },
                             Ok(Err(e)) => return Err(FxcpError::Io(e)),
-                            Err(_) => {
+                            Err(_timeout) => {
+                                let streak = TIMEOUT_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if streak >= crate::constants::IOURING_COMPLETION_TIMEOUT_STREAK {
+                                    let sq_len = ring.submission().len();
+                                    let sq_cap = ring.submission().capacity();
+                                    let cq_len = ring.completion().len();
+                                    error!("process_data_segment: io_uring hung - no completions for 60s (inflight={}, sq_len={}, sq_cap={}, cq_len={})",
+                                           inflight_ops, sq_len, sq_cap, cq_len);
+                                    return Err(FxcpError::Io(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "io_uring hung - no completions for 60s"
+                                    )));
+                                }
                                 // Timeout, force submit
                                 ring.submit()?;
                                 if let Some(c) = ring.completion().next() { c } else { continue; }

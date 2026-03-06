@@ -254,6 +254,8 @@ pub fn run(
         ("trace_vfs_fsync", &progs.trace_vfs_fsync),
         ("trace_create_entry", &progs.trace_create_entry),
         ("trace_create_exit", &progs.trace_create_exit),
+        ("trace_security_create_entry", &progs.trace_security_create_entry),
+        ("trace_d_instantiate", &progs.trace_d_instantiate),
         ("trace_mkdir_entry", &progs.trace_mkdir_entry),
         ("trace_mkdir_exit", &progs.trace_mkdir_exit),
         ("trace_mknod_entry", &progs.trace_mknod_entry),

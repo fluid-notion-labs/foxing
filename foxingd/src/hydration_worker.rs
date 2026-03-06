@@ -510,7 +510,14 @@ impl Hydrator {
             } else {
                 let bulk_job_queue = self.source.bulk_job_queue.lock();
                 if let Some(queue_sender) = bulk_job_queue.as_ref() {
-                    queue_sender.submit_job(rel_path, target_cfg, Some(ino));
+                    // Handle both tokio and std::thread contexts
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                    } else {
+                        // No tokio runtime - create one for this call
+                        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                        rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                    }
                     submitted_count += 1;
                     self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -614,7 +621,7 @@ impl Hydrator {
                     if let Some(queue_sender) = bulk_queue.as_ref() {
                         if let Ok(meta) = entry.metadata() {
                             for target in &self.targets {
-                                queue_sender.submit_job(rel_path.clone(), target.clone(), Some(meta.ino()));
+                                tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel_path.clone(), target.clone(), Some(meta.ino())));
                             }
                             frontier.files_queued += 1;
                         }
@@ -671,7 +678,13 @@ impl Hydrator {
                 if let Some(queue_sender) = bulk_job_queue.as_ref() {
                     for (rel_path, target_cfg, ino) in jobs {
                         if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) { break; }
-                        queue_sender.submit_job(rel_path, target_cfg, Some(ino));
+                        // Handle both tokio and std::thread contexts
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                        } else {
+                            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                            rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                        }
                         self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -684,7 +697,13 @@ impl Hydrator {
         let bulk_job_queue = self.source.bulk_job_queue.lock();
         if let Some(queue_sender) = bulk_job_queue.as_ref() {
             for (rel_path, target_cfg, ino) in buffer.drain(..) {
-                queue_sender.submit_job(rel_path, target_cfg, Some(ino));
+                // Handle both tokio and std::thread contexts
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                } else {
+                    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                    rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
+                }
                 self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -770,7 +789,7 @@ impl Hydrator {
         if let Some(queue_sender) = bulk_job_queue.as_ref() {
             for target_cfg in targets {
                 if m.is_file() {
-                    queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino));
+                    tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino)));
                     source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                 } else if is_dir {
                     let dst_path = target_cfg.path.join(&rel);
@@ -837,7 +856,7 @@ impl Hydrator {
                         if let Some(buf) = job_buffer {
                             buf.push((rel.clone(), target_cfg.clone(), ino));
                         } else {
-                            queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino));
+                            tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino)));
                             self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
@@ -879,9 +898,15 @@ impl Hydrator {
             }
         };
 
+        // Check cached signature ONLY if target file exists
         let dst_sig_opt = get_sync_signature(&dst_path);
         debug!("sync_file_needed {:?}: has_cached_sig={}", dst_path, dst_sig_opt.is_some());
         if let Some(dst_sig) = dst_sig_opt {
+            // CRITICAL: Verify file exists before trusting cached signature
+            if !dst_path.exists() {
+                debug!("  cached signature exists but file missing — forcing sync");
+                return Ok(true);
+            }
             let sig_match = src_sig.matches(&dst_sig);
             let src_mr = src_sig.merkle_root.as_deref().unwrap_or("none");
             let dst_mr = dst_sig.merkle_root.as_deref().unwrap_or("none");
@@ -1069,7 +1094,7 @@ pub async fn run_hydration_worker_loop(
                  let output = r.value();
                  let bdp = output.bdp_bytes;
                  if bdp > 0 {
-                     let buffers_needed = (bdp / current_alloc.chunk_size_bytes as u64) as usize;
+                     let buffers_needed = (bdp / current_alloc.chunk_size_bytes as u64).max(4) as usize;
                      dynamic_limit_from_tuner = Some(buffers_needed);
                      break;
                  }
@@ -1315,6 +1340,49 @@ pub async fn process_hydration_job(
 
         let file_size = metadata.len();
 
+        // Look up adaptive timeouts from tuner
+        let (adaptive_stall, adaptive_overall, adaptive_postcopy) = {
+            #[allow(deprecated)]
+            let mut stall = fxcp_core::constants::PROCESS_SEGMENT_STALL_SECS;
+            #[allow(deprecated)]
+            let mut overall = fxcp_core::constants::PROCESS_SEGMENT_TIMEOUT_SECS;
+            #[allow(deprecated)]
+            let mut postcopy = fxcp_core::constants::POSTCOPY_TIMEOUT_SECS;
+            let target_label = target_cfg.path.to_string_lossy().to_string();
+            for r in GLOBAL_TUNER_REGISTRY.iter() {
+                if r.key().0 == target_label {
+                    stall = r.value().segment_stall_timeout_secs;
+                    overall = r.value().segment_overall_timeout_secs;
+                    postcopy = r.value().postcopy_timeout_secs;
+                    break;
+                }
+            }
+            // Apply profile-based minimum floors — the tuner may misclassify NFS
+            // as NVMe due to fast latency probes hitting write cache
+            let (min_stall, min_overall, min_postcopy) = match target_cfg.profile {
+                crate::config::TargetProfile::Network | crate::config::TargetProfile::NFS => (60, 600, 300),
+                crate::config::TargetProfile::HDD => (30, 300, 120),
+                crate::config::TargetProfile::SSD => (15, 120, 60),
+                crate::config::TargetProfile::Auto => (30, 300, 120), // Conservative for Auto
+                _ => (10, 60, 30),
+            };
+            stall = stall.max(min_stall);
+            overall = overall.max(min_overall);
+            postcopy = postcopy.max(min_postcopy);
+
+            // Apply config overrides if set (these override everything)
+            if let Some(v) = target_cfg.segment_stall_timeout_override {
+                stall = v;
+            }
+            if let Some(v) = target_cfg.segment_overall_timeout_override {
+                overall = v;
+            }
+            if let Some(v) = target_cfg.postcopy_timeout_override {
+                postcopy = v;
+            }
+            (stall, overall, postcopy)
+        };
+
         const MERKLE_DELTA_THRESHOLD: u64 = 1024 * 1024; // 1MB
 
         // --- Delta copy path: use Merkle diff for large files with stored signatures ---
@@ -1361,6 +1429,8 @@ pub async fn process_hydration_job(
                                 governor: Some(governor.clone()),
                                 fsync_tracker: std::mem::take(fsync_tracker),
                                 skip_fsync,
+                                segment_stall_timeout_secs: adaptive_stall,
+                                segment_overall_timeout_secs: adaptive_overall,
                             };
 
                             let delta_result = smart_copier.copy_delta(
@@ -1474,7 +1544,9 @@ pub async fn process_hydration_job(
                     target_cfg.path.to_string_lossy().to_string(),
                     fsync_tracker,
                     buffer_limit,
-                    skip_fsync
+                    skip_fsync,
+                    adaptive_stall,
+                    adaptive_overall
                 )
             ).await {
                 Ok(inner) => {
@@ -1512,7 +1584,7 @@ pub async fn process_hydration_job(
                 let sig_cache_ref = sig_cache.clone();
                 let rel_path_for_cache = rel_path.clone();
 
-                let postcopy_result = spawn_blocking(move || -> std::result::Result<(), FoxingError> {
+                let postcopy_future = spawn_blocking(move || -> std::result::Result<(), FoxingError> {
                     // 1. Apply ownership/permissions/timestamps (large files only — small files done inline)
                     if is_large {
                         // WI-5: Only sync user.* xattrs, skip if none exist
@@ -1602,9 +1674,29 @@ pub async fn process_hydration_job(
                     let _ = sidecar::set_dirty_flag(&dst_post, false, "hydration_complete");
 
                     Ok(())
-                }).await
-                .map_err(FoxingError::Join)
-                .and_then(|inner| inner);
+                });
+
+                let postcopy_result = tokio::time::timeout(
+                    Duration::from_secs(adaptive_postcopy),
+                    postcopy_future
+                ).await;
+
+                let postcopy_result = match postcopy_result {
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(Ok(Err(e))) => Err(e),
+                    Ok(Err(join_err)) => Err(FoxingError::Join(join_err)),
+                    Err(_timeout) => {
+                        warn!("Hydration: Post-copy metadata timed out after {}s for {:?}",
+                              adaptive_postcopy, current_target_path);
+                        metrics::POSTCOPY_TIMEOUT_TOTAL
+                            .with_label_values(&[&target_cfg.path.to_string_lossy()])
+                            .inc();
+                        Err(FoxingError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("Post-copy metadata timeout after {}s", adaptive_postcopy)
+                        )))
+                    }
+                };
 
                 if let Err(e) = postcopy_result {
                     if is_large {

@@ -810,6 +810,10 @@ async fn create_copier(src: &Path, dst: &Path) -> fxcp_core::Result<SmartCopier>
         governor: Some(Arc::new(governor)),
         fsync_tracker: FsyncLatencyTracker::default(),
         skip_fsync: true,
+        #[allow(deprecated)]
+        segment_stall_timeout_secs: fxcp_core::constants::PROCESS_SEGMENT_STALL_SECS,
+        #[allow(deprecated)]
+        segment_overall_timeout_secs: fxcp_core::constants::PROCESS_SEGMENT_TIMEOUT_SECS,
     })
 }
 

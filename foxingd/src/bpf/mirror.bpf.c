@@ -150,6 +150,9 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16); __type(key, _
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1); __type(key, __u32); __type(value, struct stats); } statistics SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 33554432); } events SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key, __u64); __type(value, __u64); } temp_dentries SEC(".maps");
+// Separate stash for security_inode_create → d_instantiate flow to avoid
+// stealing dentries stashed by vfs_mkdir/vfs_link/etc. entry probes.
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key, __u64); __type(value, __u64); } create_dentries SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -590,6 +593,29 @@ SEC("kprobe/vfs_create")
 int BPF_KPROBE(trace_create_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
 SEC("kretprobe/vfs_create")
 int BPF_KRETPROBE(trace_create_exit, int ret) { return process_stashed_dentry(ret, EVENT_CREATE); }
+
+// Fallback for kernel 6.12+ where file creation via openat(O_CREAT) bypasses vfs_create.
+// Uses a SEPARATE stash map (create_dentries) to avoid stealing dentries stashed by
+// vfs_mkdir/vfs_link/etc. entry probes in temp_dentries.
+SEC("kprobe/security_inode_create")
+int BPF_KPROBE(trace_security_create_entry, struct inode *dir, struct dentry *dentry, umode_t mode) {
+    if (is_ignored_pid()) return 0;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 ptr = (__u64)dentry;
+    return bpf_map_update_elem(&create_dentries, &pid_tgid, &ptr, BPF_ANY);
+}
+SEC("kprobe/d_instantiate")
+int BPF_KPROBE(trace_d_instantiate, struct dentry *dentry, struct inode *inode) {
+    if (!inode) return 0;
+    if (is_ignored_pid()) return 0;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 *ptr = bpf_map_lookup_elem(&create_dentries, &pid_tgid);
+    if (!ptr) return 0;
+    struct dentry *stashed = (struct dentry *)(*ptr);
+    bpf_map_delete_elem(&create_dentries, &pid_tgid);
+    // Use the inode parameter directly — d_inode isn't set yet at kprobe entry.
+    return submit_event(inode, stashed, EVENT_CREATE, 0, 0, 0);
+}
 
 SEC("kprobe/vfs_mkdir")
 int BPF_KPROBE(trace_mkdir_entry, void *id, void *dir, struct dentry *dentry) { return stash_dentry(dentry); }
