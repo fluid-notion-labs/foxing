@@ -453,7 +453,19 @@ pub async fn run_worker(
                 info!("Worker {}: Shutdown signal received.", worker_id);
                 break;
             }
-            
+
+            // Tinned dispatch: highest priority after shutdown.
+            // Control > Structural > Metadata before stats/barrier/retry/flush.
+            Some(evt) = tinned_rx.control.recv() => {
+                received_event = Some(evt);
+            }
+            Some(evt) = tinned_rx.structural.recv() => {
+                received_event = Some(evt);
+            }
+            Some(evt) = tinned_rx.metadata.recv() => {
+                received_event = Some(evt);
+            }
+
             Some(stats) = external_stats_rx.recv() => {
                 if !stats.io_duration.is_zero() && stats.ops_count > 0 {
                     let avg_op_latency = stats.io_duration.div_f64(stats.ops_count as f64);
@@ -638,19 +650,7 @@ pub async fn run_worker(
             // The event_rx.recv() below will properly wake when events arrive.
             _ = tune_interval.tick(), if !coalescer.is_empty() || !retry_queue.is_empty() => {}
 
-            // CAKE-inspired tinned dispatch: control > structural > metadata > bulk.
-            // biased select ensures control always drains first.
-            // Control/structural/metadata process immediately.
-            // Bulk goes through the coalescer for write aggregation.
-            Some(evt) = tinned_rx.control.recv() => {
-                received_event = Some(evt);
-            }
-            Some(evt) = tinned_rx.structural.recv() => {
-                received_event = Some(evt);
-            }
-            Some(evt) = tinned_rx.metadata.recv() => {
-                received_event = Some(evt);
-            }
+            // Bulk tin: lowest priority, goes through coalescer for write aggregation
             Some(evt) = tinned_rx.bulk.recv() => {
                 // Bulk events go through coalescer
                 coalescer.push(evt);

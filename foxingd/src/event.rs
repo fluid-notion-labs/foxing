@@ -178,6 +178,12 @@ impl EventQueue {
             }
             EventTin::Structural => {
                 // Structural: try target worker, then all others, then blocking_send
+                static STRUCT_PUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let sp = STRUCT_PUSH.fetch_add(1, Ordering::Relaxed);
+                if sp < 20 || sp % 100 == 0 {
+                    tracing::info!("TinnedQueue: Structural event #{} type={:?} name={} → worker {}",
+                                   sp, e.event_type, e.name, target_idx);
+                }
                 match self.structural[target_idx].try_send(e.clone()) {
                     Ok(_) => true,
                     Err(mpsc::error::TrySendError::Full(_)) => {
