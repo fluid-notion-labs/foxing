@@ -77,13 +77,11 @@ impl EventType {
     pub fn is_control_plane(&self) -> bool {
         matches!(self,
             Self::Rename |
-            Self::Create |
             Self::Mkdir |
             Self::Rmdir |
             Self::Link |
             Self::Symlink |
             Self::Unlink |
-            Self::Mknod |
             Self::RenameIncomplete
         )
     }
@@ -120,11 +118,24 @@ impl EventQueue {
             let data_worker_count = pool_size - 1;
             1 + (hash as usize % data_worker_count)
         };
-        if self.senders[target_idx].try_send(e).is_err() {
-            metrics::EVENTS_DROPPED.inc();
-            return false;
+        match self.senders[target_idx].try_send(e.clone()) {
+            Ok(_) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — try other workers before dropping
+                for offset in 1..pool_size {
+                    let alt_idx = (target_idx + offset) % pool_size;
+                    if self.senders[alt_idx].try_send(e.clone()).is_ok() {
+                        return true;
+                    }
+                }
+                metrics::EVENTS_DROPPED.inc();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::EVENTS_DROPPED.inc();
+                false
+            }
         }
-        true
     }
 }
 

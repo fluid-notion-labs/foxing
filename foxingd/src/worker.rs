@@ -48,15 +48,29 @@ enum ErrorClass {
 }
 
 fn classify_error(err: &FoxingError, event_type: &EventType) -> ErrorClass {
-    match err {
-        FoxingError::Io(io_err) => match io_err.kind() {
+    // Extract the io::Error from any wrapper (FoxingError::Io or FoxingError::Core(FxcpError::Io))
+    let io_kind = match err {
+        FoxingError::Io(io_err) => Some(io_err.kind()),
+        FoxingError::Core(core_err) => {
+            if let fxcp_core::error::FxcpError::Io(io_err) = core_err {
+                Some(io_err.kind())
+            } else {
+                None
+            }
+        },
+        _ => None,
+    };
+
+    if let Some(kind) = io_kind {
+        match kind {
             std::io::ErrorKind::NotFound => {
-                // Write-like ops target an existing file — ENOENT means the target
-                // hasn't been created yet, so route to repair (full copy).
-                // For other ops the source is likely gone (transient lifecycle).
+                // Write/Rename-like ops need the target file to exist — ENOENT means
+                // it hasn't been created yet, so route to repair (full copy).
+                // For structural ops (unlink, rmdir, mkdir) the source is likely gone.
                 if matches!(event_type,
                     EventType::Write | EventType::WriteRange | EventType::Clone
-                    | EventType::Truncate | EventType::Fallocate)
+                    | EventType::Truncate | EventType::Fallocate
+                    | EventType::Rename | EventType::RenameIncomplete)
                 {
                     ErrorClass::TargetNotFound
                 } else {
@@ -68,8 +82,9 @@ fn classify_error(err: &FoxingError, event_type: &EventType) -> ErrorClass {
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted => ErrorClass::Transient,
             _ => ErrorClass::Transient,
-        },
-        _ => ErrorClass::Transient,
+        }
+    } else {
+        ErrorClass::Transient
     }
 }
 
@@ -985,6 +1000,39 @@ async fn process_single_event_with_wal(
                         if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
                     }
 
+                    // If old_path doesn't exist on target (Create event not yet processed
+                    // by data worker), copy the source file directly to the rename destination.
+                    if !old_path.exists() {
+                        let src_rel = old_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                        let source_file = source.mount.join(src_rel);
+                        // Source may already be renamed — try the new name too
+                        let actual_source = if source_file.exists() {
+                            source_file
+                        } else {
+                            let new_rel = rename_dest.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                            source.mount.join(new_rel)
+                        };
+                        if actual_source.exists() {
+                            if let Some(parent) = rename_dest.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let dst = rename_dest.clone();
+                            let _ = spawn_blocking(move || std::fs::copy(&actual_source, &dst)).await;
+                            // Update identity map
+                            if let Some(new_name) = &event.new_name {
+                                if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                                    identity::update_map(
+                                        &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                        new_rel, event.generation, false, false,
+                                        event.timestamp_ns, event.seq_num
+                                    );
+                                }
+                            }
+                            metrics::LIVE_ADDITIONS.inc();
+                            return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                        }
+                    }
+
                     // Strip RENAME_NOREPLACE on target — we're mirroring source state,
                     // so if source succeeded with this rename, target should too.
                     let target_flags = event.flags & !(libc::RENAME_NOREPLACE as u32);
@@ -1118,25 +1166,37 @@ async fn process_single_event_with_wal(
             }
         },
         EventType::Mkdir | EventType::Create | EventType::Mknod => {
-             // For regular file creates, route to hydration for a full copy
-             // (not just an empty file) — the source file likely has data already.
+             // For regular file creates, do an inline copy (not just empty file).
+             // Must be synchronous so subsequent rename events find the file.
              if event.event_type == EventType::Create {
                  let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
-                 let abs_path = source.mount.join(rel);
-                 if abs_path.exists() {
-                     // Full copy via hydration repair pipeline
-                     hydration_tx.send_repair_job(abs_path, Some(event.inode)).await;
-                     metrics::EVENTS_REPAIR_QUEUED.inc();
-                     // Update identity map so renames can find this inode
-                     if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
-                         identity::update_map(
-                             &source.inode_map, &source.dir_map, event.dev_id, event.inode,
-                             r.to_path_buf(), event.generation, false, false,
-                             event.timestamp_ns, event.seq_num
-                         );
+                 let source_path = source.mount.join(rel);
+                 if source_path.exists() {
+                     if let Some(parent) = target_path.parent() {
+                         let _ = std::fs::create_dir_all(parent);
                      }
-                     metrics::LIVE_ADDITIONS.inc();
-                     return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                     let src = source_path.clone();
+                     let dst = target_path.clone();
+                     let copy_res = spawn_blocking(move || {
+                         std::fs::copy(&src, &dst)
+                     }).await;
+                     match copy_res {
+                         Ok(Ok(_bytes)) => {
+                             // Update identity map so renames can find this inode
+                             if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
+                                 identity::update_map(
+                                     &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                     r.to_path_buf(), event.generation, false, false,
+                                     event.timestamp_ns, event.seq_num
+                                 );
+                             }
+                             metrics::LIVE_ADDITIONS.inc();
+                             return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                         }
+                         _ => {
+                             // Copy failed — fall through to empty file creation
+                         }
+                     }
                  }
              }
 

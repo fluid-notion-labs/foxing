@@ -167,20 +167,9 @@ impl ReorderBuffer {
             EventType::Rename
         );
 
-        if is_path_dependent {
-            let parent = evt.parent_inode;
-            if self.inflight_renames.contains_key(&parent) {
-                if is_structural {
-                    self.structural_queue.push_front(evt.clone());
-                } else {
-                    self.buffer.insert(candidate_seq, evt.clone());
-                }
-                return None;
-            }
-            if evt.event_type == EventType::Rename {
-                self.inflight_renames.insert(evt.inode, evt.seq_num);
-            }
-        }
+        // NOTE: inflight_renames tracking disabled — acknowledge() was never called
+        // by any consumer, causing permanent event blocking after any rename.
+        // The WAL barrier system in worker.rs handles rename ordering instead.
 
         if is_structural {
             metrics::ORDERING_BUF_SIZE.with_label_values(&["structural"]).dec();

@@ -421,6 +421,13 @@ pub fn run(
                         let _ = buf.push(gap);
                     }
                     if buf.push(evt.clone()) {
+                        // Diagnostic: periodically log ReorderBuffer state
+                        static PUSH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let pc = PUSH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if pc % 5000 == 0 {
+                            info!("ReorderBuffer state: next_seq={}, buffer_len={}, structural_len={}, pushed_total={}",
+                                  buf.next_seq, buf.len(), 0, pc);
+                        }
                         while let Some(ordered_evt) = buf.pop() {
                             // P1: Early transient filter — prune create→unlink chains
                             if let Ok(mut filter) = transient_filter_callback.lock() {
