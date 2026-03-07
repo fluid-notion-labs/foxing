@@ -1,6 +1,6 @@
 # Foxing Build Automation
 
-.PHONY: all check build release install-deps clean test test-json test-quick test-baseline test-compare
+.PHONY: all check build release install-deps clean test test-json test-quick test-baseline test-compare benchmark benchmark-report benchmark-baseline
 
 all: check build
 
@@ -33,3 +33,15 @@ test-baseline:
 
 test-compare:
 	python3 tests/harness.py --compare tests/baseline.json
+
+benchmark:
+	python3 tests/harness.py --benchmark --iterations 3 --human
+
+benchmark-quick:
+	python3 tests/harness.py --benchmark --iterations 1 --scale small --human
+
+benchmark-report:
+	python3 tests/harness.py --benchmark --iterations 3 --report tests/benchmark-report.md --human
+
+benchmark-baseline:
+	python3 tests/harness.py --benchmark --iterations 5 --save-baseline

@@ -273,6 +273,12 @@ def parse_args() -> argparse.Namespace:
                    help="Force rebuild of foxing binary")
     p.add_argument("--timeout", type=int, default=DEFAULT_TOOL_TIMEOUT,
                    help=f"Per-tool timeout in seconds (default: {DEFAULT_TOOL_TIMEOUT})")
+    p.add_argument("--benchmark", action="store_true",
+                   help="Run performance benchmark (multi-iteration with statistics)")
+    p.add_argument("--iterations", type=int, default=3,
+                   help="Number of iterations per benchmark run (default: 3)")
+    p.add_argument("--report", type=str, default=None, metavar="FILE",
+                   help="Write markdown performance report to FILE")
     return p.parse_args()
 
 
@@ -586,6 +592,264 @@ def print_human(report: dict):
     print()
 
 
+# ---------------------------------------------------------------------------
+# Benchmark mode: multi-iteration with statistics
+# ---------------------------------------------------------------------------
+import statistics as _stats
+
+
+def run_benchmark_suite(
+    wl_names: list[str],
+    tool_names: list[str],
+    test_root: Path,
+    scale: str,
+    iterations: int,
+    tool_timeout: int,
+) -> dict:
+    """Run benchmark: each tool × workload for N iterations, compute statistics."""
+    results = {}
+    for wl_name in wl_names:
+        gen_fn, _ = workloads.WORKLOADS[wl_name]
+        scaled_kwargs = workloads.apply_scale(wl_name, scale)
+
+        # Generate source once
+        source_dir = test_root / "source"
+        if source_dir.exists():
+            shutil.rmtree(source_dir)
+        log(f"\nBenchmark: {wl_name} (scale={scale}, {iterations} iterations)", file=sys.stderr)
+        gen_stats = gen_fn(source_dir, **scaled_kwargs)
+        log(f"  {gen_stats['files']} files, {gen_stats['bytes'] / 1024 / 1024:.1f} MB", file=sys.stderr)
+
+        for tool in tool_names:
+            durations = []
+            for i in range(iterations):
+                target_dir = test_root / f"target_{tool}"
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+
+                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
+                if result["status"] in ("PASS", "FAIL"):
+                    durations.append(result["duration_ms"])
+                log(f"  {tool} run {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms",
+                    file=sys.stderr)
+
+                # Cleanup target between iterations
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+
+            if not durations:
+                results[(wl_name, tool, "cold")] = {"status": "SKIP", "runs": []}
+                continue
+
+            # Drop warmup run if iterations > 2
+            trimmed = durations[1:] if len(durations) > 2 else durations
+
+            results[(wl_name, tool, "cold")] = {
+                "status": "PASS",
+                "mean": round(_stats.mean(trimmed), 1),
+                "median": round(_stats.median(trimmed), 1),
+                "stddev": round(_stats.stdev(trimmed), 1) if len(trimmed) > 1 else 0,
+                "min": min(trimmed),
+                "max": max(trimmed),
+                "runs": durations,
+                "files": gen_stats["files"],
+                "bytes": gen_stats["bytes"],
+            }
+
+        # Delta benchmark: mutate source, run again
+        workloads.mutate_workload(source_dir, pct=10)
+        updated_stats = workloads.get_workload_stats(source_dir)
+
+        for tool in tool_names:
+            # Pre-populate target for delta
+            target_dir = test_root / f"target_{tool}"
+            if target_dir.exists():
+                shutil.rmtree(target_dir)
+            # First: do a clean copy to set up target
+            pre_result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
+            if pre_result["status"] not in ("PASS",):
+                results[(wl_name, tool, "delta")] = {"status": "SKIP", "runs": []}
+                continue
+
+            # Now re-run against existing target (delta)
+            durations = []
+            for i in range(iterations):
+                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
+                if result["status"] in ("PASS", "FAIL"):
+                    durations.append(result["duration_ms"])
+                log(f"  {tool} delta {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms",
+                    file=sys.stderr)
+
+            if not durations:
+                results[(wl_name, tool, "delta")] = {"status": "SKIP", "runs": []}
+                continue
+
+            trimmed = durations[1:] if len(durations) > 2 else durations
+            results[(wl_name, tool, "delta")] = {
+                "status": "PASS",
+                "mean": round(_stats.mean(trimmed), 1),
+                "median": round(_stats.median(trimmed), 1),
+                "stddev": round(_stats.stdev(trimmed), 1) if len(trimmed) > 1 else 0,
+                "min": min(trimmed),
+                "max": max(trimmed),
+                "runs": durations,
+                "files": updated_stats["files"],
+                "bytes": updated_stats["bytes"],
+            }
+
+        # Cleanup
+        for d in test_root.iterdir():
+            if d.name.startswith("target_") or d.name == "source":
+                shutil.rmtree(d, ignore_errors=True)
+
+    return results
+
+
+def _fmt_ms(ms, stddev=0):
+    """Format milliseconds with optional stddev."""
+    if ms >= 1000:
+        if stddev > 0:
+            return f"{ms/1000:.2f}±{stddev/1000:.2f}s"
+        return f"{ms/1000:.2f}s"
+    if stddev > 0:
+        return f"{ms:.0f}±{stddev:.0f}ms"
+    return f"{ms:.0f}ms"
+
+
+def _fmt_ratio(numerator, denominator):
+    """Format a performance ratio, bold if >1.5x."""
+    if denominator <= 0 or numerator <= 0:
+        return "—"
+    ratio = numerator / denominator
+    s = f"{ratio:.1f}x"
+    if ratio >= 1.5:
+        return f"**{s}**"
+    return s
+
+
+def _fmt_size(b):
+    """Format bytes to human-readable."""
+    if b >= 1024 * 1024 * 1024:
+        return f"{b/1024/1024/1024:.1f} GB"
+    if b >= 1024 * 1024:
+        return f"{b/1024/1024:.0f} MB"
+    return f"{b/1024:.0f} KB"
+
+
+def generate_benchmark_report(results: dict, env: dict, iterations: int, baseline=None) -> str:
+    """Generate a markdown performance report from benchmark results."""
+    lines = []
+    ts = datetime.now().strftime("%Y-%m-%d")
+    lines.append(f"## Performance Report — {ts}\n")
+    lines.append(f"**Platform:** Linux {env['kernel']}, {env['cpus']} cores, {env['mem_gb']}GB RAM")
+    lines.append(f"**Storage:** {env['fs']} (reflink={env['reflink']})")
+    lines.append(f"**Iterations:** {iterations} (median of {max(1, iterations - 1)} runs after warmup drop)\n")
+
+    # Collect workload names (preserve order)
+    wl_names = list(dict.fromkeys(k[0] for k in results.keys()))
+    tool_order = ["rsync", "cp", "fxcp", "foxing"]
+
+    # --- Cold copy table ---
+    lines.append("### Cold Copy Performance\n")
+    header = "| Workload | Files | Size |"
+    sep = "|----------|------:|-----:|"
+    for t in tool_order:
+        if any(k[1] == t for k in results):
+            header += f" {t} |"
+            sep += "------:|"
+    header += " fxcp vs rsync |"
+    sep += "--------------:|"
+    lines.append(header)
+    lines.append(sep)
+
+    for wl in wl_names:
+        r_rsync = results.get((wl, "rsync", "cold"), {})
+        r_fxcp = results.get((wl, "fxcp", "cold"), {})
+        # Get files/size from any available result
+        files = "?"
+        size = 0
+        for t in tool_order:
+            r = results.get((wl, t, "cold"), {})
+            if r.get("files"):
+                files = r["files"]
+                size = r.get("bytes", 0)
+                break
+
+        row = f"| {wl} | {files} | {_fmt_size(size)} |"
+        for t in tool_order:
+            r = results.get((wl, t, "cold"), {})
+            if r.get("status") == "PASS":
+                row += f" {_fmt_ms(r['median'], r.get('stddev', 0))} |"
+            elif any(k[1] == t for k in results):
+                row += " — |"
+        # fxcp vs rsync ratio
+        rsync_med = r_rsync.get("median", 0)
+        fxcp_med = r_fxcp.get("median", 0)
+        row += f" {_fmt_ratio(rsync_med, fxcp_med)} |"
+        lines.append(row)
+
+    # --- Delta copy table ---
+    has_delta = any(k[2] == "delta" for k in results)
+    if has_delta:
+        lines.append("\n### Delta Copy Performance (10% mutation)\n")
+        header = "| Workload |"
+        sep = "|----------|"
+        for t in tool_order:
+            if any(k[1] == t for k in results):
+                header += f" {t} |"
+                sep += "------:|"
+        header += " fxcp vs rsync |"
+        sep += "--------------:|"
+        lines.append(header)
+        lines.append(sep)
+
+        for wl in wl_names:
+            r_rsync = results.get((wl, "rsync", "delta"), {})
+            r_fxcp = results.get((wl, "fxcp", "delta"), {})
+            row = f"| {wl} |"
+            for t in tool_order:
+                r = results.get((wl, t, "delta"), {})
+                if r.get("status") == "PASS":
+                    row += f" {_fmt_ms(r['median'], r.get('stddev', 0))} |"
+                elif any(k[1] == t for k in results):
+                    row += " — |"
+            rsync_med = r_rsync.get("median", 0)
+            fxcp_med = r_fxcp.get("median", 0)
+            row += f" {_fmt_ratio(rsync_med, fxcp_med)} |"
+            lines.append(row)
+
+    # --- Regression detection ---
+    if baseline:
+        regressions = []
+        for key, result in results.items():
+            if result.get("status") != "PASS":
+                continue
+            bl = baseline.get(str(key))
+            if not bl or bl.get("status") != "PASS":
+                continue
+            cur = result.get("median", 0)
+            base = bl.get("median", 0)
+            if base > 0 and cur > 0:
+                ratio = base / cur
+                if ratio < 0.9:
+                    regressions.append({
+                        "test": f"{key[0]}/{key[1]}/{key[2]}",
+                        "delta": round((1 - ratio) * 100, 1),
+                        "baseline": base,
+                        "current": cur,
+                    })
+        if regressions:
+            lines.append("\n### Regressions\n")
+            for r in regressions:
+                lines.append(f"- **{r['test']}:** {r['delta']:.1f}% slower "
+                             f"({r['baseline']:.0f}ms → {r['current']:.0f}ms)")
+        else:
+            lines.append("\n### Regressions\n\nNone detected (all within 10% of baseline).")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     args = parse_args()
     global _output_mode
@@ -637,6 +901,43 @@ def main():
     test_root = make_test_root(args.tmpfs)
     log(f"Test root: {test_root}", file=sys.stderr)
 
+    # --- Benchmark mode ---
+    if args.benchmark:
+        try:
+            bench_results = run_benchmark_suite(
+                wl_names, tool_names, test_root, args.scale,
+                args.iterations, args.timeout,
+            )
+        finally:
+            if test_root.exists():
+                shutil.rmtree(test_root, ignore_errors=True)
+
+        report_md = generate_benchmark_report(bench_results, env, args.iterations)
+
+        if args.report:
+            with open(args.report, "w") as f:
+                f.write(report_md)
+            log(f"Report written to {args.report}", file=sys.stderr)
+
+        if args.human:
+            print(report_md)
+        else:
+            # JSON output for benchmark mode
+            json_results = {}
+            for key, val in bench_results.items():
+                json_results[f"{key[0]}.{key[1]}.{key[2]}"] = val
+            json.dump({
+                "version": "1.0",
+                "mode": "benchmark",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "env": env,
+                "iterations": args.iterations,
+                "results": json_results,
+            }, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        return
+
+    # --- Normal test mode ---
     all_tests = []
     all_comparisons = []
 

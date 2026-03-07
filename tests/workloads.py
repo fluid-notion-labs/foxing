@@ -199,15 +199,34 @@ def get_workload_stats(root: Path) -> dict:
     return {"files": total_files, "bytes": total_bytes, "dirs": total_dirs + 1}
 
 
+def generate_single_large(root: Path, size_mb: int = 1024) -> dict:
+    """Single large file for single-stream throughput testing."""
+    root.mkdir(parents=True, exist_ok=True)
+    size = size_mb * 1024 * 1024
+    total = _write_random_file(root / "bigfile.bin", size)
+    return {"files": 1, "bytes": total, "dirs": 1}
+
+
+def generate_many_tiny(root: Path, count: int = 50000, size: int = 1024) -> dict:
+    """Many tiny files to stress per-file overhead."""
+    root.mkdir(parents=True, exist_ok=True)
+    total_bytes = 0
+    for i in range(count):
+        total_bytes += _write_random_file(root / f"tiny_{i:06d}.dat", size)
+    return {"files": count, "bytes": total_bytes, "dirs": 1}
+
+
 # ---------------------------------------------------------------------------
 # Registry: name -> (generator_fn, default_kwargs)
 # ---------------------------------------------------------------------------
 WORKLOADS = {
-    "small_files": (generate_small_files, {"count": 10000, "size": 4096}),
-    "large_files": (generate_large_files, {"count": 10, "size_mb": 100}),
-    "mixed":       (generate_mixed,       {"file_count": 5000}),
-    "deep_tree":   (generate_deep_tree,   {"depth": 10, "width": 5}),
-    "sparse":      (generate_sparse,      {"count": 10, "size_mb": 50}),
+    "small_files":  (generate_small_files,  {"count": 10000, "size": 4096}),
+    "large_files":  (generate_large_files,  {"count": 10, "size_mb": 100}),
+    "mixed":        (generate_mixed,        {"file_count": 5000}),
+    "deep_tree":    (generate_deep_tree,    {"depth": 10, "width": 5}),
+    "sparse":       (generate_sparse,       {"count": 10, "size_mb": 50}),
+    "single_large": (generate_single_large, {"size_mb": 1024}),
+    "many_tiny":    (generate_many_tiny,    {"count": 50000, "size": 1024}),
 }
 
 
