@@ -153,6 +153,8 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key
 // Separate stash for security_inode_create → d_instantiate flow to avoid
 // stealing dentries stashed by vfs_mkdir/vfs_link/etc. entry probes.
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key, __u64); __type(value, __u64); } create_dentries SEC(".maps");
+// Separate stash for security_inode_mkdir → d_instantiate flow (kernel 6.12+).
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key, __u64); __type(value, __u64); } mkdir_dentries SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -604,17 +606,38 @@ int BPF_KPROBE(trace_security_create_entry, struct inode *dir, struct dentry *de
     __u64 ptr = (__u64)dentry;
     return bpf_map_update_elem(&create_dentries, &pid_tgid, &ptr, BPF_ANY);
 }
+// Fallback for kernel 6.12+ where mkdir via mkdirat bypasses vfs_mkdir.
+SEC("kprobe/security_inode_mkdir")
+int BPF_KPROBE(trace_security_mkdir_entry, struct inode *dir, struct dentry *dentry, umode_t mode) {
+    if (is_ignored_pid()) return 0;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 ptr = (__u64)dentry;
+    return bpf_map_update_elem(&mkdir_dentries, &pid_tgid, &ptr, BPF_ANY);
+}
+
 SEC("kprobe/d_instantiate")
 int BPF_KPROBE(trace_d_instantiate, struct dentry *dentry, struct inode *inode) {
     if (!inode) return 0;
     if (is_ignored_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u64 *ptr = bpf_map_lookup_elem(&create_dentries, &pid_tgid);
-    if (!ptr) return 0;
-    struct dentry *stashed = (struct dentry *)(*ptr);
-    bpf_map_delete_elem(&create_dentries, &pid_tgid);
-    // Use the inode parameter directly — d_inode isn't set yet at kprobe entry.
-    return submit_event(inode, stashed, EVENT_CREATE, 0, 0, 0);
+
+    // Check mkdir_dentries first (directory creation)
+    __u64 *mkdir_ptr = bpf_map_lookup_elem(&mkdir_dentries, &pid_tgid);
+    if (mkdir_ptr) {
+        struct dentry *stashed = (struct dentry *)(*mkdir_ptr);
+        bpf_map_delete_elem(&mkdir_dentries, &pid_tgid);
+        return submit_event(inode, stashed, EVENT_MKDIR, 0, 0, 0);
+    }
+
+    // Check create_dentries (file creation)
+    __u64 *create_ptr = bpf_map_lookup_elem(&create_dentries, &pid_tgid);
+    if (create_ptr) {
+        struct dentry *stashed = (struct dentry *)(*create_ptr);
+        bpf_map_delete_elem(&create_dentries, &pid_tgid);
+        return submit_event(inode, stashed, EVENT_CREATE, 0, 0, 0);
+    }
+
+    return 0;
 }
 
 SEC("kprobe/vfs_mkdir")

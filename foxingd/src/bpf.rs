@@ -255,6 +255,7 @@ pub fn run(
         ("trace_create_entry", &progs.trace_create_entry),
         ("trace_create_exit", &progs.trace_create_exit),
         ("trace_security_create_entry", &progs.trace_security_create_entry),
+        ("trace_security_mkdir_entry", &progs.trace_security_mkdir_entry),
         ("trace_d_instantiate", &progs.trace_d_instantiate),
         ("trace_mkdir_entry", &progs.trace_mkdir_entry),
         ("trace_mkdir_exit", &progs.trace_mkdir_exit),
@@ -445,6 +446,18 @@ pub fn run(
                                             metrics::GLOBAL_BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
                                         }
                                     }
+                                } else {
+                                    static QUEUE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    let m = QUEUE_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if m % 1000 == 0 {
+                                        warn!("BPF: No EventQueue for dev_id=0x{:x} (miss #{})", ordered_evt.dev_id, m);
+                                    }
+                                }
+                            } else {
+                                static SRC_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let m = SRC_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if m % 1000 == 0 {
+                                    warn!("BPF: No SourceInfo for dev_id=0x{:x} (miss #{})", ordered_evt.dev_id, m);
                                 }
                             }
                         }
