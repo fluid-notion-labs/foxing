@@ -1,0 +1,68 @@
+// foxingd Error Handling & Resilience Pathways
+// Generate: dot -Tsvg error-handling.dot -o error-handling.svg
+digraph error_handling {
+    rankdir=LR;
+    compound=true;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#e8f4fd"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Entry
+    event [label="Event Processing\nResult", shape=ellipse, fillcolor="#b3e5fc"];
+
+    // Classification
+    classify [label="classify_error()\nExtract io::Error kind", shape=diamond, fillcolor="#fff9c4"];
+    event -> classify [label="Err(e)"];
+
+    // Error classes
+    target_nf [label="TargetNotFound\n(ENOENT on Write/Rename)\nTarget file doesn't exist", fillcolor="#ffcc80"];
+    source_nf [label="SourceNotFound\n(ENOENT on Unlink/Rmdir)\nSource already deleted", fillcolor="#e0e0e0"];
+    transient [label="Transient\n(Timeout, EAGAIN, EINTR\nor any unclassified I/O)", fillcolor="#fff9c4"];
+    permanent [label="Permanent\n(EPERM)\nPermission denied", fillcolor="#ffcdd2"];
+
+    classify -> target_nf [label="ENOENT\n+ data op"];
+    classify -> source_nf [label="ENOENT\n+ structural op"];
+    classify -> transient [label="timeout\nwould_block\ninterrupted\nother"];
+    classify -> permanent [label="permission\ndenied"];
+
+    // Actions
+    repair [label="Hydration Repair\nsend_repair_job()\nFull file copy\nfrom source", fillcolor="#c8e6c9"];
+    skip [label="Skip Event\n(transient lifecycle)\nIncrement source_gone\ncounter", fillcolor="#e0e0e0"];
+    retry [label="Retry Queue\nExponential backoff\n50ms → 100ms → ... → 5s\nMax 10 attempts", fillcolor="#fff9c4"];
+    drop_evt [label="Drop Event\nLog error\nIncrement\nevents_dropped", fillcolor="#ef9a9a"];
+
+    target_nf -> repair [color=green, penwidth=2];
+    source_nf -> skip;
+    transient -> retry [color=orange];
+    permanent -> drop_evt [color=red];
+
+    // Retry outcomes
+    retry_ok [label="Retry Success\nReset error streak\nProcess normally", fillcolor="#c8e6c9"];
+    retry_exhaust [label="Retries Exhausted\n(10 attempts)\nDrop event", fillcolor="#ef9a9a"];
+    retry_overflow [label="Queue Overflow\n(> 1000 events)\nDrop oldest", fillcolor="#ef9a9a"];
+
+    retry -> retry_ok [label="attempt N\nsucceeds", color=green];
+    retry -> retry_exhaust [label="attempt > 10", color=red];
+    retry -> retry_overflow [label="queue full", color=red];
+
+    // Error streak
+    streak [label="Error Streak\nCounter\n(per worker)", shape=diamond, fillcolor="#b3e5fc"];
+    rescan [label="Request Rescan\nhydration.request_rescan\n= true", fillcolor="#c8e6c9"];
+
+    retry_ok -> streak [label="success\nafter errors"];
+    streak -> rescan [label="streak > 5\nthen success"];
+
+    // Mount monitoring path
+    mount_lost [label="Mount Lost\n(detected by\nhealth probe)", fillcolor="#ef9a9a"];
+    pause [label="Workers Paused\nEvents → journal\nNo processing", fillcolor="#fff9c4"];
+    mount_back [label="Mount Recovered\n(device ID +\nfsync probe)", fillcolor="#c8e6c9"];
+    recovery_scan [label="Recovery Scan\nClear dir hashes\nFull scan no pruning", fillcolor="#c8e6c9"];
+
+    mount_lost -> pause [color=red, penwidth=2];
+    pause -> mount_back [label="probe detects\nrecovery", style=dashed];
+    mount_back -> recovery_scan [color=green, penwidth=2];
+
+    // Success path
+    success [label="Event Success\nUpdate identity map\nAdvance WAL epoch\nReport to tuner", fillcolor="#a5d6a7"];
+    event -> success [label="Ok(stats)", color=green, penwidth=2];
+}

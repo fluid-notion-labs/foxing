@@ -6,19 +6,40 @@ This document outlines how `foxing` handles common operational failure modes, ra
 ## Story 1: The "Digital Nomad" Gap
 **Scenario:** A user unmounts the backup target USB drive to take off-site for 2 weeks. The daemon keeps running on the source. The user returns, plugs the drive back in, and expects the mirror to catch up.
 
-### System Response
+### System Response (v0.4.1 — Mount Identity Monitoring)
 1.  **Disconnect Phase:**
-    * The `Worker` attempts to write to the missing path.
-    * **FailureState:** Captures `ENOENT` or `EIO`.
-    * **Circuit Breaker:** Trips immediately due to inability to stat filesystem capacity.
-    * **Backoff:** The worker enters "Hibernation Mode" (sleeping 300s between retry probes) to stop spamming logs and burning CPU.
-2.  **Reconnect Phase:**
-    * The `FailureState` probe detects the directory is readable again.
-    * **Auto-Hydration:** The Manager triggers a `spawn_hydration_thread`.
-    * **Catch-Up:** The walker compares Source `mtime` vs Target `mtime`. Since the source files changed during the 2 weeks, their timestamps are newer.
-    * **Sync:** The worker queue fills with update events. The `TargetTuner` likely shifts to `HighLoad` mode to churn through the backlog efficiently.
+    * The **mount identity probe** (10-second interval) detects the target is gone:
+      - `metadata(target_path)` fails → device ID = 0
+      - OR `fsync` liveness probe fails (stale NFS cache, EIO)
+    * **Workers paused:** `target_cfg.paused = true` — workers stop processing events immediately.
+    * **Outage journal:** While paused, incoming BPF events are drained into `outage_journal: DashSet<PathBuf>`, recording which source paths changed.
+    * No retry queue burn, no log spam, no CPU waste.
+2.  **Long Outage (2 weeks):**
+    * The outage journal accumulates modified paths. If it exceeds 100,000 entries, it clears itself (flag for full scan on resume).
+    * BPF events continue flowing from the source kernel — the source filesystem is unaffected.
+    * Workers check `paused` flag each iteration and continue draining to journal.
+3.  **Reconnect Phase:**
+    * User plugs drive back in. Mount identity probe detects:
+      - `metadata(target_path)` succeeds with new `st_dev` (different from baseline)
+      - `fsync` probe succeeds
+    * **State transition:** `UNAVAILABLE → AVAILABLE`
+    * **Workers unpaused:** `paused = false`, events resume processing.
+    * **Recovery scan triggered:** `request_recovery_scan = true`
+      - Clears ALL stored directory Merkle hashes on target (defeats tree pruning)
+      - Runs `full_scan` without pruning — verifies every file
+      - Detects all files modified during the 2-week outage
+      - Queues them to hydration workers for sync
+4.  **Catch-Up:**
+    * Hydration workers copy all changed files from source to target.
+    * BBR tuner adapts to target throughput capacity.
+    * `foxing_events_repair_completed_total` metric tracks progress.
 
-**Result:** Consistency restored. No daemon restart required.
+**Result:** Consistency restored automatically. No daemon restart required. Zero data loss — all source changes captured in BPF event stream and outage journal.
+
+**Key metrics to monitor:**
+- `foxing_target_mount_status` — 1=available, 0=unavailable
+- `foxing_events_repair_completed_total` — repair progress after recovery
+- `foxing_hydration_dir_pruned` — should be 0 during recovery scan (pruning disabled)
 
 ---
 

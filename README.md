@@ -1,6 +1,6 @@
 # Foxing: High-Fidelity Filesystem Replication
 
-![Version](https://img.shields.io/badge/version-0.4.0-blue) ![License](https://img.shields.io/badge/license-GPLv2-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange)
+![Version](https://img.shields.io/badge/version-0.4.1-blue) ![License](https://img.shields.io/badge/license-GPLv2-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange)
 
 **Foxing** is a high-performance filesystem replication system with two components:
 
@@ -88,7 +88,26 @@ fxcp-core provides the I/O engine shared by both binaries:
 - **Storage awareness**: dm-crypt, dm-thin, kvdo, container detection
 - **Governor**: PSI-based system stress management with QoS floor
 
-foxingd adds eBPF event capture, CQRS event ordering, adaptive BBR tuning, and MARS versioning on top.
+foxingd adds eBPF event capture, CQRS event ordering, adaptive BBR tuning, mount identity monitoring, and MARS versioning on top.
+
+### foxingd Processing Pipeline
+
+![Event Pipeline](docs/diagrams/event-pipeline.svg)
+
+```
+Kernel BPF probes → Ring Buffer (33MB) → ReorderBuffer → TransientFilter
+  → IdentityProjector → TinnedDispatcher (4-tin CAKE priority queues)
+  → Workers (Control Plane W0 + Data Plane W1..N)
+  → SmartCopier → Target Filesystem
+```
+
+**Key subsystems:**
+
+- **TinnedDispatcher** — CAKE-inspired 4-priority queue (Control/Structural/Metadata/Bulk). Control-plane events (Create, Rename, Mkdir) serialize on Worker 0. Bulk writes hash-distribute to data workers. Metadata and bulk events are droppable under pressure.
+- **Mount Monitoring** — Per-target device ID tracking + fsync liveness probes (10s interval). Detects NFS lazy unmount, USB disconnect, remount. Workers pause during outage, events drain to outage journal. Recovery triggers pruning-disabled full scan.
+- **Hydration Pipeline** — Directory Merkle tree pruning for O(dirs) resume. BLAKE3 chunk-level delta copy for >1MB files (<50% dirty threshold). Targeted rescan from outage journal for fast recovery.
+
+See [Architecture Diagrams](docs/ARCHITECTURE.md) for detailed graphviz diagrams of all pathways.
 
 ## Configuration
 
@@ -112,8 +131,10 @@ make test-compare  # Compare against saved baseline
 
 ## Documentation
 
+- [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling diagrams
 - [ADR-001: Workspace Split](docs/adr/001-workspace-split.md) — Architecture decision record
 - [Implementation Plan](docs/adr/001-implementation-plan.md) — Phase-by-phase execution plan
+- [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
 - [Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md)
 - [Failure Scenarios](docs/FAILURE_SCENARIOS.md)
 

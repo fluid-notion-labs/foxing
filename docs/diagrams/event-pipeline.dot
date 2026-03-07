@@ -1,0 +1,118 @@
+// foxingd Event Processing Pipeline
+// Generate: dot -Tsvg event-pipeline.dot -o event-pipeline.svg
+digraph event_pipeline {
+    rankdir=TB;
+    compound=true;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#e8f4fd"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Kernel layer
+    subgraph cluster_kernel {
+        label="Linux Kernel (BPF Probes)";
+        style="filled"; fillcolor="#fff3e0";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        vfs_write [label="vfs_write_iter\nxfs/btrfs/ext4/nfs\nwrite hooks", fillcolor="#ffcc80"];
+        vfs_create [label="security_inode_create\n+ d_instantiate\n(kernel 6.12+)", fillcolor="#ffcc80"];
+        vfs_mkdir [label="security_inode_mkdir\n+ d_instantiate", fillcolor="#ffcc80"];
+        vfs_rename [label="vfs_rename\n(entry/exit pair)", fillcolor="#ffcc80"];
+        vfs_unlink [label="vfs_unlink\nvfs_rmdir", fillcolor="#ffcc80"];
+        vfs_meta [label="notify_change\n(chmod/chown/utimes)", fillcolor="#ffcc80"];
+        vfs_fsync [label="vfs_fsync\nxfs_trans_commit", fillcolor="#ffcc80"];
+    }
+
+    // Ring buffer
+    ringbuf [label="BPF Ring Buffer\n33MB | struct event (1088B)\nPer-device sequence numbers", shape=cylinder, fillcolor="#c8e6c9"];
+
+    vfs_write -> ringbuf;
+    vfs_create -> ringbuf;
+    vfs_mkdir -> ringbuf;
+    vfs_rename -> ringbuf;
+    vfs_unlink -> ringbuf;
+    vfs_meta -> ringbuf;
+    vfs_fsync -> ringbuf;
+
+    // Userspace processing
+    subgraph cluster_userspace {
+        label="foxingd Userspace Pipeline";
+        style="filled"; fillcolor="#e8eaf6";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        callback [label="RingBuffer Callback\nParse RawEvent → Arc<Event>", fillcolor="#b3e5fc"];
+        seq_track [label="Sequence Tracker\nPer-device gap detection\n(delta > 1000 → GAP event)", fillcolor="#b3e5fc"];
+        transient [label="TransientFilter (P1)\nCreate→Unlink suppression\nGC every 30s", fillcolor="#b3e5fc"];
+        reorder [label="ReorderBuffer\nBTreeMap<seq, Event>\nStructural ordering queue\nStall timeout: 50-2000ms", fillcolor="#b3e5fc"];
+        projector [label="IdentityProjector\nUpdate inode_map + dir_map\nin real-time from events", fillcolor="#d1c4e9"];
+    }
+
+    ringbuf -> callback;
+    callback -> seq_track;
+    seq_track -> transient;
+    transient -> reorder;
+    reorder -> projector;
+
+    // Tinned Dispatcher
+    subgraph cluster_tinned {
+        label="TinnedDispatcher (CAKE-inspired)";
+        style="filled"; fillcolor="#fce4ec";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        tin0 [label="Tin 0: Control\nUnbounded\nBarrier, Gap, Fsync", fillcolor="#ef9a9a"];
+        tin1 [label="Tin 1: Structural\n4096 capacity\nCreate, Mkdir, Rename\nUnlink, Link, Mknod", fillcolor="#ef9a9a"];
+        tin2 [label="Tin 2: Metadata\n1024 capacity\nChmod, Chown, Utimes\nSetXattr", fillcolor="#ef9a9a"];
+        tin3 [label="Tin 3: Bulk\n64 capacity (droppable)\nWrite, WriteRange\nClone, Truncate", fillcolor="#ef9a9a"];
+    }
+
+    projector -> tin0 [label="control events"];
+    projector -> tin1 [label="structural events"];
+    projector -> tin2 [label="metadata events"];
+    projector -> tin3 [label="bulk events"];
+
+    // Worker routing
+    subgraph cluster_routing {
+        label="Worker Routing";
+        style="filled"; fillcolor="#e0f2f1";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        w0 [label="Worker 0\n(Control Plane)\nAll structural + control\nevents serialized here", fillcolor="#80cbc4"];
+        w1 [label="Workers 1..N\n(Data Plane)\nBulk events\nhash(parent_inode)", fillcolor="#80cbc4"];
+    }
+
+    tin0 -> w0 [label="always W0"];
+    tin1 -> w0 [label="is_control_plane()"];
+    tin2 -> w0 [label="hash routed", style=dashed];
+    tin2 -> w1 [label="hash routed", style=dashed];
+    tin3 -> w1 [label="hash(parent_inode)"];
+
+    // Worker internals
+    subgraph cluster_worker {
+        label="Worker Event Loop";
+        style="filled"; fillcolor="#f3e5f5";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        pause_check [label="Pause Check\n(target unavailable?)\n→ drain to outage journal", fillcolor="#ce93d8"];
+        coalescer [label="Coalescer\nWrite aggregation\nElastic scan depth\nTransient lifecycle pruning", fillcolor="#ce93d8"];
+        process [label="process_single_event\n_with_wal()\nResolve target path\nExecute copy/rename/etc", fillcolor="#ce93d8"];
+        retry_q [label="RetryQueue\nMax 10 retries\nBackoff: 50ms→5s\nCapacity: 1000", fillcolor="#ce93d8"];
+    }
+
+    w0 -> pause_check;
+    w1 -> pause_check;
+    pause_check -> coalescer [label="not paused"];
+    coalescer -> process [label="pop_batch"];
+    process -> retry_q [label="Transient error", style=dashed, color=red];
+    retry_q -> process [label="retry tick\n(batch of 16)", style=dashed];
+
+    // Error paths
+    repair [label="Hydration Repair\nFull file copy\nvia HydrationQueue", fillcolor="#fff9c4"];
+    drop_evt [label="Drop\n(SourceNotFound\nor Permanent)", shape=octagon, fillcolor="#ffcdd2"];
+
+    process -> repair [label="TargetNotFound", color=orange];
+    process -> drop_evt [label="SourceNotFound\nPermanent", color=red, style=dashed];
+
+    // Target
+    target [label="Target Filesystem\n(NFS / XFS / btrfs / ext4 / USB)", shape=folder, fillcolor="#c8e6c9"];
+    process -> target [label="Success\n(SmartCopier)", color=green, penwidth=2];
+    repair -> target [label="repair copy", color=orange];
+}

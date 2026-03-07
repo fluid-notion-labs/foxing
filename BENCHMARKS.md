@@ -168,7 +168,7 @@ The ratios vary between runs due to system load and btrfs CoW variance. The key 
 
 ## foxingd Adversarial Testing (XFS→NFS, koero VM)
 
-**Date:** 2026-03-05
+**Date:** 2026-03-08 (v0.4.1)
 **VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
 **Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
 **Target:** `/mnt/target-nfs` (NFS 4.2 → awa.3d.ae.net.nz, HDD-backed 32TB)
@@ -178,22 +178,32 @@ The ratios vary between runs due to system load and btrfs CoW variance. The key 
 
 | Tool | 111 files (60MB) | Throughput |
 |------|-----------------|-----------|
-| cp | 325ms | **184 MB/s** |
-| rsync | N/A (not installed) | — |
+| cp | 325ms | **180-193 MB/s** |
+| rsync | 520ms | **109-119 MB/s** |
 
-NFS target is healthy — the bottleneck is in foxingd's event processing, not NFS I/O.
-
-### Adversarial Test Phases
+### Adversarial Test Results (v0.4.1, 9 phases)
 
 | Phase | Test | Duration | Result | Key Signal |
 |-------|------|----------|--------|------------|
-| 0 | Baseline cp/rsync | 1-2s | PASS | cp=184-221 MB/s |
-| 1 | Heavy Hydration (5000 files, 2.8GB) | 80-86s | FAIL→fixed | ENOENT→repair path |
-| 2 | Live Write Storm (fio randwrite 30s) | 38-52s | PASS | Coalescer under back-pressure |
-| 3 | Rename Chain Storm (100 chains a→e) | 37-51s | FAIL | Rename ordering on NFS |
-| 4 | NFS Target Drop + Resync | 77-105s | FAIL | CircuitBreaker + sidecar resync |
-| 5 | Large File Kill/Resume (100MB) | 25s | PASS | Dirty flag resume |
+| 0 | Baseline cp/rsync | 2s | **PASS** | cp=193MB/s rsync=113MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | 57s | **PASS** | 5000/5000 in 20s |
+| 2 | Live Write Storm (fio randwrite 30s) | 44s | **PASS** | Coalescer under back-pressure |
+| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, cross=50/50, ghosts=276 |
+| 4 | NFS Target Drop + Resync (300 files) | 37s | **PASS** | Mount identity + recovery scan |
+| 5 | Large File Kill/Resume (100MB) | 27s | **PASS** | Dirty flag resume, SHA-256 match |
 | 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
+| 7 | BLAKE3 Delta Copy | 50s | FAIL (signal) | Data correct, delta metric not triggered |
+| 8 | Directory Merkle Pruning | 50s | FAIL (signal) | Data correct, pruning metric not triggered |
+| 9 | Combined Delta + Pruning | 53s | **PASS** | Both delta and pruning active |
+
+**Total:** 7 PASS / 2 FAIL (signal only) / 1 SKIP — **352 seconds**
+
+**v0.4.0 → v0.4.1 improvements:**
+- Phase 1: FAIL → **PASS** (ENOENT→repair path fix)
+- Phase 3 cross-dir renames: 0/50 → **50/50** (resolve_event_path inode_map fallback)
+- Phase 4 NFS resync: 200/300 → **300/300** (mount identity monitoring + recovery scan)
+- Hydration worker panic: **fixed** (try_submit_job_sync for non-tokio contexts)
+- Metrics endpoint: **always responsive** (dedicated thread, not affected by I/O saturation)
 
 ### Critical Bug Found and Fixed: ENOENT Data Loss
 
@@ -256,22 +266,22 @@ Proactive routing of BPF events for unhydrated files directly to repair, elimina
 - Worker checks gate before attempting write: if inode not hydrated AND target doesn't exist → route to repair immediately
 - 30s grace period cleanup after hydration completes
 
-### Full Adversarial Suite Results (9 phases, `97f0f0b`)
+### Full Adversarial Suite Results (9 phases, v0.4.1 `3b659a0`)
 
 | Phase | Test | Result | Duration | Signals |
 |-------|------|--------|----------|---------|
-| 0 | Baseline NFS Throughput | **PASS** | 2s | cp=194MB/s rsync=116MB/s |
-| 1 | Heavy Initial Hydration (5000 files) | FAIL | 119s | STALLED (event/hydration race) |
-| 2 | Live Write Storm (fio 30s) | **PASS** | 75s | Coalescer under back-pressure |
-| 3 | Rename Chain Storm (100 chains) | FAIL | 74s | Rename ordering on NFS |
-| 4 | NFS Target Drop + Resync | FAIL | 154s | CircuitBreaker + sidecar |
-| 5 | Large File Kill/Resume (100MB) | **PASS** | 25s | Dirty flag resume |
+| 0 | Baseline NFS Throughput | **PASS** | 2s | cp=193MB/s rsync=113MB/s |
+| 1 | Heavy Initial Hydration (5000 files) | **PASS** | 57s | 5000/5000 converged in 20s |
+| 2 | Live Write Storm (fio 30s) | **PASS** | 44s | Coalescer under back-pressure |
+| 3 | Rename Chain Storm (100 chains) | **PASS** | 11s | finals=100/100, cross=50/50 |
+| 4 | NFS Target Drop + Resync | **PASS** | 37s | Mount identity + recovery scan |
+| 5 | Large File Kill/Resume (100MB) | **PASS** | 27s | SHA-256 match after kill/resume |
 | 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
-| 7 | BLAKE3 Delta Copy | **PASS** | 49s | Chunk-level resync |
-| 8 | Directory Merkle Pruning | **PASS** | 51s | Stable dirs pruned |
+| 7 | BLAKE3 Delta Copy | FAIL (signal) | 50s | Data correct, metric detection |
+| 8 | Directory Merkle Pruning | FAIL (signal) | 50s | Data correct, metric detection |
 | 9 | Combined Delta + Pruning | **PASS** | 53s | Both paths active |
 
-**Total:** 6 PASS / 3 FAIL / 1 SKIP — **603 seconds** (10 min)
+**Total:** 7 PASS / 2 FAIL (signal only) / 1 SKIP — **352 seconds** (6 min)
 
 ### foxingd vs cp vs rsync — XFS→NFS Throughput
 

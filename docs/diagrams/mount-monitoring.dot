@@ -1,0 +1,88 @@
+// foxingd Mount Monitoring & Target Recovery
+// Generate: dot -Tsvg mount-monitoring.dot -o mount-monitoring.svg
+digraph mount_monitoring {
+    rankdir=TB;
+    compound=true;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#e8f4fd"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Health probe
+    subgraph cluster_probe {
+        label="Health Probe (every 10s)";
+        style="filled"; fillcolor="#e0f7fa";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        stat_check [label="1. Device ID Check\nmetadata(target_path).dev()\nCompare vs baseline_dev", fillcolor="#80deea"];
+        fsync_probe [label="2. Fsync Liveness Probe\nopen(.foxing_mount_probe)\nwrite + sync_all()\n(catches stale NFS cache)", fillcolor="#80deea"];
+        eval [label="3. Evaluate Reachability\nreachable = dev_match AND live", shape=diamond, fillcolor="#4dd0e1"];
+    }
+
+    stat_check -> fsync_probe [label="stat OK"];
+    stat_check -> gone [label="stat FAILS", color=red];
+    fsync_probe -> eval [label="result"];
+
+    // State transitions
+    subgraph cluster_states {
+        label="Target Mount States";
+        style="filled"; fillcolor="#f3e5f5";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        available [label="AVAILABLE\nWorkers active\nEvents processed normally", shape=ellipse, fillcolor="#a5d6a7"];
+        unavailable [label="UNAVAILABLE\nWorkers paused\nEvents → outage journal", shape=ellipse, fillcolor="#ef9a9a"];
+    }
+
+    gone [label="Mount Gone\nmetadata() failed", shape=octagon, fillcolor="#ffcdd2"];
+    remounted [label="Remount Detected\ndev changed\n(new st_dev)", shape=octagon, fillcolor="#fff9c4"];
+    recovered [label="Target Recovered\nfsync succeeds\ndev matches or new", shape=octagon, fillcolor="#c8e6c9"];
+
+    eval -> available [label="reachable\n&& was available\n(no change)", style=dashed, color=gray];
+    eval -> gone [label="!reachable\n&& was available"];
+    eval -> recovered [label="reachable\n&& was unavailable"];
+    eval -> remounted [label="dev changed\n&& was available"];
+
+    gone -> unavailable [label="pause workers\nset paused=true"];
+    recovered -> available [label="unpause workers\nupdate baseline_dev"];
+    remounted -> available [label="update baseline_dev\nclear outage journal"];
+
+    // Recovery actions
+    subgraph cluster_recovery {
+        label="Recovery Actions";
+        style="filled"; fillcolor="#fff3e0";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        recovery_scan [label="Recovery Scan\n1. Clear stored dir hashes\n2. Full scan (no pruning)\n3. Compare ALL source vs target", fillcolor="#ffcc80"];
+        targeted_rescan [label="Targeted Rescan\n1. Read outage journal\n2. Check only journaled paths\n3. Queue mismatched files", fillcolor="#ffcc80"];
+        full_scan [label="Full Scan\n1. Walk source tree\n2. Tree pruning (Merkle)\n3. Queue changed files", fillcolor="#ffcc80"];
+    }
+
+    recovered -> recovery_scan [label="request_recovery_scan", color=blue, penwidth=2];
+    remounted -> recovery_scan [label="request_recovery_scan\n(clear journal)", color=blue, penwidth=2];
+
+    // Outage journal
+    subgraph cluster_journal {
+        label="Outage Journal";
+        style="filled"; fillcolor="#e8eaf6";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        journal [label="DashSet<PathBuf>\nRecords modified paths\nwhile target unavailable", shape=cylinder, fillcolor="#9fa8da"];
+        overflow [label="Journal Overflow\n> 100,000 entries\n→ clear (forces full scan)", shape=diamond, fillcolor="#ef9a9a"];
+    }
+
+    unavailable -> journal [label="drain events\ninto journal"];
+    journal -> overflow [label="check size"];
+    overflow -> journal [label="< max", style=dashed];
+    overflow -> full_scan [label="> max\n(clear journal)", color=red];
+
+    // Journal to rescan
+    journal -> targeted_rescan [label="on resume\n(if non-empty)", style=dashed, color=blue];
+
+    // Hydration queue
+    hydration_q [label="HydrationQueue\nRound-robin to\nhydration workers", fillcolor="#c8e6c9"];
+    target [label="Target Filesystem", shape=folder, fillcolor="#a5d6a7"];
+
+    recovery_scan -> hydration_q [label="queue jobs"];
+    targeted_rescan -> hydration_q [label="queue jobs"];
+    full_scan -> hydration_q [label="queue jobs"];
+    hydration_q -> target [label="copy files", color=green, penwidth=2];
+}

@@ -1,0 +1,122 @@
+// foxingd Hydration & Recovery Pipeline
+// Generate: dot -Tsvg hydration-pipeline.dot -o hydration-pipeline.svg
+digraph hydration {
+    rankdir=TB;
+    compound=true;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#e8f4fd"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Trigger sources
+    subgraph cluster_triggers {
+        label="Rescan Triggers";
+        style="filled"; fillcolor="#fff3e0";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        startup [label="Daemon Startup\ninitial_sync = true", fillcolor="#ffcc80"];
+        mount_recovery [label="Mount Recovery\nDevice ID change\nor fsync probe success", fillcolor="#ffcc80"];
+        error_streak [label="Worker Error Streak\n> 5 consecutive errors\nthen success", fillcolor="#ffcc80"];
+        inotify [label="Inotify Watcher\nSource file change\ndetected post-scan", fillcolor="#ffcc80"];
+    }
+
+    // Scan types
+    subgraph cluster_scans {
+        label="Scan Types";
+        style="filled"; fillcolor="#e8eaf6";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        full_scan [label="Full Scan\n1. WalkDir source tree\n2. Tree pruning (Merkle dir hash)\n3. Signature verification\n4. Queue mismatched files", fillcolor="#9fa8da"];
+        recovery [label="Recovery Scan\n1. Clear ALL dir hashes on target\n2. Full scan WITHOUT pruning\n3. Verifies every file", fillcolor="#ef9a9a"];
+        targeted [label="Targeted Rescan\n1. Read outage journal\n2. Check only logged paths\n3. Size+mtime comparison\n4. Queue missing/changed", fillcolor="#a5d6a7"];
+    }
+
+    startup -> full_scan;
+    mount_recovery -> recovery [label="request_recovery_scan", color=red, penwidth=2];
+    error_streak -> full_scan [label="request_rescan"];
+    inotify -> targeted [label="changed path"];
+
+    // Tree pruning detail
+    subgraph cluster_pruning {
+        label="Tree Pruning (Merkle)";
+        style="filled"; fillcolor="#f3e5f5";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        compute_hash [label="Compute Source Dir Hash\nBLAKE3(sorted child names\n+ metadata)", fillcolor="#ce93d8"];
+        compare_hash [label="Compare vs Stored Hash\n(xattr on target dir)", shape=diamond, fillcolor="#ba68c8"];
+        prune [label="Prune Directory\nSkip all children\n(O(dirs) not O(files))", fillcolor="#c8e6c9"];
+        scan_dir [label="Scan Directory\nVerify each file\n(sync_file_needed)", fillcolor="#ef9a9a"];
+    }
+
+    full_scan -> compute_hash;
+    compute_hash -> compare_hash;
+    compare_hash -> prune [label="hash matches\nAND no dirty children"];
+    compare_hash -> scan_dir [label="hash differs\nOR dirty children"];
+
+    // File verification
+    subgraph cluster_verify {
+        label="File Verification (sync_file_needed)";
+        style="filled"; fillcolor="#e0f2f1";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        check_dirty [label="1. Check dirty flag\n(sidecar xattr)", fillcolor="#80cbc4"];
+        check_sig [label="2. Compare SyncSignature\n(size + mtime)", fillcolor="#80cbc4"];
+        lite_hash [label="3. BLAKE3 Lite Hash\n(head 4KB + tail 4KB)", fillcolor="#80cbc4"];
+        merkle_verify [label="4. Merkle Root Compare\n(64KB chunk hashes)", fillcolor="#80cbc4"];
+        needs_sync [label="Needs Sync", shape=octagon, fillcolor="#ffcc80"];
+        skip [label="Skip (up to date)", shape=octagon, fillcolor="#c8e6c9"];
+    }
+
+    scan_dir -> check_dirty;
+    check_dirty -> needs_sync [label="dirty=true"];
+    check_dirty -> check_sig [label="not dirty"];
+    check_sig -> needs_sync [label="size/mtime differ"];
+    check_sig -> lite_hash [label="sig match\n(check deeper)"];
+    lite_hash -> skip [label="mismatch (full copy)"];
+    lite_hash -> merkle_verify [label="lite match\n(check chunks)"];
+    merkle_verify -> needs_sync [label="root mismatch\n→ delta copy"];
+    merkle_verify -> skip [label="root match"];
+
+    // Hydration queue
+    subgraph cluster_queue {
+        label="HydrationQueue";
+        style="filled"; fillcolor="#fce4ec";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        queue [label="HydrationQueue\nPer-worker mpsc channels\nRound-robin distribution\nBackpressure: try_send", shape=cylinder, fillcolor="#f48fb1"];
+        hw0 [label="Hydration\nWorker 0", fillcolor="#ef9a9a"];
+        hw1 [label="Hydration\nWorker 1", fillcolor="#ef9a9a"];
+        hw2 [label="Hydration\nWorker 2", fillcolor="#ef9a9a"];
+        hw3 [label="Hydration\nWorker 3", fillcolor="#ef9a9a"];
+    }
+
+    needs_sync -> queue;
+    targeted -> queue [label="queue jobs"];
+    recovery -> queue [label="queue all\nverified files", style=dashed];
+
+    queue -> hw0;
+    queue -> hw1;
+    queue -> hw2;
+    queue -> hw3;
+
+    // Copy operation
+    subgraph cluster_copy {
+        label="Copy Operation";
+        style="filled"; fillcolor="#e8f5e9";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        smart_copy [label="SmartCopier\nTier 1: FICLONE (CoW)\nTier 1.5: copy_file_range (NFS)\nTier 2: sendfile (<64KB)\nTier 3: io_uring (large files)", fillcolor="#a5d6a7"];
+        delta_copy [label="Delta Copy\nMerkle diff → DirtyRanges\nCopy only changed 64KB chunks\n(<50% dirty threshold)", fillcolor="#81c784"];
+        postcopy [label="Post-Copy\nMetadata sync\nMerkle signature store\nSync signature cache", fillcolor="#a5d6a7"];
+    }
+
+    hw0 -> smart_copy;
+    hw1 -> smart_copy;
+    hw2 -> delta_copy [label="Merkle mismatch\n(>1MB files)", style=dashed];
+    hw3 -> smart_copy;
+
+    target [label="Target\nFilesystem", shape=folder, fillcolor="#c8e6c9"];
+
+    smart_copy -> postcopy;
+    delta_copy -> postcopy;
+    postcopy -> target [color=green, penwidth=2];
+}
