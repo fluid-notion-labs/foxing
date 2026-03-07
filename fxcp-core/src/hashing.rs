@@ -93,6 +93,31 @@ pub fn verify_incremental(src: &Path, dst: &Path, size: u64) -> Result<bool> {
     Ok(src_hash == dst_hash)
 }
 
+/// Compute a directory hash by reading the directory at `path`.
+/// Each child's metadata (size, mtime, type) is hashed, then all children
+/// are sorted by name and combined into a single BLAKE3 directory fingerprint.
+/// Skips foxing internal files (.foxing*, .foxing_meta sidecars).
+pub fn compute_dir_hash_from_path(dir_path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::os::unix::fs::MetadataExt;
+    let mut children: Vec<(String, [u8; 32])> = Vec::new();
+    for entry in std::fs::read_dir(dir_path).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && name.ends_with(".foxing_meta") { continue; }
+        if name.starts_with(".foxing") { continue; }
+        if let Ok(meta) = entry.metadata() {
+            let mut hasher = Hasher::new();
+            hasher.update(&meta.len().to_le_bytes());
+            hasher.update(&meta.mtime().to_le_bytes());
+            hasher.update(&meta.mtime_nsec().to_le_bytes());
+            if meta.is_dir() { hasher.update(b"d"); } else { hasher.update(b"f"); }
+            children.push((name, *hasher.finalize().as_bytes()));
+        }
+    }
+    if children.is_empty() { return None; }
+    Some(compute_dir_hash(&mut children))
+}
+
 /// Compute a directory hash from sorted child (name, hash) pairs.
 /// Uses BLAKE3 over concatenation of sorted `name:hash` entries.
 /// Provides a stable, order-independent directory fingerprint.

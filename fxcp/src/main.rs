@@ -50,6 +50,8 @@ struct Cli {
     zero_copy: bool,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     debug: bool,
+    #[arg(long, help = "Generate foxingd-compatible sync signatures (xattr/sidecar) for fast resync")]
+    generate_sigs: bool,
 }
 
 // Auto-adaptive thresholds
@@ -71,11 +73,30 @@ struct SyncStats {
     bytes_small: u64,
     bytes_delta: u64,
     errors: u64,
+    sigs_stored: u64,
+    dirs_hashed: u64,
+}
+
+/// Store foxingd-compatible sync signatures on the destination file.
+/// Writes SyncSignature (size/mtime/lite_hash/merkle_root) and for files
+/// above the Merkle threshold, a full MerkleSignature (leaf hashes for
+/// chunk-level delta copy).
+fn store_foxing_signatures(dst: &std::path::Path) -> fxcp_core::error::Result<()> {
+    use fxcp_core::{sidecar, hashing};
+    let sig = sidecar::SyncSignature::compute(dst)?;
+    sidecar::set_sync_signature(dst, &sig)?;
+    let file_size = std::fs::metadata(dst)?.len();
+    if file_size > (hashing::CHUNK_SIZE * 4) as u64 {
+        let tree = hashing::MerkleTree::from_file(dst, hashing::CHUNK_SIZE as u64)?;
+        let merkle_sig = tree.to_signature();
+        sidecar::set_merkle_signature(dst, &merkle_sig)?;
+    }
+    Ok(())
 }
 
 impl Default for SyncStats {
     fn default() -> Self {
-        Self { files_copied: 0, files_reflinked: 0, files_cfr: 0, files_small: 0,
+        Self { files_copied: 0, files_reflinked: 0, files_cfr: 0, files_small: 0, sigs_stored: 0, dirs_hashed: 0,
                files_skipped: 0, files_delta: 0, files_deleted: 0,
                dirs_created: 0, bytes_copied: 0, bytes_reflinked: 0,
                bytes_cfr: 0, bytes_small: 0, bytes_delta: 0, errors: 0 }
@@ -601,6 +622,9 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                 if cli.archive {
                     let _ = preserve_metadata(src_path, &dst_path);
                 }
+                if cli.generate_sigs {
+                    if store_foxing_signatures(&dst_path).is_ok() { stats.sigs_stored += 1; }
+                }
                 continue;
             }
         }
@@ -614,6 +638,9 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                     stats.bytes_cfr += bytes;
                     if cli.archive {
                         let _ = preserve_metadata(src_path, &dst_path);
+                    }
+                    if cli.generate_sigs {
+                        if store_foxing_signatures(&dst_path).is_ok() { stats.sigs_stored += 1; }
                     }
                     continue;
                 }
@@ -637,6 +664,9 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                     if cli.archive {
                         let _ = preserve_metadata(src_path, &dst_path);
                     }
+                    if cli.generate_sigs {
+                        if store_foxing_signatures(&dst_path).is_ok() { stats.sigs_stored += 1; }
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -655,6 +685,9 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
                 stats.bytes_copied += copy_stats.bytes_processed;
                 if cli.archive {
                     let _ = preserve_metadata(src_path, &dst_path);
+                }
+                if cli.generate_sigs {
+                    if store_foxing_signatures(&dst_path).is_ok() { stats.sigs_stored += 1; }
                 }
             }
             Err(e) => {
@@ -686,6 +719,33 @@ async fn run_sync(cli: &Cli) -> fxcp_core::Result<SyncStats> {
     // Handle --delete
     if cli.delete && !cli.dry_run {
         stats.files_deleted = delete_extra_files(&source, &destination, &exclude_patterns)?;
+    }
+
+    // Generate directory hashes for foxingd tree pruning (bottom-up)
+    if cli.generate_sigs && !cli.dry_run {
+        let dir_walker = walkdir::WalkDir::new(&destination)
+            .contents_first(true) // bottom-up: children before parents
+            .follow_links(false);
+        for entry in dir_walker.into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_dir() {
+                let dst_dir = entry.path();
+                // Compute hash from the SOURCE directory (same relative path)
+                if let Ok(rel) = dst_dir.strip_prefix(&destination) {
+                    let src_dir = source.join(rel);
+                    if src_dir.is_dir() {
+                        if let Some(hash) = fxcp_core::hashing::compute_dir_hash_from_path(&src_dir) {
+                            if fxcp_core::sidecar::set_dir_hash(dst_dir, &hash).is_ok() {
+                                stats.dirs_hashed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if stats.sigs_stored > 0 || stats.dirs_hashed > 0 {
+            info!("{} file signatures + {} directory hashes stored (foxingd-compatible)",
+                  stats.sigs_stored, stats.dirs_hashed);
+        }
     }
 
     Ok(stats)

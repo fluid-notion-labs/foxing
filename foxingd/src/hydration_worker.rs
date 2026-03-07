@@ -213,35 +213,9 @@ impl Hydrator {
     }
 
     /// Compute the current directory hash from immediate children's stat signatures.
-    /// Uses size + mtime + type as per-child input — fast (stat-only, no file I/O).
+    /// Delegates to shared fxcp_core implementation.
     fn compute_current_dir_hash(src_dir: &Path) -> Option<[u8; 32]> {
-        let entries = std::fs::read_dir(src_dir).ok()?;
-        let mut children: Vec<(String, [u8; 32])> = Vec::new();
-
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip sidecar files
-            if name.starts_with('.') && name.ends_with(".foxing_meta") { continue; }
-            // Skip foxing internal files
-            if name.starts_with(".foxing") { continue; }
-
-            let path = entry.path();
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&meta.len().to_le_bytes());
-                hasher.update(&meta.mtime().to_le_bytes());
-                hasher.update(&meta.mtime_nsec().to_le_bytes());
-                if meta.is_dir() {
-                    hasher.update(b"d");
-                } else {
-                    hasher.update(b"f");
-                }
-                children.push((name, *hasher.finalize().as_bytes()));
-            }
-        }
-
-        if children.is_empty() { return None; }
-        Some(fxcp_core::hashing::compute_dir_hash(&mut children))
+        fxcp_core::hashing::compute_dir_hash_from_path(src_dir)
     }
 
     /// Targeted rescan: only check paths recorded in the outage journal.
