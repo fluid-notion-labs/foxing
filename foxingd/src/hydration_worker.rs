@@ -315,7 +315,7 @@ impl Hydrator {
                 .filter_map(|e| e.ok())
                 .try_for_each(|entry| {
                     if entry.file_type().is_dir() {
-                        fxcp_core::sidecar::clear_dir_hash(entry.path());
+                        let _ = fxcp_core::sidecar::clear_dir_hash(entry.path());
                     }
                     Ok::<(), ()>(())
                 }) { let _ = walker; }

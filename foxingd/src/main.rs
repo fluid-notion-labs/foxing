@@ -560,18 +560,35 @@ async fn run_runtime(
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
-    
-    let api_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(addr).await;
-        match listener {
-            Ok(l) => {
-                if let Err(e) = axum::serve(l, api_app).await {
-                    error!("API Server Error: {}", e);
+
+    // Run the metrics/API server on a DEDICATED tokio runtime with its own
+    // thread so it stays responsive even when the main runtime's threads
+    // are saturated by NFS I/O or heavy spawn_blocking work.
+    let api_shutdown = tokio::sync::watch::channel(false);
+    let api_shutdown_rx = api_shutdown.1.clone();
+    let api_handle = std::thread::Builder::new()
+        .name("foxing-metrics".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build metrics runtime");
+            rt.block_on(async move {
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => { error!("Failed to bind API port {}: {}", addr.port(), e); return; }
+                };
+                let server = axum::serve(listener, api_app);
+                let mut shutdown_rx = api_shutdown_rx;
+                tokio::select! {
+                    result = server => {
+                        if let Err(e) = result { error!("API Server Error: {}", e); }
+                    }
+                    _ = shutdown_rx.changed() => {}
                 }
-            },
-            Err(e) => error!("Failed to bind API port {}: {}", metrics_port, e),
-        }
-    });
+            });
+        })
+        .expect("Failed to spawn metrics thread");
 
     if !one_shot_mode {
         info!("Metrics API listening on http://{}", addr);
@@ -836,7 +853,8 @@ async fn run_runtime(
         }
     }
     
-    api_handle.abort();
+    let _ = api_shutdown.0.send(true);
+    let _ = api_handle.join();
     info!("Shutdown Complete.");
     
     constants::ONE_SHOT_MODE.store(false, Ordering::Relaxed);
