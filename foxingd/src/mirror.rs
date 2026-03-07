@@ -385,7 +385,7 @@ impl Manager {
                     target_available.insert(tgt_cfg.path.clone(), true);
                 }
             }
-            let mut health_interval = tokio::time::interval(Duration::from_secs(30));
+            let mut health_interval = tokio::time::interval(Duration::from_secs(10));
             health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {

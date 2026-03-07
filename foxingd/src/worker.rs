@@ -1256,9 +1256,18 @@ async fn process_single_event_with_wal(
                              metrics::LIVE_ADDITIONS.inc();
                              return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                          }
+                         Ok(Err(e)) => {
+                             // Copy failed but source still exists — target may be
+                             // unreachable (NFS outage). Report as error so retry/repair
+                             // kicks in. If source is gone, it was renamed — skip silently.
+                             if source_path.exists() {
+                                 op_result = Err(FoxingError::Io(e));
+                             } else {
+                                 return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                             }
+                         }
                          _ => {
-                             // Copy failed — source may have been renamed. Skip creating
-                             // empty ghost files; the rename handler will copy if needed.
+                             // JoinError or other — skip silently
                              return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                          }
                      }
