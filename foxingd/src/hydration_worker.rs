@@ -1180,6 +1180,98 @@ pub async fn run_hydration_worker_loop(
 
         match job {
             Some(job) => {
+                // Batch drain: collect additional small-file jobs from channel
+                let mut batch = vec![job.clone()];
+                while batch.len() < 64 {
+                    match rx.try_recv() {
+                        Ok(j) => batch.push(j),
+                        Err(_) => break,
+                    }
+                }
+
+                // Fast path: batch process small files via std::fs::copy
+                // (skip io_uring overhead for files < 64KB)
+                if batch.len() > 1 {
+                    let mut fast_processed = 0u64;
+                    let mut remaining = Vec::new();
+                    for bj in batch {
+                        let src = source.mount.join(&bj.rel_path);
+                        let dst = bj.target_cfg.path.join(&bj.rel_path);
+                        let is_small = src.metadata().map(|m| m.len() <= 65536).unwrap_or(false);
+
+                        if is_small && src.exists() {
+                            if let Some(parent) = dst.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match std::fs::copy(&src, &dst) {
+                                Ok(bytes) => {
+                                    // Apply metadata
+                                    let _ = fxcp_core::security::apply_metadata(&src, &dst);
+                                    crate::metrics::EVENTS_REPAIR_COMPLETED.inc();
+                                    crate::metrics::BYTES_REPLICATED
+                                        .with_label_values(&[&bj.target_cfg.path.to_string_lossy()])
+                                        .inc_by(bytes as f64);
+                                    source.active_repairs.remove(&bj.rel_path);
+                                    fast_processed += 1;
+                                    jobs_processed += 1;
+                                    pending_count.fetch_sub(1, Ordering::SeqCst);
+                                }
+                                Err(_) => {
+                                    // Fall back to full processing
+                                    remaining.push(bj);
+                                }
+                            }
+                        } else {
+                            remaining.push(bj);
+                        }
+                    }
+                    if fast_processed > 0 {
+                        debug!("Hydration Worker {}: Batch-copied {} small files", worker_id, fast_processed);
+                    }
+                    // Process remaining (large/complex) files individually
+                    for bj in remaining {
+                        let source_check_path = source.mount.join(&bj.rel_path);
+                        if !source_check_path.exists() {
+                            let target_check_path = bj.target_cfg.path.join(&bj.rel_path);
+                            if target_check_path.exists() { let _ = std::fs::remove_file(&target_check_path); }
+                            jobs_skipped += 1;
+                            jobs_processed += 1;
+                            pending_count.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        let target_path_root = bj.target_cfg.path.clone();
+                        let target_caps = caps_cache.entry(target_path_root.clone())
+                            .or_insert_with(|| probe_capabilities(&target_path_root))
+                            .clone();
+                        match process_hydration_job(
+                            bj.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool,
+                            async_fd.clone(), &source_caps, &target_caps, &tracker, &mut fsync_tracker,
+                            current_limit, skip_fsync, &sig_cache
+                        ).await {
+                            Ok(Some(stats)) => {
+                                crate::metrics::EVENTS_REPAIR_COMPLETED.inc();
+                                source.active_repairs.remove(&bj.rel_path);
+                                if let Some(senders) = stats_senders.get(&bj.target_cfg.path) {
+                                    if let Some(sender) = senders.choose(&mut rand::rng()) {
+                                        let _ = sender.send(stats);
+                                    }
+                                }
+                            }
+                            Ok(None) => { jobs_skipped += 1; }
+                            Err(e) => {
+                                crate::metrics::EVENTS_REPAIR_FAILED.inc();
+                                source.active_repairs.remove(&bj.rel_path);
+                                jobs_failed += 1;
+                                warn!("Hydration Worker {}: Batch remainder failed {:?}: {}", worker_id, bj.rel_path, e);
+                            }
+                        }
+                        jobs_processed += 1;
+                        pending_count.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+
+                // Single job path (original logic)
                 let target_path_root = job.target_cfg.path.clone();
                 let target_caps = caps_cache.entry(target_path_root.clone())
                     .or_insert_with(|| probe_capabilities(&target_path_root))
@@ -1188,7 +1280,6 @@ pub async fn run_hydration_worker_loop(
                 // Skip jobs where source file no longer exists (renamed during queue wait)
                 let source_check_path = source.mount.join(&job.rel_path);
                 if !source_check_path.exists() {
-                    // Also remove any ghost copy that might have been created
                     let target_check_path = job.target_cfg.path.join(&job.rel_path);
                     if target_check_path.exists() {
                         let _ = std::fs::remove_file(&target_check_path);
