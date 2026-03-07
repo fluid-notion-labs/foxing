@@ -187,12 +187,119 @@ def build_foxing(force: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Tool runner
 # ---------------------------------------------------------------------------
-def run_tool(tool_name: str, src: Path, dst: Path, timeout: int = DEFAULT_TOOL_TIMEOUT) -> dict:
-    """Run a copy tool and return timing + status."""
+def _read_diskstats() -> dict:
+    """Read /proc/diskstats and return {device: {reads, writes, read_bytes, write_bytes}}."""
+    stats = {}
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 14:
+                    dev = parts[2]
+                    # Fields: reads_completed, sectors_read, writes_completed, sectors_written
+                    stats[dev] = {
+                        "reads": int(parts[3]),
+                        "read_sectors": int(parts[5]),
+                        "writes": int(parts[7]),
+                        "write_sectors": int(parts[9]),
+                    }
+    except (OSError, ValueError):
+        pass
+    return stats
+
+
+def _diff_diskstats(before: dict, after: dict) -> dict:
+    """Compute delta of diskstats across all devices."""
+    total = {"reads": 0, "writes": 0, "read_bytes": 0, "write_bytes": 0}
+    for dev in after:
+        if dev in before:
+            total["reads"] += max(0, after[dev]["reads"] - before[dev]["reads"])
+            total["writes"] += max(0, after[dev]["writes"] - before[dev]["writes"])
+            total["read_bytes"] += max(0, (after[dev]["read_sectors"] - before[dev]["read_sectors"]) * 512)
+            total["write_bytes"] += max(0, (after[dev]["write_sectors"] - before[dev]["write_sectors"]) * 512)
+    return total
+
+
+def _parse_gnu_time(stderr: str) -> dict:
+    """Parse GNU /usr/bin/time -v output from stderr."""
+    telemetry = {}
+    for line in stderr.splitlines():
+        line = line.strip()
+        if ": " not in line:
+            continue
+        key, _, val = line.partition(": ")
+        key = key.strip()
+        val = val.strip()
+        if key == "Percent of CPU this job got":
+            telemetry["cpu_pct"] = val.rstrip("%")
+        elif key == "Maximum resident set size (kbytes)":
+            try:
+                telemetry["peak_rss_kb"] = int(val)
+            except ValueError:
+                pass
+        elif key == "Voluntary context switches":
+            try:
+                telemetry["ctx_voluntary"] = int(val)
+            except ValueError:
+                pass
+        elif key == "Involuntary context switches":
+            try:
+                telemetry["ctx_involuntary"] = int(val)
+            except ValueError:
+                pass
+        elif key == "File system inputs":
+            try:
+                telemetry["fs_inputs"] = int(val)
+            except ValueError:
+                pass
+        elif key == "File system outputs":
+            try:
+                telemetry["fs_outputs"] = int(val)
+            except ValueError:
+                pass
+        elif key == "Minor (reclaiming a frame) page faults":
+            try:
+                telemetry["page_faults_minor"] = int(val)
+            except ValueError:
+                pass
+        elif key == "Major (requiring I/O) page faults":
+            try:
+                telemetry["page_faults_major"] = int(val)
+            except ValueError:
+                pass
+        elif "wall clock" in key:
+            telemetry["wall_clock"] = val
+        elif "User time" in key:
+            try:
+                telemetry["user_time_s"] = float(val)
+            except ValueError:
+                pass
+        elif "System time" in key:
+            try:
+                telemetry["sys_time_s"] = float(val)
+            except ValueError:
+                pass
+    return telemetry
+
+
+# Check for GNU time availability (needed for telemetry)
+GNU_TIME = shutil.which("time", path="/usr/bin") or shutil.which("gtime")
+
+
+def run_tool(tool_name: str, src: Path, dst: Path, timeout: int = DEFAULT_TOOL_TIMEOUT,
+             capture_telemetry: bool = False) -> dict:
+    """Run a copy tool and return timing + status + optional telemetry."""
     cmd = TOOLS[tool_name](str(src), str(dst))
+
+    # Wrap with GNU time for telemetry capture
+    if capture_telemetry and GNU_TIME:
+        cmd = [GNU_TIME, "-v"] + cmd
 
     # Ensure target dir exists (rsync and foxing create it, cp needs it)
     dst.mkdir(parents=True, exist_ok=True)
+
+    # Capture disk I/O before
+    io_before = _read_diskstats() if capture_telemetry else {}
 
     start = time.monotonic()
     try:
@@ -205,9 +312,13 @@ def run_tool(tool_name: str, src: Path, dst: Path, timeout: int = DEFAULT_TOOL_T
     except FileNotFoundError:
         return {"status": "SKIP", "duration_ms": 0, "error": f"{tool_name} not found"}
 
+    # Capture disk I/O after
+    io_after = _read_diskstats() if capture_telemetry else {}
+
     status = "PASS"
     error = None
 
+    # GNU time wraps the exit code — check the underlying tool's status
     if result.returncode != 0:
         stderr = result.stderr[-1000:] if result.stderr else ""
         # foxing: BPF crash is expected unprivileged — check if hydration still completed
@@ -231,6 +342,17 @@ def run_tool(tool_name: str, src: Path, dst: Path, timeout: int = DEFAULT_TOOL_T
     result_dict = {"status": status, "duration_ms": elapsed_ms}
     if error:
         result_dict["error"] = error
+
+    # Parse telemetry from GNU time output
+    if capture_telemetry:
+        telemetry = {}
+        if GNU_TIME and result.stderr:
+            telemetry = _parse_gnu_time(result.stderr)
+        if io_before and io_after:
+            telemetry["disk_io"] = _diff_diskstats(io_before, io_after)
+        if telemetry:
+            result_dict["telemetry"] = telemetry
+
     return result_dict
 
 
@@ -622,16 +744,27 @@ def run_benchmark_suite(
 
         for tool in tool_names:
             durations = []
+            last_telemetry = {}
             for i in range(iterations):
                 target_dir = test_root / f"target_{tool}"
                 if target_dir.exists():
                     shutil.rmtree(target_dir)
 
-                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
+                # Capture telemetry on last iteration only (avoids overhead on timing runs)
+                is_last = (i == iterations - 1)
+                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout,
+                                  capture_telemetry=is_last)
                 if result["status"] in ("PASS", "FAIL"):
                     durations.append(result["duration_ms"])
-                log(f"  {tool} run {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms",
-                    file=sys.stderr)
+                if is_last and "telemetry" in result:
+                    last_telemetry = result["telemetry"]
+                    rss = last_telemetry.get("peak_rss_kb", 0)
+                    cpu = last_telemetry.get("cpu_pct", "?")
+                    log(f"  {tool} run {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms "
+                        f"(RSS={rss}KB CPU={cpu}%)", file=sys.stderr)
+                else:
+                    log(f"  {tool} run {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms",
+                        file=sys.stderr)
 
                 # Cleanup target between iterations
                 if target_dir.exists():
@@ -644,7 +777,7 @@ def run_benchmark_suite(
             # Drop warmup run if iterations > 2
             trimmed = durations[1:] if len(durations) > 2 else durations
 
-            results[(wl_name, tool, "cold")] = {
+            entry = {
                 "status": "PASS",
                 "mean": round(_stats.mean(trimmed), 1),
                 "median": round(_stats.median(trimmed), 1),
@@ -655,6 +788,9 @@ def run_benchmark_suite(
                 "files": gen_stats["files"],
                 "bytes": gen_stats["bytes"],
             }
+            if last_telemetry:
+                entry["telemetry"] = last_telemetry
+            results[(wl_name, tool, "cold")] = entry
 
         # Delta benchmark: mutate source, run again
         workloads.mutate_workload(source_dir, pct=10)
@@ -673,10 +809,15 @@ def run_benchmark_suite(
 
             # Now re-run against existing target (delta)
             durations = []
+            last_telemetry = {}
             for i in range(iterations):
-                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout)
+                is_last = (i == iterations - 1)
+                result = run_tool(tool, source_dir, target_dir, timeout=tool_timeout,
+                                  capture_telemetry=is_last)
                 if result["status"] in ("PASS", "FAIL"):
                     durations.append(result["duration_ms"])
+                if is_last and "telemetry" in result:
+                    last_telemetry = result["telemetry"]
                 log(f"  {tool} delta {i+1}/{iterations}: {result['status']} {result['duration_ms']}ms",
                     file=sys.stderr)
 
@@ -685,7 +826,7 @@ def run_benchmark_suite(
                 continue
 
             trimmed = durations[1:] if len(durations) > 2 else durations
-            results[(wl_name, tool, "delta")] = {
+            delta_entry = {
                 "status": "PASS",
                 "mean": round(_stats.mean(trimmed), 1),
                 "median": round(_stats.median(trimmed), 1),
@@ -696,6 +837,9 @@ def run_benchmark_suite(
                 "files": updated_stats["files"],
                 "bytes": updated_stats["bytes"],
             }
+            if last_telemetry:
+                delta_entry["telemetry"] = last_telemetry
+            results[(wl_name, tool, "delta")] = delta_entry
 
         # Cleanup
         for d in test_root.iterdir():
@@ -845,6 +989,43 @@ def generate_benchmark_report(results: dict, env: dict, iterations: int, baselin
                              f"({r['baseline']:.0f}ms → {r['current']:.0f}ms)")
         else:
             lines.append("\n### Regressions\n\nNone detected (all within 10% of baseline).")
+
+    # --- Resource usage table (from telemetry) ---
+    has_telemetry = any(r.get("telemetry") for r in results.values())
+    if has_telemetry:
+        lines.append("\n### Resource Usage (cold copy, last iteration)\n")
+        lines.append("| Workload | Tool | Peak RSS | CPU% | User Time | Sys Time | Ctx Sw (vol) | FS Reads | FS Writes |")
+        lines.append("|----------|------|--------:|-----:|----------:|---------:|-------------:|---------:|----------:|")
+        for wl in wl_names:
+            for t in tool_order:
+                r = results.get((wl, t, "cold"), {})
+                tel = r.get("telemetry", {})
+                if not tel:
+                    continue
+                rss_kb = tel.get("peak_rss_kb", 0)
+                rss_str = f"{rss_kb // 1024}MB" if rss_kb >= 1024 else f"{rss_kb}KB"
+                cpu = tel.get("cpu_pct", "—")
+                utime = tel.get("user_time_s", 0)
+                stime = tel.get("sys_time_s", 0)
+                ctx = tel.get("ctx_voluntary", 0)
+                fsin = tel.get("fs_inputs", 0)
+                fsout = tel.get("fs_outputs", 0)
+                lines.append(f"| {wl} | {t} | {rss_str} | {cpu}% | {utime:.2f}s | {stime:.2f}s | {ctx} | {fsin} | {fsout} |")
+
+        # Disk I/O summary if available
+        has_disk_io = any(r.get("telemetry", {}).get("disk_io") for r in results.values())
+        if has_disk_io:
+            lines.append("\n### Disk I/O (cold copy, last iteration)\n")
+            lines.append("| Workload | Tool | Read Ops | Write Ops | Read MB | Write MB |")
+            lines.append("|----------|------|--------:|---------:|-------:|---------:|")
+            for wl in wl_names:
+                for t in tool_order:
+                    r = results.get((wl, t, "cold"), {})
+                    dio = r.get("telemetry", {}).get("disk_io", {})
+                    if not dio:
+                        continue
+                    lines.append(f"| {wl} | {t} | {dio.get('reads', 0)} | {dio.get('writes', 0)} | "
+                                 f"{dio.get('read_bytes', 0) / 1048576:.1f} | {dio.get('write_bytes', 0) / 1048576:.1f} |")
 
     lines.append("")
     return "\n".join(lines)
