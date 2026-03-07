@@ -88,6 +88,29 @@ impl HydrationQueue {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// Synchronous try_send for use from non-tokio (spawn_blocking) contexts.
+    /// Drops the job if the channel is full instead of retrying with async sleep.
+    pub fn try_submit_job_sync(&self, rel_path: PathBuf, target_cfg: TargetConfig, inode: Option<u64>) {
+        if self.shutdown.load(Ordering::Relaxed) || self.senders.is_empty() {
+            return;
+        }
+        let job = HydrationJob { rel_path, target_cfg, inode };
+        self.pending_count.fetch_add(1, Ordering::SeqCst);
+        let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        let sender = &self.senders[worker_idx];
+        match sender.try_send(job) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(j)) => {
+                debug!("try_submit_job_sync: worker={} FULL, dropping {:?}", worker_idx, j.rel_path);
+                crate::metrics::EVENTS_DROPPED.inc();
+                self.pending_count.fetch_sub(1, Ordering::SeqCst);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.pending_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
     pub async fn submit_job(&self, rel_path: PathBuf, target_cfg: TargetConfig, inode: Option<u64>) {
         if self.shutdown.load(Ordering::Relaxed) || self.senders.is_empty() {
             return;

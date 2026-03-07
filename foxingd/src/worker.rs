@@ -736,6 +736,13 @@ async fn resolve_event_path(source: &Arc<SourceInfo>, parent_inode: u64, name: &
     if let Some(dir_entry) = source.dir_map.get(&parent_inode) {
         return Ok(dir_entry.value().join(name));
     }
+    // Fallback: parent inode may be in inode_map but not yet in dir_map
+    // (e.g., Mkdir event processed but dir_map not yet updated, or timing race).
+    if let Some(parent_entry) = source.inode_map.get(&parent_inode) {
+        let parent_path = parent_entry.primary_path();
+        source.dir_map.insert(parent_inode, parent_path.clone());
+        return Ok(parent_path.join(name));
+    }
     Ok(PathBuf::from(name))
 }
 

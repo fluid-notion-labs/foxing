@@ -510,14 +510,7 @@ impl Hydrator {
             } else {
                 let bulk_job_queue = self.source.bulk_job_queue.lock();
                 if let Some(queue_sender) = bulk_job_queue.as_ref() {
-                    // Handle both tokio and std::thread contexts
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                    } else {
-                        // No tokio runtime - create one for this call
-                        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-                        rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                    }
+                    queue_sender.try_submit_job_sync(rel_path, target_cfg, Some(ino));
                     submitted_count += 1;
                     self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -621,7 +614,7 @@ impl Hydrator {
                     if let Some(queue_sender) = bulk_queue.as_ref() {
                         if let Ok(meta) = entry.metadata() {
                             for target in &self.targets {
-                                tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel_path.clone(), target.clone(), Some(meta.ino())));
+                                queue_sender.try_submit_job_sync(rel_path.clone(), target.clone(), Some(meta.ino()));
                             }
                             frontier.files_queued += 1;
                         }
@@ -678,13 +671,7 @@ impl Hydrator {
                 if let Some(queue_sender) = bulk_job_queue.as_ref() {
                     for (rel_path, target_cfg, ino) in jobs {
                         if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) { break; }
-                        // Handle both tokio and std::thread contexts
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                        } else {
-                            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-                            rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                        }
+                        queue_sender.try_submit_job_sync(rel_path, target_cfg, Some(ino));
                         self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -697,13 +684,7 @@ impl Hydrator {
         let bulk_job_queue = self.source.bulk_job_queue.lock();
         if let Some(queue_sender) = bulk_job_queue.as_ref() {
             for (rel_path, target_cfg, ino) in buffer.drain(..) {
-                // Handle both tokio and std::thread contexts
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                } else {
-                    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-                    rt.block_on(queue_sender.submit_job(rel_path, target_cfg, Some(ino)));
-                }
+                queue_sender.try_submit_job_sync(rel_path, target_cfg, Some(ino));
                 self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -789,7 +770,7 @@ impl Hydrator {
         if let Some(queue_sender) = bulk_job_queue.as_ref() {
             for target_cfg in targets {
                 if m.is_file() {
-                    tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino)));
+                    queue_sender.try_submit_job_sync(rel.clone(), target_cfg.clone(), Some(ino));
                     source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                 } else if is_dir {
                     let dst_path = target_cfg.path.join(&rel);
@@ -856,7 +837,7 @@ impl Hydrator {
                         if let Some(buf) = job_buffer {
                             buf.push((rel.clone(), target_cfg.clone(), ino));
                         } else {
-                            tokio::runtime::Handle::current().block_on(queue_sender.submit_job(rel.clone(), target_cfg.clone(), Some(ino)));
+                            queue_sender.try_submit_job_sync(rel.clone(), target_cfg.clone(), Some(ino));
                             self.source.hydration.synced.fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
