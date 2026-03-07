@@ -1203,7 +1203,6 @@ async fn process_single_event_with_wal(
                      }).await;
                      match copy_res {
                          Ok(Ok(_bytes)) => {
-                             // Update identity map so renames can find this inode
                              if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
                                  identity::update_map(
                                      &source.inode_map, &source.dir_map, event.dev_id, event.inode,
@@ -1215,9 +1214,23 @@ async fn process_single_event_with_wal(
                              return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                          }
                          _ => {
-                             // Copy failed — fall through to empty file creation
+                             // Copy failed — source may have been renamed. Skip creating
+                             // empty ghost files; the rename handler will copy if needed.
+                             return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                          }
                      }
+                 } else {
+                     // Source doesn't exist — file was likely already renamed.
+                     // Don't create an empty ghost; the rename handler copies if needed.
+                     // Still update identity map so rename can resolve this inode.
+                     if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
+                         identity::update_map(
+                             &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                             r.to_path_buf(), event.generation, false, false,
+                             event.timestamp_ns, event.seq_num
+                         );
+                     }
+                     return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                  }
              }
 
