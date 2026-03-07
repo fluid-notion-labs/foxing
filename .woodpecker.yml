@@ -1,0 +1,32 @@
+# Woodpecker CI pipeline for Codeberg Pages (rustdoc)
+# Deploys generated rustdoc to https://aenertia.codeberg.page/foxing/
+#
+# Triggered on push to dev branch. Builds docs and publishes to pages branch.
+
+when:
+  branch: dev
+  event: push
+
+steps:
+  build-docs:
+    image: rust:latest
+    commands:
+      - apt-get update -qq && apt-get install -y -qq clang llvm libbpf-dev 2>/dev/null
+      - cargo doc --workspace --no-deps
+      # Create index redirect to fxcp_core docs
+      - echo '<meta http-equiv="refresh" content="0; url=fxcp_core/index.html">' > target/doc/index.html
+
+  deploy-pages:
+    image: bitnami/git
+    commands:
+      - git config --global user.email "ci@foxing.dev"
+      - git config --global user.name "Woodpecker CI"
+      # Create orphan pages branch with doc content
+      - cd target/doc
+      - git init
+      - git checkout -b pages
+      - git add -A
+      - git commit -m "Deploy rustdoc from ${CI_COMMIT_SHA:0:8}"
+      - git remote add origin ${CI_REPO_LINK}.git
+      - git push --force origin pages
+    secrets: [codeberg_token]

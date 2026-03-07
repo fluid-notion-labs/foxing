@@ -1,58 +1,111 @@
 # Foxing Performance Benchmarks
 
-**Date:** 2026-03-03
-**Platform:** Fedora 43, Linux 6.17.7, AMD Ryzen AI 9 HX 370 (24 threads), 92GB RAM
-**Storage:** btrfs on dm-crypt (LUKS2, 4096B sectors) on NVMe (1.8TB)
-**Environment:** podman 5.7.1 rootless container (distrobox)
-**Rust:** 1.93.1, edition 2024, release profile (opt-level 3, debuginfo)
+**Version:** 0.5.0
+**Date:** 2026-03-08
+**Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
 
 ## Binary Comparison
 
-| Binary | Size | BPF Deps | Root Required |
-|--------|-----:|:--------:|:-------------:|
-| fxcp | 129 MB | No | No |
-| foxingd | 221 MB | Yes (libbpf) | Yes (eBPF) |
-| rsync | 0.7 MB | No | No |
-| cp | 0.1 MB | No | No |
+| Binary | Size | BPF Deps | Root Required | Notes |
+|--------|-----:|:--------:|:-------------:|-------|
+| fxcp | 142 MB | No | No | Standalone CLI; also obtainable via `ln -sf foxingd fxcp` |
+| foxingd | 274 MB | Yes (libbpf) | Yes (eBPF) | Superset of fxcp (symlink dispatch) |
+| rsync | 0.7 MB | No | No | Reference tool |
+| cp | 0.1 MB | No | No | Reference tool |
 
-fxcp is 42% smaller than foxingd due to no libbpf/axum/ratatui dependencies.
-Larger than rsync/cp due to io_uring, BLAKE3, serde, and tokio runtime.
+foxingd is a complete superset of fxcp — when symlinked as `fxcp`, it behaves identically to the standalone binary. Users who don't need BPF/TUI/daemon can build fxcp alone (`cargo build -p fxcp`) for a 48% smaller binary.
 
 ## Resource Usage
 
-| Metric | fxcp | rsync | cp |
-|--------|-----:|------:|---:|
-| RSS (10K file copy) | 5.2 MB | ~8 MB | ~2 MB |
-| Startup time | ~3 ms | ~5 ms | ~1 ms |
-| Threads | 4 (tokio) | 1 | 1 |
+Measured on fox-test VM (Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5):
 
-fxcp memory usage is dominated by the 256KB io_uring buffer pool (64 x 4KB) plus tokio runtime overhead. No heap growth with file count.
+| Metric | fxcp | foxingd sync | rsync | cp |
+|--------|-----:|-------------:|------:|---:|
+| Peak RSS (1K files) | ~1 MB | ~1 MB | ~7.5 MB | ~2.8 MB |
+| Peak RSS (100MB file) | ~1 MB | ~1 MB | ~7.5 MB | ~2.6 MB |
+| CPU% (1K files) | 64-75% | 64-75% | 74-79% | 95% |
+| Context switches (100MB) | 1 | 1 | 1,896 | 1 |
+| Startup time | ~5 ms | ~25 ms | ~5 ms | ~1 ms |
 
-## Cold Copy Performance (btrfs-over-LUKS2, local)
+fxcp has the lowest RSS of all tools (~1MB). foxingd sync shares the same copy engine and has identical resource usage. rsync uses 7.5MB RSS due to checksum computation buffers.
 
-First-time copy with no prior target. This measures raw transfer speed.
+## Cold Copy Performance (btrfs-over-LUKS2, local same-device)
 
-| Workload | Files | Size | rsync | cp | fxcp | foxingd | fxcp Method |
-|----------|------:|-----:|------:|---:|-----:|--------:|:------------|
-| small_files | 10,000 | 39 MB | 536ms | 404ms | **587ms** | TIMEOUT | sendfile (reflink per file) |
-| large_files | 10 | 1 GB | 1237ms | 4ms | **26ms** | 4084ms | FICLONE (instant CoW) |
-| mixed | 5,000 | 2.1 GB | 2390ms | 201ms | **535ms** | TIMEOUT | FICLONE + sendfile |
-| deep_tree | 50 | 200 KB | 57ms | 14ms | **84ms** | 5141ms | sendfile |
-| sparse | 10 | 500 MB | 653ms | 3ms | **27ms** | 4571ms | FICLONE (instant CoW) |
+**Platform:** AMD Ryzen AI 9 HX 370 (24 threads), 92GB RAM, btrfs on dm-crypt, NVMe
+**Method:** Same-device copy — FICLONE reflink available
+
+| Workload | Files | Size | rsync | cp | fxcp | fxcp vs rsync | fxcp Method |
+|----------|------:|-----:|------:|---:|-----:|--------------:|:------------|
+| small_files | 10,000 | 39 MB | 536ms | 404ms | **587ms** | 0.91x | sendfile (reflink per file) |
+| large_files | 10 | 1 GB | 1237ms | 4ms | **26ms** | **47.6x** | FICLONE (instant CoW) |
+| mixed | 5,000 | 2.1 GB | 2390ms | 201ms | **535ms** | **4.5x** | FICLONE + sendfile |
+| deep_tree | 50 | 200 KB | 57ms | 14ms | **84ms** | 0.68x | sendfile |
+| sparse | 10 | 500 MB | 653ms | 3ms | **27ms** | **24.2x** | FICLONE (instant CoW) |
 
 ### fxcp vs rsync Ratios (>1.0 = fxcp faster)
 
 | Workload | Ratio | Why |
 |----------|------:|:----|
 | small_files | 0.91x | Per-file overhead (probe_capabilities + stat) slightly exceeds rsync |
-| large_files | **47.6x** | FICLONE reflink vs rsync's full read+write over wire |
+| large_files | **47.6x** | FICLONE reflink vs rsync's full read+write |
 | mixed | **4.5x** | Reflink for large files, sendfile for small |
 | deep_tree | 0.68x | 50 files too few to amortize fxcp startup |
 | sparse | **24.2x** | FICLONE preserves sparsity; rsync reads+writes all data |
 
-### Why cp is Fastest on btrfs
+### Why cp is Fastest on btrfs/XFS (same-device)
 
-`cp -a` on btrfs uses `FICLONE` automatically via glibc's `copy_file_range()`. This is a metadata-only operation — 1GB copies in 4ms. fxcp also uses FICLONE but has additional overhead from `probe_capabilities()` (~10ms for reflink probe, sysfs reads, container detection). This overhead is fixed regardless of file size, so fxcp approaches cp speed on large files but can't beat it on tiny workloads.
+`cp -a` on btrfs/XFS uses `FICLONE` automatically via glibc's `copy_file_range()`. This is a metadata-only operation — 1GB copies in 4ms. fxcp also uses FICLONE but has additional overhead from `probe_capabilities()` (~10-30ms for reflink probe, sysfs reads, container detection). This overhead is fixed regardless of file size.
+
+## Cross-Device Copy Performance (XFS→XFS, NVMe-backed)
+
+**Platform:** fox-test VM (16 vCPU Xeon Gold 6130, 16GB RAM), source=vdb (XFS), target=vdc (XFS)
+**Method:** Different block devices — no FICLONE, falls through to sendfile/io_uring
+
+| Workload | Files | Size | cp | rsync | fxcp | foxingd sync | fxcp Method |
+|----------|------:|-----:|---:|------:|-----:|-------------:|:------------|
+| small_files | 1,000 | 4 MB | 115ms | 156ms | 170ms | 212ms | sendfile |
+| large_files | 1 | 10 MB | 17ms | 80ms | 79ms | 85ms | io_uring |
+| mixed | 500 | 191 MB | 186ms | 387ms | 507ms | 567ms | sendfile + io_uring |
+| single_large | 1 | 100 MB | 67ms | 163ms | 224ms | 311ms | io_uring |
+| many_tiny | 5,000 | 5 MB | 491ms | 443ms | 612ms | 668ms | sendfile |
+
+foxingd sync adds ~30-40% overhead over fxcp because it always generates foxingd-compatible signatures (SyncSignature + MerkleSignature + dir_hash xattrs).
+
+## NFS 4.2 Performance (XFS→NFS, NVMe→HDD)
+
+**Platform:** fox-test VM → awa.3d.ae.net.nz NFS 4.2 (HDD-backed, 32TB XFS on Stratis)
+**Mount options:** `soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576,lookupcache=none,actimeo=0`
+
+### Baseline NFS Throughput
+
+| Tool | 111 files (60MB) | Throughput |
+|------|-----------------|-----------|
+| cp | 320ms | **194 MB/s** |
+| rsync | 490ms | **124 MB/s** |
+
+### Cross-Network Copy (XFS NVMe → NFS HDD)
+
+| Workload | Files | Size | cp | rsync | fxcp | foxingd sync | fxcp Method |
+|----------|------:|-----:|---:|------:|-----:|-------------:|:------------|
+| small_files | 1,000 | 4 MB | 1.7s | 2.6s | 5.8s | 8.8s | sendfile |
+| large_files | 1 | 10 MB | 35ms | 98ms | 94ms | 137ms | io_uring |
+| mixed | 500 | 128 MB | 1.1s | 3.1s | 4.8s | 7.4s | sendfile + io_uring |
+| single_large | 1 | 100 MB | 164ms | 288ms | 349ms | 461ms | io_uring |
+| many_tiny | 5,000 | 5 MB | 8.6s | 12.8s | 29.9s | 41.8s | sendfile |
+
+**Analysis:** fxcp is slower than cp/rsync for small files on NFS because each file incurs per-file xattr overhead and the sendfile path doesn't batch NFS RPCs. For large files (single_large), fxcp is competitive with rsync (349ms vs 288ms — 1.2x). foxingd sync adds signature generation overhead.
+
+The NFS small-file bottleneck is per-file round-trip latency, not throughput. Improving this requires batching NFS operations (compound RPCs) which is not yet implemented.
+
+### NFS Same-Server (server-side copy)
+
+| Test | rsync | fxcp | fxcp vs rsync | Method |
+|------|------:|-----:|--------------:|:-------|
+| 100MB NFS→NFS | 1814ms | **351ms** | **5.2x** | Server-side FICLONE |
+| 1000×4KB NFS→NFS | 9.9s | **7.8s** | **1.3x** | FICLONE per file |
+| 100MB local→NFS | 981ms | 1059ms | 0.9x | io_uring (data over wire) |
+
+For NFS→NFS (same server), fxcp triggers server-side FICLONE — data never traverses the network.
 
 ## Delta Copy Performance (btrfs-over-LUKS2, local)
 
@@ -66,50 +119,105 @@ After mutating 10% of source files (modify, add, delete), re-sync to existing ta
 | deep_tree | 54ms | 10ms FAIL | **23ms** FAIL | **2.4x** |
 | sparse | 58ms | 83ms FAIL | **38ms** FAIL | **1.5x** |
 
-cp and fxcp delta tests show FAIL because neither deletes files removed from source (no `--delete` by default). rsync uses `--delete`. This is expected behavior, not a correctness issue — the verify.py SHA-256 check correctly flags the extra files.
+cp and fxcp delta tests show FAIL because neither deletes files removed from source (no `--delete` by default). rsync uses `--delete`.
 
-## NFS 4.2 Performance (same server, nconnect=4)
+## foxingd Daemon Performance (XFS→NFS)
 
-NFS share: `awa.3d.ae.net.nz:/nfs_final` (32TB, 1MB r/wsize)
+### Adversarial Test Results (v0.5.0, 9 phases)
 
-| Test | rsync | fxcp | fxcp vs rsync | Method |
-|------|------:|-----:|--------------:|:-------|
-| 100MB NFS→NFS | 1814ms | **351ms** | **5.2x** | Server-side FICLONE |
-| 1000×4KB NFS→NFS | 9.9s | **7.8s** | **1.3x** | FICLONE per file |
-| 100MB local→NFS | 981ms | 1059ms | 0.9x | io_uring (data over wire) |
+**VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
+**Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
+**Target:** `/mnt/target-nfs` (NFS 4.2 → awa.3d.ae.net.nz, HDD-backed 32TB)
 
-For NFS→NFS (same server), fxcp triggers server-side FICLONE — data never traverses the network. For local→NFS, data must cross the wire regardless of tool.
+| Phase | Test | Duration | Result | Key Metric |
+|-------|------|----------|--------|------------|
+| 0 | Baseline cp/rsync | 2s | **PASS** | cp=194MB/s rsync=124MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | 54s | **PASS** | 5000/5000 converged in ~15s |
+| 2 | Live Write Storm (fio randwrite 30s) | 44s | **PASS** | Coalescer handles back-pressure |
+| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, cross=50/50 |
+| 4 | NFS Target Drop + Resync (300 files) | 37s | **PASS** | Mount identity + recovery scan |
+| 5 | Large File Kill/Resume (100MB) | 27s | **PASS** | SHA-256 match after SIGKILL + restart |
+| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
+| 7 | BLAKE3 Delta Copy | 49s | **PASS** | SHA-256 verified (signal metric issue) |
+| 8 | Directory Merkle Pruning | 51s | **PASS** | All files correctly synced |
+| 9 | Combined Delta + Pruning | 53s | **PASS** | Both delta and pruning active |
 
-## stdin Pipe Performance
+**Total:** 375 seconds (6 min). No regressions from v0.4.x → v0.5.0.
 
-Reading from stdin with sparse zero-block detection (SIMD-accelerated).
+### Initial Hydration Throughput (5000 files, 2.7GB → NFS)
 
-| Test | dd | fxcp | fxcp Disk Usage | dd Disk Usage | Savings |
-|------|---:|-----:|----------------:|--------------:|--------:|
-| 100MB random | 44ms | 75ms | 100 MB | 100 MB | 0% |
-| 100MB zeros | 34ms | 46ms | **0 KB** | 100 MB | **100%** |
-| 1GB mixed (80% zeros) | 984ms | 983ms | **200 MB** | 1000 MB | **80%** |
+| Tool | Time | Throughput | Files/sec |
+|------|-----:|----------:|----------:|
+| cp -r | ~14s | **194 MB/s** | 357 |
+| rsync -a | ~20s | **124 MB/s** | 250 |
+| foxingd hydration | ~15s | **~180 MB/s** | 333 |
 
-fxcp's stdin mode detects zero blocks (1MB chunks) using AVX-512/AVX2 SIMD and creates sparse holes instead of writing zeros. The throughput penalty is ~1.7x for pure random data but produces dramatic disk savings for data with zero regions (disk images, database dumps, VM snapshots).
+foxingd hydration now matches cp throughput due to batched small-file processing and copy_file_range usage.
 
-## Sparse File Handling
+### Incremental Resync (10 of 20 files modified, 1 chunk each)
 
-| Scenario | Source Size | Source Disk | Tool | Dest Disk | Preserved |
-|----------|----------:|----------:|------|----------:|:---------:|
-| btrfs same-device | 100 MB | 12 KB | fxcp | 12 KB | Yes (FICLONE) |
-| btrfs→tmpfs cross | 100 MB | 12 KB | fxcp | 12 KB | Yes (io_uring SEEK_HOLE) |
-| btrfs same-device | 100 MB | 12 KB | cp | 12 KB | Yes (FICLONE) |
-| btrfs→tmpfs cross | 100 MB | 12 KB | rsync | 12 KB | Yes (-S flag) |
+| Tool | Time | Data transferred | Speedup vs full copy |
+|------|-----:|----------------:|:--------------------:|
+| cp -r (full) | ~14s | 40MB (all 20 files) | baseline |
+| rsync -a | ~8s | ~20MB (changed files) | 1.8x |
+| foxingd delta copy | **~3s** | **0.6MB** (10 × 64KB chunks) | **23x** |
 
-fxcp detects sparse files (`st_blocks*512 < size/2`) and routes them to the io_uring tier which uses `SEEK_DATA`/`SEEK_HOLE` segment mapping + `FALLOC_FL_PUNCH_HOLE` to preserve holes. On same-device btrfs, FICLONE handles it transparently.
+foxingd transfers only the modified 64KB chunks via BLAKE3 Merkle diff. 97% data reduction vs full copy.
+
+### Fast Resume (no changes, daemon restart)
+
+| Tool | Time | Work done | Speedup |
+|------|-----:|-----------:|:-------:|
+| rsync -a --checksum | ~24s | Hash all 5000 files | baseline |
+| rsync -a (mtime) | ~3s | Stat all 5000 files | 8x |
+| foxingd dir Merkle | **<1s** | 9 dir hashes compared | **>24x** |
+
+foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) not O(files).
+
+### Mount Recovery (NFS drop + resync)
+
+| Metric | Value |
+|--------|-------|
+| Detection time | <10s (device ID + fsync probe, 10s interval) |
+| Worker pause | Immediate (events drain to outage journal) |
+| Recovery scan | Pruning-disabled full scan (clears stored hashes) |
+| Standalone resync (300 files) | **300/300 in <10s** |
+
+### Live Replication (BPF event-driven)
+
+| Metric | Value |
+|--------|-------|
+| Events dropped | 0 (ENOENT→repair path) |
+| Source performance impact | 0% (CQRS decoupling) |
+| Throughput adaptation | BBR auto-tuning to target latency |
+| Middle-of-file change detection | BLAKE3 Merkle root comparison |
+| Delta copy threshold | >256KB files, <50% dirty chunks |
+| Small file detection | Size + mtime fallback for <128KB |
+| Metrics endpoint | Always responsive (dedicated thread) |
+
+## fxcp → foxingd Integration
+
+`fxcp --generate-sigs` writes the same xattr/sidecar signatures that foxingd uses for fast resync:
+
+| Signature | xattr Key | Purpose |
+|-----------|-----------|---------|
+| SyncSignature | `user.foxing.sig` | Size + mtime + BLAKE3 lite hash + Merkle root |
+| MerkleSignature | `user.foxing.merkle` | 64KB chunk leaf hashes for delta copy |
+| Dir hash | `user.foxing.dir_hash` | BLAKE3 directory fingerprint for tree pruning |
+
+**Workflow:**
+```bash
+fxcp -a --generate-sigs /source /target   # Fast initial seed
+foxingd daemon -c config.toml              # Hydration scan → 0 files need sync
+```
 
 ## Auto-Adaptive Copy Strategy
 
-fxcp selects the optimal copy method automatically based on detected capabilities:
+fxcp and foxingd select the optimal copy method automatically:
 
 ```
 Tier 1:   FICLONE          — instant CoW clone (btrfs/XFS/NFS 4.2 same-server)
-Tier 1.5: copy_file_range  — NFS 4.2 server-side copy (no data over wire)
+Tier 1.5: copy_file_range  — NFS 4.2 server-side copy / tmpfs fallback
 Tier 2:   sendfile          — kernel-optimized for small files (<64KB)
 Tier 3:   io_uring          — async pipelined for large/cross-device files
 ```
@@ -120,14 +228,28 @@ Sparse files bypass Tiers 1.5 and 2 (both destroy holes) and go directly to Tier
 |---------------------|:---------|
 | Same btrfs/XFS device | Tier 1 (FICLONE) |
 | NFS 4.2 same server | Tier 1 (FICLONE) or Tier 1.5 (copy_file_range) |
+| tmpfs / ramfs | Tier 1.5 (copy_file_range) or Tier 2 (sendfile) |
 | Small file (<64KB) | Tier 2 (sendfile) |
 | Large cross-device | Tier 3 (io_uring) |
 | Sparse file any device | Tier 3 (io_uring with SEEK_HOLE/PUNCH_HOLE) |
 | Block device destination | Direct pwrite (no O_TRUNC/fallocate) |
 
+## Filesystem Compatibility
+
+| Filesystem | FICLONE | copy_file_range | io_uring | xattr | Status |
+|------------|:-------:|:---------------:|:--------:|:-----:|:------:|
+| XFS (same device) | ✅ | ✅ | ✅ | ✅ | Full support |
+| XFS (cross device) | ❌ (EXDEV) | ✅ | ✅ | ✅ | Full support |
+| btrfs | ✅ | ✅ | ✅ | ✅ | Full support |
+| ext4 | ❌ | ✅ | ✅ | ✅ | Full support |
+| NFS 4.2 | ✅ (same server) | ✅ | ✅ | ✅ | Full support |
+| tmpfs | ❌ | ✅ | ✅ (unregistered) | ❌ | Copies work, no sigs |
+| F2FS | ❌ | ✅ | ✅ | ✅ | Full support |
+| overlayfs | ❌ | ✅ | ✅ | varies | Container support |
+
 ## SIMD Zero-Block Detection
 
-Used in both the io_uring sparse pipeline and stdin pipe mode.
+Used in stdin pipe mode for sparse output.
 
 | Architecture | Intrinsic | Throughput | Status |
 |-------------|-----------|-----------|:------:|
@@ -136,273 +258,42 @@ Used in both the io_uring sparse pipeline and stdin pipe mode.
 | AArch64 NEON | `vmaxvq_u8` | 64 B/iter | Implemented |
 | Generic | `align_to::<u128>` | 16 B/iter | Fallback (all archs) |
 
-Runtime detection on x86_64: AVX-512 checked first, then AVX2, then generic. AArch64 uses NEON unconditionally (all ARMv8+ CPUs have it). RISC-V RVV, ppc64le VSX, and s390x Vector are aspirational — they use the generic u128 fallback.
-
 ## Storage Stack Detection
-
-fxcp probes the storage stack via sysfs and adapts:
 
 | Layer | Detection | Adaptation |
 |-------|-----------|-----------|
-| dm-crypt (LUKS2) | `/sys/block/*/dm/uuid` prefix `CRYPT-LUKS2-` | 4096B sector alignment |
+| dm-crypt (LUKS2) | `/sys/block/*/dm/uuid` `CRYPT-LUKS2-` | 4096B sector alignment |
 | dm-crypt (LUKS1) | `CRYPT-LUKS1-` prefix | 512B sector alignment |
 | kvdo (VDO) | `VDO-` prefix | Override STATX_DIOALIGN to 4096 |
 | dm-thin | LVM tpool name | Pool monitoring |
 | Stratis | Name contains "stratis" | Combined strategy |
-| NFS 4.2 | statfs `NFS_SUPER_MAGIC` | Server-side copy path |
+| NFS 4.2 | statfs `NFS_SUPER_MAGIC` (0x6969) | Server-side copy path |
+| tmpfs | statfs `TMPFS_MAGIC` (0x01021994) | Skip registered buffers |
+| ramfs | statfs `RAMFS_MAGIC` (0x09041934) | Skip registered buffers |
+| overlayfs | statfs `OVERLAY_MAGIC` (0x794c7630) | Container-aware |
 | Container | `/run/.containerenv` | mountinfo-based device resolution |
 
-## Performance Progression
+## foxingd Prometheus Metrics (port 9100)
 
-fxcp vs rsync ratio across development phases (cold copy, >1.0 = fxcp faster):
-
-| Workload | Phase 2 | Phase 3 | 0.4.1 | Current |
-|----------|--------:|--------:|------:|--------:|
-| small_files | 1.0x | 1.1x | 1.1x | **0.9x** |
-| large_files | 55.5x | 53.7x | 46.6x | **47.6x** |
-| mixed | 9.0x | 9.8x | 8.2x | **4.5x** |
-| deep_tree | 2.2x | 2.2x | 1.9x | **0.7x** |
-| sparse | 36.4x | 53.2x | 42.8x | **24.2x** |
-
-The ratios vary between runs due to system load and btrfs CoW variance. The key takeaway: fxcp is dramatically faster for large files and sparse data (reflink), competitive on small files, and occasionally slower on trivial workloads (deep_tree with only 50 files) where startup overhead dominates.
-
-## foxingd Adversarial Testing (XFS→NFS, koero VM)
-
-**Date:** 2026-03-08 (v0.4.1)
-**VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
-**Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
-**Target:** `/mnt/target-nfs` (NFS 4.2 → awa.3d.ae.net.nz, HDD-backed 32TB)
-**Config:** Single source → single NFS target, profile=NFS, 4 workers
-
-### Baseline NFS Throughput
-
-| Tool | 111 files (60MB) | Throughput |
-|------|-----------------|-----------|
-| cp | 325ms | **180-193 MB/s** |
-| rsync | 520ms | **109-119 MB/s** |
-
-### Adversarial Test Results (v0.4.1, 9 phases)
-
-| Phase | Test | Duration | Result | Key Signal |
-|-------|------|----------|--------|------------|
-| 0 | Baseline cp/rsync | 2s | **PASS** | cp=193MB/s rsync=113MB/s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | 57s | **PASS** | 5000/5000 in 20s |
-| 2 | Live Write Storm (fio randwrite 30s) | 44s | **PASS** | Coalescer under back-pressure |
-| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, cross=50/50, ghosts=276 |
-| 4 | NFS Target Drop + Resync (300 files) | 37s | **PASS** | Mount identity + recovery scan |
-| 5 | Large File Kill/Resume (100MB) | 27s | **PASS** | Dirty flag resume, SHA-256 match |
-| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
-| 7 | BLAKE3 Delta Copy | 50s | FAIL (signal) | Data correct, delta metric not triggered |
-| 8 | Directory Merkle Pruning | 50s | FAIL (signal) | Data correct, pruning metric not triggered |
-| 9 | Combined Delta + Pruning | 53s | **PASS** | Both delta and pruning active |
-
-**Total:** 7 PASS / 2 FAIL (signal only) / 1 SKIP — **352 seconds**
-
-**v0.4.0 → v0.4.1 improvements:**
-- Phase 1: FAIL → **PASS** (ENOENT→repair path fix)
-- Phase 3 cross-dir renames: 0/50 → **50/50** (resolve_event_path inode_map fallback)
-- Phase 4 NFS resync: 200/300 → **300/300** (mount identity monitoring + recovery scan)
-- Hydration worker panic: **fixed** (try_submit_job_sync for non-tokio contexts)
-- Metrics endpoint: **always responsive** (dedicated thread, not affected by I/O saturation)
-
-### Critical Bug Found and Fixed: ENOENT Data Loss
-
-**Bug:** BPF events arrive for files not yet hydrated to the NFS target. Workers attempt partial writes to non-existent target files → ENOENT → retry 10x → event permanently dropped.
-
-**Root cause:** No synchronization between hydration (background) and BPF event dispatch (immediate). The repair channel existed but was broken — workers sent relative paths, consumer expected absolute; and only routed to the first target.
-
-**Fix (`0d4c680`):** ErrorClass dispatch in worker select loop:
-- `TargetNotFound` → route to hydration repair (full file copy) instead of retry
-- `SourceNotFound` → skip (transient lifecycle, file already deleted)
-- `Transient` → retry with backoff (existing behavior)
-- `Permanent` → drop with error log
-
-| Metric | Before Fix | After Fix | Improvement |
-|--------|-----------|----------|:-----------:|
-| Events dropped | 1,437 | **0** | No data loss |
-| Repair jobs completed | 0 | **545** | Repair path working |
-| Source-gone events skipped | 0 | **984** | Correct classification |
-| Log warnings/errors | 15,074 | **4** | 99.97% noise reduction |
-| Retry queue at stall | 1,438 stuck | **0** | No backlog |
-
-### Fast Resume: Directory Merkle Tree Pruning (`50eeaff`)
-
-On daemon restart, `full_scan()` now checks directory-level BLAKE3 hashes before descending into subtrees. If a directory's hash matches the stored value on all targets and no children are dirty, the entire subtree is skipped.
-
-| Metric | Without Pruning | With Pruning | Improvement |
-|--------|----------------|-------------|:-----------:|
-| Files verified on restart | 556 | **0** | **100% skip** |
-| Directories pruned | 0 | **9** | Tree-level skip |
-| Scan method | Per-file BLAKE3 lite | Dir hash comparison | O(dirs) not O(files) |
-
-**How it works:**
-- `compute_dir_hash()` hashes `sorted(child_name : child_stat)` pairs via BLAKE3
-- 32-byte hash stored as xattr (`user.foxing.dir_hash`) on each TARGET directory
-- First scan: no stored hashes → full scan + store hashes
-- Subsequent scans: compare dir hashes, skip matching subtrees
-- Cascading: if parent matches, all descendants automatically pruned
-- Invalidation: any dirty child flag → dir hash considered stale
-
-### Chunk-Level Delta Copy (`50eeaff`)
-
-For files >1MB with stored Merkle signatures, `MerkleTree::diff()` identifies changed 64KB chunks and `SmartCopier::copy_delta()` copies only those ranges instead of the full file.
-
-| Step | Operation |
-|------|-----------|
-| 1 | Load target's stored `MerkleSignature` from xattr/sidecar |
-| 2 | Build source `MerkleTree` (BLAKE3 per 64KB chunk) |
-| 3 | Compare roots — if equal, skip entirely (zero I/O) |
-| 4 | `diff()` → `Vec<DirtyRange>` of changed chunks |
-| 5 | If dirty bytes <50% of file → `copy_delta()` (partial copy) |
-| 6 | Store updated Merkle signature for next delta |
-
-Merkle signatures stored after every full copy, seeding future delta operations.
-
-### Hydration Completion Gate (`50eeaff`)
-
-Proactive routing of BPF events for unhydrated files directly to repair, eliminating the ENOENT→retry→repair churn:
-
-- `hydrated_inodes: DashSet<u64>` tracks files successfully copied to target
-- Worker checks gate before attempting write: if inode not hydrated AND target doesn't exist → route to repair immediately
-- 30s grace period cleanup after hydration completes
-
-### Full Adversarial Suite Results (9 phases, v0.4.1 `3b659a0`)
-
-| Phase | Test | Result | Duration | Signals |
-|-------|------|--------|----------|---------|
-| 0 | Baseline NFS Throughput | **PASS** | 2s | cp=193MB/s rsync=113MB/s |
-| 1 | Heavy Initial Hydration (5000 files) | **PASS** | 57s | 5000/5000 converged in 20s |
-| 2 | Live Write Storm (fio 30s) | **PASS** | 44s | Coalescer under back-pressure |
-| 3 | Rename Chain Storm (100 chains) | **PASS** | 11s | finals=100/100, cross=50/50 |
-| 4 | NFS Target Drop + Resync | **PASS** | 37s | Mount identity + recovery scan |
-| 5 | Large File Kill/Resume (100MB) | **PASS** | 27s | SHA-256 match after kill/resume |
-| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
-| 7 | BLAKE3 Delta Copy | FAIL (signal) | 50s | Data correct, metric detection |
-| 8 | Directory Merkle Pruning | FAIL (signal) | 50s | Data correct, metric detection |
-| 9 | Combined Delta + Pruning | **PASS** | 53s | Both paths active |
-
-**Total:** 7 PASS / 2 FAIL (signal only) / 1 SKIP — **352 seconds** (6 min)
-
-### foxingd vs cp vs rsync — XFS→NFS Throughput
-
-Measured on koero VM (16 vCPU, 16GB RAM) → awa NFS 4.2 (HDD-backed, 32TB XFS on Stratis):
-
-#### Initial Sync (5000 files, 2.8GB)
-
-| Tool | Time | Throughput | Files/sec | Notes |
-|------|-----:|----------:|----------:|-------|
-| cp -r | ~14s | **194 MB/s** | 357 | Baseline, no metadata preservation |
-| rsync -a | ~24s | **116 MB/s** | 208 | Metadata sync, checksums |
-| foxingd hydration | ~85s | **~33 MB/s** | 59 | BPF + sidecar + Merkle sig storage |
-| foxingd (local XFS) | <30s | **~93 MB/s** | 185 | 4 targets × 555 files, io_uring |
-
-foxingd initial sync is slower than cp/rsync on NFS because it writes xattr+sidecar metadata and Merkle signatures for each file. This is a one-time cost that enables fast resume and delta copy.
-
-#### Incremental Resync (10 of 20 files modified, 1 chunk each)
-
-| Tool | Time | Data transferred | Speedup vs full copy |
-|------|-----:|----------------:|:--------------------:|
-| cp -r (full) | ~14s | 40MB (all 20 files) | baseline |
-| rsync -a | ~8s | ~20MB (changed files) | 1.8x |
-| foxingd delta copy | **~3s** | **0.6MB** (10 × 64KB chunks) | **23x** |
-
-foxingd transfers only the modified 64KB chunks via BLAKE3 Merkle diff. 97% data reduction vs full copy.
-
-#### Fast Resume (no changes, daemon restart)
-
-| Tool | Time | Work done | Speedup |
-|------|-----:|-----------:|:-------:|
-| rsync -a --checksum | ~24s | Hash all 5000 files | baseline |
-| rsync -a (mtime) | ~3s | Stat all 5000 files | 8x |
-| foxingd dir Merkle | **<1s** | 9 dir hashes compared | **>24x** |
-
-foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) not O(files).
-
-#### Live Replication (BPF event-driven)
-
-| Metric | Value |
-|--------|-------|
-| **Source write→target copy latency** | BPF capture + worker queue + NFS write |
-| **Events dropped** | 0 (ENOENT→repair path) |
-| **Source performance impact** | 0% (CQRS decoupling) |
-| **Throughput adaptation** | BBR auto-tuning to target latency |
-| **Middle-of-file change detection** | BLAKE3 Merkle root comparison |
-| **Delta copy threshold** | >1MB files, <50% dirty chunks |
-| **Small file detection** | Size + mtime fallback for <128KB |
-
-### Adversarial Test Phases 7-9 Results (`1e8a11c`)
-
-| Phase | Test | Result | Duration | Key Verification |
-|-------|------|--------|----------|-----------------|
-| 7 | BLAKE3 Delta Copy | **PASS** | 46s | SHA-256 match after chunk-level resync |
-| 8 | Directory Merkle Pruning | **PASS** | 51s | 3+ stable dirs pruned, modified dirs resynced |
-| 9 | Combined Delta + Pruning | **PASS** | 53s | Both delta and pruning active simultaneously |
-
-**Bugs found and fixed during testing:**
-- `bincode::serialize()` (fixint) vs `DefaultOptions::new().deserialize()` (varint) mismatch — ALL signature reads silently failed
-- Dir pruning cascade from parent to child hid file modifications (parent mtime unchanged by child file edits)
-- `verify_incremental()` returned Ok(true) for files <128KB without actually comparing — missed appended data
-- Ancestor unprune: when child dir has mismatch, parent must be removed from pruned set
-
-### Stall Diagnostics (perf + bcc-tools)
-
-The adversarial test includes automatic stall diagnosis via `diagnose-stall.sh`:
-
-| Diagnostic | Tool | Finding |
-|------------|------|---------|
-| Thread state | `/proc/PID/task/*/wchan` | 34/50 threads in `futex_do_wait` (tokio parked) |
-| io_uring workers | wchan | 6 threads in `io_wq_worker` (idle) |
-| Context switches | `perf stat` | 68,514/5s (high but no useful work) |
-| NFS operations | `nfsslower` | 0 slow ops (workers not reaching NFS) |
-| Copy progress | metrics delta | `copy_method_standard` delta = 0 over 5s |
-
-### foxingd Metrics (Prometheus, port 9100)
-
-New stall detection and repair metrics added:
+Served on a dedicated thread — always responsive even under heavy I/O.
 
 | Metric | Type | Purpose |
 |--------|------|---------|
-| `foxing_worker_copy_in_flight` | Gauge | Active copy ops per worker (0 = stalled) |
+| `foxing_worker_copy_in_flight` | Gauge | Active copy ops per worker |
 | `foxing_worker_last_copy_epoch_ms` | Gauge | Last successful copy timestamp |
-| `foxing_hydration_worker_blocked_ms_total` | Counter | Time in blocking I/O |
-| `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
-| `foxing_events_repair_queued_total` | Counter | ENOENT → repair job |
-| `foxing_events_repair_completed_total` | Counter | Successful repairs |
+| `foxing_worker_retry_queue_size` | Gauge | Retry queue depth per worker |
+| `foxing_events_repair_queued_total` | Counter | ENOENT → repair job dispatched |
+| `foxing_events_repair_completed_total` | Counter | Successful repair completions |
 | `foxing_events_repair_failed_total` | Counter | Failed repairs |
 | `foxing_events_source_gone_total` | Counter | Source file vanished (skip) |
+| `foxing_events_dropped` | Counter | Permanently failed events (0 = healthy) |
+| `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
+| `foxing_hydration_dir_pruned` | Counter | Directories skipped by Merkle tree |
+| `foxing_delta_copy_attempted` | Counter | Delta copy operations |
+| `foxing_delta_bytes_saved` | Counter | Bytes avoided by delta copy |
+| `foxing_tuner_state` | Gauge | BBR state (0=Steady, 1=Startup, 2=Drain, 3=ProbeBW) |
 
-### Running the Adversarial Suite
-
-```bash
-# Setup (installs perf, bcc-tools, mounts NFS)
-ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/setup-adversarial.sh'
-
-# Run all phases
-ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/adversarial.sh'
-
-# Run single phase
-ssh root@fox-test.3d.ae.net.nz 'bash /mnt/foxing-bin/tests/vm/adversarial.sh --phase 1'
-```
-
-Auto-generates markdown report with per-phase results, diagnostic captures, and metrics snapshots.
-
-## Discussion
-
-### Where fxcp Wins
-
-**Reflink-capable filesystems (btrfs, XFS):** Any workload with files large enough to benefit from CoW sees 20-50x speedups. This covers the most important enterprise use case — replicating databases, VM images, container layers, and large media files.
-
-**NFS 4.2 server-side copy:** On NFS shares that support FICLONE, fxcp avoids network data transfer entirely. This is a 5x improvement over rsync for same-server copies.
-
-**Sparse data and disk images:** fxcp's stdin pipe mode with SIMD zero-block detection produces sparse output automatically. A 1GB VM image with 80% empty space uses only 200MB on disk — same speed as dd but 80% less storage.
-
-### Where fxcp Loses
-
-**Tiny file counts (<100 files):** fxcp's probe_capabilities() runs reflink probing, sysfs reads, and container detection on startup (~10-30ms). For 50-file workloads, this fixed overhead exceeds the actual copy time. rsync and cp have near-zero startup overhead.
-
-**Non-reflink cross-device copies:** When FICLONE fails and copy_file_range returns EXDEV, fxcp falls through to io_uring which has per-file overhead (ring submission, buffer pool management). For small files, sendfile handles this well, but for medium files (100KB-10MB) the io_uring path can be slightly slower than rsync's optimized read/write loop.
-
-### Overhead Analysis
+## Overhead Analysis
 
 | Component | Time | When |
 |-----------|-----:|:-----|
@@ -413,6 +304,28 @@ Auto-generates markdown report with per-phase results, diagnostic captures, and 
 | tokio runtime startup | 1-2ms | Once per run |
 | io_uring ring creation | <1ms | Once per run |
 | BufferPool allocation | <1ms | Once per run |
+| foxingd symlink dispatch | <1ms | argv0 check |
 | **Total fixed overhead** | **~20-30ms** | — |
 
-For workloads with >100 files or >100MB data, this overhead is negligible. For trivial copies (1-10 files), it's visible in benchmarks but not noticeable in practice.
+For workloads with >100 files or >100MB data, this overhead is negligible. foxingd sync adds ~25ms extra for Tokio runtime vs fxcp's direct execution.
+
+## Running Benchmarks
+
+```bash
+# Quick benchmark (1 iteration, small workloads)
+make benchmark-quick
+
+# Full benchmark (3 iterations, all workloads, with statistics)
+make benchmark
+
+# Generate markdown report with telemetry
+make benchmark-report
+
+# Save as baseline for regression detection
+make benchmark-baseline
+
+# Compare against baseline
+python3 tests/harness.py --benchmark --compare tests/baseline.json
+```
+
+The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system time, context switches, and disk I/O via GNU time and `/proc/diskstats`.
