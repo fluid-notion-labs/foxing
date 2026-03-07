@@ -381,87 +381,53 @@ async fn async_main() -> anyhow::Result<()> {
             run_runtime(cfg, tui, false, logs, cli.verbose).await?;
         },
         Some(Commands::Sync { source, destination, archive, recursive, snapshot, watch, exclude, profile, dry_run }) => {
-            let one_shot_mode_flag = !watch;
-            if one_shot_mode_flag {
-                constants::ONE_SHOT_MODE.store(true, Ordering::Relaxed);
-            }
-            
-            if dry_run {
-                info!("Dry run requested. (Verifying config only)");
-            }
-            
-            let is_recursive = archive || recursive;
-            if source.is_dir() && !is_recursive {
-                anyhow::bail!("Source is a directory. Use -r or -a to copy directories.");
-            }
-
-            let profile = profile.unwrap_or(TargetProfile::Auto);
-            
-            let target_config = TargetConfig {
-                path: destination,
-                profile,
-                autotune_target_latency_ms: 50,
-                target_bandwidth_mbps: None,
-                target_iops: None,
-                initial_sync: true,
-                supports_reflink: Arc::new(AtomicBool::new(false)),
-                vdo_optimization: true,
-                vdo_stall_threshold: 1000,
-                include: vec![],
-                exclude,
-                enable_versioning: snapshot,
-                max_versions: 24,
-                max_versions_size_mb: 1024,
-                force_retention_files: vec![],
-                force_retention_count: 0,
-                worker_count: foxingd::config::SYS.logical_cores.min(8),
-                batch_size: 64,
-                worker_flush_interval_us: 100_000,
-                io_buffer_size_mib: 4,
-                ordering_scan_depth: 16,
-                worker_hibernation_secs: 10,
-                worker_retry_initial_ms: 10,
-                worker_retry_max_ms: 1000,
-                atomic_writes: false,
-                source_uncached: false,
-                target_uncached: false,
-                segment_stall_timeout_override: None,
-                segment_overall_timeout_override: None,
-                postcopy_timeout_override: None,
-                xattr_supported: Arc::new(AtomicBool::new(true)),
-                direct_io_ok: Arc::new(AtomicBool::new(false)),
-                rwf_uncached_ok: Arc::new(AtomicBool::new(false)),
-                rwf_atomic_ok: Arc::new(AtomicBool::new(false)),
-                include_regexes: vec![],
-                exclude_regexes: vec![],
-                force_retention_regexes: vec![],
-                label: "".into(),
-                paused: Arc::new(AtomicBool::new(false)),
-                outage_journal: Arc::new(dashmap::DashSet::new()),
+            // Fast sync using shared copy engine (no daemon overhead)
+            let opts = fxcp_core::sync::SyncOptions {
+                source: source.clone(),
+                destination: destination.clone(),
+                archive,
+                recursive: recursive || archive,
+                delete: false,
+                dry_run,
+                exclude: exclude.clone(),
+                generate_sigs: true, // always generate sigs in foxingd context
+                ..Default::default()
             };
 
-            let source_config = SourceConfig {
-                path: source,
-                targets: vec![target_config],
-                rwf_uncached_ok: Arc::new(AtomicBool::new(false)),
-                cross_subvolumes: false,
-            };
+            info!("Starting fast sync: {:?} → {:?}", source, destination);
+            let stats = fxcp_core::sync::run(opts).await?;
+            fxcp_core::sync::print_summary(&stats);
 
-            let mut config = Config::default();
-            config.sources = vec![source_config];
-            
-            // Pre-compile config to validate paths
-            for sc in &mut config.sources {
-                sc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&sc.path), Ordering::Relaxed);
-                for tc in &mut sc.targets {
-                    tc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&tc.path), Ordering::Relaxed);
-                    tc.direct_io_ok.store(fxcp_core::security::probe_direct_io(&tc.path), Ordering::Relaxed);
-                    tc.compile(config.worker_count, config.io_buffer_size_mib)?;
+            // If --watch, start daemon for live monitoring after initial sync
+            if watch {
+                info!("Initial sync complete. Starting live BPF monitoring...");
+                let profile = profile.unwrap_or(TargetProfile::Auto);
+                let target_config = TargetConfig {
+                    path: destination,
+                    profile,
+                    initial_sync: false, // already synced above
+                    exclude,
+                    enable_versioning: snapshot,
+                    ..Default::default()
+                };
+                let source_config = SourceConfig {
+                    path: source,
+                    targets: vec![target_config],
+                    rwf_uncached_ok: Arc::new(AtomicBool::new(false)),
+                    cross_subvolumes: false,
+                };
+                let mut config = Config::default();
+                config.sources = vec![source_config];
+                for sc in &mut config.sources {
+                    sc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&sc.path), Ordering::Relaxed);
+                    for tc in &mut sc.targets {
+                        tc.rwf_uncached_ok.store(fxcp_core::security::probe_rwf_uncached(&tc.path), Ordering::Relaxed);
+                        tc.direct_io_ok.store(fxcp_core::security::probe_direct_io(&tc.path), Ordering::Relaxed);
+                        tc.compile(config.worker_count, config.io_buffer_size_mib)?;
+                    }
                 }
+                run_runtime(config, false, false, None, cli.verbose).await?;
             }
-
-            info!("Starting Sync (One-Shot: {})", one_shot_mode_flag);
-            run_runtime(config, false, one_shot_mode_flag, None, cli.verbose).await?;
         },
         Some(Commands::Check { config }) => {
             match Config::load(&config) {
