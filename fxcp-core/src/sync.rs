@@ -710,7 +710,11 @@ pub(crate) async fn create_copier(src: &Path, dst: &Path) -> crate::Result<Smart
     let async_fd = Arc::new(AsyncFd::new(eventfd)?);
     let mut buffer_pool = BufferPool::new(64, 4096, 512)?;
     let iovs = buffer_pool.as_io_vecs();
-    unsafe { ring.submitter().register_buffers(&iovs) }?;
+    // Try to register buffers for zero-copy I/O — falls back gracefully on
+    // tmpfs/ramfs/hugetlbfs where page pinning fails with EINVAL.
+    if unsafe { ring.submitter().register_buffers(&iovs) }.is_err() {
+        debug!("io_uring buffer registration failed (tmpfs/ramfs?) — using unregistered I/O");
+    }
     let governor = Governor::new(4.0, 0, 10.0, 10.0);
     Ok(SmartCopier {
         ring, buffer_pool,

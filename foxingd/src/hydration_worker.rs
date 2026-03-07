@@ -1076,7 +1076,9 @@ pub async fn run_hydration_worker_loop(
 
     {
         let iovs = buffer_pool.as_io_vecs();
-        unsafe { ring.submitter().register_buffers(&iovs) }.map_err(|e| FoxingError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        if unsafe { ring.submitter().register_buffers(&iovs) }.is_err() {
+            debug!("Hydration Worker {}: io_uring buffer registration failed — using unregistered I/O", worker_id);
+        }
     }
 
     let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };

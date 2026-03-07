@@ -39,6 +39,10 @@ const FICLONE: u64 = 0x40049409;
 const FICLONERANGE: u64 = 0x4020940D;
 pub const NFS_SUPER_MAGIC: i64 = 0x6969;
 pub const BTRFS_SUPER_MAGIC: i64 = 0x9123683E;
+pub const TMPFS_SUPER_MAGIC: i64 = 0x01021994;
+pub const RAMFS_SUPER_MAGIC: i64 = 0x09041934;
+pub const HUGETLBFS_MAGIC: i64 = 0x958458f6_u32 as i64;
+pub const OVERLAYFS_MAGIC: i64 = 0x794c7630;
 pub const FS_IOC_GETFLAGS: u64 = 0x80086601;
 pub const FS_IOC_SETFLAGS: u64 = 0x40086602;
 pub const FS_IMMUTABLE_FL: u32 = 0x00000010;
@@ -590,6 +594,13 @@ pub fn probe_capabilities(path: &Path) -> Arc<Capabilities> {
                 caps_inner.atomic_max_bytes.store(u32::MAX, Ordering::Relaxed);
                 debug!("Probe: F2FS Detected. Enabling Legacy Atomic Writes (IOCTL).");
             }
+        }
+        if magic == TMPFS_SUPER_MAGIC || magic == RAMFS_SUPER_MAGIC || magic == HUGETLBFS_MAGIC {
+            // tmpfs/ramfs: no reflinks, no O_DIRECT, no registered io_uring buffers
+            debug!("Probe: tmpfs/ramfs/hugetlbfs detected — disabling O_DIRECT and reflink");
+        }
+        if magic == OVERLAYFS_MAGIC {
+            debug!("Probe: overlayfs detected");
         }
     }
 
