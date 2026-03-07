@@ -365,6 +365,10 @@ pub struct TargetConfig {
     pub force_retention_regexes: Vec<Regex>,
     #[serde(skip, default)]
     pub label: Arc<str>,
+    #[serde(skip, default)]
+    pub paused: Arc<AtomicBool>,
+    #[serde(skip, default)]
+    pub outage_journal: Arc<dashmap::DashSet<PathBuf>>,
 }
 
 impl Default for TargetConfig {
@@ -408,6 +412,8 @@ impl Default for TargetConfig {
             exclude_regexes: vec![],
             force_retention_regexes: vec![],
             label: "".into(),
+            paused: Arc::new(AtomicBool::new(false)),
+            outage_journal: Arc::new(dashmap::DashSet::new()),
         }
     }
 }

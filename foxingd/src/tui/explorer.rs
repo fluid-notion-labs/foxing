@@ -212,6 +212,8 @@ impl ExplorerState {
             exclude_regexes: vec![],
             force_retention_regexes: vec![],
             label: "".into(),
+            paused: Arc::new(AtomicBool::new(false)),
+            outage_journal: Arc::new(dashmap::DashSet::new()),
         };
         SourceConfig {
             path: src_path,

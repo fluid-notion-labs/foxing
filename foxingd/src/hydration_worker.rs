@@ -86,6 +86,8 @@ pub struct HydrationState {
     /// Set by workers after detecting target reconnection — triggers full rescan
     /// to discover files created during outage.
     pub request_rescan: AtomicBool,
+    /// Set on mount recovery — triggers recovery_scan (no pruning) instead of full_scan.
+    pub request_recovery_scan: AtomicBool,
 }
 
 impl Default for HydrationState {
@@ -96,6 +98,7 @@ impl Default for HydrationState {
             synced: AtomicU64::new(0),
             shutdown_requested: AtomicBool::new(false),
             request_rescan: AtomicBool::new(false),
+            request_recovery_scan: AtomicBool::new(false),
         }
     }
 }
@@ -239,6 +242,85 @@ impl Hydrator {
 
         if children.is_empty() { return None; }
         Some(fxcp_core::hashing::compute_dir_hash(&mut children))
+    }
+
+    /// Targeted rescan: only check paths recorded in the outage journal.
+    /// Falls back to full_scan if journal is empty (was cleared due to overflow).
+    pub fn targeted_rescan(&self, journal: &dashmap::DashSet<PathBuf>, target: &crate::config::TargetConfig) {
+        let journal_size = journal.len();
+        if journal_size == 0 {
+            info!("Hydration: Outage journal empty (overflow) — falling back to full scan");
+            self.full_scan(false);
+            return;
+        }
+
+        info!("Hydration: Targeted rescan for {} journaled paths → {:?}", journal_size, target.path);
+
+        // Collect and clear journal
+        let paths: Vec<PathBuf> = journal.iter().map(|r| r.key().clone()).collect();
+        journal.clear();
+
+        // Ensure parent directories exist on target
+        let mut dirs_created: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for p in &paths {
+            if let Some(parent) = p.parent() {
+                if parent != std::path::Path::new("") && dirs_created.insert(parent.to_path_buf()) {
+                    let target_dir = target.path.join(parent);
+                    let _ = std::fs::create_dir_all(&target_dir);
+                }
+            }
+        }
+
+        // Queue sync jobs for files that differ between source and target
+        let mut queued = 0u64;
+        let bulk_job_queue = self.source.bulk_job_queue.lock();
+        if let Some(queue_sender) = bulk_job_queue.as_ref() {
+            for rel_path in &paths {
+                if self.source.hydration.shutdown_requested.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+                let source_path = self.source.path.join(rel_path);
+                if !source_path.exists() { continue; }
+
+                let target_path = target.path.join(rel_path);
+                let needs_sync = match (source_path.metadata(), target_path.metadata()) {
+                    (Ok(s), Ok(t)) => {
+                        use std::os::unix::fs::MetadataExt;
+                        s.len() != t.len() || s.mtime() != t.mtime()
+                    }
+                    (Ok(_), Err(_)) => true,
+                    _ => false,
+                };
+
+                if needs_sync {
+                    let ino = source_path.metadata().map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        m.ino()
+                    }).ok();
+                    queue_sender.try_submit_job_sync(rel_path.clone(), target.clone(), ino);
+                    queued += 1;
+                }
+            }
+        }
+
+        info!("Hydration: Targeted rescan complete — {} of {} paths need sync", queued, paths.len());
+    }
+
+    /// Recovery scan: clear stored dir hashes on target then full scan.
+    /// This forces all directories to be re-verified instead of pruned.
+    pub fn recovery_scan(&self) {
+        info!("Hydration: Recovery scan — clearing stored dir hashes on targets");
+        for target in &self.targets {
+            // Walk target and clear stored dir hashes so pruning is defeated
+            if let Ok(walker) = walkdir::WalkDir::new(&target.path).into_iter()
+                .filter_map(|e| e.ok())
+                .try_for_each(|entry| {
+                    if entry.file_type().is_dir() {
+                        fxcp_core::sidecar::clear_dir_hash(entry.path());
+                    }
+                    Ok::<(), ()>(())
+                }) { let _ = walker; }
+        }
+        self.full_scan(false);
     }
 
     pub fn full_scan(&self, enable_watching: bool) {

@@ -377,12 +377,25 @@ impl Manager {
             let mut last_full_scan = Instant::now().sub(Duration::from_secs(60));
             let mut batch_buffer: Vec<(PathBuf, Option<u64>)> = Vec::with_capacity(100);
 
-            // Target health probe: track availability of each target path
-            let mut target_available: HashMap<PathBuf, bool> = HashMap::new();
-            // Initialize all targets as available
+            // Mount identity tracking: detect target disappearance/remount
+            struct MountState {
+                baseline_dev: u64,
+                available: bool,
+                paused_since: Option<Instant>,
+            }
+            let mut mount_states: HashMap<PathBuf, MountState> = HashMap::new();
             for h in hydrators_arc.iter() {
                 for tgt_cfg in &h.targets {
-                    target_available.insert(tgt_cfg.path.clone(), true);
+                    let dev = std::fs::metadata(&tgt_cfg.path).map(|m| m.dev()).unwrap_or(0);
+                    let available = dev != 0;
+                    if !available {
+                        tgt_cfg.paused.store(true, Ordering::SeqCst);
+                    }
+                    mount_states.insert(tgt_cfg.path.clone(), MountState {
+                        baseline_dev: dev,
+                        available,
+                        paused_since: if available { None } else { Some(Instant::now()) },
+                    });
                 }
             }
             let mut health_interval = tokio::time::interval(Duration::from_secs(10));
@@ -392,17 +405,48 @@ impl Manager {
                 // Check if any source requested a rescan (e.g. after target recovery)
                 // or if the rescan flag was set by worker error streak detection.
                 for h in hydrators_arc.iter() {
-                    if h.source.hydration.request_rescan.swap(false, Ordering::SeqCst) {
+                    // Recovery scan (pruning disabled) takes priority over normal rescan
+                    let recovery = h.source.hydration.request_recovery_scan.swap(false, Ordering::SeqCst);
+                    let rescan = h.source.hydration.request_rescan.swap(false, Ordering::SeqCst);
+                    if recovery || rescan {
                         let now = Instant::now();
                         if now.duration_since(last_full_scan) > Duration::from_secs(5) {
                             last_full_scan = now;
-                            info!("Hydration: Rescan triggered for {:?}", h.source.path);
-                            let h_clone = h.clone();
-                            h.source.hydration.active.store(true, Ordering::SeqCst);
-                            std::thread::spawn(move || {
-                                let _ = h_clone.full_scan(false);
-                                Ok::<(), FoxingError>(())
-                            });
+                            if recovery {
+                                info!("Hydration: Recovery scan (no pruning) for {:?}", h.source.path);
+                                let h_clone = h.clone();
+                                h.source.hydration.active.store(true, Ordering::SeqCst);
+                                std::thread::spawn(move || {
+                                    h_clone.recovery_scan();
+                                    Ok::<(), FoxingError>(())
+                                });
+                            } else {
+                                // Check if any target has a non-empty outage journal
+                                let journal_targets: Vec<_> = h.targets.iter()
+                                    .filter(|t| !t.outage_journal.is_empty())
+                                    .cloned()
+                                    .collect();
+                                if !journal_targets.is_empty() {
+                                    info!("Hydration: Targeted rescan for {} targets with outage journals", journal_targets.len());
+                                    let h_clone = h.clone();
+                                    h.source.hydration.active.store(true, Ordering::SeqCst);
+                                    std::thread::spawn(move || {
+                                        for tgt in &journal_targets {
+                                            h_clone.targeted_rescan(&tgt.outage_journal, tgt);
+                                        }
+                                        h_clone.source.hydration.active.store(false, Ordering::SeqCst);
+                                        Ok::<(), FoxingError>(())
+                                    });
+                                } else {
+                                    info!("Hydration: Full rescan triggered for {:?}", h.source.path);
+                                    let h_clone = h.clone();
+                                    h.source.hydration.active.store(true, Ordering::SeqCst);
+                                    std::thread::spawn(move || {
+                                        let _ = h_clone.full_scan(false);
+                                        Ok::<(), FoxingError>(())
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -410,26 +454,74 @@ impl Manager {
                 let first_item = tokio::select! {
                     item = hydration_rx_task.recv() => item,
                     _ = health_interval.tick() => {
-                        // Periodic target health probe
+                        // Mount identity probe: device ID + fsync liveness
                         for h in hydrators_arc.iter() {
                             for tgt_cfg in &h.targets {
-                                // Probe by writing a test file INSIDE the target, not just
-                                // checking the mount point directory. Lazy unmount (umount -l)
-                                // keeps the mount point visible but filesystem ops fail.
-                                let probe_path = tgt_cfg.path.join(".foxing_health_probe");
-                                let reachable = tokio::fs::write(&probe_path, b"ok").await.is_ok();
-                                let _ = tokio::fs::remove_file(&probe_path).await;
-                                let was_available = target_available.get(&tgt_cfg.path).copied().unwrap_or(true);
-                                if reachable && !was_available {
-                                    info!("Target {:?} recovered — requesting rescan", tgt_cfg.path);
-                                    h.source.hydration.request_rescan.store(true, Ordering::SeqCst);
-                                    // Reset debounce so recovery rescan fires immediately
+                                let state = mount_states.entry(tgt_cfg.path.clone()).or_insert(MountState {
+                                    baseline_dev: 0, available: false, paused_since: Some(Instant::now()),
+                                });
+
+                                // 1. Device ID check
+                                let meta_ok = std::fs::metadata(&tgt_cfg.path).ok();
+                                let current_dev = meta_ok.as_ref().map(|m| m.dev()).unwrap_or(0);
+                                let dev_match = meta_ok.is_some() && current_dev == state.baseline_dev && state.baseline_dev != 0;
+
+                                // 2. Fsync liveness probe (catches stale NFS cache from lazy unmount)
+                                let live = if meta_ok.is_some() {
+                                    let probe_path = tgt_cfg.path.join(".foxing_mount_probe");
+                                    tokio::task::spawn_blocking(move || {
+                                        match std::fs::OpenOptions::new()
+                                            .write(true).create(true).truncate(true)
+                                            .open(&probe_path)
+                                        {
+                                            Ok(f) => {
+                                                let ok = f.sync_all().is_ok();
+                                                let _ = std::fs::remove_file(&probe_path);
+                                                ok
+                                            }
+                                            Err(_) => false,
+                                        }
+                                    }).await.unwrap_or(false)
+                                } else {
+                                    false
+                                };
+
+                                let reachable = (dev_match || (meta_ok.is_some() && state.baseline_dev == 0)) && live;
+
+                                if reachable && !state.available {
+                                    // TARGET RECOVERED
+                                    let new_dev = current_dev;
+                                    if new_dev != state.baseline_dev {
+                                        info!("Target {:?} recovered with new mount (dev {:x} → {:x}) — requesting rescan",
+                                              tgt_cfg.path, state.baseline_dev, new_dev);
+                                    } else {
+                                        info!("Target {:?} recovered — requesting rescan", tgt_cfg.path);
+                                    }
+                                    state.baseline_dev = new_dev;
+                                    state.paused_since = None;
+                                    tgt_cfg.paused.store(false, Ordering::SeqCst);
+                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
-                                if !reachable && was_available {
-                                    info!("Target {:?} became unavailable", tgt_cfg.path);
+
+                                if !reachable && state.available {
+                                    // TARGET LOST
+                                    info!("Target {:?} became unavailable — pausing workers", tgt_cfg.path);
+                                    tgt_cfg.paused.store(true, Ordering::SeqCst);
+                                    state.paused_since = Some(Instant::now());
                                 }
-                                target_available.insert(tgt_cfg.path.clone(), reachable);
+
+                                if meta_ok.is_some() && !dev_match && state.available && state.baseline_dev != 0 {
+                                    // DEVICE ID CHANGED (remount detected)
+                                    info!("Target {:?} remounted (dev {:x} → {:x}) — requesting recovery scan",
+                                          tgt_cfg.path, state.baseline_dev, current_dev);
+                                    state.baseline_dev = current_dev;
+                                    tgt_cfg.outage_journal.clear();
+                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
+                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                }
+
+                                state.available = reachable;
                             }
                         }
                         continue;

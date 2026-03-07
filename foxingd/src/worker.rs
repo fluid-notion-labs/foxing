@@ -322,6 +322,45 @@ pub async fn run_worker(
     });
 
     loop {
+        // Target pause: drain events into outage journal when target is unavailable
+        if target_cfg.paused.load(Ordering::Relaxed) {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Worker {}: Shutdown during target pause.", worker_id);
+                    break;
+                }
+                Some(evt) = tinned_rx.control.recv() => {
+                    if evt.event_type != EventType::Barrier && evt.event_type != EventType::SequenceGap {
+                        if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                            target_cfg.outage_journal.insert(rel);
+                        }
+                    }
+                }
+                Some(evt) = tinned_rx.structural.recv() => {
+                    if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                        target_cfg.outage_journal.insert(rel);
+                    }
+                }
+                Some(evt) = tinned_rx.metadata.recv() => {
+                    if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                        target_cfg.outage_journal.insert(rel);
+                    }
+                }
+                Some(evt) = tinned_rx.bulk.recv() => {
+                    if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                        target_cfg.outage_journal.insert(rel);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            if target_cfg.outage_journal.len() > constants::OUTAGE_JOURNAL_MAX_ENTRIES {
+                warn!("Worker {}: Outage journal overflow ({} entries) — will trigger full scan on resume",
+                      worker_id, target_cfg.outage_journal.len());
+                target_cfg.outage_journal.clear();
+            }
+            continue;
+        }
+
         if last_tune.elapsed().as_micros() > constants::WORKER_TUNE_INTERVAL_US as u128 {
             let elapsed = last_tune.elapsed().as_secs_f64();
             let current_usage = crate::metrics::GLOBAL_BUFFER_COUNT.load(Ordering::Relaxed);

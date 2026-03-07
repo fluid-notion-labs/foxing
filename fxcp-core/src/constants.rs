@@ -113,3 +113,8 @@ pub const REORDER_ZOMBIE_TIMEOUT_MS: u64 = 30_000;
 pub const REORDER_PRESSURE_PANIC_PCT: f64 = 0.8;
 pub const REORDER_PRESSURE_WARN_PCT: f64 = 0.5;
 pub const REORDER_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+
+// Mount monitoring & outage journal
+pub const MOUNT_PROBE_FSYNC_TIMEOUT_SECS: u64 = 5;
+pub const OUTAGE_JOURNAL_MAX_ENTRIES: usize = 100_000;
+pub const OUTAGE_FULL_SCAN_THRESHOLD_SECS: u64 = 86400;
