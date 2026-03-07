@@ -621,6 +621,11 @@ int BPF_KPROBE(trace_d_instantiate, struct dentry *dentry, struct inode *inode) 
     if (is_ignored_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
 
+    // Skip if a rename is in progress for this thread — the rename probe
+    // handles the event. d_instantiate fires during rename for the new
+    // dentry, which would generate spurious Create events (ghost files).
+    if (bpf_map_lookup_elem(&pending_renames, &pid_tgid)) return 0;
+
     // Check mkdir_dentries first (directory creation)
     __u64 *mkdir_ptr = bpf_map_lookup_elem(&mkdir_dentries, &pid_tgid);
     if (mkdir_ptr) {
