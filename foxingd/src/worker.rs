@@ -1022,34 +1022,45 @@ async fn process_single_event_with_wal(
                     }
 
                     // If old_path doesn't exist on target (Create event not yet processed
-                    // by data worker), copy the source file directly to the rename destination.
+                    // or file was part of a rename chain), try to copy the source file
+                    // directly to the rename destination — but ONLY if the destination
+                    // name matches what currently exists on source (i.e., this is the
+                    // final rename step). Intermediate renames just update identity map
+                    // to avoid creating ghost files.
                     if !old_path.exists() {
-                        let src_rel = old_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
-                        let source_file = source.mount.join(src_rel);
-                        // Source may already be renamed — try the new name too
-                        let actual_source = if source_file.exists() {
-                            source_file
-                        } else {
-                            let new_rel = rename_dest.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
-                            source.mount.join(new_rel)
-                        };
-                        if actual_source.exists() {
+                        let new_rel = rename_dest.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                        let dest_on_source = source.mount.join(new_rel);
+                        if dest_on_source.exists() {
+                            // Destination name exists on source — this is the final rename.
+                            // Copy source file directly to the final target path.
                             if let Some(parent) = rename_dest.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
                             let dst = rename_dest.clone();
-                            let _ = spawn_blocking(move || std::fs::copy(&actual_source, &dst)).await;
-                            // Update identity map
+                            let _ = spawn_blocking(move || std::fs::copy(&dest_on_source, &dst)).await;
                             if let Some(new_name) = &event.new_name {
-                                if let Ok(new_rel) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                                if let Ok(nr) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
                                     identity::update_map(
                                         &source.inode_map, &source.dir_map, event.dev_id, event.inode,
-                                        new_rel, event.generation, false, false,
+                                        nr, event.generation, false, false,
                                         event.timestamp_ns, event.seq_num
                                     );
                                 }
                             }
                             metrics::LIVE_ADDITIONS.inc();
+                            return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                        } else {
+                            // Neither old nor new name exists on source — intermediate rename.
+                            // Just update identity map; don't create ghost files.
+                            if let Some(new_name) = &event.new_name {
+                                if let Ok(nr) = resolve_event_path(&source, event.new_parent_inode, new_name).await {
+                                    identity::update_map(
+                                        &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                        nr, event.generation, false, false,
+                                        event.timestamp_ns, event.seq_num
+                                    );
+                                }
+                            }
                             return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                         }
                     }
