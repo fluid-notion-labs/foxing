@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/tui/explorer.rs — TUI file explorer wizard
+
+//! Interactive file/directory browser for the foxingd setup TUI.
+
 use std::path::PathBuf;
 use std::collections::HashSet;
 use std::fs;

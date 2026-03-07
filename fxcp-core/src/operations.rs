@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/operations.rs — SmartCopier, io_uring pipeline, reflink/CoW, probe_capabilities
+
 // Core copy engine — SmartCopier, Capabilities, io_uring I/O
 use std::path::{Path, PathBuf};
 use std::os::unix::io::{AsRawFd, RawFd, FromRawFd, IntoRawFd};

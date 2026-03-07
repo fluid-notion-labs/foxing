@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/main.rs — foxingd daemon entry point — CLI, symlink dispatch, runtime
+
 use std::path::{Path, PathBuf};
 use tracing::{info, error, debug, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

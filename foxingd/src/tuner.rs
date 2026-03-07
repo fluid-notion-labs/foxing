@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/tuner.rs — BBR-inspired adaptive tuner — batch size, flush interval
+
+//! Adaptive performance tuner modeled after TCP BBR congestion control.
+//! Adjusts batch sizes, flush intervals, and timeouts based on target latency.
+
 use std::time::{Instant, Duration};
 use std::collections::VecDeque;
 use std::sync::Arc;

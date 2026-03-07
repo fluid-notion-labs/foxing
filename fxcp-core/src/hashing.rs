@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/hashing.rs — BLAKE3 hashing, Merkle tree, delta detection, directory hashing
+
 use blake3::{Hasher, Hash};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;

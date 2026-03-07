@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/projector.rs — IdentityProjector — real-time identity map updates from events
+
+//! Projects BPF events onto the identity map in real-time.
+//! Handles rename chain tracking, directory map updates, and inode lifecycle.
+
 use crate::identity::{ShardedInodeMap, ShardedDirMap, IdentityEntry};
 use crate::event::{Event, EventType};
 use std::path::{Path, PathBuf};

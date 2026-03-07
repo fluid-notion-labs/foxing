@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/tui.rs — Terminal UI module — ratatui dashboard
+
+//! Real-time terminal dashboard using ratatui for monitoring foxingd state.
+
 use std::io;
 use std::time::Duration;
 use std::path::PathBuf;

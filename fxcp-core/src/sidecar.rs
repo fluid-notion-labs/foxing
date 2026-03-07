@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/sidecar.rs — Xattr/sidecar metadata — SyncSignature, MerkleSignature, dir_hash
+
 // Sidecar — metadata/dirty-flag management via xattr (primary) with JSON sidecar fallback
 //
 // Architecture: xattrs are the canonical store. Sidecar JSON files are ONLY

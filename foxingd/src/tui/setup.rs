@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/tui/setup.rs — TUI setup wizard for initial configuration
+
+//! Guided setup wizard for creating foxingd configuration via TUI.
+
 use std::path::{PathBuf};
 use std::fs;
 use std::io;

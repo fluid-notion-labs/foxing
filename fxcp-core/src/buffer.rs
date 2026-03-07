@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/buffer.rs — Aligned buffer pool for io_uring registered I/O
+
+//! Memory-aligned buffer pool for io_uring fixed-buffer operations.
+//! Provides pinned, aligned allocations that can be registered with the kernel.
+
 use std::alloc::{alloc, dealloc, Layout};
 use std::{ops::{Deref, DerefMut}, slice};
 use tracing::{debug, error, trace, info};

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/metrics.rs — Prometheus metrics definitions and initialization
+
+//! Prometheus metric counters and gauges for copy operations, I/O stats,
+//! and storage detection results.
+
 use lazy_static::lazy_static;
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,

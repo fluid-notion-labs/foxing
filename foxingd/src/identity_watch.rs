@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/identity_watch.rs — Identity map change watcher
+
+//! Monitors identity map changes for proactive cache invalidation.
+
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

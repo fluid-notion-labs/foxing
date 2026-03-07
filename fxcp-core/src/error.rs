@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/error.rs — Error types — FxcpError, CopyErrorKind, Result
+
+//! Error types for the fxcp-core copy engine.
+
 use thiserror::Error;
 
 /// Classification of copy operation errors for retry/fallback decisions

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/resilience.rs — PoisonCabinet, CircuitBreaker — failure tracking
+
+//! Resilience primitives for handling persistent failures.
+//! PoisonCabinet tracks permanently failed inodes; CircuitBreaker backs off on target errors.
+
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::ops::Sub;

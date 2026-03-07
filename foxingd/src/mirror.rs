@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/mirror.rs — Manager, SourceInfo, mount monitoring, health probes
+
+//! Replication manager orchestrating sources, targets, and hydration.
+//! Includes mount identity monitoring with device ID tracking and fsync liveness probes.
+
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock, broadcast};

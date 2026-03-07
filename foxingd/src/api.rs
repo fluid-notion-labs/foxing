@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/api.rs — HTTP API handlers for metrics and status endpoints
+
+//! Axum HTTP handlers for the Prometheus metrics and JSON status API.
+
 use std::collections::HashMap;
 use crate::tuner::TunerState;
 use serde::{Deserialize, Serialize};

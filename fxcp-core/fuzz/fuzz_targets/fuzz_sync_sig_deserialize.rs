@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/fuzz/fuzz_targets/fuzz_sync_sig_deserialize.rs — Fuzz target for SyncSignature deserialization
+
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use fxcp_core::sidecar::SyncSignature;

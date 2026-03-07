@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/consistency/exchange.rs — Atomic exchange operations for safe file replacement
+
 use std::path::Path;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/constants.rs — Shared constants for tuning, timeouts, thresholds
+
+//! Compile-time and runtime constants for foxing subsystems.
+//! Includes worker tuning, retry limits, buffer sizes, and feature flags.
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_COMMIT_HASH: &str = {
     match option_env!("GIT_HEAD_REF") {

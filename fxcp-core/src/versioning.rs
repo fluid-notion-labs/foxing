@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/versioning.rs — MARS versioning — reflink snapshots, epoch management
+
+//! Mirror & Archive Recovery System (MARS) — zero-cost reflink snapshots
+//! with epoch-based version management and retention policies.
+
 use std::path::{Path, PathBuf};
 use crate::error::{Result, FxcpError as MirrorError};
 use std::fs;

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/event.rs — TinnedDispatcher — CAKE-inspired 4-priority event queues
+
 use crate::metrics;
 use tokio::sync::mpsc;
 use std::sync::Arc;

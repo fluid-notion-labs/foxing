@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/sync.rs — Shared copy/sync engine for fxcp CLI and foxingd sync
+
 //! Shared copy/sync engine used by both fxcp CLI and foxingd sync command.
 //!
 //! Provides recursive directory copy with auto-adaptive strategy selection

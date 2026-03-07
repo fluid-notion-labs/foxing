@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/security.rs — Metadata sync, permissions, ownership, xattr operations
+
 // Security — metadata sync, capability checks, fallocate, xattr preservation
 use std::path::Path;
 use crate::error::{FxcpError, Result};

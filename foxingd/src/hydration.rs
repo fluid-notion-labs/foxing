@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/hydration.rs — HydrationQueue — per-worker job channels, round-robin
+
+//! Job queue distributing hydration work across worker threads.
+//! Provides both async submit and synchronous try_send for non-tokio contexts.
+
 use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{self, Sender, UnboundedSender};

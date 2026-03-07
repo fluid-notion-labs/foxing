@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/config.rs — Configuration — TargetConfig, SourceConfig, profiles
+
+//! TOML configuration loading and validation for foxingd.
+//! Defines target profiles (NVMe/SSD/HDD/NFS), worker settings, and feature flags.
+
 use serde::{Deserialize, Serialize};
 use std::path::{PathBuf, Path};
 use std::sync::Arc;

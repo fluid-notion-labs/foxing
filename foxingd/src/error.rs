@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/error.rs — foxingd error types — FoxingError
+
+//! Error types for the foxingd daemon.
+
 use thiserror::Error;
 use fxcp_core::FxcpError;
 

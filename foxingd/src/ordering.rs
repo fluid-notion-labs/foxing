@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/ordering.rs — ReorderBuffer, Coalescer — event ordering and write merging
+
+//! Event ordering and write coalescing for the replication pipeline.
+//! ReorderBuffer delivers events in sequence; Coalescer merges adjacent writes.
+
 use std::collections::{BTreeMap, VecDeque, HashSet, HashMap};
 use std::sync::Arc;
 use crate::event::{Event, EventType};

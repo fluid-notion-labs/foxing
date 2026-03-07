@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/consistency/wal.rs — Write-ahead log for crash recovery
+
+//! In-memory write-ahead log for tracking pending operations.
+//! Enables crash recovery by replaying uncommitted operations on restart.
+
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use crossbeam::queue::SegQueue;

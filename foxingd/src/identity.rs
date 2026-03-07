@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/identity.rs — Identity resolution — inode_map, dir_map, path mapping
+
+//! Inode-to-path identity system for resolving BPF events to target paths.
+//! Maintains sharded DashMap caches with lazy tree repair and generation tracking.
+
 use std::path::{Path, PathBuf, Component};
 use crate::error::{FoxingError, Result};
 use std::sync::atomic::{Ordering, AtomicU64};

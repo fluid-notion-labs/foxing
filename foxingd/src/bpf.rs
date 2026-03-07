@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/bpf.rs — BPF userspace — ring buffer callback, sequence tracking
+
 use crate::event::{Event, EventType, EventQueue};
 use crate::error::{FoxingError, Result};
 use libbpf_rs::RingBufferBuilder;

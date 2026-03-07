@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/consistency/serialization.rs — Binary serialization for WAL entries
+
+//! Serialization helpers for WAL entry persistence.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::consistency::sequencer::{GlobalSequencer, SequenceBarrier};

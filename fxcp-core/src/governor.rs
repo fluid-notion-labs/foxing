@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// fxcp-core/src/governor.rs — PSI-based system stress management with QoS floor
+
 // Governor — system stress management
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/metrics.rs — Prometheus metrics for foxingd daemon
+
+//! Prometheus metric definitions for the foxingd replication daemon.
+//! Includes copy stats, worker health, tuner state, and hydration progress.
+
 // Re-export all fxcp-core metrics (latency, data movement, IO methods,
 // versioning core, memory/buffer pool, reliability copy-plane, integrity,
 // BatchedCounter, BatchedAtomicCounter, initialize_metrics)

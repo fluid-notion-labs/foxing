@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/src/worker.rs — BPF event worker loop — tinned dispatch, coalescer, retry
+
+//! Per-target worker processing BPF events through a biased select loop.
+//! Implements write coalescing, exponential backoff retry, and error classification.
+
 use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast, Mutex};
 use tracing::{error, info, debug, warn};

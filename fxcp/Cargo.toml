@@ -2,6 +2,9 @@
 name = "fxcp"
 version = "0.5.0"
 edition = "2024"
+license = "GPL-2.0-or-later"
+authors = ["Joel Wirāmu Pauling <aenertia@aenertia.net>"]
+repository = "https://codeberg.org/aenertia/foxing"
 description = "Smart filesystem copy — rsync replacement with CoW/reflink support"
 
 [[bin]]

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025 Joel Wirāmu Pauling <aenertia@aenertia.net>
+//
+// foxingd/build.rs — Build script — libbpf-cargo BPF skeleton generation
+
+//! Cargo build script that compiles mirror.bpf.c via libbpf-cargo
+//! and generates Rust skeleton bindings for BPF program interaction.
+
 use libbpf_cargo::SkeletonBuilder;
 use std::{env, path::PathBuf, process::Command, fs};
 
