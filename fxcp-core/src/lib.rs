@@ -9,5 +9,6 @@ pub mod operations;
 pub mod governor;
 pub mod versioning;
 pub mod consistency;
+pub mod sync;
 
 pub use error::{FxcpError, CopyErrorKind, Result};

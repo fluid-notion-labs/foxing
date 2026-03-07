@@ -277,10 +277,27 @@ fn format_bytes(bytes: f64) -> String {
     format!("{:.2} GiB", bytes / div)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Symlink dispatch: when called as `fxcp`, behave as the standalone copy tool
+    let argv0 = std::env::args().next().unwrap_or_default();
+    let bin_name = std::path::Path::new(&argv0)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("foxingd");
+    if bin_name == "fxcp" {
+        return fxcp_core::sync::cli_main();
+    }
+
+    // Normal foxingd entry — build async runtime
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    
+
     let one_shot_mode = matches!(cli.command, Some(Commands::Sync { watch: false, .. }));
     if one_shot_mode {
         constants::ONE_SHOT_MODE.store(true, Ordering::Relaxed);
