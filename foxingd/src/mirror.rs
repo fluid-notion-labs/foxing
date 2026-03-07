@@ -413,11 +413,18 @@ impl Manager {
                         // Periodic target health probe
                         for h in hydrators_arc.iter() {
                             for tgt_cfg in &h.targets {
-                                let reachable = tokio::fs::metadata(&tgt_cfg.path).await.is_ok();
+                                // Probe by writing a test file INSIDE the target, not just
+                                // checking the mount point directory. Lazy unmount (umount -l)
+                                // keeps the mount point visible but filesystem ops fail.
+                                let probe_path = tgt_cfg.path.join(".foxing_health_probe");
+                                let reachable = tokio::fs::write(&probe_path, b"ok").await.is_ok();
+                                let _ = tokio::fs::remove_file(&probe_path).await;
                                 let was_available = target_available.get(&tgt_cfg.path).copied().unwrap_or(true);
                                 if reachable && !was_available {
                                     info!("Target {:?} recovered — requesting rescan", tgt_cfg.path);
                                     h.source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                                    // Reset debounce so recovery rescan fires immediately
+                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
                                 if !reachable && was_available {
                                     info!("Target {:?} became unavailable", tgt_cfg.path);
