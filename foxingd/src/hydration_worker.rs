@@ -1129,6 +1129,20 @@ pub async fn run_hydration_worker_loop(
                     .or_insert_with(|| probe_capabilities(&target_path_root))
                     .clone();
 
+                // Skip jobs where source file no longer exists (renamed during queue wait)
+                let source_check_path = source.mount.join(&job.rel_path);
+                if !source_check_path.exists() {
+                    // Also remove any ghost copy that might have been created
+                    let target_check_path = job.target_cfg.path.join(&job.rel_path);
+                    if target_check_path.exists() {
+                        let _ = std::fs::remove_file(&target_check_path);
+                    }
+                    jobs_skipped += 1;
+                    jobs_processed += 1;
+                    pending_count.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+
                 match process_hydration_job(
                     job.clone(), &source, &governor, &tuner_board, &mut ring, &mut buffer_pool,
                     async_fd.clone(), &source_caps, &target_caps, &tracker, &mut fsync_tracker,
@@ -1546,6 +1560,13 @@ pub async fn process_hydration_job(
 
         match copy_result {
             Ok(Some(stats)) => {
+                // Ghost prevention: if source file was renamed during copy,
+                // remove the ghost copy on target and skip post-copy work.
+                if !current_source_path.exists() {
+                    let _ = std::fs::remove_file(&current_target_path);
+                    debug!("Hydration: Removed ghost copy at {:?} (source renamed during copy)", current_target_path);
+                }
+
                 crate::metrics::BYTES_REPLICATED.with_label_values(&[&target_cfg.path.to_string_lossy()]).inc_by(stats.bytes_processed as f64);
 
                 // Consolidated post-copy: single spawn_blocking for ALL metadata + hashing.

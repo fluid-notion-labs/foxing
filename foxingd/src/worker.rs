@@ -1103,6 +1103,17 @@ async fn process_single_event_with_wal(
                         }
                     };
 
+                    // Clean up ghost copies at the old path. The hydration walker
+                    // may have concurrently created a copy at old_path after the
+                    // rename moved it. Remove it if it doesn't exist on source.
+                    if op_result.is_ok() && old_path.exists() {
+                        let old_rel = old_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                        let old_on_source = source.mount.join(old_rel);
+                        if !old_on_source.exists() {
+                            let _ = std::fs::remove_file(&old_path);
+                        }
+                    }
+
                     // Update identity map for ALL renames (not just directories).
                     // File rename chains (a→b→c→d) need the identity map updated
                     // after each step so the next rename can resolve the source path.
@@ -1221,6 +1232,20 @@ async fn process_single_event_with_wal(
                      }).await;
                      match copy_res {
                          Ok(Ok(_bytes)) => {
+                             // Re-check: if source was renamed during copy, the copy
+                             // created a ghost at an intermediate name. Remove it.
+                             if !source_path.exists() {
+                                 let _ = std::fs::remove_file(&target_path);
+                                 // Still update identity so rename handler can find this inode
+                                 if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
+                                     identity::update_map(
+                                         &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                                         r.to_path_buf(), event.generation, false, false,
+                                         event.timestamp_ns, event.seq_num
+                                     );
+                                 }
+                                 return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                             }
                              if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
                                  identity::update_map(
                                      &source.inode_map, &source.dir_map, event.dev_id, event.inode,
