@@ -34,9 +34,27 @@ fxcp -a --delete /source /destination
 
 # Dry run
 fxcp -a -n /source /destination
+
+# Generate foxingd-compatible signatures (for later fast resync)
+fxcp -a --generate-sigs /source /destination
 ```
 
 fxcp detects the storage stack (dm-crypt, btrfs, XFS, containers) and adapts automatically.
+
+### fxcp + foxingd Integration
+
+`fxcp --generate-sigs` writes the same xattr/sidecar signatures that foxingd uses for fast resync. This enables the workflow:
+
+```bash
+# 1. Fast initial seed with fxcp (no BPF, no root needed for local)
+fxcp -a --generate-sigs /source /target
+
+# 2. Start foxingd — hydration scan sees signatures, skips matched files
+foxingd daemon -c config.toml
+# Log: "Hydration: 0 files require synchronization"
+```
+
+Also enables sneakernet: copy to USB with fxcp, ship it, plug into target host, foxingd recognizes the signatures and only syncs changes since the copy.
 
 ## Quick Start: foxingd (eBPF Daemon)
 
@@ -52,6 +70,12 @@ sudo ./target/release/foxingd daemon --config config.toml --tui
 
 # One-shot sync (like rsync)
 ./target/release/foxingd sync -a /source /destination
+
+# Check status
+foxingd status
+
+# View metrics
+foxingd metrics
 ```
 
 ## Building
@@ -67,15 +91,21 @@ cargo build --release -p foxingd
 cargo build --release --workspace
 ```
 
+### Requirements
+
+- **Kernel:** Linux 6.12+ (BPF `security_inode_create` + `d_instantiate` fallbacks)
+- **Build Tools:** `cargo`, `clang`, `llvm`, `bpftool`, `libbpf-dev`
+- **Target Filesystem:** XFS, btrfs, ext4, F2FS, NFS 4.2 (for reflink/CoW support)
+
 ## Workspace Structure
 
 ```
 foxing/
 ├── fxcp-core/     Smart copy engine library (io_uring, reflink, Merkle, sidecar)
-├── fxcp/          Standalone CLI binary (118MB, no BPF)
-├── foxingd/       eBPF replication daemon (230MB, requires libbpf)
+├── fxcp/          Standalone CLI binary (~130MB, no BPF)
+├── foxingd/       eBPF replication daemon (~220MB, requires libbpf)
 ├── tests/         Regression harness (rsync/cp/fxcp/foxingd comparison)
-└── docs/          Architecture decisions and documentation
+└── docs/          Architecture decisions, diagrams, and documentation
 ```
 
 ## Architecture
@@ -83,9 +113,9 @@ foxing/
 fxcp-core provides the I/O engine shared by both binaries:
 
 - **SmartCopier**: io_uring async copy with registered buffers
-- **Reflink/CoW**: FICLONE ioctl for instant copies on btrfs/XFS
+- **Reflink/CoW**: FICLONE ioctl for instant copies on btrfs/XFS/NFS 4.2
 - **BLAKE3 Merkle**: Chunk-level delta detection for incremental sync
-- **Storage awareness**: dm-crypt, dm-thin, kvdo, container detection
+- **Storage awareness**: dm-crypt, dm-thin, kvdo, Stratis, container detection
 - **Governor**: PSI-based system stress management with QoS floor
 
 foxingd adds eBPF event capture, CQRS event ordering, adaptive BBR tuning, mount identity monitoring, and MARS versioning on top.
@@ -101,24 +131,204 @@ Kernel BPF probes → Ring Buffer (33MB) → ReorderBuffer → TransientFilter
   → SmartCopier → Target Filesystem
 ```
 
-**Key subsystems:**
+**Pipeline stages:**
 
-- **TinnedDispatcher** — CAKE-inspired 4-priority queue (Control/Structural/Metadata/Bulk). Control-plane events (Create, Rename, Mkdir) serialize on Worker 0. Bulk writes hash-distribute to data workers. Metadata and bulk events are droppable under pressure.
-- **Mount Monitoring** — Per-target device ID tracking + fsync liveness probes (10s interval). Detects NFS lazy unmount, USB disconnect, remount. Workers pause during outage, events drain to outage journal. Recovery triggers pruning-disabled full scan.
-- **Hydration Pipeline** — Directory Merkle tree pruning for O(dirs) resume. BLAKE3 chunk-level delta copy for >1MB files (<50% dirty threshold). Targeted rescan from outage journal for fast recovery.
+1. **BPF Event Capture** — Kernel probes (`vfs_write_iter`, `security_inode_create`, `vfs_rename`, `notify_change`, etc.) capture filesystem events into a 33MB ring buffer with per-device sequence numbers.
+
+2. **Reorder & Filter** — `ReorderBuffer` (BTreeMap) delivers events in sequence order. `TransientFilter` suppresses Create→Unlink chains (temp files). `IdentityProjector` maintains real-time inode→path mapping.
+
+3. **TinnedDispatcher** — CAKE-inspired 4-priority queue (Control/Structural/Metadata/Bulk). Control-plane events (Create, Rename, Mkdir) serialize on Worker 0 for ordering correctness. Bulk writes hash-distribute to data workers. Metadata and bulk events are droppable under pressure.
+
+4. **Worker Processing** — Biased `tokio::select!` loop with adaptive coalescing, exponential backoff retry, and error classification (TargetNotFound→repair, Transient→retry, Permanent→drop).
+
+5. **Mount Monitoring** — Per-target device ID tracking + fsync liveness probes (10s interval). Detects NFS lazy unmount, USB disconnect, remount. Workers pause during outage, events drain to outage journal. Recovery triggers pruning-disabled full scan.
+
+6. **Hydration Pipeline** — Directory Merkle tree pruning for O(dirs) resume. BLAKE3 chunk-level delta copy for >1MB files (<50% dirty threshold). Targeted rescan from outage journal for fast recovery.
 
 See [Architecture Diagrams](docs/ARCHITECTURE.md) for detailed graphviz diagrams of all pathways.
 
+### Auto-Adaptive Copy Strategy
+
+fxcp and foxingd select the optimal copy method automatically:
+
+```
+Tier 1:   FICLONE          — instant CoW clone (btrfs/XFS/NFS 4.2 same-server)
+Tier 1.5: copy_file_range  — NFS 4.2 server-side copy (no data over wire)
+Tier 2:   sendfile          — kernel-optimized for small files (<64KB)
+Tier 3:   io_uring          — async pipelined for large/cross-device files
+```
+
+Sparse files bypass Tiers 1.5 and 2 (both destroy holes) and go directly to Tier 3 with hole-aware I/O.
+
 ## Configuration
 
-foxingd uses TOML configuration. See the built-in help:
+foxingd uses TOML configuration:
 
 ```bash
 foxingd --help
 foxingd explain  # Prints configuration cheatsheet
 ```
 
+```toml
+# Minimal example
+worker_count = 4
+queue_max = 200000
+
+[[sources]]
+path = "/mnt/data"
+
+  [[sources.targets]]
+  path = "/mnt/backup"
+  profile = "SSD"            # NVMe, SSD, HDD, Network, NFS, SdCard, Auto
+  enable_versioning = true
+  max_versions = 5
+  max_versions_size_mb = 10240
+```
+
 fxcp requires no configuration — it auto-detects everything.
+
+## CLI Usage
+
+### foxingd Commands
+
+```bash
+# Start daemon (foreground or systemd)
+foxingd daemon --config /etc/foxing.toml
+
+# Start with TUI monitor
+foxingd daemon --config /etc/foxing.toml --tui
+
+# One-shot sync (like rsync)
+foxingd sync -a /source /destination
+
+# One-shot sync with I/O profile and versioning
+foxingd sync -a --snapshot --profile NFS /source /destination
+
+# One-shot sync + watch for changes (daemon mode)
+foxingd sync -a --watch /source /destination
+
+# Validate configuration
+foxingd check --config /etc/foxing.toml
+
+# Print configuration cheatsheet
+foxingd explain
+
+# Check daemon status
+foxingd status
+
+# View metrics (text)
+foxingd metrics
+
+# Attach TUI monitor to running daemon
+foxingd metrics --ui
+```
+
+### Versioning Commands (MARS)
+
+If `enable_versioning` is active, the daemon creates zero-cost reflink snapshots on `fsync`:
+
+```bash
+# List versions of a specific file
+foxingd snapshot list /mnt/backup/database.db
+
+# Revert file to a specific epoch (atomic rollback via Reflink)
+foxingd snapshot revert /mnt/backup/database.db 105432
+
+# Extract a past version to a new file
+foxingd snapshot copy /mnt/backup/database.db 105432 /tmp/db_restore.db
+
+# Clean up old snapshots (dry run)
+foxingd snapshot cleanup /mnt/backup/database.db --dry-run
+
+# Force a tagged snapshot
+foxingd snapshot force /mnt/backup/database.db --tag "pre-migration"
+```
+
+### fxcp Commands
+
+```bash
+# Archive copy (recursive, preserve attributes)
+fxcp -a /source /destination
+
+# With delete (like rsync --delete)
+fxcp -a --delete /source /destination
+
+# Generate foxingd-compatible signatures for fast resync
+fxcp -a --generate-sigs /source /destination
+
+# Exclude patterns
+fxcp -a -e '*.tmp' -e '.git' /source /destination
+
+# Dry run
+fxcp -a -n /source /destination
+
+# Clean orphaned .tmp files and stale dirty flags
+fxcp --cleanup /target
+
+# Read from stdin with sparse detection (SIMD zero-block)
+tar cf - /data | fxcp - /backup/data.tar
+
+# stdin with CoW checkpoints (periodic reflink snapshots)
+fxcp - /backup/stream.bin --checkpoint-interval 300 --checkpoint-keep 5
+
+# stdin with pre-allocated size
+fxcp - /backup/disk.img --size 10737418240
+```
+
+## Capacity Planning
+
+Unlike block-level replication, foxing incurs a per-file metadata cost on the target:
+
+- **Native xattrs** (`user.foxing.*`): Near-zero overhead on XFS, btrfs, ext4 (0 extra inodes)
+- **Sidecar fallback** (`.foxing_meta`): 4KB/1-inode per file on filesystems without xattr support
+
+Always provision the target with at least **5% more capacity** than the source to accommodate versioning history and filesystem overhead.
+
+> If the target fills up, the daemon enters a "Safe Stall" — replication pauses without crashing or corrupting existing files. See [Failure Scenarios: Story 5](docs/FAILURE_SCENARIOS.md).
+
+## Safety Mechanisms
+
+1. **Loop Prevention:**
+   - **Device Filtering:** eBPF ignores events on the target device
+   - **PID Filtering:** eBPF ignores events generated by the daemon's own PID/TGID
+
+2. **Partial Write Protection:**
+   - **Atomic Mode:** New files written to `.tmp.uuid` and renamed
+   - **Delta Mode:** In-place updates with MARS versioning as crash consistency safety net
+
+3. **Consistency:**
+   - `fsync` events trigger global barrier on target
+   - Full metadata replication (xattr, ACL, timestamps)
+   - Dirty flag sidecar tracking for crash recovery
+
+4. **Mount Monitoring:**
+   - Device ID tracking detects target disappearance (USB unplug, NFS unmount)
+   - fsync liveness probe catches stale NFS cache from lazy unmount
+   - Workers pause during outage, outage journal captures changes
+   - Recovery scan (pruning-disabled) runs on reconnect
+
+5. **Global Emergency Pruning:**
+   - On `ENOSPC`, system deletes oldest version snapshots to free space
+   - Live mirror continues after space reclaimed
+
+## Monitoring & Observability
+
+Prometheus metrics served on a **dedicated thread** at `http://localhost:9100/metrics` (responsive even under heavy I/O):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `foxing_events_dropped` | Counter | Events dropped due to full queues (>0 = data gap) |
+| `foxing_governor_stressed` | Gauge | 1 if Governor throttling due to system load |
+| `foxing_worker_buffer_utilization` | Gauge | Internal buffer usage (>0.8 triggers emergency drain) |
+| `foxing_worker_copy_in_flight` | Gauge | Active copy ops per worker (0 = stalled) |
+| `foxing_worker_retry_queue_size` | Gauge | Retry queue depth per worker |
+| `foxing_events_repair_queued_total` | Counter | ENOENT → repair job dispatched |
+| `foxing_events_repair_completed_total` | Counter | Successful repair completions |
+| `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
+| `foxing_hydration_dir_pruned` | Counter | Directories skipped by Merkle tree pruning |
+| `foxing_delta_copy_attempted` | Counter | Delta copy operations (chunk-level) |
+| `foxing_delta_bytes_saved` | Counter | Bytes avoided by delta copy |
+| `foxing_tuner_state` | Gauge | 0=Steady, 1=Startup, 2=Drain, 3=ProbeBW |
 
 ## Testing
 
@@ -129,20 +339,37 @@ make test-json     # JSON output for CI
 make test-compare  # Compare against saved baseline
 ```
 
+### foxingd Adversarial Test Suite (v0.4.1)
+
+9-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2):
+
+| Phase | Test | Result |
+|-------|------|--------|
+| 0 | Baseline NFS Throughput (cp/rsync) | **PASS** |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** |
+| 2 | Live Write Storm (fio 30s) | **PASS** |
+| 3 | Rename Chain Storm (100 chains a→e) | **PASS** |
+| 4 | NFS Target Drop + Resync (300 files) | **PASS** |
+| 5 | Large File Kill/Resume (100MB) | **PASS** |
+| 7 | BLAKE3 Delta Copy on Resync | **PASS** (combined) |
+| 8 | Directory Merkle Pruning | **PASS** (combined) |
+| 9 | Combined Delta + Pruning | **PASS** |
+
 ## Documentation
 
-- [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling diagrams
+- [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling (graphviz)
+- [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
+- [Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md) — Default limits and safety behaviors
+- [Failure Scenarios](docs/FAILURE_SCENARIOS.md) — Disconnect, crash, ransomware, capacity exhaustion
+- [Versioning Simulation](docs/VERSIONING_SIMULATION.md) — Disk space usage under different workloads
 - [ADR-001: Workspace Split](docs/adr/001-workspace-split.md) — Architecture decision record
 - [Implementation Plan](docs/adr/001-implementation-plan.md) — Phase-by-phase execution plan
-- [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
-- [Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md)
-- [Failure Scenarios](docs/FAILURE_SCENARIOS.md)
 
 ## Why the name?
 
-"Foxing" is an archival term for the brownish spots that appear on old paper and antique mirrors. Since this project is a Mirror written in Rust, the name fit perfectly.
+"Foxing" is an archival term for the brownish spots that appear on old paper and antique mirrors — the "rusting" of desilvered glass. Since this project is a **Mirror** written in **Rust**, the name fit perfectly.
 
-It also nods to "The quick brown fox jumps over the lazy dog" — the fast NVMe source drive leaping over the latency of the slower backup target.
+It also nods to the classic pangram, "The quick brown fox jumps over the lazy dog." In our case, this represents the core architectural goal: allowing the "Quick Fox" (your fast NVMe source drive) to perform at full speed, completely decoupled from and leaping over the latency of the "Lazy Dog" (your slower backup HDD/Network target).
 
 ## License
 
