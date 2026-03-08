@@ -1312,6 +1312,16 @@ async fn process_single_event_with_wal(
                                  }
                                  return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
                              }
+                             // Post-copy size check: if source was still being written
+                             // during copy, target may have partial/zero content. Queue
+                             // a repair job to re-copy once the write completes.
+                             let src_size = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+                             let dst_size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
+                             if dst_size < src_size {
+                                 debug!("Create copy size mismatch ({} vs {} bytes) — queuing repair for {:?}",
+                                        dst_size, src_size, source_path.file_name().unwrap_or_default());
+                                 hydration_tx.send_repair_job(source_path.clone(), Some(event.inode)).await;
+                             }
                              if let Ok(r) = target_path.strip_prefix(&target_cfg.path) {
                                  identity::update_map(
                                      &source.inode_map, &source.dir_map, event.dev_id, event.inode,
