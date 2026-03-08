@@ -292,6 +292,15 @@ impl Hydrator {
     /// Recovery scan: clear stored dir hashes on target then full scan.
     /// This forces all directories to be re-verified instead of pruned.
     pub fn recovery_scan(&self) {
+        // Bump generation to invalidate stale bulk jobs from the previous scan.
+        // Workers will skip any queued jobs with an older generation, ensuring
+        // the recovery scan's fresh jobs are processed promptly.
+        {
+            let bulk_job_queue = self.source.bulk_job_queue.lock();
+            if let Some(queue) = bulk_job_queue.as_ref() {
+                queue.bump_generation();
+            }
+        }
         info!("Hydration: Recovery scan — clearing stored dir hashes on targets");
         for target in &self.targets {
             // Walk target and clear stored dir hashes so pruning is defeated
@@ -1165,6 +1174,7 @@ pub async fn run_hydration_worker_loop(
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     stats_senders: Arc<HashMap<PathBuf, Vec<UnboundedSender<CopyStats>>>>,
     sig_cache: SignatureCache,
+    queue_generation: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<()> {
     
     use fxcp_core::operations::FsyncLatencyTracker;
@@ -1312,11 +1322,27 @@ pub async fn run_hydration_worker_loop(
 
         match job {
             Some(job) => {
+                // Skip stale-generation jobs (queued before a recovery scan)
+                let current_gen = queue_generation.load(Ordering::Relaxed) as u64;
+                if job.generation < current_gen {
+                    jobs_skipped += 1;
+                    pending_count.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+
                 // Batch drain: collect additional small-file jobs from channel
+                // Filter out stale-generation jobs during drain
                 let mut batch = vec![job.clone()];
                 while batch.len() < 64 {
                     match rx.try_recv() {
-                        Ok(j) => batch.push(j),
+                        Ok(j) => {
+                            if j.generation < current_gen {
+                                jobs_skipped += 1;
+                                pending_count.fetch_sub(1, Ordering::SeqCst);
+                            } else {
+                                batch.push(j);
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -1535,7 +1561,7 @@ pub async fn process_hydration_job(
     use crate::identity;
     
 
-    let crate::hydration::HydrationJob { mut rel_path, target_cfg, inode: job_inode } = job;
+    let crate::hydration::HydrationJob { mut rel_path, target_cfg, inode: job_inode, .. } = job;
     
     let target_caps = target_caps_ref.clone();
     if !target_cfg.target_uncached { target_caps.atomic_writes.store(false, Ordering::Relaxed); }

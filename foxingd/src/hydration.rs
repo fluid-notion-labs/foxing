@@ -29,6 +29,8 @@ pub struct HydrationJob {
     pub rel_path: PathBuf,
     pub target_cfg: TargetConfig,
     pub inode: Option<u64>,
+    /// Generation counter — jobs with stale generation are skipped by workers
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,8 @@ pub struct HydrationQueue {
     next_worker: Arc<AtomicUsize>,
     pub pending_count: Arc<AtomicUsize>,
     pub shutdown: Arc<AtomicBool>,
+    /// Incremented on recovery scan — stale-generation jobs are skipped by workers
+    pub generation: Arc<AtomicUsize>,
 }
 
 impl HydrationQueue {
@@ -58,6 +62,7 @@ impl HydrationQueue {
         let tracker = Arc::new(DashMap::new());
         let pending_count = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicUsize::new(0));
         let mut senders = Vec::with_capacity(worker_count);
         // Shared signature cache for tiered cloning — first target to complete
         // a file caches its Merkle/SyncSignature, subsequent targets reuse it.
@@ -74,12 +79,13 @@ impl HydrationQueue {
             let pending_clone = pending_count.clone();
             let stats_senders_clone = stats_senders.clone();
             let sig_cache_clone = sig_cache.clone();
+            let generation_clone = generation.clone();
 
             scope.spawn(async move {
                 crate::hydration_worker::run_hydration_worker_loop(
                     rx, source_clone, config_clone, governor_clone,
                     tuner_clone, worker_count, id, tracker_clone, pending_clone,
-                    stats_senders_clone, sig_cache_clone
+                    stats_senders_clone, sig_cache_clone, generation_clone
                 ).await
             });
         }
@@ -89,11 +95,20 @@ impl HydrationQueue {
             next_worker: Arc::new(AtomicUsize::new(0)),
             pending_count,
             shutdown,
+            generation: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Bump generation counter — workers will skip stale-generation jobs still in the queue.
+    /// Called before recovery_scan to invalidate pending bulk jobs from the previous scan.
+    pub fn bump_generation(&self) -> u64 {
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::info!("HydrationQueue: bumped generation to {} — stale jobs will be skipped", new_gen);
+        new_gen as u64
     }
 
     /// Synchronous try_send for use from non-tokio (spawn_blocking) contexts.
@@ -102,7 +117,7 @@ impl HydrationQueue {
         if self.shutdown.load(Ordering::Relaxed) || self.senders.is_empty() {
             return;
         }
-        let job = HydrationJob { rel_path, target_cfg, inode };
+        let job = HydrationJob { rel_path, target_cfg, inode, generation: self.generation.load(Ordering::Relaxed) as u64 };
         self.pending_count.fetch_add(1, Ordering::SeqCst);
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         let sender = &self.senders[worker_idx];
@@ -124,7 +139,7 @@ impl HydrationQueue {
             return;
         }
 
-        let job = HydrationJob { rel_path, target_cfg, inode };
+        let job = HydrationJob { rel_path, target_cfg, inode, generation: self.generation.load(Ordering::Relaxed) as u64 };
         self.pending_count.fetch_add(1, Ordering::SeqCst);
 
         // Round-robin across per-worker channels
