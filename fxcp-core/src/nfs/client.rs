@@ -573,21 +573,36 @@ impl NfsCompoundClient {
     }
 
     /// Read a complete RPC reply (record-mark framed) from the TCP stream.
+    /// Handles multi-fragment replies by reading until the last-fragment bit is set.
     fn read_reply(&mut self) -> Result<Vec<u8>, NfsError> {
-        let mut rm_buf = [0u8; 4];
-        self.stream.read_exact(&mut rm_buf)?;
-        let rm = u32::from_be_bytes(rm_buf);
-        let length = (rm & 0x7FFFFFFF) as usize;
+        let mut result = Vec::with_capacity(4096);
 
-        if length > 16 * 1024 * 1024 + 4096 {
-            return Err(NfsError::RpcError(format!("reply too large: {} bytes", length)));
+        loop {
+            let mut rm_buf = [0u8; 4];
+            self.stream.read_exact(&mut rm_buf)?;
+            let rm = u32::from_be_bytes(rm_buf);
+            let last_fragment = (rm & 0x80000000) != 0;
+            let length = (rm & 0x7FFFFFFF) as usize;
+
+            if length > 16 * 1024 * 1024 + 4096 {
+                return Err(NfsError::RpcError(format!("reply fragment too large: {} bytes", length)));
+            }
+
+            if result.is_empty() {
+                // First fragment — include the record mark for the parser
+                result.extend_from_slice(&rm_buf);
+            }
+
+            let offset = result.len();
+            result.resize(offset + length, 0);
+            self.stream.read_exact(&mut result[offset..])?;
+
+            if last_fragment {
+                break;
+            }
         }
 
-        let mut data = vec![0u8; 4 + length];
-        data[..4].copy_from_slice(&rm_buf);
-        self.stream.read_exact(&mut data[4..])?;
-
-        Ok(data)
+        Ok(result)
     }
 
     /// Get or resolve the NFS file handle for a directory path.
