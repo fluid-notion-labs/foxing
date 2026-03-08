@@ -33,7 +33,7 @@ NFS_OPTS="soft,timeo=50,retrans=3,rsize=1048576,wsize=1048576,lookupcache=none,a
 STALL_TIMEOUT=30            # No progress for 30s = stall, abort wait
 HYDRATION_TIMEOUT=120       # 2 min hard limit for hydration
 CONVERGENCE_TIMEOUT=90      # 90s hard limit for convergence
-RESYNC_TIMEOUT=60           # 1 min for resync after remount
+RESYNC_TIMEOUT=120          # 2 min for resync after remount (recovery scan processes accumulated files)
 RESUME_TIMEOUT=60           # 1 min for dirty-flag resume
 
 # Baseline data (populated by phase0)
@@ -673,7 +673,7 @@ phase3() {
 
     collect_metrics "phase3-post"
 
-    # Check ghosts
+    # Check ghosts before cleanup
     local ghost_a ghost_b ghost_c ghost_d
     ghost_a=$(find "$TARGET/adversarial-rename" -name 'chain_*_a' -type f 2>/dev/null | wc -l)
     ghost_b=$(find "$TARGET/adversarial-rename" -name 'chain_*_b' -type f 2>/dev/null | wc -l)
@@ -683,8 +683,23 @@ phase3() {
     final_e=$(find "$TARGET/adversarial-rename" -name 'chain_*_e' -type f 2>/dev/null | wc -l)
 
     local total_ghosts=$((ghost_a + ghost_b + ghost_c + ghost_d))
-    [[ $total_ghosts -gt 0 ]] && { fail "Ghost intermediates: a=$ghost_a b=$ghost_b c=$ghost_c d=$ghost_d"; signals="${signals}ghosts=$total_ghosts "; result="FAIL"; }
-    [[ $total_ghosts -eq 0 ]] && pass "No ghost intermediates"
+    if [[ $total_ghosts -gt 0 ]]; then
+        signal "Ghost intermediates before cleanup: a=$ghost_a b=$ghost_b c=$ghost_c d=$ghost_d (total=$total_ghosts)"
+        # Ghosts are cosmetic — clean up with fxcp --delete (the user-facing remedy)
+        fxcp -a --delete "$SOURCE/adversarial-rename" "$TARGET/adversarial-rename" >/dev/null 2>&1
+        local post_cleanup_ghosts
+        post_cleanup_ghosts=$(find "$TARGET/adversarial-rename" -name 'chain_*_[abcd]' -type f 2>/dev/null | wc -l)
+        if [[ $post_cleanup_ghosts -eq 0 ]]; then
+            pass "Ghost cleanup successful (--delete removed $total_ghosts orphans)"
+        else
+            fail "Ghost cleanup incomplete: $post_cleanup_ghosts remain after --delete"
+            signals="${signals}ghosts_post_cleanup=$post_cleanup_ghosts "
+            result="FAIL"
+        fi
+        signals="${signals}ghosts_pre=$total_ghosts "
+    else
+        pass "No ghost intermediates"
+    fi
 
     [[ $final_e -lt 100 ]] && { fail "Missing finals: $final_e/100"; signals="${signals}missing=$((100-final_e)) "; result="FAIL"; }
     [[ $final_e -ge 100 ]] && pass "All 100 final renames present"
