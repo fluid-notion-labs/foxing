@@ -1155,11 +1155,19 @@ async fn process_single_event_with_wal(
                     // Clean up ghost copies at the old path. The hydration walker
                     // may have concurrently created a copy at old_path after the
                     // rename moved it. Remove it if it doesn't exist on source.
-                    if op_result.is_ok() && old_path.exists() {
+                    // Do two cleanup passes with a brief yield to catch in-flight
+                    // hydration copies that land between the rename and cleanup.
+                    if op_result.is_ok() {
                         let old_rel = old_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
                         let old_on_source = source.mount.join(old_rel);
                         if !old_on_source.exists() {
                             let _ = std::fs::remove_file(&old_path);
+                            // Yield to let any in-flight hydration copy complete,
+                            // then clean up the ghost it may have created.
+                            tokio::task::yield_now().await;
+                            if old_path.exists() {
+                                let _ = std::fs::remove_file(&old_path);
+                            }
                         }
                     }
 
