@@ -697,6 +697,27 @@ impl NfsCompoundClient {
     }
 }
 
+/// Fast NFS server liveness check via NULL RPC.
+///
+/// Opens a fresh TCP connection to the NFS server and sends a NULL procedure
+/// call. Returns true if the server responds within 2 seconds. Does not
+/// touch any session or cached state — safe to call from the health probe.
+pub fn probe_server_alive(server_addr: &std::net::SocketAddr) -> bool {
+    use std::io::{Read, Write};
+    let mut stream = match std::net::TcpStream::connect_timeout(server_addr, std::time::Duration::from_secs(2)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let msg = rpc::build_null_call(1);
+    if stream.write_all(&msg).is_err() { return false; }
+    if stream.flush().is_err() { return false; }
+    // NULL reply is just an RPC reply header — reading any bytes means success
+    let mut rm_buf = [0u8; 4];
+    stream.read_exact(&mut rm_buf).is_ok()
+}
+
 /// Encode AUTH_SYS credentials.
 fn encode_auth_sys(enc: &mut super::xdr::XdrEncoder, uid: u32, gid: u32, machine: &str) {
     enc.encode_u32(rpc::AUTH_SYS);

@@ -388,6 +388,7 @@ impl Manager {
             // Mount identity tracking: detect target disappearance/remount
             struct MountState {
                 baseline_dev: u64,
+                mount_id: u64,
                 available: bool,
                 paused_since: Option<Instant>,
             }
@@ -395,12 +396,14 @@ impl Manager {
             for h in hydrators_arc.iter() {
                 for tgt_cfg in &h.targets {
                     let dev = std::fs::metadata(&tgt_cfg.path).map(|m| m.dev()).unwrap_or(0);
+                    let mid = fxcp_core::nfs::mount::get_mount_id(&tgt_cfg.path).unwrap_or(0);
                     let available = dev != 0;
                     if !available {
                         tgt_cfg.paused.store(true, Ordering::SeqCst);
                     }
                     mount_states.insert(tgt_cfg.path.clone(), MountState {
                         baseline_dev: dev,
+                        mount_id: mid,
                         available,
                         paused_since: if available { None } else { Some(Instant::now()) },
                     });
@@ -423,8 +426,21 @@ impl Manager {
                             if recovery {
                                 info!("Hydration: Recovery scan (no pruning) for {:?}", h.source.path);
                                 let h_clone = h.clone();
+                                let journal_targets: Vec<_> = h.targets.iter()
+                                    .filter(|t| !t.outage_journal.is_empty())
+                                    .cloned()
+                                    .collect();
                                 h.source.hydration.active.store(true, Ordering::SeqCst);
                                 std::thread::spawn(move || {
+                                    // Process outage journal first (fast, targeted)
+                                    if !journal_targets.is_empty() {
+                                        info!("Hydration: Processing {} outage journals before recovery scan",
+                                              journal_targets.len());
+                                        for tgt in &journal_targets {
+                                            h_clone.targeted_rescan(&tgt.outage_journal, tgt);
+                                        }
+                                    }
+                                    // Then full recovery scan (slow, comprehensive)
                                     h_clone.recovery_scan();
                                     Ok::<(), FoxingError>(())
                                 });
@@ -466,7 +482,7 @@ impl Manager {
                         for h in hydrators_arc.iter() {
                             for tgt_cfg in &h.targets {
                                 let state = mount_states.entry(tgt_cfg.path.clone()).or_insert(MountState {
-                                    baseline_dev: 0, available: false, paused_since: Some(Instant::now()),
+                                    baseline_dev: 0, mount_id: 0, available: false, paused_since: Some(Instant::now()),
                                 });
 
                                 // 1. Device ID check
@@ -527,6 +543,32 @@ impl Manager {
                                     tgt_cfg.outage_journal.clear();
                                     h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                }
+
+                                // Mount ID check: detect NFS remount even when device ID
+                                // stays the same. /proc/self/mountinfo assigns a new mount
+                                // ID on each mount, even for the same server:export.
+                                let current_mount_id = fxcp_core::nfs::mount::get_mount_id(&tgt_cfg.path).unwrap_or(0);
+                                if current_mount_id != state.mount_id && state.mount_id != 0 && current_mount_id != 0 {
+                                    info!("Target {:?} mount ID changed ({} → {}) — requesting recovery",
+                                          tgt_cfg.path, state.mount_id, current_mount_id);
+                                    state.mount_id = current_mount_id;
+                                    state.baseline_dev = current_dev;
+                                    if !state.available {
+                                        // Was unavailable, now remounted — unpause and recover
+                                        tgt_cfg.paused.store(false, Ordering::SeqCst);
+                                        state.paused_since = None;
+                                    }
+                                    // Don't clear outage journal — the targeted rescan path
+                                    // (line 436+) will process journaled paths first, which is
+                                    // faster than a full recovery walk for accumulated files.
+                                    // Also request recovery scan to catch anything the journal missed.
+                                    h.source.hydration.request_rescan.store(true, Ordering::SeqCst);
+                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
+                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                }
+                                if current_mount_id != 0 {
+                                    state.mount_id = current_mount_id;
                                 }
 
                                 state.available = reachable;

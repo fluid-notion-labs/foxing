@@ -469,3 +469,28 @@ pub fn nfs4_error_name(code: u32) -> &'static str {
         _ => "NFS4ERR_UNKNOWN",
     }
 }
+
+/// Build a minimal NFS NULL RPC call (zero-overhead server liveness check).
+///
+/// The NULL procedure requires no session, no filehandle, no authentication.
+/// Response time is <1ms when the server is reachable. Standard NFS liveness probe.
+pub fn build_null_call(xid: u32) -> Vec<u8> {
+    let mut body = XdrEncoder::new(64);
+    body.encode_u32(xid);
+    body.encode_u32(0);              // CALL
+    body.encode_u32(RPC_VERSION);
+    body.encode_u32(NFS_PROGRAM);
+    body.encode_u32(NFS_V4);
+    body.encode_u32(NFSPROC4_NULL);  // procedure 0 = NULL
+    // AUTH_NONE credentials + verifier
+    body.encode_u32(AUTH_NONE);
+    body.encode_u32(0);
+    body.encode_u32(AUTH_NONE);
+    body.encode_u32(0);
+    let bytes = body.into_bytes();
+    let rm = 0x80000000u32 | (bytes.len() as u32);
+    let mut msg = Vec::with_capacity(4 + bytes.len());
+    msg.extend_from_slice(&rm.to_be_bytes());
+    msg.extend_from_slice(&bytes);
+    msg
+}

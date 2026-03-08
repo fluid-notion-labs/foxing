@@ -134,6 +134,31 @@ pub fn probe_nfs_bypass(path: &Path) -> Option<NfsBypassInfo> {
     })
 }
 
+/// Get the mount ID for a path from `/proc/self/mountinfo`.
+///
+/// Each mount gets a unique ID. After lazy unmount + remount, the mount ID
+/// changes even if the device ID stays the same. This detects NFS remounts
+/// that `metadata().dev()` misses.
+pub fn get_mount_id(path: &Path) -> Option<u64> {
+    let canonical = path.canonicalize().ok()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, u64)> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 { continue; }
+        let mount_id: u64 = fields[0].parse().ok()?;
+        let mount_point = fields[4];
+        let mp = PathBuf::from(mount_point);
+        if canonical.starts_with(&mp) {
+            let len = mount_point.len();
+            if best.map_or(true, |(best_len, _)| len > best_len) {
+                best = Some((len, mount_id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// Maximum NFS file handle size (kernel constant).
 const MAX_HANDLE_SZ: usize = 128;
 
