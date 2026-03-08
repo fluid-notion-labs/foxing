@@ -13,11 +13,14 @@ digraph mount_monitoring {
         style="filled"; fillcolor="#e0f7fa";
         fontsize=12; fontname="Helvetica-Bold";
 
+        proc_mounts [label="0. /proc/mounts Check\nGlobal namespace\n(detects lazy unmount)", fillcolor="#80deea"];
         stat_check [label="1. Device ID Check\nmetadata(target_path).dev()\nCompare vs baseline_dev", fillcolor="#80deea"];
         fsync_probe [label="2. Fsync Liveness Probe\nopen(.foxing_mount_probe)\nwrite + sync_all()\n(catches stale NFS cache)", fillcolor="#80deea"];
         eval [label="3. Evaluate Reachability\nreachable = dev_match AND live", shape=diamond, fillcolor="#4dd0e1"];
     }
 
+    proc_mounts -> gone [label="mount absent\n(lazy unmount)", color=red];
+    proc_mounts -> stat_check [label="mount present"];
     stat_check -> fsync_probe [label="stat OK"];
     stat_check -> gone [label="stat FAILS", color=red];
     fsync_probe -> eval [label="result"];
@@ -43,7 +46,7 @@ digraph mount_monitoring {
 
     gone -> unavailable [label="pause workers\nset paused=true"];
     recovered -> available [label="unpause workers\nupdate baseline_dev"];
-    remounted -> available [label="update baseline_dev\nclear outage journal"];
+    remounted -> available [label="update baseline_dev"];
 
     // Recovery actions
     subgraph cluster_recovery {
@@ -65,11 +68,16 @@ digraph mount_monitoring {
         style="filled"; fillcolor="#e8eaf6";
         fontsize=12; fontname="Helvetica-Bold";
 
-        journal [label="DashSet<PathBuf>\nRecords modified paths\nwhile target unavailable", shape=cylinder, fillcolor="#9fa8da"];
+        journal [label="DashSet<PathBuf>\nRecords modified paths\nwhile target unavailable\n+ copy failures during\ndetection gap", shape=cylinder, fillcolor="#9fa8da"];
         overflow [label="Journal Overflow\n> 100,000 entries\n→ clear (forces full scan)", shape=diamond, fillcolor="#ef9a9a"];
     }
 
     unavailable -> journal [label="drain events\ninto journal"];
+
+    // Copy failures during detection gap also feed journal
+    copy_fail [label="Worker Copy Failure\n(target unreachable\nbefore pause detected)", fillcolor="#ffcdd2"];
+    available -> copy_fail [label="copy error\n(detection gap)", style=dashed, color=red];
+    copy_fail -> journal [label="insert rel_path", color=red];
     journal -> overflow [label="check size"];
     overflow -> journal [label="< max", style=dashed];
     overflow -> full_scan [label="> max\n(clear journal)", color=red];

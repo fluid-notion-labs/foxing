@@ -78,6 +78,19 @@ digraph nfs_bypass {
     verify -> success [label="NFS4_OK", color=green, penwidth=2];
     verify -> vfs_path [label="any error", color=orange, style=dashed];
 
+    // Batch stat (prescan)
+    subgraph cluster_batchstat {
+        label="Batch Stat (Hydration Prescan)";
+        style="filled"; fillcolor="#e0f2f1";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        batch_compound [label="SEQUENCE\n+ PUTFH(dir_handle)\n+ [LOOKUP(file) + GETATTR]×7\nSIZE + TIME_MODIFY", fillcolor="#80cbc4"];
+        batch_result [label="Cache Results\nHashMap<path, (size, mtime_s, mtime_ns)>\nSkip unchanged files in\nsync_file_needed()", fillcolor="#80cbc4"];
+    }
+
+    cache -> batch_compound [label="dir handle\n(prescan path)", style=dashed];
+    batch_compound -> batch_result [label="up to 7 files\nper compound"];
+
     // Session recovery
     session_err [label="Session Recovery\nReconnect TCP\nRe-establish session\nClear handle cache", fillcolor="#ef9a9a"];
 

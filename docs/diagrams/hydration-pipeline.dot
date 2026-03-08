@@ -25,8 +25,8 @@ digraph hydration {
         style="filled"; fillcolor="#e8eaf6";
         fontsize=12; fontname="Helvetica-Bold";
 
-        full_scan [label="Full Scan\n1. WalkDir source tree\n2. Tree pruning (Merkle dir hash)\n3. Signature verification\n4. Queue mismatched files", fillcolor="#9fa8da"];
-        recovery [label="Recovery Scan\n1. Clear ALL dir hashes on target\n2. Full scan WITHOUT pruning\n3. Verifies every file", fillcolor="#ef9a9a"];
+        full_scan [label="Full Scan\n1. WalkDir source tree\n2. Tree pruning (Merkle dir hash)\n3. NFS batch_stat prescan\n4. Signature verification\n5. Queue mismatched files", fillcolor="#9fa8da"];
+        recovery [label="Recovery Scan\n1. Bump generation counter\n2. Clear ALL dir hashes on target\n3. NFS batch_stat prescan\n4. Full scan WITHOUT pruning", fillcolor="#ef9a9a"];
         targeted [label="Targeted Rescan\n1. Read outage journal\n2. Check only logged paths\n3. Size+mtime comparison\n4. Queue missing/changed", fillcolor="#a5d6a7"];
     }
 
@@ -58,6 +58,7 @@ digraph hydration {
         style="filled"; fillcolor="#e0f2f1";
         fontsize=12; fontname="Helvetica-Bold";
 
+        nfs_prescan [label="0. NFS Prescan Cache\nbatch_stat compound\n(7 files per RPC)", fillcolor="#4db6ac"];
         check_dirty [label="1. Check dirty flag\n(sidecar xattr)", fillcolor="#80cbc4"];
         check_sig [label="2. Compare SyncSignature\n(size + mtime)", fillcolor="#80cbc4"];
         lite_hash [label="3. BLAKE3 Lite Hash\n(head 4KB + tail 4KB)", fillcolor="#80cbc4"];
@@ -66,7 +67,9 @@ digraph hydration {
         skip [label="Skip (up to date)", shape=octagon, fillcolor="#c8e6c9"];
     }
 
-    scan_dir -> check_dirty;
+    scan_dir -> nfs_prescan;
+    nfs_prescan -> skip [label="size+mtime match\n(cached from batch_stat)"];
+    nfs_prescan -> check_dirty [label="no cache hit\nor mismatch"];
     check_dirty -> needs_sync [label="dirty=true"];
     check_dirty -> check_sig [label="not dirty"];
     check_sig -> needs_sync [label="size/mtime differ"];
@@ -82,7 +85,7 @@ digraph hydration {
         style="filled"; fillcolor="#fce4ec";
         fontsize=12; fontname="Helvetica-Bold";
 
-        queue [label="HydrationQueue\nPer-worker mpsc channels\nRound-robin distribution\nBackpressure: try_send", shape=cylinder, fillcolor="#f48fb1"];
+        queue [label="HydrationQueue\nPer-worker mpsc channels\nRound-robin distribution\nGeneration counter (skip stale)", shape=cylinder, fillcolor="#f48fb1"];
         hw0 [label="Hydration\nWorker 0", fillcolor="#ef9a9a"];
         hw1 [label="Hydration\nWorker 1", fillcolor="#ef9a9a"];
         hw2 [label="Hydration\nWorker 2", fillcolor="#ef9a9a"];

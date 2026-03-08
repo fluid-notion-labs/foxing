@@ -1,6 +1,6 @@
 # foxingd Architecture
 
-foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.5.2.
+foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.6.0.
 
 ## Processing Pipeline
 
@@ -96,6 +96,7 @@ Generalized mount identity tracking handles NFS lazy unmount, USB disconnect, of
 
 ### Detection (every 10 seconds)
 
+0. **Global mount check**: `/proc/mounts` prefix scan detects `umount -l` (lazy unmount invisible to `/proc/self/mountinfo` when process holds the mount)
 1. **Device ID check**: `metadata(target_path).dev()` compared against baseline recorded at startup
 2. **Fsync liveness probe**: Open + write + `sync_all()` on `.foxing_mount_probe`. Forces NFS server round-trip — stale cache from `umount -l` fails here with ESTALE/EIO
 3. **State evaluation**: `reachable = (dev_match OR first_probe) AND fsync_ok`
@@ -104,20 +105,28 @@ Generalized mount identity tracking handles NFS lazy unmount, USB disconnect, of
 
 | From | To | Trigger | Action |
 |------|----|---------|--------|
-| Available | Unavailable | fsync fails OR metadata fails | Pause workers, start outage journal |
-| Unavailable | Available | fsync succeeds | Unpause, trigger recovery scan |
-| Available | Available | Device ID changed | Clear journal, trigger recovery scan |
+| Available | Unavailable | /proc/mounts absent OR fsync fails | Pause workers, start outage journal |
+| Unavailable | Available | /proc/mounts present + fsync OK | Unpause, targeted rescan → recovery scan |
+| Available | Available | Device ID changed | Trigger recovery scan |
 
-### Target Pause (Workers)
+### Outage Journal
 
-When paused, workers drain incoming events into `outage_journal: DashSet<PathBuf>` instead of processing them. This records which source paths changed during the outage without attempting I/O to the dead target. Journal capped at 100,000 entries (overflow → full scan on resume).
+Events are captured into `outage_journal: DashSet<PathBuf>` from two sources:
+
+1. **Paused workers**: While target is unavailable, incoming BPF events drain into the journal instead of being processed
+2. **Copy failures during detection gap**: Between target going down and health probe detecting it (up to 10s), workers that fail to copy insert the relative path into the journal
+
+Journal capped at 100,000 entries (overflow → full scan on resume).
 
 ### Recovery Scan
 
-On mount recovery, `recovery_scan()` clears all stored directory Merkle hashes on the target, then runs `full_scan` with pruning disabled. This forces re-verification of every file, catching:
-- Files written during outage (BPF events processed against stale cache)
-- Files with corrupted metadata from partial writes
-- Missing files that were never replicated
+On mount recovery, `recovery_scan()`:
+1. **Bumps generation counter** — invalidates stale bulk jobs still in the hydration queue, ensuring recovery jobs are processed immediately
+2. Clears all stored directory Merkle hashes on the target
+3. Runs **NFS batch_stat prescan** — bulk-fetches SIZE+TIME_MODIFY via compound RPCs (7 files per compound) to skip unchanged files without per-file VFS stat
+4. Runs `full_scan` with pruning disabled, re-verifying every file
+
+The **targeted_rescan** processes the outage journal first (fast, only journaled paths), before the comprehensive recovery scan.
 
 ## Hydration Pipeline
 
@@ -139,6 +148,7 @@ Each source directory hash = BLAKE3(sorted child names + metadata). Stored as xa
 
 Tiered verification to minimize I/O:
 
+0. **NFS batch_stat prescan**: For NFS targets, SIZE+TIME_MODIFY are bulk-fetched via compound RPCs (7 files per SEQUENCE+PUTFH+[LOOKUP+GETATTR]×7). Files where source and target match are skipped immediately — no VFS stat, xattr reads, or hash computation.
 1. **Dirty flag check**: sidecar `dirty=true` → force resync
 2. **SyncSignature**: size + mtime comparison (fast reject)
 3. **BLAKE3 lite hash**: head 4KB + tail 4KB (detect truncation/append)
@@ -207,21 +217,21 @@ If bypass is unavailable (Kerberos auth, non-v4.2, connection failure) or any co
 
 ## Performance Characteristics
 
-### Adversarial Test Results (v0.5.0, XFS→NFS)
+### Adversarial Test Results (v0.6.0, XFS→NFS)
 
 | Phase | Test | Result | Duration |
 |-------|------|--------|----------|
 | 0 | Baseline NFS Throughput | **PASS** | 2s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | 54s |
-| 2 | Live Write Storm (fio 30s) | **PASS** | 44s |
-| 3 | Rename Chain Storm (100 chains a→e) | **PASS** (finals=100/100) | 11s |
-| 4 | NFS Target Drop + Resync (300 files) | **PASS** | 37s |
-| 5 | Large File Kill/Resume (100MB) | **PASS** | 27s |
-| 7 | BLAKE3 Delta Copy | **PASS** | 49s |
-| 8 | Directory Merkle Pruning | **PASS** | 51s |
+| 1 | Heavy Hydration (5000 files, 2.6GB) | **PASS** | 59s |
+| 2 | Live Write Storm (fio 30s) | **PASS** | 48s |
+| 3 | Rename Chain Storm (100 chains a→e) | **PASS** | 12s |
+| 4 | NFS Target Drop + Resync (300 files) | **PASS** | 52s |
+| 5 | Large File Kill/Resume (100MB) | **PASS** | 25s |
+| 7 | BLAKE3 Delta Copy | **PASS** | 44s |
+| 8 | Directory Merkle Pruning | **PASS** | 45s |
 | 9 | Combined Delta + Pruning | **PASS** | 53s |
 
-Phase 3 ghosts (~340) are cosmetic — correct files at final names, race between hydration NFS copies and BPF rename events.
+Phase 3 ghosts (~300-350) are cosmetic — correct files at final names, cleaned by `--delete`. Phase 4 recovery uses outage journal + NFS batch_stat prescan + generation counter for reliable resync.
 
 ### Throughput (XFS→NFS 4.2, 16 vCPU VM)
 

@@ -408,3 +408,69 @@ python3 tests/harness.py --benchmark --compare tests/baseline.json
 ```
 
 The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system time, context switches, and disk I/O via GNU time and `/proc/diskstats`.
+
+## Comparison with Other Replication Tools
+
+### vs rsync
+
+| Metric | rsync | foxing |
+|--------|-------|--------|
+| **Change detection** | Full file walk + mtime/size | BPF kernel events (O(1), ~16ms) |
+| **Delta transfer** | Rolling checksum (reads whole file) | BLAKE3 Merkle tree (64KB chunks, reads only dirty) |
+| **Small files NFS** | 2.7s (1000×4KB) | 2.5s (NFS compound RPC) — **1.10x** |
+| **Server-side copy** | None (always transfers data) | FICLONE (NFS→NFS same server) — **3.44x** |
+| **Data reduction** | ~50% (changed files only) | **97%** (chunk-level delta) |
+| **Resume after crash** | Full re-scan + checksum | Dir Merkle hash O(dirs) — **>24x** |
+| **Memory** | 7.5MB RSS | 1MB RSS — **7.5x less** |
+
+rsync is faster for single large files (335ms vs 428ms for 100MB) due to optimized streaming. foxing wins on small-file NFS (compound RPC bypass), delta efficiency (97% reduction), and continuous replication (16ms vs batch-scheduled).
+
+### vs lsyncd (inotify + rsync)
+
+| Metric | lsyncd | foxing |
+|--------|--------|--------|
+| **Event source** | inotify (userspace, ~128K watch limit) | eBPF (kernel-space, unlimited) |
+| **Latency** | 1-5s (batch delay + rsync fork) | **16-20ms** (BPF → copy → fsync) |
+| **Copy method** | rsync fork per batch (~7.5MB each) | In-process tiered copy (1MB RSS) |
+| **Rename handling** | Delete + recopy | Direct rename propagation |
+
+foxing is 50-300x lower latency than lsyncd. lsyncd requires inotify watches per directory (kernel limit ~128K), while foxing uses a single BPF program per device.
+
+### vs DRBD (block-level replication)
+
+| Metric | DRBD | foxing |
+|--------|------|--------|
+| **Level** | Block device (sector-level) | Filesystem (file-level) |
+| **Consistency** | Synchronous (Protocol C) | Eventual (~16ms single file) |
+| **Topology** | Primary-secondary (1:1) | 1:N (one source, many targets) |
+| **Cross-filesystem** | No (same block device) | Yes (XFS→NFS, btrfs→ext4, etc.) |
+
+DRBD provides stronger consistency (synchronous) but requires identical block devices. foxing operates at the filesystem level — replicate across filesystem boundaries, networks, and storage tiers.
+
+### vs Ceph / GlusterFS (distributed filesystems)
+
+| Metric | Ceph/Gluster | foxing |
+|--------|-------------|--------|
+| **Architecture** | Distributed filesystem (unified namespace) | Async file replicator (separate namespaces) |
+| **Minimum nodes** | 3+ (quorum) | 1 source + N targets |
+| **Complexity** | High (MON, OSD, MDS / bricks) | Low (single binary, TOML config) |
+| **Recovery** | Rebalancing (minutes-hours) | Journal-first + full scan (<10s) |
+
+foxing is NOT a distributed filesystem — it's a unidirectional replication engine. Ceph/Gluster provide unified namespaces with strong consistency. foxing maintains separate filesystem copies with async replication, trading consistency for simplicity and cross-platform flexibility.
+
+### Summary: Where Foxing Wins and Loses
+
+**Wins:**
+- Small-file NFS replication (compound RPC bypass, 1 round-trip per file)
+- Delta efficiency (97% data reduction via BLAKE3 Merkle, 64KB chunks)
+- Event latency (16-20ms BPF-driven, not polling)
+- Recovery speed (<1s dir Merkle resume, <10s NFS journal recovery)
+- Server-side NFS copy (3.44x vs rsync via FICLONE)
+- Memory footprint (1MB RSS vs rsync 7.5MB)
+
+**Loses:**
+- Large single files (rsync streaming 22% faster for 100MB)
+- Mixed workloads to NFS (directory creation overhead)
+- No bidirectional sync (unidirectional only)
+- Binary size (290MB foxingd vs 0.7MB rsync)
+- Root required for foxingd (CAP_BPF + CAP_NET_BIND_SERVICE)

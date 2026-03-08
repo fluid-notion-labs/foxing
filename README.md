@@ -1,15 +1,15 @@
 # Foxing: High-Fidelity Filesystem Replication
 
-![Version](https://img.shields.io/badge/version-0.5.2-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
+![Version](https://img.shields.io/badge/version-0.6.0-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
 
 **Foxing** is a high-performance filesystem replication system with two components:
 
 - **fxcp** — Standalone smart copy tool. Drop-in replacement for `rsync`/`cp` with auto-adaptive CoW/reflink, io_uring, and BLAKE3 Merkle delta detection. No BPF or root required.
 - **foxingd** — eBPF-powered replication daemon for continuous, event-driven mirroring with sub-millisecond latency.
 
-## Performance (fxcp vs rsync vs cp)
+## Performance
 
-Measured on btrfs-over-LUKS2 (NVMe), Fedora 43, kernel 6.17:
+### fxcp vs rsync vs cp (btrfs-over-LUKS2, NVMe)
 
 | Workload | rsync | cp | fxcp | fxcp vs rsync |
 |----------|------:|---:|-----:|--------------:|
@@ -18,7 +18,25 @@ Measured on btrfs-over-LUKS2 (NVMe), Fedora 43, kernel 6.17:
 | Mixed (5K files, 2.1GB) | 3998ms | 239ms | **383ms** | **10x faster** |
 | Sparse files (10x50MB) | 764ms | 3ms | **21ms** | **36x faster** |
 
-fxcp auto-selects the optimal strategy: reflink (instant CoW) for same-device copies, sendfile for small files, io_uring for large cross-device transfers.
+### NFS 4.2 Performance (XFS NVMe → NFS HDD)
+
+| Workload | rsync | fxcp | fxcp vs rsync |
+|----------|------:|-----:|--------------:|
+| 1000×4KB small files | 2.7s | **2.5s** | **1.10x faster** |
+| 5000 tiny files | 13.2s | **12.3s** | **1.07x faster** |
+| NFS→NFS 100MB (same server) | 286ms | **83ms** | **3.44x faster** |
+
+### foxingd Daemon Latency (BPF event-driven)
+
+| Workload | XFS→XFS | XFS→NFS |
+|----------|--------:|--------:|
+| Single file create (4KB) | **16ms** | **20ms** |
+| Single file create (64KB) | **16ms** | **20ms** |
+| Delta resync (10/20 modified) | **~3s** | — |
+
+fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 16-20ms replication latency.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices and tool comparisons.
 
 ## Quick Start: fxcp (No Root, No BPF)
 
@@ -101,11 +119,11 @@ cargo build --release --workspace
 
 ```
 foxing/
-├── fxcp-core/     Smart copy engine library (io_uring, reflink, Merkle, sidecar)
-├── fxcp/          Standalone CLI binary (~130MB, no BPF)
-├── foxingd/       eBPF replication daemon (~220MB, requires libbpf)
-├── tests/         Regression harness (rsync/cp/fxcp/foxingd comparison)
-└── docs/          Architecture decisions, diagrams, and documentation
+├── fxcp-core/     Smart copy engine library (io_uring, reflink, Merkle, NFS bypass)
+├── fxcp/          Standalone CLI binary (~142MB, no BPF)
+├── foxingd/       eBPF replication daemon (~290MB, requires libbpf)
+├── tests/         Regression harness + adversarial test suite
+└── docs/          Architecture, diagrams, configuration reference
 ```
 
 ## Architecture
@@ -342,32 +360,31 @@ make test-json     # JSON output for CI
 make test-compare  # Compare against saved baseline
 ```
 
-### foxingd Adversarial Test Suite (v0.4.1)
+### foxingd Adversarial Test Suite (v0.6.0)
 
-9-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2):
+9-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2), all passing:
 
-| Phase | Test | Result |
-|-------|------|--------|
-| 0 | Baseline NFS Throughput (cp/rsync) | **PASS** |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** |
-| 2 | Live Write Storm (fio 30s) | **PASS** |
-| 3 | Rename Chain Storm (100 chains a→e) | **PASS** |
-| 4 | NFS Target Drop + Resync (300 files) | **PASS** |
-| 5 | Large File Kill/Resume (100MB) | **PASS** |
-| 7 | BLAKE3 Delta Copy on Resync | **PASS** (combined) |
-| 8 | Directory Merkle Pruning | **PASS** (combined) |
-| 9 | Combined Delta + Pruning | **PASS** |
+| Phase | Test | Result | Key Metric |
+|-------|------|--------|------------|
+| 0 | Baseline NFS Throughput | **PASS** | cp=193MB/s rsync=113MB/s |
+| 1 | Heavy Hydration (5000 files, 2.6GB) | **PASS** | Converged in ~15s |
+| 2 | Live Write Storm (fio 30s) | **PASS** | Back-pressure handling |
+| 3 | Rename Chain Storm (100 chains a→e) | **PASS** | 100/100 finals, ghosts cleaned |
+| 4 | NFS Target Drop + Resync (300 files) | **PASS** | Outage journal + batch_stat recovery |
+| 5 | Large File Kill/Resume (100MB) | **PASS** | SHA-256 verified after SIGKILL |
+| 7 | BLAKE3 Delta Copy on Resync | **PASS** | 10 deltas, 20MB saved (97% reduction) |
+| 8 | Directory Merkle Pruning | **PASS** | 13 dirs pruned |
+| 9 | Combined Delta + Pruning | **PASS** | Both optimizations active |
 
 ## Documentation
 
 - **[API Reference (rustdoc)](https://aenertia.codeberg.page/foxing/)** — Live auto-generated API documentation
 - [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling (graphviz)
+- [Benchmarks & Comparisons](BENCHMARKS.md) — Performance data, MTTC matrices, tool comparisons
 - [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
 - [Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md) — Default limits and safety behaviors
 - [Failure Scenarios](docs/FAILURE_SCENARIOS.md) — Disconnect, crash, ransomware, capacity exhaustion
 - [Versioning Simulation](docs/VERSIONING_SIMULATION.md) — Disk space usage under different workloads
-- [ADR-001: Workspace Split](docs/adr/001-workspace-split.md) — Architecture decision record
-- [Implementation Plan](docs/adr/001-implementation-plan.md) — Phase-by-phase execution plan
 
 ## Why the name?
 
@@ -377,4 +394,4 @@ It also nods to the classic pangram, "The quick brown fox jumps over the lazy do
 
 ## License
 
-GPLv2
+GPL-2.0-or-later
