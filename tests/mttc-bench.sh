@@ -501,7 +501,7 @@ add_p2_workload "rename 4KB" \
 add_p2_workload "batch 10x4KB" \
     ":" \
     "for i in \$(seq 1 10); do dd if=/dev/urandom of=\$SRC/p2b\${P2_ITER}_\$i.dat bs=4K count=1 2>/dev/null; done" \
-    "wait_for_batch \$SRC \$DST 'p2b\${P2_ITER}_*.dat' 10 15000"
+    "wait_for_batch \$SRC \$DST \"p2b\${P2_ITER}_*.dat\" 10 15000"
 
 # Collect Phase 2 results
 P2_NUM_TOPOS=${#P2_TOPO_NAMES[@]}
