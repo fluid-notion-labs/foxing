@@ -219,37 +219,42 @@ impl NfsCompoundClient {
         body.encode_u32(2); // minorversion
         body.encode_u32(1); // 1 operation
 
-        // CREATE_SESSION operation
+        // CREATE_SESSION operation (RFC 8881 §18.36)
         body.encode_u32(rpc::OP_CREATE_SESSION);
         body.encode_u64(client_id);          // csa_clientid
-        body.encode_u32(1);                   // csa_sequence (from EXCHANGE_ID)
-        body.encode_u32(0x00000003);          // csa_flags: CREATE_SESSION4_FLAG_PERSIST | CONN_BACK_CHAN
-        // csa_fore_chan_attrs: ca_headerpadsize, ca_maxrequestsize, ca_maxresponsesize,
-        //   ca_maxresponsesize_cached, ca_maxoperations, ca_maxrequests, ca_rdma_ird
+        body.encode_u32(1);                   // csa_sequence (from EXCHANGE_ID eir_sequenceid)
+        body.encode_u32(0);                   // csa_flags: 0 (no persist, no back channel)
+        // csa_fore_chan_attrs (channel_attrs4):
+        //   headerpadsize, maxrequestsize, maxresponsesize,
+        //   maxresponsesize_cached, maxoperations, maxrequests, rdma_ird[]
         body.encode_u32(0);                   // ca_headerpadsize
-        body.encode_u32(16 * 1024 * 1024 + 4096); // ca_maxrequestsize (16MB + framing)
-        body.encode_u32(4096);                // ca_maxresponsesize
+        body.encode_u32(16 * 1024 * 1024 + 4096); // ca_maxrequestsize
+        body.encode_u32(1024 * 1024);         // ca_maxresponsesize
         body.encode_u32(4096);                // ca_maxresponsesize_cached
         body.encode_u32(16);                  // ca_maxoperations
         body.encode_u32(1);                   // ca_maxrequests (1 slot)
-        body.encode_u32(0);                   // ca_rdma_ird count (no RDMA)
-        // csa_back_chan_attrs (same structure, minimal)
+        body.encode_u32(0);                   // ca_rdma_ird count (empty array)
+        // csa_back_chan_attrs (minimal — no back channel)
         body.encode_u32(0);                   // ca_headerpadsize
         body.encode_u32(4096);                // ca_maxrequestsize
         body.encode_u32(4096);                // ca_maxresponsesize
-        body.encode_u32(4096);                // ca_maxresponsesize_cached
+        body.encode_u32(0);                   // ca_maxresponsesize_cached
         body.encode_u32(2);                   // ca_maxoperations
-        body.encode_u32(1);                   // ca_maxrequests
+        body.encode_u32(0);                   // ca_maxrequests (0 = no back channel)
         body.encode_u32(0);                   // ca_rdma_ird count
         // csa_cb_program
-        body.encode_u32(0x40000000);          // callback program number
-        // csa_sec_parms: 1 element, AUTH_SYS
-        body.encode_u32(1);                   // count
-        body.encode_u32(rpc::AUTH_SYS);       // flavor
-        // secparms4 for AUTH_SYS: target, source (both machinenames)
-        // Actually it's: case RPCSEC_GSS... simplified — just target_window
-        // The correct encoding for SP4_NONE + AUTH_SYS callback is minimal:
-        body.encode_u32(0);                   // no additional sec parms
+        body.encode_u32(0x40000000);          // callback program number (unused)
+        // csa_sec_parms: callback_sec_parms4[]
+        // For AUTH_SYS: secflavor(4) + authsys_parms
+        body.encode_u32(1);                   // array count: 1 element
+        body.encode_u32(rpc::AUTH_SYS);       // cb_secflavor
+        // authsys_parms (cbsp_sys_cred):
+        body.encode_u32(0);                   // stamp
+        body.encode_string(&self.machine);    // machinename
+        body.encode_u32(self.uid);            // uid
+        body.encode_u32(self.gid);            // gid
+        body.encode_u32(1);                   // gids count
+        body.encode_u32(self.gid);            // gids[0]
 
         let body_bytes = body.into_bytes();
         let mut msg = Vec::with_capacity(4 + body_bytes.len());

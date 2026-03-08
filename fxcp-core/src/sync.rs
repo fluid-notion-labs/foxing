@@ -434,7 +434,9 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
     #[cfg(feature = "nfs-bypass")]
     {
         let nfs_bypass_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
-        if dst_caps.is_nfs.load(Ordering::Relaxed) && nfs_bypass_env != "0" {
+        let is_nfs = dst_caps.is_nfs.load(Ordering::Relaxed);
+        debug!("NFS bypass init: is_nfs={}, env={}", is_nfs, nfs_bypass_env);
+        if is_nfs && nfs_bypass_env != "0" {
             match crate::nfs::mount::probe_nfs_bypass(&destination) {
                 Some(info) => {
                     match crate::nfs::NfsCompoundClient::connect(&info) {
