@@ -476,7 +476,17 @@ impl NfsCompoundClient {
             Nfs4Op::PutRootFh,
         ];
 
-        // Add LOOKUP for each path component
+        // Get the export root filehandle via name_to_handle_at on the mount point,
+        // then LOOKUP from there into the target subdirectory.
+        // Using PUTFH(mount_point_handle) instead of PUTROOTFH avoids pseudo-root
+        // permission restrictions.
+        let mount_fh = super::mount::resolve_nfs_handle(&self.server_info.mount_point)
+            .map_err(|e| NfsError::StaleHandle { path: format!("mount point: {}", e) })?;
+        // Replace PUTROOTFH with PUTFH(mount_point_handle)
+        ops.pop(); // Remove PutRootFh
+        ops.push(Nfs4Op::PutFh { handle: mount_fh });
+
+        // Now LOOKUP only the relative path components (within the export)
         for component in rel_path.components() {
             if let std::path::Component::Normal(name) = component {
                 ops.push(Nfs4Op::Lookup { name: name.to_string_lossy().to_string() });
@@ -492,6 +502,12 @@ impl NfsCompoundClient {
 
         let reply_data = self.read_reply()?;
         let reply = rpc::parse_compound_reply(&reply_data)?;
+
+        debug!("NFS LOOKUP reply: overall_status={} ({}) ops={}",
+               reply.status, rpc::nfs4_error_name(reply.status), reply.op_results.len());
+        for (i, r) in reply.op_results.iter().enumerate() {
+            debug!("  LOOKUP op[{}]: op={} status={} ({})", i, r.op, r.status, rpc::nfs4_error_name(r.status));
+        }
 
         if reply.status != rpc::NFS4_OK {
             return Err(NfsError::Nfs4Error {

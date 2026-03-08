@@ -444,6 +444,8 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
 pub fn nfs4_error_name(code: u32) -> &'static str {
     match code {
         NFS4_OK => "NFS4_OK",
+        1 => "NFS4ERR_PERM",
+        NFS4ERR_NOENT => "NFS4ERR_NOENT",
         NFS4ERR_STALE => "NFS4ERR_STALE",
         NFS4ERR_NOENT => "NFS4ERR_NOENT",
         NFS4ERR_EXIST => "NFS4ERR_EXIST",
