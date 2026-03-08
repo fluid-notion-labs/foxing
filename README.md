@@ -1,6 +1,6 @@
 # Foxing: High-Fidelity Filesystem Replication
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue) ![License](https://img.shields.io/badge/license-GPLv2-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange)
+![Version](https://img.shields.io/badge/version-0.5.0-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
 
 **Foxing** is a high-performance filesystem replication system with two components:
 
@@ -357,6 +357,7 @@ make test-compare  # Compare against saved baseline
 
 ## Documentation
 
+- **[API Reference (rustdoc)](https://aenertia.codeberg.page/foxing/)** — Live auto-generated API documentation
 - [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling (graphviz)
 - [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
 - [Configuration Defaults](docs/CONFIGURATION_DEFAULTS.md) — Default limits and safety behaviors
