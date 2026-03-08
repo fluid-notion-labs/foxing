@@ -280,6 +280,10 @@ lazy_static! {
         "foxing_hydration_hash_skipped",
         "Files skipped during hydration because size/mtime matched"
     ).unwrap();
+    pub static ref HYDRATION_NFS_PRESCAN_HITS: Counter = register_counter!(
+        "foxing_hydration_nfs_prescan_hits",
+        "Files skipped via NFS batch_stat prescan (size+mtime match)"
+    ).unwrap();
     pub static ref HYDRATION_DIR_PRUNED: Counter = register_counter!(
         "foxing_hydration_dir_pruned_total",
         "Directories skipped by tree-level Merkle hash pruning"

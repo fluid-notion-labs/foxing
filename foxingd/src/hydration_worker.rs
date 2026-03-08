@@ -41,6 +41,11 @@ use fxcp_core::hashing;
 use rand::seq::IndexedRandom;
 use serde::{Serialize, Deserialize};
 
+/// Pre-scanned NFS target file attributes (size, mtime_sec, mtime_nsec).
+/// Keyed by target file path. Used to skip `sync_file_needed` for unchanged files
+/// without per-file VFS stat round-trips.
+type NfsPrescanCache = HashMap<PathBuf, (u64, i64, i64)>;
+
 /// Convert a raw st_dev value to the synthetic device ID used by mirror.rs.
 /// Mirror uses (major << 20) | minor, but st_dev uses kernel encoding.
 fn normalize_dev(raw_dev: u64) -> u32 {
@@ -302,6 +307,105 @@ impl Hydrator {
         self.full_scan(false);
     }
 
+    /// Pre-scan NFS targets using batch_stat compounds to bulk-fetch size+mtime.
+    ///
+    /// Groups files by parent directory and sends SEQUENCE+PUTFH+[LOOKUP+GETATTR]×7
+    /// compounds to each NFS target. Returns a cache of target_path → (size, mtime_sec, mtime_nsec).
+    /// Files where source and target size+mtime match can be skipped without per-file VFS stat.
+    #[cfg(feature = "nfs-bypass")]
+    fn prescan_nfs_targets(
+        &self,
+        files: &[&PathBuf],
+        source_path: &Path,
+        source_mount: &Path,
+    ) -> NfsPrescanCache {
+        use fxcp_core::nfs::mount::probe_nfs_bypass;
+        use fxcp_core::nfs::NfsCompoundClient;
+
+        let mut cache = NfsPrescanCache::new();
+
+        for target in &self.targets {
+            if target.profile != crate::config::TargetProfile::NFS
+                && target.profile != crate::config::TargetProfile::Network
+            {
+                continue;
+            }
+
+            // Probe if target is an NFSv4.2 mount eligible for compound RPCs
+            let bypass_info = match probe_nfs_bypass(&target.path) {
+                Some(info) => info,
+                None => continue,
+            };
+
+            let mut client = match NfsCompoundClient::connect(&bypass_info) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("NFS prescan: cannot connect to {} for batch_stat: {}",
+                           bypass_info.server_addr, e);
+                    continue;
+                }
+            };
+
+            // Group files by parent directory (relative to source)
+            let mut dir_files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+            for path in files {
+                let rel = match path.strip_prefix(source_path)
+                    .or_else(|_| path.strip_prefix(source_mount))
+                {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if let (Some(parent), Some(filename)) = (rel.parent(), rel.file_name()) {
+                    dir_files.entry(parent.to_path_buf())
+                        .or_default()
+                        .push(filename.to_string_lossy().to_string());
+                }
+            }
+
+            let mut total_cached = 0u64;
+            for (rel_dir, filenames) in &dir_files {
+                let target_dir = target.path.join(rel_dir);
+
+                // Resolve the directory handle for this target directory
+                let dir_handle = match client.get_or_resolve_handle(&target_dir) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        debug!("NFS prescan: handle resolve failed for {:?}: {}", target_dir, e);
+                        continue;
+                    }
+                };
+
+                // batch_stat handles max 7 files per compound
+                for chunk in filenames.chunks(7) {
+                    let names: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                    match client.batch_stat(&dir_handle, &names) {
+                        Ok(results) => {
+                            for (name, size, mtime_s, mtime_ns) in results {
+                                let target_path = target_dir.join(&name);
+                                cache.insert(target_path, (size, mtime_s, mtime_ns));
+                                total_cached += 1;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("NFS prescan: batch_stat failed for {:?}: {}", target_dir, e);
+                            // Session might be bad — try recovery once
+                            if client.recover_session().is_err() {
+                                break; // Give up on this target
+                            }
+                        }
+                    }
+                }
+            }
+
+            if total_cached > 0 {
+                info!("NFS prescan: cached {} file attributes for target {:?} via batch_stat",
+                      total_cached, target.path);
+            }
+        }
+
+        cache
+    }
+
     pub fn full_scan(&self, enable_watching: bool) {
         self.source.hydration.active.store(true, Ordering::SeqCst);
         info!("Hydration: Starting full scan for {:?} (Mode: {:?}, Enable Watch: {})", 
@@ -488,6 +592,14 @@ impl Hydrator {
         info!("Hydration: Pre-computing signatures for {} files ({} skipped by tree pruning)...",
               files_to_check.len(), files.len() - files_to_check.len());
 
+        // NFS prescan: batch-fetch target file attributes via compound RPCs
+        // to skip per-file VFS stat round-trips for unchanged files.
+        #[cfg(feature = "nfs-bypass")]
+        let nfs_prescan = self.prescan_nfs_targets(&files_to_check, source_path, source_mount);
+        #[cfg(not(feature = "nfs-bypass"))]
+        let nfs_prescan = NfsPrescanCache::new();
+        let nfs_prescan = &nfs_prescan; // shared ref for par_iter
+
         let verification_results: Vec<(PathBuf, TargetConfig, u64)> = files_to_check
             .par_iter()
             .flat_map(|path| {
@@ -510,7 +622,7 @@ impl Hydrator {
                 for target in targets_ref {
                     metrics::HASH_VERIFICATIONS_TOTAL.inc();
                     
-                    match self.sync_file_needed(path, &rel, &meta, ino, target) {
+                    match self.sync_file_needed(path, &rel, &meta, ino, target, nfs_prescan) {
                         Ok(true) => {
                             jobs.push((rel.clone(), target.clone(), ino));
                         },
@@ -890,11 +1002,12 @@ impl Hydrator {
             );
         }
 
+        let empty_prescan = NfsPrescanCache::new();
         let bulk_job_queue = self.source.bulk_job_queue.lock();
         if let Some(queue_sender) = bulk_job_queue.as_ref() {
             for target_cfg in &self.targets {
                 if m.is_file() {
-                    if urgent || self.sync_file_needed(path, rel.as_path(), &m, ino, target_cfg)? {
+                    if urgent || self.sync_file_needed(path, rel.as_path(), &m, ino, target_cfg, &empty_prescan)? {
                         if let Some(buf) = job_buffer {
                             buf.push((rel.clone(), target_cfg.clone(), ino));
                         } else {
@@ -920,9 +1033,21 @@ impl Hydrator {
         Ok(())
     }
 
-    fn sync_file_needed(&self, src_path: &Path, rel: &Path, src_meta: &fs::Metadata, _ino: u64, target_cfg: &TargetConfig) -> Result<bool> {
+    fn sync_file_needed(&self, src_path: &Path, rel: &Path, src_meta: &fs::Metadata, _ino: u64, target_cfg: &TargetConfig, nfs_prescan: &NfsPrescanCache) -> Result<bool> {
         let dst_path = target_cfg.path.join(rel);
-        
+
+        // NFS prescan fast path: if batch_stat returned matching size+mtime, skip
+        if let Some(&(tgt_size, tgt_mtime_s, tgt_mtime_ns)) = nfs_prescan.get(&dst_path) {
+            if tgt_size == src_meta.len()
+                && tgt_mtime_s == src_meta.mtime()
+                && tgt_mtime_ns == src_meta.mtime_nsec()
+            {
+                debug!("NFS prescan skip: {:?} (size+mtime match)", dst_path);
+                metrics::HYDRATION_NFS_PRESCAN_HITS.inc();
+                return Ok(false);
+            }
+        }
+
         if sidecar::is_dirty(&dst_path) {
             if self.mode == HydrationMode::Streaming {
                 debug!("Hydration: Skipping DIRTY file {:?} (BPF active).", dst_path);

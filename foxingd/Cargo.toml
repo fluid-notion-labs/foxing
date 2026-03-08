@@ -8,6 +8,8 @@ repository = "https://codeberg.org/aenertia/foxing"
 description = "Foxing: eBPF-powered filesystem replication daemon with adaptive tuning and versioning"
 
 [features]
+default = ["nfs-bypass"]
+nfs-bypass = ["fxcp-core/nfs-bypass"]
 debug_metrics = ["fxcp-core/debug_metrics"]
 
 [lib]
