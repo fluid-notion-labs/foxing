@@ -64,10 +64,14 @@ pub const UNSTABLE4: u32 = 0;
 pub const DATA_SYNC4: u32 = 1;
 pub const FILE_SYNC4: u32 = 2;
 
+// FATTR4 attribute bitmap positions (word 0)
+pub const FATTR4_SIZE: u32 = 4;        // bit 4 = word 0, bit 4
+
 // FATTR4 attribute bitmap positions (word 1)
 pub const FATTR4_MODE: u32 = 33;       // bit 33 = word 1, bit 1
 pub const FATTR4_OWNER: u32 = 36;      // bit 36 = word 1, bit 4
 pub const FATTR4_OWNER_GROUP: u32 = 37; // bit 37 = word 1, bit 5
+pub const FATTR4_TIME_MODIFY: u32 = 53; // bit 53 = word 1, bit 21
 pub const FATTR4_TIME_MODIFY_SET: u32 = 52; // bit 52 = word 1, bit 20
 
 // RPC reply status
@@ -169,6 +173,10 @@ pub struct OpResult {
     pub stateid: Option<StateId>,
     /// For GETFH: the returned filehandle.
     pub filehandle: Option<Vec<u8>>,
+    /// For GETATTR: file size (if SIZE bit was in bitmap).
+    pub size: Option<u64>,
+    /// For GETATTR: modification time (seconds, nanoseconds).
+    pub mtime: Option<(i64, i64)>,
 }
 
 /// Parsed NFSv4.2 compound reply.
@@ -393,6 +401,8 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
 
         let mut filehandle = None;
         let stateid = None;
+        let mut size = None;
+        let mut mtime = None;
 
         // Parse enough of each op result to skip to the next
         if status == NFS4_OK {
@@ -404,7 +414,6 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
                     // No result data
                 }
                 OP_GETFH => {
-                    // GETFH result: opaque filehandle
                     let fh = dec.decode_opaque().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     filehandle = Some(fh.to_vec());
                 }
@@ -413,7 +422,7 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
                     let sid_other = dec.decode_opaque_fixed(12).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     let mut other = [0u8; 12];
                     other.copy_from_slice(sid_other);
-                    op_results.push(OpResult { op, status, stateid: Some(StateId { seqid: sid_seqid, other }), filehandle: None });
+                    op_results.push(OpResult { op, status, stateid: Some(StateId { seqid: sid_seqid, other }), filehandle: None, size: None, mtime: None });
                     break; // Stop parsing — OPEN result is complex
                 }
                 OP_WRITE => {
@@ -427,10 +436,24 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
                     dec.skip_raw(4 + 12).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
                 OP_GETATTR => {
-                    // bitmap + attr_vals — skip
+                    // Parse bitmap + attribute values for SIZE and TIME_MODIFY
                     let bm_len = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
-                    dec.skip_raw(bm_len as usize * 4).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
-                    let _ = dec.decode_opaque().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    let mut bitmap = vec![0u32; bm_len as usize];
+                    for b in bitmap.iter_mut() {
+                        *b = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    }
+                    let attr_data = dec.decode_opaque().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    // Parse requested attributes from the opaque value in bitmap order
+                    let mut attr_dec = XdrDecoder::new(attr_data);
+                    if bm_len > 0 && (bitmap[0] & (1 << FATTR4_SIZE)) != 0 {
+                        size = attr_dec.decode_u64().ok();
+                    }
+                    if bm_len > 1 && (bitmap[1] & (1 << (FATTR4_TIME_MODIFY - 32))) != 0 {
+                        // nfstime4: seconds (i64) + nseconds (u32)
+                        if let (Ok(secs), Ok(nsecs)) = (attr_dec.decode_u64(), attr_dec.decode_u32()) {
+                            mtime = Some((secs as i64, nsecs as i64));
+                        }
+                    }
                 }
                 _ => {
                     break; // Unknown op — can't skip safely
@@ -438,7 +461,7 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
             }
         }
 
-        op_results.push(OpResult { op, status, stateid, filehandle });
+        op_results.push(OpResult { op, status, stateid, filehandle, size, mtime });
     }
 
     Ok(CompoundReply {

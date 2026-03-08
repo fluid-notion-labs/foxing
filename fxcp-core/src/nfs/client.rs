@@ -695,6 +695,76 @@ impl NfsCompoundClient {
     pub fn invalidate_handle(&self, dir_path: &Path) {
         self.dir_handle_cache.remove(dir_path);
     }
+
+    /// Batch-fetch size+mtime for multiple files in a directory.
+    ///
+    /// Sends a single compound: SEQUENCE + PUTFH(dir) + [LOOKUP(file) + GETATTR]×N
+    /// Returns (filename, size, mtime_sec, mtime_nsec) for each file found.
+    /// Files that don't exist (LOOKUP returns NFS4ERR_NOENT) are silently skipped.
+    /// Max 7 files per compound (SEQUENCE + PUTFH + 7×(LOOKUP+GETATTR) = 16 ops).
+    pub fn batch_stat(
+        &mut self,
+        dir_handle: &[u8],
+        filenames: &[&str],
+    ) -> Result<Vec<(String, u64, i64, i64)>, NfsError> {
+        let xid = self.next_xid();
+        let seq_id = self.next_sequence_id();
+
+        let attr_request = [1 << rpc::FATTR4_SIZE, 1 << (rpc::FATTR4_TIME_MODIFY - 32)];
+
+        let mut ops = vec![
+            rpc::Nfs4Op::Sequence {
+                session_id: self.session_id,
+                sequence_id: seq_id,
+                slot_id: 0,
+                highest_slot_id: 0,
+                cache_this: false,
+            },
+            rpc::Nfs4Op::PutFh { handle: dir_handle.to_vec() },
+        ];
+
+        for name in filenames {
+            ops.push(rpc::Nfs4Op::Lookup { name: name.to_string() });
+            ops.push(rpc::Nfs4Op::GetAttr { attr_request });
+        }
+
+        let msg = rpc::build_compound(xid, "bstat", self.uid, self.gid, &self.machine, &ops);
+        self.stream.write_all(&msg)?;
+        self.stream.flush()?;
+
+        let reply_data = self.read_reply()?;
+        let reply = rpc::parse_compound_reply(&reply_data)?;
+
+        // Extract results: for each LOOKUP+GETATTR pair, check status
+        let mut results = Vec::new();
+        for (i, name) in filenames.iter().enumerate() {
+            // Find the LOOKUP result for this file (skip SEQUENCE + PUTFH = first 2 ops)
+            let lookup_idx = 2 + i * 2;
+            let getattr_idx = lookup_idx + 1;
+
+            // Check LOOKUP status
+            if let Some(lookup_result) = reply.op_results.get(lookup_idx) {
+                if lookup_result.status != rpc::NFS4_OK {
+                    continue; // file doesn't exist or LOOKUP failed
+                }
+            } else {
+                break; // compound stopped processing (prior error)
+            }
+
+            // Check GETATTR result
+            if let Some(getattr_result) = reply.op_results.get(getattr_idx) {
+                if getattr_result.status == rpc::NFS4_OK {
+                    if let (Some(size), Some((mtime_s, mtime_ns))) = (getattr_result.size, getattr_result.mtime) {
+                        results.push((name.to_string(), size, mtime_s, mtime_ns));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// Fast NFS server liveness check via NULL RPC.
