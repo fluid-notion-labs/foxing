@@ -1,6 +1,6 @@
 # Foxing Performance Benchmarks
 
-**Version:** 0.5.1
+**Version:** 0.5.2
 **Date:** 2026-03-08
 **Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
 
