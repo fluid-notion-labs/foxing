@@ -485,6 +485,36 @@ impl Manager {
                                     baseline_dev: 0, mount_id: 0, available: false, paused_since: Some(Instant::now()),
                                 });
 
+                                // 0. Global mount check: detect lazy unmount (umount -l)
+                                // Must run BEFORE device/fsync checks because those see the
+                                // OLD detached mount which still works for this process.
+                                let globally_mounted = fxcp_core::nfs::mount::is_mount_present_global(&tgt_cfg.path);
+                                if !globally_mounted && state.available {
+                                    info!("Target {:?} lazy unmount detected (/proc/mounts) — pausing workers",
+                                          tgt_cfg.path);
+                                    tgt_cfg.paused.store(true, Ordering::SeqCst);
+                                    state.paused_since = Some(Instant::now());
+                                    state.available = false;
+                                    state.mount_id = 0;
+                                    continue; // skip device/fsync checks on detached mount
+                                }
+                                if globally_mounted && !state.available && state.mount_id == 0 {
+                                    // Mount reappeared after lazy unmount — recovery
+                                    let new_mount_id = fxcp_core::nfs::mount::get_mount_id(&tgt_cfg.path).unwrap_or(1);
+                                    info!("Target {:?} remounted after lazy unmount (mount_id={}) — requesting recovery",
+                                          tgt_cfg.path, new_mount_id);
+                                    state.mount_id = new_mount_id;
+                                    tgt_cfg.paused.store(false, Ordering::SeqCst);
+                                    state.paused_since = None;
+                                    state.available = true;
+                                    // Update baseline_dev to the NEW mount's device
+                                    let new_dev = std::fs::metadata(&tgt_cfg.path).map(|m| m.dev()).unwrap_or(0);
+                                    state.baseline_dev = new_dev;
+                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
+                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                    continue; // recovery triggered, skip normal checks
+                                }
+
                                 // 1. Device ID check
                                 let meta_ok = std::fs::metadata(&tgt_cfg.path).ok();
                                 let current_dev = meta_ok.as_ref().map(|m| m.dev()).unwrap_or(0);
@@ -545,48 +575,14 @@ impl Manager {
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
 
-                                // Mount check via /proc/mounts (global namespace): detects
-                                // lazy unmount even when this process holds the mount open.
-                                // /proc/self/mountinfo is invisible to lazy unmount because
-                                // the process's own mount namespace keeps the mount alive.
-                                let current_mount_id = fxcp_core::nfs::mount::get_global_mount_id(&tgt_cfg.path);
-
-                                if current_mount_id == 0 && state.mount_id != 0 {
-                                    // Mount disappeared from mountinfo (lazy unmount)
-                                    if state.available {
-                                        info!("Target {:?} disappeared from mountinfo (lazy unmount?) — pausing workers",
-                                              tgt_cfg.path);
-                                        tgt_cfg.paused.store(true, Ordering::SeqCst);
-                                        state.paused_since = Some(Instant::now());
-                                        state.available = false;
-                                    }
-                                } else if current_mount_id != 0 && state.mount_id == 0 {
-                                    // Mount reappeared after being gone — recovery
-                                    info!("Target {:?} reappeared in mountinfo (mount_id={}) — requesting recovery",
-                                          tgt_cfg.path, current_mount_id);
-                                    state.mount_id = current_mount_id;
-                                    state.baseline_dev = current_dev;
-                                    tgt_cfg.paused.store(false, Ordering::SeqCst);
-                                    state.paused_since = None;
-                                    state.available = true;
-                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
-                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
-                                } else if current_mount_id != 0 && current_mount_id != state.mount_id && state.mount_id != 0 {
-                                    // Mount ID changed (different mount instance)
-                                    info!("Target {:?} mount ID changed ({} → {}) — requesting recovery",
-                                          tgt_cfg.path, state.mount_id, current_mount_id);
-                                    state.mount_id = current_mount_id;
-                                    state.baseline_dev = current_dev;
-                                    if !state.available {
-                                        tgt_cfg.paused.store(false, Ordering::SeqCst);
-                                        state.paused_since = None;
-                                        state.available = true;
-                                    }
-                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
-                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                // Update mount_id tracking for non-lazy-unmount cases
+                                let mount_id = fxcp_core::nfs::mount::get_mount_id(&tgt_cfg.path).unwrap_or(0);
+                                if mount_id != 0 && mount_id != state.mount_id && state.mount_id != 0 {
+                                    info!("Target {:?} mount ID changed ({} → {})",
+                                          tgt_cfg.path, state.mount_id, mount_id);
                                 }
-                                if current_mount_id != 0 {
-                                    state.mount_id = current_mount_id;
+                                if mount_id != 0 {
+                                    state.mount_id = mount_id;
                                 }
 
                                 state.available = reachable;

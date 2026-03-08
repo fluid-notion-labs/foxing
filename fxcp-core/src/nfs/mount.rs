@@ -149,27 +149,29 @@ pub fn get_mount_id(path: &Path) -> Option<u64> {
 /// process's namespace. This detects lazy unmounts (`umount -l`) that are
 /// invisible to `/proc/self/mountinfo` when the process holds the mount open.
 ///
-/// Returns a synthetic mount ID derived from the device numbers in `/proc/mounts`.
-/// Returns 0 if the path is not mounted in the global namespace.
-pub fn get_global_mount_id(path: &Path) -> u64 {
-    // /proc/mounts format: device mountpoint fstype options dump pass
+/// Returns `true` if any mount point in `/proc/mounts` covers the given path.
+pub fn is_mount_present_global(path: &Path) -> bool {
     let mounts = match std::fs::read_to_string("/proc/mounts") {
         Ok(m) => m,
-        Err(_) => return 0,
+        Err(_) => return true, // can't read → assume mounted (safe default)
     };
+    // Use the raw path (don't canonicalize — that goes through VFS which
+    // still sees the old mount after lazy unmount).
     let path_str = path.to_string_lossy();
+    // Find any mount point in /proc/mounts that is a prefix of path.
+    // Exclude root (/) which covers everything.
     for line in mounts.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 2 { continue; }
-        if fields[1] == path_str.as_ref() {
-            // Found exact mount point match — return a hash as synthetic ID
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            line.hash(&mut hasher);
-            return hasher.finish();
+        if fields.len() < 3 { continue; }
+        let mount_point = fields[1];
+        if mount_point == "/" { continue; }
+        if path_str.starts_with(mount_point)
+            && (path_str.len() == mount_point.len() || path_str.as_bytes().get(mount_point.len()) == Some(&b'/'))
+        {
+            return true;
         }
     }
-    0 // Not found — mount is gone
+    false
 }
 
 fn get_mount_id_from(mountinfo_path: &str, path: &Path) -> Option<u64> {
