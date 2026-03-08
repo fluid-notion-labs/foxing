@@ -18,6 +18,7 @@ pub mod governor;
 pub mod versioning;
 pub mod consistency;
 pub mod sync;
+pub mod tombstone;
 #[cfg(feature = "nfs-bypass")]
 pub mod nfs;
 
