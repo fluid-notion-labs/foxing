@@ -129,6 +129,7 @@ pub enum Nfs4Op {
         seqid: u32,
         share_access: u32,
         share_deny: u32,
+        clientid: u64,
         owner: Vec<u8>,
         filename: String,
         mode: u32,
@@ -219,13 +220,13 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
             enc.encode_u32(OP_LOOKUP);
             enc.encode_string(name);
         }
-        Nfs4Op::Open { seqid, share_access, share_deny, owner, filename, mode } => {
+        Nfs4Op::Open { seqid, share_access, share_deny, clientid, owner, filename, mode } => {
             enc.encode_u32(OP_OPEN);
             enc.encode_u32(*seqid);          // seqid
             enc.encode_u32(*share_access);   // share_access
             enc.encode_u32(*share_deny);     // share_deny
             // open_owner4: clientid(8) + owner(opaque)
-            enc.encode_u64(0);               // clientid (0 = use session binding)
+            enc.encode_u64(*clientid);       // clientid from EXCHANGE_ID
             enc.encode_opaque(owner);        // owner
             // openhow4: opentype + createhow
             enc.encode_u32(OPEN4_CREATE);    // opentype = OPEN4_CREATE

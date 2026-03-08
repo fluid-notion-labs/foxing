@@ -495,6 +495,7 @@ impl NfsCompoundClient {
                 seqid: 0,
                 share_access: rpc::OPEN4_SHARE_ACCESS_WRITE,
                 share_deny: rpc::OPEN4_SHARE_DENY_NONE,
+                clientid: self.client_id,
                 owner: format!("foxing-{}", std::process::id()).into_bytes(),
                 filename: filename.to_string(),
                 mode,
@@ -515,6 +516,14 @@ impl NfsCompoundClient {
 
         debug!("NFS write compound: {} bytes, {} ops, handle={} bytes, data={} bytes",
                msg.len(), ops.len(), parent_handle.len(), data.len());
+        // Hex dump the compound starting after RPC header to show op boundaries
+        // Skip 4 (record mark) + ~120 (RPC+AUTH+COMPOUND header)
+        // The ops start after the compound header
+        if msg.len() > 140 {
+            let ops_start = &msg[4..]; // skip record mark
+            // Find the ops by looking for the number of ops u32
+            debug!("NFS compound hex (first 200 bytes after record mark): {:02x?}", &ops_start[..ops_start.len().min(200)]);
+        }
 
         self.stream.write_all(&msg)?;
         self.stream.flush()?;
