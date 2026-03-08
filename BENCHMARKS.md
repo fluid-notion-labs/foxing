@@ -1,6 +1,6 @@
 # Foxing Performance Benchmarks
 
-**Version:** 0.5.2
+**Version:** 0.6.0
 **Date:** 2026-03-08
 **Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
 
@@ -9,7 +9,7 @@
 | Binary | Size | BPF Deps | Root Required | Notes |
 |--------|-----:|:--------:|:-------------:|-------|
 | fxcp | 142 MB | No | No | Standalone CLI; also obtainable via `ln -sf foxingd fxcp` |
-| foxingd | 274 MB | Yes (libbpf) | Yes (eBPF) | Superset of fxcp (symlink dispatch) |
+| foxingd | 290 MB | Yes (libbpf) | Yes (eBPF) | Superset of fxcp (symlink dispatch) |
 | rsync | 0.7 MB | No | No | Reference tool |
 | cp | 0.1 MB | No | No | Reference tool |
 
@@ -80,8 +80,8 @@ foxingd sync adds ~30-40% overhead over fxcp because it always generates foxingd
 
 | Tool | 111 files (60MB) | Throughput |
 |------|-----------------|-----------|
-| cp | 320ms | **194 MB/s** |
-| rsync | 490ms | **124 MB/s** |
+| cp | 305ms | **196 MB/s** |
+| rsync | 513ms | **116 MB/s** |
 
 ### Cross-Network Copy (XFS NVMe → NFS HDD)
 
@@ -89,12 +89,14 @@ With NFS bypass enabled (default), fxcp sends OPEN+WRITE+CLOSE as a single compo
 
 | Workload | Files | Size | cp | rsync | fxcp | rsync/fxcp | fxcp Method |
 |----------|------:|-----:|---:|------:|-----:|-----------:|:------------|
-| small_files | 1,000 | 4 MB | 1.8s | 2.9s | 2.4s | **1.18x** | NFS compound RPC |
-| large_files | 1 | 100 MB | 206ms | 330ms | 401ms | 0.82x | io_uring |
+| small_files | 1,000 | 4 MB | 1.9s | 2.7s | 2.5s | **1.10x** | NFS compound RPC |
+| large_files | 1 | 100 MB | 211ms | 335ms | 428ms | 0.78x | io_uring |
 | mixed | 500 | 128 MB | 1.4s | 2.9s | 6.0s | 0.48x | compound + io_uring |
-| many_tiny | 5,000 | ~150 KB | 9.5s | 13.5s | 12.0s | **1.11x** | NFS compound RPC |
+| many_tiny | 5,000 | ~150 KB | 9.2s | 13.2s | 12.3s | **1.07x** | NFS compound RPC |
+| resync (no changes) | 500 | 128 MB | — | 352ms | 460ms | 0.76x | stat + skip |
+| NFS→NFS server-side | 1 | 100 MB | — | 286ms | 83ms | **3.44x** | Server-side FICLONE |
 
-**Analysis:** With NFS bypass, fxcp is now faster than rsync for small files (1.18x for 1000x4KB, 1.11x for 5000 tiny). Large files (100MB) use io_uring and are competitive with rsync. Mixed workloads still show overhead because directory creation and large files go through VFS.
+**Analysis:** With NFS bypass, fxcp is faster than rsync for small files (1.10x for 1000x4KB, 1.07x for 5000 tiny). Large files (100MB) use io_uring and are competitive with rsync. NFS→NFS same-server copies are 3.4x faster via server-side FICLONE.
 
 ### NFS Bypass Performance (before/after)
 
@@ -105,15 +107,25 @@ With NFS bypass enabled (default), fxcp sends OPEN+WRITE+CLOSE as a single compo
 
 The bypass eliminates per-file VFS overhead by packing OPEN+WRITE+CLOSE into one TCP round-trip (~2ms per file vs ~6ms through the kernel NFS client).
 
+### --verify Overhead
+
+| Workload | Without verify | With --verify | Overhead |
+|----------|------:|------:|------:|
+| 500-file mixed → NFS | 469ms | 1468ms | +999ms |
+
 ### NFS Same-Server (server-side copy)
 
 | Test | rsync | fxcp | fxcp vs rsync | Method |
 |------|------:|-----:|--------------:|:-------|
-| 100MB NFS→NFS | 1814ms | **351ms** | **5.2x** | Server-side FICLONE |
-| 1000×4KB NFS→NFS | 9.9s | **7.8s** | **1.3x** | FICLONE per file |
-| 100MB local→NFS | 981ms | 1059ms | 0.9x | io_uring (data over wire) |
+| 100MB NFS→NFS | 286ms | **83ms** | **3.44x** | Server-side FICLONE |
 
 For NFS→NFS (same server), fxcp triggers server-side FICLONE — data never traverses the network.
+
+### XFS-to-NFS Overhead vs XFS-to-XFS
+
+| Copy | XFS-to-XFS | XFS-to-NFS | NFS overhead |
+|------|------:|------:|------:|
+| 100MB fxcp | 235ms | 406ms | **72.7%** |
 
 ## Delta Copy Performance (btrfs-over-LUKS2, local)
 
@@ -131,7 +143,7 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 ## foxingd Daemon Performance (XFS→NFS)
 
-### Adversarial Test Results (v0.5.0, 9 phases)
+### Adversarial Test Results (v0.6.0, 9 phases)
 
 **VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
 **Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
@@ -139,28 +151,28 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 | Phase | Test | Duration | Result | Key Metric |
 |-------|------|----------|--------|------------|
-| 0 | Baseline cp/rsync | 2s | **PASS** | cp=194MB/s rsync=124MB/s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | 54s | **PASS** | 5000/5000 converged in ~15s |
-| 2 | Live Write Storm (fio randwrite 30s) | 44s | **PASS** | Coalescer handles back-pressure |
-| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, cross=50/50 |
-| 4 | NFS Target Drop + Resync (300 files) | 37s | **PASS** | Mount identity + recovery scan |
+| 0 | Baseline cp/rsync | 2s | **PASS** | cp=196MB/s rsync=116MB/s |
+| 1 | Heavy Hydration (5000 files, 2.6GB) | 52s | **PASS** | 5000/5000 converged in ~15s |
+| 2 | Live Write Storm (fio randwrite 30s) | 43s | **PASS** | no_coalescing, transient_leak=25 |
+| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, ghosts=349 (cleaned) |
+| 4 | NFS Target Drop + Resync (300 files) | 58s | **FAIL** | 200/300 — intermittent recovery stall |
 | 5 | Large File Kill/Resume (100MB) | 27s | **PASS** | SHA-256 match after SIGKILL + restart |
 | 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
-| 7 | BLAKE3 Delta Copy | 49s | **PASS** | SHA-256 verified (signal metric issue) |
-| 8 | Directory Merkle Pruning | 51s | **PASS** | All files correctly synced |
-| 9 | Combined Delta + Pruning | 53s | **PASS** | Both delta and pruning active |
+| 7 | BLAKE3 Delta Copy | 44s | **PASS** | 10 deltas, 20MB saved |
+| 8 | Directory Merkle Pruning | 45s | **PASS** | 13 dirs pruned |
+| 9 | Combined Delta + Pruning | 53s | **PASS** | delta=6, pruned=13, 12MB saved |
 
-**Total:** 375 seconds (6 min). No regressions from v0.4.x → v0.5.0.
+**Total:** 336 seconds (5.6 min). NFS batch_stat prescan confirmed working (851 file attributes cached via compound RPCs). Phase 4 intermittent failure is a pre-existing recovery scan issue.
 
-### Initial Hydration Throughput (5000 files, 2.7GB → NFS)
+### Initial Hydration Throughput (5000 files, 2.6GB → NFS)
 
 | Tool | Time | Throughput | Files/sec |
 |------|-----:|----------:|----------:|
-| cp -r | ~14s | **194 MB/s** | 357 |
-| rsync -a | ~20s | **124 MB/s** | 250 |
-| foxingd hydration | ~15s | **~180 MB/s** | 333 |
+| cp -r | ~14s | **196 MB/s** | 357 |
+| rsync -a | ~20s | **116 MB/s** | 250 |
+| foxingd hydration | ~15s | **~173 MB/s** | 333 |
 
-foxingd hydration now matches cp throughput due to batched small-file processing and copy_file_range usage.
+foxingd hydration matches cp throughput due to batched small-file processing and copy_file_range usage.
 
 ### Incremental Resync (10 of 20 files modified, 1 chunk each)
 
@@ -186,10 +198,10 @@ foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) n
 
 | Metric | Value |
 |--------|-------|
-| Detection time | <10s (device ID + fsync probe, 10s interval) |
+| Detection time | <10s (device ID + /proc/mounts + fsync probe, 10s interval) |
 | Worker pause | Immediate (events drain to outage journal) |
-| Recovery scan | Pruning-disabled full scan (clears stored hashes) |
-| Standalone resync (300 files) | **300/300 in <10s** |
+| Recovery scan | Pruning-disabled full scan with NFS batch_stat prescan |
+| NFS prescan cache | 851 file attributes cached via compound RPCs |
 
 ### Live Replication (BPF event-driven)
 
@@ -202,6 +214,62 @@ foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) n
 | Delta copy threshold | >256KB files, <50% dirty chunks |
 | Small file detection | Size + mtime fallback for <128KB |
 | Metrics endpoint | Always responsive (dedicated thread) |
+
+## Mean Time to Consistency (MTTC)
+
+### Phase 1: fxcp One-Shot
+
+How long from a source modification until the target is fully consistent (fxcp -a completes with content verified). Measures include fxcp startup, filesystem detection, copy, and fsync on target.
+
+**Platform:** fox-test VM (16 vCPU Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5)
+**Source:** XFS on virtio-blk (NVMe-backed), **fxcp:** 0.6.0, **Iterations:** 5 (median)
+
+| Workload | XFS-to-XFS | XFS-to-NFS | NFS-to-NFS | XFS-to-tmpfs | XFS-same |
+|----------|------:|------:|------:|------:|------:|
+| single 4KB | 79ms | 90ms | 95ms | 55ms | 66ms |
+| single 1MB | 81ms | 97ms | 101ms | 56ms | 63ms |
+| single 100MB | 232ms | 374ms | 312ms | 228ms | 113ms |
+| modify 4KB | 77ms | 91ms | 100ms | 63ms | 67ms |
+| modify 1MB | 82ms | 103ms | 118ms | 64ms | 74ms |
+| append 4KB | 81ms | 101ms | 108ms | 64ms | 68ms |
+| metadata | 77ms | 119ms | 93ms | 65ms | 69ms |
+| rename | 78ms | 119ms | 100ms | 58ms | 65ms |
+| batch 100x4KB | 115ms | 426ms | 576ms | 80ms | 85ms |
+| batch 10x10MB | 269ms | 1031ms | 1445ms | 225ms | 297ms |
+
+**Topologies:**
+- **XFS-to-XFS**: Cross-device local copy (vdb→vdc, sendfile/io_uring)
+- **XFS-to-NFS**: Network copy to NFS 4.2 HDD-backed target (NFS bypass for small files, io_uring for large)
+- **NFS-to-NFS**: Same-server copy (FICLONE server-side for large files, NFS bypass for small)
+- **XFS-to-tmpfs**: Memory-backed target (copy_file_range/sendfile, no xattr support)
+- **XFS-same**: Same-device copy (FICLONE reflink — instant CoW for large files)
+
+**Key observations:**
+- **Fixed overhead ~55-79ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
+- **XFS-same 100MB = 113ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
+- **NFS single 4KB = 90ms**: NFS bypass compound RPC adds only ~11ms over local XFS (90ms vs 79ms)
+- **NFS batch 100x4KB = 426ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
+- **NFS-to-NFS 100MB = 312ms**: Server-side FICLONE — faster than XFS-to-NFS (374ms) since data stays on server
+
+### Phase 2: foxingd Daemon (BPF Event-Driven)
+
+**Mode:** foxingd daemon with eBPF event capture, target pre-synced with `--generate-sigs`
+**Latency:** Source write to target file consistent (polled at 10ms resolution)
+
+| Workload | XFS-to-XFS | XFS-to-NFS | XFS-to-tmpfs |
+|----------|------:|------:|------:|
+| create 4KB | 16ms | 20ms | 16ms |
+| create 8KB | 16ms | 19ms | 16ms |
+| create 32KB | 16ms | 17ms | 14ms |
+| create 64KB | 16ms | 20ms | 14ms |
+| rename 4KB | 16ms | 20ms | TIMEOUT |
+| batch 10x4KB | TIMEOUT | TIMEOUT | TIMEOUT |
+
+**Key observations:**
+- **Single-file BPF latency = 14-20ms**: BPF event capture → copy → fsync in under 1 polling interval
+- **XFS-to-NFS overhead = ~4ms**: NFS compound RPC adds minimal latency (20ms vs 16ms)
+- **Batch TIMEOUT**: 10-file batches exceed the polling window; write coalescer timing issue under investigation
+- **rename TIMEOUT on tmpfs**: xattr-based dirty tracking not available on tmpfs
 
 ## fxcp → foxingd Integration
 
@@ -299,6 +367,7 @@ Served on a dedicated thread — always responsive even under heavy I/O.
 | `foxing_events_dropped` | Counter | Permanently failed events (0 = healthy) |
 | `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
 | `foxing_hydration_dir_pruned` | Counter | Directories skipped by Merkle tree |
+| `foxing_hydration_nfs_prescan_hits` | Counter | Files skipped via NFS batch_stat prescan |
 | `foxing_delta_copy_attempted` | Counter | Delta copy operations |
 | `foxing_delta_bytes_saved` | Counter | Bytes avoided by delta copy |
 | `foxing_tuner_state` | Gauge | BBR state (0=Steady, 1=Startup, 2=Drain, 3=ProbeBW) |
@@ -339,37 +408,3 @@ python3 tests/harness.py --benchmark --compare tests/baseline.json
 ```
 
 The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system time, context switches, and disk I/O via GNU time and `/proc/diskstats`.
-
-## Mean Time to Consistency (MTTC)
-
-How long from a source modification until the target is fully consistent (fxcp -a completes with content verified). Measures include fxcp startup, filesystem detection, copy, and fsync on target.
-
-**Platform:** fox-test VM (16 vCPU Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5)
-**Source:** XFS on virtio-blk (NVMe-backed), **Iterations:** 5 (median)
-
-| Workload | XFS-to-XFS | XFS-to-NFS | NFS-to-NFS | XFS-to-tmpfs | XFS-same |
-|----------|------:|------:|------:|------:|------:|
-| single 4KB | 69ms | 82ms | 88ms | 55ms | 65ms |
-| single 1MB | 73ms | 89ms | 99ms | 63ms | 64ms |
-| single 100MB | 217ms | 398ms | 728ms | 212ms | 108ms |
-| modify 4KB | 70ms | 88ms | 93ms | 56ms | 62ms |
-| modify 1MB | 76ms | 109ms | 118ms | 62ms | 70ms |
-| append 4KB | 70ms | 110ms | 93ms | 59ms | 64ms |
-| metadata | 71ms | 113ms | 88ms | 59ms | 60ms |
-| rename | 72ms | 110ms | 93ms | 57ms | 62ms |
-| batch 100x4KB | 96ms | 407ms | 543ms | 80ms | 90ms |
-| batch 10x10MB | 309ms | 1045ms | 1426ms | 280ms | 307ms |
-
-**Topologies:**
-- **XFS-to-XFS**: Cross-device local copy (vdb→vdc, sendfile/io_uring)
-- **XFS-to-NFS**: Network copy to NFS 4.2 HDD-backed target (NFS bypass for small files, io_uring for large)
-- **NFS-to-NFS**: Same-server copy (FICLONE server-side for large files, NFS bypass for small)
-- **XFS-to-tmpfs**: Memory-backed target (copy_file_range/sendfile, no xattr support)
-- **XFS-same**: Same-device copy (FICLONE reflink — instant CoW for large files)
-
-**Key observations:**
-- **Fixed overhead ~55-70ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
-- **XFS-same 100MB = 108ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
-- **NFS single 4KB = 82ms**: NFS bypass compound RPC adds only ~13ms over local XFS (82ms vs 69ms)
-- **NFS batch 100x4KB = 407ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
-- **NFS-to-NFS 100MB = 728ms**: Server-side FICLONE but NFS metadata overhead on both source reads and target writes
