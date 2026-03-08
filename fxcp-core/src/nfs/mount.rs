@@ -188,7 +188,31 @@ pub fn resolve_nfs_handle(dir_path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
 
-    Ok(fh.f_handle[..handle_len].to_vec())
+    let raw = &fh.f_handle[..handle_len];
+
+    // For NFS CLIENT mounts (handle_type >= 2), the kernel stores:
+    //   [0..4]   fileid (inode, LE u32)
+    //   [4..8]   generation (LE u32)
+    //   [8..14]  internal metadata (size fields, padding)
+    //   [14..14+N] the actual NFS wire protocol filehandle
+    //   [14+N..] padding zeros
+    //
+    // The wire filehandle is what the NFS server gave during mount.
+    // We extract it by finding the non-zero payload after the 14-byte header,
+    // trimming trailing zeros.
+    if fh.handle_type >= 2 && handle_len > 14 {
+        let wire_region = &raw[14..];
+        // Trim trailing zero padding
+        let wire_len = wire_region.iter().rposition(|&b| b != 0)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if wire_len > 0 {
+            return Ok(wire_region[..wire_len].to_vec());
+        }
+    }
+
+    // Fallback: return full handle
+    Ok(raw.to_vec())
 }
 
 #[cfg(test)]

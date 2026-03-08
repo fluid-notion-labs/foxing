@@ -51,6 +51,8 @@ impl NfsCompoundClient {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
 
+        // Use effective UID/GID directly. The NFS server handles root_squash
+        // mapping — we send our real credentials and let the server decide.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let machine = {
@@ -459,12 +461,18 @@ impl NfsCompoundClient {
         Ok(handle)
     }
 
-    /// Resolve a relative path from the export root using PUTROOTFH + LOOKUP + GETFH.
+    /// Resolve a relative path from the export root using PUTFH + LOOKUP + GETFH.
     fn resolve_via_lookup(&mut self, rel_path: &Path) -> Result<Vec<u8>, NfsError> {
         let xid = self.next_xid();
         let seq_id = self.next_sequence_id();
 
-        // Build compound: SEQUENCE + PUTROOTFH + LOOKUP(component1) + ... + GETFH
+        // Get the mount point's NFS wire filehandle via name_to_handle_at.
+        // The kernel stores the server's opaque handle; we extract the wire
+        // portion (skipping the kernel's internal 14-byte header).
+        let mount_fh = super::mount::resolve_nfs_handle(&self.server_info.mount_point)
+            .map_err(|e| NfsError::StaleHandle { path: format!("mount: {}", e) })?;
+        debug!("NFS PUTFH: mount handle {} bytes: {:02x?}", mount_fh.len(), &mount_fh[..mount_fh.len().min(16)]);
+
         let mut ops = vec![
             Nfs4Op::Sequence {
                 session_id: self.session_id,
@@ -473,20 +481,10 @@ impl NfsCompoundClient {
                 highest_slot_id: 0,
                 cache_this: false,
             },
-            Nfs4Op::PutRootFh,
+            Nfs4Op::PutFh { handle: mount_fh },
         ];
 
-        // Get the export root filehandle via name_to_handle_at on the mount point,
-        // then LOOKUP from there into the target subdirectory.
-        // Using PUTFH(mount_point_handle) instead of PUTROOTFH avoids pseudo-root
-        // permission restrictions.
-        let mount_fh = super::mount::resolve_nfs_handle(&self.server_info.mount_point)
-            .map_err(|e| NfsError::StaleHandle { path: format!("mount point: {}", e) })?;
-        // Replace PUTROOTFH with PUTFH(mount_point_handle)
-        ops.pop(); // Remove PutRootFh
-        ops.push(Nfs4Op::PutFh { handle: mount_fh });
-
-        // Now LOOKUP only the relative path components (within the export)
+        // LOOKUP only the relative path within the export
         for component in rel_path.components() {
             if let std::path::Component::Normal(name) = component {
                 ops.push(Nfs4Op::Lookup { name: name.to_string_lossy().to_string() });
