@@ -43,10 +43,9 @@ impl NfsCompoundClient {
     ///
     /// Performs TCP connect → EXCHANGE_ID → CREATE_SESSION.
     pub fn connect(info: &NfsBypassInfo) -> Result<Self, NfsError> {
-        let stream = TcpStream::connect_timeout(
-            &info.server_addr,
-            std::time::Duration::from_secs(5),
-        )?;
+        // NFS servers default to `secure` — require source port <1024.
+        // Bind to a privileged port before connecting (requires root/CAP_NET_BIND_SERVICE).
+        let stream = Self::connect_privileged(&info.server_addr)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
@@ -319,6 +318,84 @@ impl NfsCompoundClient {
 
         info!("NFS bypass: session recovered (client_id={:#x})", self.client_id);
         Ok(())
+    }
+
+    /// Connect to an NFS server from a privileged source port (<1024).
+    /// NFS servers with `secure` (default) reject connections from ports ≥1024.
+    fn connect_privileged(server: &std::net::SocketAddr) -> Result<TcpStream, NfsError> {
+        use std::os::unix::io::FromRawFd;
+
+        let domain = if server.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(NfsError::ConnectionFailed(std::io::Error::last_os_error()));
+        }
+
+        // Try binding to ports 900-1023 (privileged range, avoids well-known services)
+        let mut bound = false;
+        for port in (900..1024).rev() {
+            let ret = if server.is_ipv4() {
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: (port as u16).to_be(),
+                    sin_addr: libc::in_addr { s_addr: 0 },
+                    sin_zero: [0; 8],
+                };
+                unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as u32) }
+            } else {
+                let addr = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as u16,
+                    sin6_port: (port as u16).to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+                    sin6_scope_id: 0,
+                };
+                unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32) }
+            };
+            if ret == 0 {
+                bound = true;
+                debug!("NFS bypass: bound to privileged port {}", port);
+                break;
+            }
+        }
+
+        if !bound {
+            unsafe { libc::close(fd); }
+            // Fall back to ephemeral port (works if server has `insecure` export option)
+            debug!("NFS bypass: no privileged port available, using ephemeral");
+            return Ok(TcpStream::connect_timeout(server, std::time::Duration::from_secs(5))?);
+        }
+
+        // Connect to server
+        let connect_result = match server {
+            std::net::SocketAddr::V4(v4) => {
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) },
+                    sin_zero: [0; 8],
+                };
+                unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as u32) }
+            }
+            std::net::SocketAddr::V6(v6) => {
+                let addr = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as u16,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr { s6_addr: v6.ip().octets() },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32) }
+            }
+        };
+
+        if connect_result != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd); }
+            return Err(NfsError::ConnectionFailed(err));
+        }
+
+        Ok(unsafe { TcpStream::from_raw_fd(fd) })
     }
 
     fn next_xid(&self) -> u32 {
