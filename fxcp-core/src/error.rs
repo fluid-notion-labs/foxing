@@ -20,6 +20,12 @@ pub enum CopyErrorKind {
     Transient,
     /// Permanent failure (permission denied, read-only fs) — don't retry
     Permanent,
+    /// NFS compound RPC transient error (stale handle, session expired) — retry with re-resolve
+    #[cfg(feature = "nfs-bypass")]
+    NfsTransient,
+    /// NFS bypass unavailable (version mismatch, auth failure) — permanent fallback to VFS
+    #[cfg(feature = "nfs-bypass")]
+    NfsBypassUnavailable,
 }
 
 #[derive(Error, Debug)]
@@ -51,6 +57,9 @@ pub enum FxcpError {
     },
     #[error("Memory Limit Exhausted: {0}")]
     MemoryExhausted(String),
+    #[cfg(feature = "nfs-bypass")]
+    #[error("NFS: {0}")]
+    Nfs(#[from] crate::nfs::NfsError),
 }
 
 impl FxcpError {
@@ -64,6 +73,22 @@ impl FxcpError {
                 _ => CopyErrorKind::Transient,
             },
             FxcpError::Security(_) => CopyErrorKind::Permanent,
+            #[cfg(feature = "nfs-bypass")]
+            FxcpError::Nfs(nfs_err) => match nfs_err {
+                crate::nfs::NfsError::StaleHandle { .. } => CopyErrorKind::NfsTransient,
+                crate::nfs::NfsError::Nfs4Error { code, .. } => {
+                    use crate::nfs::rpc;
+                    match *code {
+                        rpc::NFS4ERR_STALE | rpc::NFS4ERR_DELAY | rpc::NFS4ERR_BADSESSION
+                        | rpc::NFS4ERR_BADSEQ | rpc::NFS4ERR_SEQ_MISORDERED => CopyErrorKind::NfsTransient,
+                        rpc::NFS4ERR_ACCESS => CopyErrorKind::Permanent,
+                        _ => CopyErrorKind::Transient,
+                    }
+                }
+                crate::nfs::NfsError::KerberosRequired => CopyErrorKind::NfsBypassUnavailable,
+                crate::nfs::NfsError::Timeout(_) => CopyErrorKind::Timeout,
+                _ => CopyErrorKind::Transient,
+            },
             _ => CopyErrorKind::Transient,
         }
     }

@@ -678,6 +678,10 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
                     CopyErrorKind::Timeout => { warn!("Copy timed out: {:?}: {}", src_path, e); stats.errors += 1; }
                     CopyErrorKind::Transient => { warn!("Transient error: {:?}: {}", src_path, e); stats.errors += 1; }
                     CopyErrorKind::Permanent => { error!("Permanent error: {:?}: {}", src_path, e); stats.errors += 1; }
+                    #[cfg(feature = "nfs-bypass")]
+                    CopyErrorKind::NfsTransient | CopyErrorKind::NfsBypassUnavailable => {
+                        debug!("NFS bypass error: {:?}: {}", src_path, e); stats.errors += 1;
+                    }
                 }
             }
         }
