@@ -1076,8 +1076,23 @@ phase7() {
         last_count=$tgt_count
     done
 
-    # Give foxingd time to store Merkle signatures (happens after copy)
-    sleep 5
+    # Give foxingd time to store Merkle signatures (happens after copy).
+    # On NFS with actimeo=0, xattr writes may take several seconds to flush.
+    # Wait until at least one file has a stored Merkle signature.
+    log "Waiting for Merkle signatures to be stored on target..."
+    local sig_wait=0
+    while [[ $sig_wait -lt 30 ]]; do
+        local has_merkle
+        has_merkle=$(getfattr -n user.foxing.merkle "$TARGET/adversarial-delta/large_1.dat" 2>/dev/null | grep -c merkle || echo 0)
+        [[ "$has_merkle" -gt 0 ]] && break
+        sleep 1
+        sig_wait=$((sig_wait + 1))
+    done
+    if [[ $sig_wait -ge 30 ]]; then
+        signal "WARNING: Merkle signatures not detected after 30s"
+    else
+        log "Merkle signatures confirmed after ${sig_wait}s"
+    fi
 
     collect_metrics "phase7-post-initial"
     stop_foxingd
@@ -1255,8 +1270,22 @@ phase8() {
         last_count=$tgt_count
     done
 
-    # Give foxingd time to store directory hashes
-    sleep 5
+    # Give foxingd time to store directory hashes on NFS target.
+    # Wait until at least one directory has a stored hash xattr.
+    log "Waiting for directory hashes to be stored on target..."
+    local hash_wait=0
+    while [[ $hash_wait -lt 30 ]]; do
+        local has_hash
+        has_hash=$(getfattr -n user.foxing.dir_hash "$TARGET/adversarial-dirprune/stable-a" 2>/dev/null | grep -c dir_hash || echo 0)
+        [[ "$has_hash" -gt 0 ]] && break
+        sleep 1
+        hash_wait=$((hash_wait + 1))
+    done
+    if [[ $hash_wait -ge 30 ]]; then
+        signal "WARNING: Directory hashes not detected after 30s"
+    else
+        log "Directory hashes confirmed after ${hash_wait}s"
+    fi
 
     collect_metrics "phase8-post-initial"
     stop_foxingd
