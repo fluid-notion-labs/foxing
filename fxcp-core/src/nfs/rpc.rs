@@ -258,7 +258,7 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
             });
             enc.encode_opaque(data);
         }
-        Nfs4Op::SetAttr { stateid, mode, uid, gid, mtime } => {
+        Nfs4Op::SetAttr { stateid, mode, uid: _, gid: _, mtime: _ } => {
             enc.encode_u32(OP_SETATTR);
             // stateid4
             enc.encode_u32(stateid.seqid);
@@ -390,8 +390,8 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
         let op = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
         let status = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
 
-        let mut stateid = None;
         let mut filehandle = None;
+        let stateid = None;
 
         // Parse enough of each op result to skip to the next
         if status == NFS4_OK {
@@ -412,7 +412,7 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
                     let sid_other = dec.decode_opaque_fixed(12).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     let mut other = [0u8; 12];
                     other.copy_from_slice(sid_other);
-                    stateid = Some(StateId { seqid: sid_seqid, other });
+                    op_results.push(OpResult { op, status, stateid: Some(StateId { seqid: sid_seqid, other }), filehandle: None });
                     break; // Stop parsing — OPEN result is complex
                 }
                 OP_WRITE => {
@@ -455,7 +455,6 @@ pub fn nfs4_error_name(code: u32) -> &'static str {
         1 => "NFS4ERR_PERM",
         NFS4ERR_NOENT => "NFS4ERR_NOENT",
         NFS4ERR_STALE => "NFS4ERR_STALE",
-        NFS4ERR_NOENT => "NFS4ERR_NOENT",
         NFS4ERR_EXIST => "NFS4ERR_EXIST",
         NFS4ERR_ACCESS => "NFS4ERR_ACCESS",
         NFS4ERR_DELAY => "NFS4ERR_DELAY",

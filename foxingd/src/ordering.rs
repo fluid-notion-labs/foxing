@@ -168,7 +168,7 @@ impl ReorderBuffer {
             self.buffer.remove(&candidate_seq).unwrap()
         };
 
-        let is_path_dependent = matches!(evt.event_type, 
+        let _is_path_dependent = matches!(evt.event_type,
             EventType::Write | EventType::WriteRange | 
             EventType::Create | EventType::Unlink | EventType::Mkdir | 
             EventType::Mknod | EventType::Link | EventType::Symlink |

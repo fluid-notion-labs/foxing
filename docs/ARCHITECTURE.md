@@ -1,6 +1,6 @@
 # foxingd Architecture
 
-foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.4.1.
+foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.5.1.
 
 ## Processing Pipeline
 
@@ -148,23 +148,50 @@ Tiered verification to minimize I/O:
 
 For files >1MB with stored Merkle signatures, `MerkleTree::diff()` identifies changed 64KB chunks. Only dirty chunks are copied if <50% of file is modified. 97% data reduction vs full copy for typical single-chunk modifications.
 
+## Unified Binary & Symlink Dispatch
+
+foxingd is a superset of fxcp. When the binary is invoked as `fxcp` (via symlink or renamed binary), it dispatches to the fxcp-core CLI entry point, providing identical behavior to the standalone fxcp binary without requiring a separate build.
+
+```
+argv[0] check → "fxcp" → fxcp_core::sync::cli_main()
+             → "foxingd" → foxingd main (daemon, sync, status, etc.)
+```
+
+This enables single-binary deployments: `ln -sf foxingd fxcp` gives users both tools.
+
+## Batched Hydration Workers
+
+Small files (<64KB) are batched during hydration to reduce per-file overhead. Instead of spawning individual copy operations, the hydration pipeline groups small files and processes them via `sendfile(2)` in batches, amortizing syscall overhead.
+
+For large files (>64KB), the io_uring path is used with registered buffers for zero-copy async I/O.
+
+## NFS Bypass (Experimental, Feature-Gated)
+
+The `nfs-bypass` feature (default OFF in 0.5.1) implements userspace NFSv4.2 compound RPCs to bypass VFS overhead for small-file writes to NFS targets.
+
+**Protocol stack:** TCP connect → EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE → PUTFH + LOOKUP + GETFH (directory handle resolution) → OPEN + WRITE + CLOSE compounds.
+
+**Status:** The protocol stack works through PUTFH+LOOKUP+GETFH (directory handles resolve correctly). OPEN returns NFS4ERR_STALE_STATEID on some servers — investigation ongoing. VFS fallback ensures all files copy correctly when bypass is unavailable.
+
+Enable with `cargo build --features nfs-bypass`.
+
 ## Performance Characteristics
 
-### Adversarial Test Results (v0.4.1, XFS→NFS)
+### Adversarial Test Results (v0.5.0, XFS→NFS)
 
 | Phase | Test | Result | Duration |
 |-------|------|--------|----------|
 | 0 | Baseline NFS Throughput | **PASS** | 2s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | 57s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | 54s |
 | 2 | Live Write Storm (fio 30s) | **PASS** | 44s |
-| 3 | Rename Chain Storm (100 chains a→e) | **PASS** (ghosts=276) | 11s |
-| 4 | NFS Target Drop + Resync (300 files) | **PASS** (standalone) | 37s |
+| 3 | Rename Chain Storm (100 chains a→e) | **PASS** (finals=100/100) | 11s |
+| 4 | NFS Target Drop + Resync (300 files) | **PASS** | 37s |
 | 5 | Large File Kill/Resume (100MB) | **PASS** | 27s |
-| 7 | BLAKE3 Delta Copy | FAIL (signal only) | 50s |
-| 8 | Directory Merkle Pruning | FAIL (signal only) | 50s |
+| 7 | BLAKE3 Delta Copy | **PASS** | 49s |
+| 8 | Directory Merkle Pruning | **PASS** | 51s |
 | 9 | Combined Delta + Pruning | **PASS** | 53s |
 
-Phase 3 ghosts (276) are cosmetic — correct files at final names, race between hydration NFS copies and BPF rename events. Phases 7/8 fail on test signal detection but data integrity is correct.
+Phase 3 ghosts (~340) are cosmetic — correct files at final names, race between hydration NFS copies and BPF rename events.
 
 ### Throughput (XFS→NFS 4.2, 16 vCPU VM)
 

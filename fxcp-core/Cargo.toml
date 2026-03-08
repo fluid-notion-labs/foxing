@@ -1,6 +1,6 @@
 [package]
 name = "fxcp-core"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "GPL-2.0-or-later"
 authors = ["Joel Wirāmu Pauling <aenertia@aenertia.net>"]
@@ -8,7 +8,7 @@ repository = "https://codeberg.org/aenertia/foxing"
 description = "Core copy engine for foxing — smart filesystem copy with CoW/reflink/io_uring support"
 
 [features]
-default = ["nfs-bypass"]
+default = []
 debug_metrics = []
 nfs-bypass = []
 

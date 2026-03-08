@@ -34,7 +34,7 @@ unsafe fn find_inode_match_avx2(inodes: &[u64], target: u64, start: usize, end: 
 
     // Process 4 inodes per iteration
     while i + 4 <= end {
-        let data = _mm256_loadu_si256(inodes[i..].as_ptr() as *const _);
+        let data = unsafe { _mm256_loadu_si256(inodes[i..].as_ptr() as *const _) };
         let cmp = _mm256_cmpeq_epi64(data, target_vec);
         let mask = _mm256_movemask_epi8(cmp);
         if mask != 0 {
@@ -53,8 +53,6 @@ unsafe fn find_inode_match_avx2(inodes: &[u64], target: u64, start: usize, end: 
     None
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use std::arch::x86_64::*;
 #[derive(Debug, Default)]
 pub struct EventBatch {
     pub inodes: Vec<u64>,

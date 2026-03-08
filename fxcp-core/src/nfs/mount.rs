@@ -217,7 +217,6 @@ pub fn resolve_nfs_handle(dir_path: &Path) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_parse_nfs_source() {

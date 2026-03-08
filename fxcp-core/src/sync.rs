@@ -53,6 +53,7 @@ pub struct SyncOptions {
     pub checkpoint_interval: Option<u64>,
     pub checkpoint_keep: usize,
     pub zero_copy: bool,
+    pub verify: bool,
 }
 
 impl Default for SyncOptions {
@@ -71,6 +72,7 @@ impl Default for SyncOptions {
             checkpoint_interval: None,
             checkpoint_keep: 5,
             zero_copy: false,
+            verify: false,
         }
     }
 }
@@ -94,6 +96,8 @@ pub struct SyncStats {
     pub errors: u64,
     pub sigs_stored: u64,
     pub dirs_hashed: u64,
+    pub files_verified: u64,
+    pub verify_failures: u64,
     #[cfg(feature = "nfs-bypass")]
     pub files_nfs_bypass: u64,
     #[cfg(feature = "nfs-bypass")]
@@ -147,8 +151,6 @@ pub fn cli_main() -> anyhow::Result<()> {
         exclude: Vec<String>,
         #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
         cleanup: bool,
-        #[arg(long, help = "Force full hash verification, ignore stored signatures")]
-        strict_hash: bool,
         #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
         size: Option<u64>,
         #[arg(long, help = "Interval in seconds to create CoW checkpoints of stdin stream")]
@@ -185,6 +187,7 @@ pub fn cli_main() -> anyhow::Result<()> {
         checkpoint_interval: cli.checkpoint_interval,
         checkpoint_keep: cli.checkpoint_keep,
         zero_copy: cli.zero_copy,
+        verify: cli.verify,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -689,6 +692,38 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         }
     }
 
+    // Post-copy BLAKE3 verification pass
+    if opts.verify && !opts.dry_run {
+        info!("Running post-copy BLAKE3 verification...");
+        let verify_walker = walkdir::WalkDir::new(&source)
+            .follow_links(false)
+            .sort_by_file_name();
+        for entry in verify_walker.into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+            let src_path = entry.path();
+            let rel = match src_path.strip_prefix(&source) { Ok(r) => r, Err(_) => continue };
+            if exclude_patterns.iter().any(|p| p.matches_path(rel)) { continue; }
+            let dst_path = destination.join(rel);
+            if !dst_path.exists() { continue; }
+            match verify_blake3(src_path, &dst_path) {
+                Ok(true) => { stats.files_verified += 1; }
+                Ok(false) => {
+                    error!("BLAKE3 mismatch: {:?}", src_path);
+                    stats.verify_failures += 1;
+                }
+                Err(e) => {
+                    warn!("verify error {:?}: {}", src_path, e);
+                    stats.verify_failures += 1;
+                }
+            }
+        }
+        if stats.verify_failures > 0 {
+            warn!("{} files failed BLAKE3 verification", stats.verify_failures);
+        } else {
+            info!("{} files verified OK", stats.files_verified);
+        }
+    }
+
     if opts.delete && !opts.dry_run {
         stats.files_deleted = delete_extra_files(&source, &destination, &exclude_patterns)?;
     }
@@ -931,6 +966,13 @@ fn prune_stream_checkpoints(base_path: &Path, keep: usize) {
     }
 }
 
+/// BLAKE3 verification: hash both files and compare.
+fn verify_blake3(src: &Path, dst: &Path) -> std::io::Result<bool> {
+    let src_hash = blake3::hash(&std::fs::read(src)?);
+    let dst_hash = blake3::hash(&std::fs::read(dst)?);
+    Ok(src_hash == dst_hash)
+}
+
 fn format_bytes(b: u64) -> String {
     if b >= 1024 * 1024 * 1024 { format!("{:.1} GB", b as f64 / 1024.0 / 1024.0 / 1024.0) }
     else if b >= 1024 * 1024 { format!("{:.1} MB", b as f64 / 1024.0 / 1024.0) }
@@ -940,7 +982,9 @@ fn format_bytes(b: u64) -> String {
 
 /// Print a human-readable summary of sync results.
 pub fn print_summary(stats: &SyncStats) {
+    #[allow(unused_mut)]
     let mut total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_cfr + stats.bytes_small + stats.bytes_delta;
+    #[allow(unused_mut)]
     let mut total_files = stats.files_copied + stats.files_reflinked + stats.files_cfr + stats.files_small + stats.files_delta;
     #[cfg(feature = "nfs-bypass")]
     {
@@ -972,5 +1016,7 @@ pub fn print_summary(stats: &SyncStats) {
     if stats.files_deleted > 0 { println!("  Files deleted: {}", stats.files_deleted); }
     println!("  Dirs created:  {}", stats.dirs_created);
     println!("  Bytes total:   {} ({:.1} MB)", total_bytes, total_bytes as f64 / 1024.0 / 1024.0);
+    if stats.files_verified > 0 { println!("  Verified:      {} (BLAKE3)", stats.files_verified); }
+    if stats.verify_failures > 0 { println!("  Verify FAIL:   {}", stats.verify_failures); }
     if stats.errors > 0 { println!("  Errors:        {}", stats.errors); }
 }
