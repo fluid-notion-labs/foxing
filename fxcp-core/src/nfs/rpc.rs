@@ -27,6 +27,7 @@ pub const OP_DESTROY_SESSION: u32 = 44;
 pub const OP_PUTROOTFH: u32 = 24;
 pub const OP_LOOKUP: u32 = 15;
 pub const OP_GETFH: u32 = 10;
+pub const OP_RECLAIM_COMPLETE: u32 = 58;
 
 // NFS4 status codes
 pub const NFS4_OK: u32 = 0;
@@ -153,6 +154,8 @@ pub enum Nfs4Op {
         attr_request: [u32; 2],
     },
     GetFh,
+    /// Tell server we have no state to reclaim (ends grace period for this session).
+    ReclaimComplete,
 }
 
 /// Parsed result of a single operation in a compound reply.
@@ -289,6 +292,10 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
         Nfs4Op::GetFh => {
             enc.encode_u32(OP_GETFH);
         }
+        Nfs4Op::ReclaimComplete => {
+            enc.encode_u32(OP_RECLAIM_COMPLETE);
+            enc.encode_bool(false); // rca_one_fs = false (complete for all filesystems)
+        }
     }
 }
 
@@ -391,7 +398,7 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
                 OP_SEQUENCE => {
                     dec.skip_raw(16 + 4 + 4 + 4 + 4 + 4).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
-                OP_PUTFH | OP_PUTROOTFH | OP_LOOKUP => {
+                OP_PUTFH | OP_PUTROOTFH | OP_LOOKUP | OP_RECLAIM_COMPLETE => {
                     // No result data
                 }
                 OP_GETFH => {
@@ -451,6 +458,9 @@ pub fn nfs4_error_name(code: u32) -> &'static str {
         NFS4ERR_EXIST => "NFS4ERR_EXIST",
         NFS4ERR_ACCESS => "NFS4ERR_ACCESS",
         NFS4ERR_DELAY => "NFS4ERR_DELAY",
+        10013 => "NFS4ERR_GRACE",
+        10015 => "NFS4ERR_SHARE_DENIED",
+        10016 => "NFS4ERR_WRONGSEC",
         NFS4ERR_BADSESSION => "NFS4ERR_BADSESSION",
         NFS4ERR_BADSEQ => "NFS4ERR_BADSEQ",
         NFS4ERR_SEQ_MISORDERED => "NFS4ERR_SEQ_MISORDERED",

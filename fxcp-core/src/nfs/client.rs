@@ -99,6 +99,11 @@ impl NfsCompoundClient {
         self.sequence_id.store(1, Ordering::Relaxed);
         debug!("NFS bypass: CREATE_SESSION ok, session={:02x?}", &session_id[..4]);
 
+        // Step 3: RECLAIM_COMPLETE — tell server we have no state to reclaim.
+        // This ends the grace period for our session so OPEN works immediately.
+        self.do_reclaim_complete()?;
+        debug!("NFS bypass: RECLAIM_COMPLETE ok");
+
         Ok(())
     }
 
@@ -298,6 +303,32 @@ impl NfsCompoundClient {
         Err(NfsError::SessionFailed("cannot parse session_id from CREATE_SESSION reply".into()))
     }
 
+    /// Send RECLAIM_COMPLETE to end the grace period for our session.
+    fn do_reclaim_complete(&mut self) -> Result<(), NfsError> {
+        let seq_id = self.next_sequence_id();
+        let ops = vec![
+            Nfs4Op::Sequence {
+                session_id: self.session_id,
+                sequence_id: seq_id,
+                slot_id: 0,
+                highest_slot_id: 0,
+                cache_this: false,
+            },
+            Nfs4Op::ReclaimComplete,
+        ];
+        let msg = rpc::build_compound(self.next_xid(), "rclm", self.uid, self.gid, &self.machine, &ops);
+        self.stream.write_all(&msg)?;
+        self.stream.flush()?;
+        let reply_data = self.read_reply()?;
+        let reply = rpc::parse_compound_reply(&reply_data)?;
+        if reply.status != rpc::NFS4_OK {
+            return Err(NfsError::SessionFailed(format!(
+                "RECLAIM_COMPLETE failed: {} ({})", rpc::nfs4_error_name(reply.status), reply.status
+            )));
+        }
+        Ok(())
+    }
+
     /// Re-establish session after NFS4ERR_BADSESSION or connection loss.
     pub fn recover_session(&mut self) -> Result<(), NfsError> {
         warn!("NFS bypass: recovering session...");
@@ -409,15 +440,44 @@ impl NfsCompoundClient {
     /// Write a single file to the NFS server via compound RPC.
     ///
     /// SEQUENCE + PUTFH(parent) + OPEN(create) + WRITE(FILE_SYNC) + CLOSE
+    /// Retries on NFS4ERR_GRACE (server grace period after session creation).
     pub fn write_file(
         &mut self,
         parent_handle: &[u8],
         filename: &str,
         data: &[u8],
         mode: u32,
-        uid: u32,
-        gid: u32,
-        mtime: (i64, i64),
+        _uid: u32,
+        _gid: u32,
+        _mtime: (i64, i64),
+    ) -> Result<(), NfsError> {
+        for attempt in 0..3 {
+            match self.write_file_inner(parent_handle, filename, data, mode) {
+                Ok(()) => return Ok(()),
+                Err(NfsError::Nfs4Error { code: 10013, .. }) => {
+                    // NFS4ERR_GRACE — server in grace period, retry after delay
+                    if attempt < 2 {
+                        debug!("NFS bypass: server in grace period, retry {} in 500ms", attempt + 1);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                    return Err(NfsError::Nfs4Error {
+                        code: 10013,
+                        message: "server grace period persists after retries".into(),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    fn write_file_inner(
+        &mut self,
+        parent_handle: &[u8],
+        filename: &str,
+        data: &[u8],
+        mode: u32,
     ) -> Result<(), NfsError> {
         let xid = self.next_xid();
         let seq_id = self.next_sequence_id();
