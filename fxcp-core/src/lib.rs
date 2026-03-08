@@ -18,5 +18,7 @@ pub mod governor;
 pub mod versioning;
 pub mod consistency;
 pub mod sync;
+#[cfg(feature = "nfs-bypass")]
+pub mod nfs;
 
 pub use error::{FxcpError, CopyErrorKind, Result};
