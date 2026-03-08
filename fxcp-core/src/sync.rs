@@ -876,6 +876,23 @@ pub fn preserve_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn delete_extra_files(source: &Path, target: &Path, excludes: &[glob::Pattern]) -> crate::Result<u64> {
+    // Fast path: if a tombstone journal exists on the target, replay it
+    // instead of walking the entire target tree.
+    let journal_path = target.join(".foxing_tombstones.jsonl");
+    if journal_path.exists() {
+        if let Ok(journal) = crate::tombstone::TombstoneJournal::open(&journal_path) {
+            if let Ok(entries) = journal.read_all() {
+                if !entries.is_empty() {
+                    info!("Replaying {} tombstones (skipping full target walk)", entries.len());
+                    let deleted = crate::tombstone::replay_tombstones(target, &entries, excludes)?;
+                    let _ = journal.clear();
+                    return Ok(deleted);
+                }
+            }
+        }
+    }
+
+    // Slow path: full target walk (no journal available)
     let mut deleted = 0u64;
     for entry in walkdir::WalkDir::new(target).contents_first(true) {
         let entry = match entry { Ok(e) => e, Err(_) => continue };
@@ -883,6 +900,7 @@ fn delete_extra_files(source: &Path, target: &Path, excludes: &[glob::Pattern]) 
         let rel = match tgt_path.strip_prefix(target) { Ok(r) => r, Err(_) => continue };
         if rel.as_os_str().is_empty() { continue; }
         if excludes.iter().any(|p| p.matches_path(rel)) { continue; }
+        if rel.to_string_lossy().contains(".foxing_tombstones") { continue; }
         let src_path = source.join(rel);
         if !src_path.exists() {
             if entry.file_type().is_dir() { let _ = std::fs::remove_dir(tgt_path); }

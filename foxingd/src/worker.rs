@@ -1259,6 +1259,20 @@ async fn process_single_event_with_wal(
             match res {
                 Ok(Ok(_)) => {
                     identity::remove_entry(&source.inode_map, &source.dir_map, event.dev_id, event.inode);
+                    // Persist tombstone for restart recovery and fxcp --delete optimization
+                    if let Ok(rel) = target_path.strip_prefix(&target_cfg.path) {
+                        if let Some(ref journal) = target_cfg.tombstone_journal {
+                            let entry = fxcp_core::tombstone::TombstoneEntry {
+                                rel_path: rel.to_path_buf(),
+                                is_dir: event.event_type == EventType::Rmdir,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                seq: event.seq_num,
+                            };
+                            if let Err(e) = journal.append(&entry) {
+                                tracing::debug!("tombstone append failed: {}", e);
+                            }
+                        }
+                    }
                 },
                 Ok(Err(e)) => op_result = Err(FoxingError::Io(e)),
                 Err(e) => op_result = Err(e.into()),

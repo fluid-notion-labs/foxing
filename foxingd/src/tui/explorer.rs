@@ -221,6 +221,7 @@ impl ExplorerState {
             label: "".into(),
             paused: Arc::new(AtomicBool::new(false)),
             outage_journal: Arc::new(dashmap::DashSet::new()),
+            tombstone_journal: None,
         };
         SourceConfig {
             path: src_path,

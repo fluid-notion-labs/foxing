@@ -38,6 +38,7 @@ pub struct TombstoneEntry {
 }
 
 /// Persistent append-only tombstone journal backed by a JSONL file.
+#[derive(Debug)]
 pub struct TombstoneJournal {
     path: PathBuf,
     entry_count: AtomicU64,

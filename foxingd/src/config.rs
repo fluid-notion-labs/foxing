@@ -377,6 +377,8 @@ pub struct TargetConfig {
     pub paused: Arc<AtomicBool>,
     #[serde(skip, default)]
     pub outage_journal: Arc<dashmap::DashSet<PathBuf>>,
+    #[serde(skip)]
+    pub tombstone_journal: Option<Arc<fxcp_core::tombstone::TombstoneJournal>>,
 }
 
 impl Default for TargetConfig {
@@ -422,6 +424,7 @@ impl Default for TargetConfig {
             label: "".into(),
             paused: Arc::new(AtomicBool::new(false)),
             outage_journal: Arc::new(dashmap::DashSet::new()),
+            tombstone_journal: None,
         }
     }
 }
@@ -481,6 +484,26 @@ impl TargetConfig {
             let (min, _) = get_flush_multiplier_bounds(&self.profile);
             // 50ms * multiplier -> microseconds
             self.worker_flush_interval_us = (min as u64) * 50_000;
+        }
+
+        // Initialize tombstone journal on the target
+        let tombstone_path = self.path.join(".foxing_tombstones.jsonl");
+        match fxcp_core::tombstone::TombstoneJournal::open(&tombstone_path) {
+            Ok(journal) => {
+                let count = journal.len();
+                if count > 0 {
+                    tracing::info!("Tombstone journal: {} pending entries at {:?}", count, tombstone_path);
+                }
+                self.tombstone_journal = Some(std::sync::Arc::new(journal));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open tombstone journal {:?}: {} — deletions will not be persisted", tombstone_path, e);
+            }
+        }
+
+        // Add tombstone journal to internal exclude patterns
+        if !self.exclude.iter().any(|e| e.contains("foxing_tombstones")) {
+            self.exclude.push(".foxing_tombstones*".to_string());
         }
 
         Ok(())
