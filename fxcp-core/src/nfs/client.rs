@@ -361,14 +361,14 @@ impl NfsCompoundClient {
                 mode,
             },
             Nfs4Op::Write {
-                stateid: StateId::default(), // Server uses current stateid from OPEN
+                stateid: StateId::current(), // Use current stateid from preceding OPEN
                 offset: 0,
                 stable: WriteStable::FileSync,
                 data: data.to_vec(),
             },
             Nfs4Op::Close {
                 seqid: 1,
-                stateid: StateId::default(),
+                stateid: StateId::current(),
             },
         ];
 
@@ -379,6 +379,13 @@ impl NfsCompoundClient {
 
         let reply_data = self.read_reply()?;
         let reply = rpc::parse_compound_reply(&reply_data)?;
+
+        // Log detailed reply info
+        debug!("NFS compound reply: overall_status={} ({}) ops={}",
+               reply.status, rpc::nfs4_error_name(reply.status), reply.op_results.len());
+        for (i, r) in reply.op_results.iter().enumerate() {
+            debug!("  op[{}]: op={} status={} ({})", i, r.op, r.status, rpc::nfs4_error_name(r.status));
+        }
 
         if reply.status != rpc::NFS4_OK {
             let code = reply.status;
@@ -433,16 +440,77 @@ impl NfsCompoundClient {
     }
 
     /// Get or resolve the NFS file handle for a directory path.
-    pub fn get_or_resolve_handle(&self, dir_path: &Path) -> Result<Vec<u8>, NfsError> {
+    ///
+    /// Uses PUTROOTFH + LOOKUP compounds to walk from the export root to
+    /// the target directory, caching intermediate handles.
+    pub fn get_or_resolve_handle(&mut self, dir_path: &Path) -> Result<Vec<u8>, NfsError> {
         if let Some(cached) = self.dir_handle_cache.get(dir_path) {
             return Ok(cached.clone());
         }
 
-        let handle = super::mount::resolve_nfs_handle(dir_path)
-            .map_err(|e| NfsError::StaleHandle { path: format!("{}: {}", dir_path.display(), e) })?;
+        // Compute relative path from mount point
+        let rel = dir_path.strip_prefix(&self.server_info.mount_point)
+            .unwrap_or(std::path::Path::new(""));
+
+        // Walk from export root via PUTROOTFH + LOOKUP chain + GETFH
+        let handle = self.resolve_via_lookup(rel)?;
 
         self.dir_handle_cache.insert(dir_path.to_path_buf(), handle.clone());
         Ok(handle)
+    }
+
+    /// Resolve a relative path from the export root using PUTROOTFH + LOOKUP + GETFH.
+    fn resolve_via_lookup(&mut self, rel_path: &Path) -> Result<Vec<u8>, NfsError> {
+        let xid = self.next_xid();
+        let seq_id = self.next_sequence_id();
+
+        // Build compound: SEQUENCE + PUTROOTFH + LOOKUP(component1) + ... + GETFH
+        let mut ops = vec![
+            Nfs4Op::Sequence {
+                session_id: self.session_id,
+                sequence_id: seq_id,
+                slot_id: 0,
+                highest_slot_id: 0,
+                cache_this: false,
+            },
+            Nfs4Op::PutRootFh,
+        ];
+
+        // Add LOOKUP for each path component
+        for component in rel_path.components() {
+            if let std::path::Component::Normal(name) = component {
+                ops.push(Nfs4Op::Lookup { name: name.to_string_lossy().to_string() });
+            }
+        }
+
+        // GETFH to retrieve the actual server-side filehandle
+        ops.push(Nfs4Op::GetFh);
+
+        let msg = rpc::build_compound(xid, "lkup", self.uid, self.gid, &self.machine, &ops);
+        self.stream.write_all(&msg)?;
+        self.stream.flush()?;
+
+        let reply_data = self.read_reply()?;
+        let reply = rpc::parse_compound_reply(&reply_data)?;
+
+        if reply.status != rpc::NFS4_OK {
+            return Err(NfsError::Nfs4Error {
+                code: reply.status,
+                message: format!("LOOKUP for {:?} failed: {}", rel_path, rpc::nfs4_error_name(reply.status)),
+            });
+        }
+
+        // Extract the filehandle from GETFH result
+        for result in &reply.op_results {
+            if result.op == rpc::OP_GETFH {
+                if let Some(fh) = &result.filehandle {
+                    debug!("NFS GETFH: resolved {:?} → {} bytes", rel_path, fh.len());
+                    return Ok(fh.clone());
+                }
+            }
+        }
+
+        Err(NfsError::SessionFailed(format!("GETFH not found in reply for {:?}", rel_path)))
     }
 
     /// Invalidate a cached directory handle.

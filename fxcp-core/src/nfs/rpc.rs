@@ -26,6 +26,7 @@ pub const OP_CREATE_SESSION: u32 = 43;
 pub const OP_DESTROY_SESSION: u32 = 44;
 pub const OP_PUTROOTFH: u32 = 24;
 pub const OP_LOOKUP: u32 = 15;
+pub const OP_GETFH: u32 = 10;
 
 // NFS4 status codes
 pub const NFS4_OK: u32 = 0;
@@ -77,10 +78,25 @@ pub const SUCCESS: u32 = 0;
 // -----------------------------------------------------------------------
 
 /// Represents an NFSv4 state identifier (returned by OPEN, used by WRITE/SETATTR/CLOSE).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct StateId {
     pub seqid: u32,
     pub other: [u8; 12],
+}
+
+impl Default for StateId {
+    fn default() -> Self {
+        Self { seqid: 0, other: [0u8; 12] }
+    }
+}
+
+impl StateId {
+    /// The "current stateid" special value — tells the server to use the stateid
+    /// from the most recent stateful operation (OPEN) in this compound.
+    /// RFC 8881 §16.2.3.1.2
+    pub fn current() -> Self {
+        Self { seqid: 0xFFFFFFFF, other: [0xFF; 12] }
+    }
 }
 
 /// Write stability level.
@@ -136,6 +152,7 @@ pub enum Nfs4Op {
     GetAttr {
         attr_request: [u32; 2],
     },
+    GetFh,
 }
 
 /// Parsed result of a single operation in a compound reply.
@@ -145,6 +162,8 @@ pub struct OpResult {
     pub status: u32,
     /// For OPEN: the returned stateid.
     pub stateid: Option<StateId>,
+    /// For GETFH: the returned filehandle.
+    pub filehandle: Option<Vec<u8>>,
 }
 
 /// Parsed NFSv4.2 compound reply.
@@ -267,6 +286,9 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
             enc.encode_u32(attr_request[0]);
             enc.encode_u32(attr_request[1]);
         }
+        Nfs4Op::GetFh => {
+            enc.encode_u32(OP_GETFH);
+        }
     }
 }
 
@@ -361,54 +383,53 @@ pub fn parse_compound_reply(data: &[u8]) -> Result<CompoundReply, NfsError> {
         let status = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
 
         let mut stateid = None;
+        let mut filehandle = None;
 
         // Parse enough of each op result to skip to the next
         if status == NFS4_OK {
             match op {
                 OP_SEQUENCE => {
-                    // session_id(16) + sequenceid(4) + slotid(4) + highest_slotid(4) + target_highest_slotid(4) + status_flags(4)
                     dec.skip_raw(16 + 4 + 4 + 4 + 4 + 4).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
-                OP_PUTFH | OP_PUTROOTFH => {
+                OP_PUTFH | OP_PUTROOTFH | OP_LOOKUP => {
                     // No result data
                 }
-                OP_LOOKUP => {
-                    // No result data
+                OP_GETFH => {
+                    // GETFH result: opaque filehandle
+                    let fh = dec.decode_opaque().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    filehandle = Some(fh.to_vec());
                 }
                 OP_OPEN => {
-                    // Parse stateid from OPEN result
                     let sid_seqid = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     let sid_other = dec.decode_opaque_fixed(12).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     let mut other = [0u8; 12];
                     other.copy_from_slice(sid_other);
                     stateid = Some(StateId { seqid: sid_seqid, other });
-                    // Skip remaining OPEN result fields (cinfo, rflags, bitmap, delegation)
-                    // This is complex — for now skip to end by reading remaining
-                    // We'll handle this more precisely if needed
-                    break; // Stop parsing after OPEN stateid
+                    break; // Stop parsing — OPEN result is complex
                 }
                 OP_WRITE => {
-                    // count(4) + committed(4) + writeverf(8)
                     dec.skip_raw(4 + 4 + 8).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
                 OP_SETATTR => {
-                    // attrsset bitmap
                     let bm_len = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                     dec.skip_raw(bm_len as usize * 4).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
                 OP_CLOSE => {
-                    // stateid4
                     dec.skip_raw(4 + 12).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
                 }
+                OP_GETATTR => {
+                    // bitmap + attr_vals — skip
+                    let bm_len = dec.decode_u32().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    dec.skip_raw(bm_len as usize * 4).map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                    let _ = dec.decode_opaque().map_err(|e| NfsError::XdrDecode(e.to_string()))?;
+                }
                 _ => {
-                    // Unknown op — can't skip safely
-                    break;
+                    break; // Unknown op — can't skip safely
                 }
             }
         }
-        // On error status, no result data to skip
 
-        op_results.push(OpResult { op, status, stateid });
+        op_results.push(OpResult { op, status, stateid, filehandle });
     }
 
     Ok(CompoundReply {
