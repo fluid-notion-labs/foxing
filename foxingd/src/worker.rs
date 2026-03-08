@@ -466,6 +466,13 @@ pub async fn run_worker(
                             latency_samples_count += 1;
                             target_error_streak += 1;
 
+                            // Save failed event to outage journal so it's replayed on recovery.
+                            // This captures events during the detection gap (between target going
+                            // down and the health probe pausing workers).
+                            if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                                target_cfg.outage_journal.insert(rel);
+                            }
+
                             match classify_error(&e, &evt.event_type) {
                                 ErrorClass::TargetNotFound => {
                                     let repair_rel = resolve_event_path(&source, evt.parent_inode, &evt.name).await.unwrap_or_else(|_| PathBuf::from(&evt.name));
@@ -604,6 +611,11 @@ pub async fn run_worker(
                             if duration > max_latency_in_window { max_latency_in_window = duration; }
                             latency_samples_count += 1;
 
+                            // Capture to outage journal for recovery replay
+                            if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                                target_cfg.outage_journal.insert(rel);
+                            }
+
                             match classify_error(&e, &evt.event_type) {
                                 ErrorClass::TargetNotFound => {
                                     let repair_rel = resolve_event_path(&source, evt.parent_inode, &evt.name).await.unwrap_or_else(|_| PathBuf::from(&evt.name));
@@ -669,6 +681,11 @@ pub async fn run_worker(
                         if duration > max_latency_in_window { max_latency_in_window = duration; }
                         latency_samples_count += 1;
                         target_error_streak += 1;
+
+                        // Capture to outage journal for recovery replay
+                        if let Ok(rel) = resolve_event_path(&source, evt.parent_inode, &evt.name).await {
+                            target_cfg.outage_journal.insert(rel);
+                        }
 
                         match classify_error(&e, &evt.event_type) {
                             ErrorClass::TargetNotFound => {

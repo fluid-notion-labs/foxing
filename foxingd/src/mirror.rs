@@ -570,7 +570,7 @@ impl Manager {
                                     info!("Target {:?} remounted (dev {:x} → {:x}) — requesting recovery scan",
                                           tgt_cfg.path, state.baseline_dev, current_dev);
                                     state.baseline_dev = current_dev;
-                                    tgt_cfg.outage_journal.clear();
+                                    // Don't clear outage_journal here — targeted_rescan reads it first
                                     h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
