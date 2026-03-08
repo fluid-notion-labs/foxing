@@ -1155,21 +1155,23 @@ phase7() {
         last_delta=$current_delta
     done
 
-    collect_metrics "phase7-post"
-    stop_foxingd
-
-    # Read final delta metrics from snapshot
+    # Read delta metrics BEFORE stopping (endpoint still alive)
     local delta_attempted
     delta_attempted=$(get_metric "foxing_delta_copy_attempted_total")
     local delta_saved
     delta_saved=$(get_metric "foxing_delta_copy_bytes_saved_total")
 
-    # foxingd is stopped — metrics endpoint gone, use last collected snapshot
-    local snap_file
-    snap_file=$(ls -t "$REPORT_DIR"/metrics_phase7-post_*.txt 2>/dev/null | head -1)
-    if [[ -n "$snap_file" ]]; then
-        delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
-        delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
+    collect_metrics "phase7-post"
+    stop_foxingd
+
+    # If live read failed, fall back to snapshot
+    if [[ -z "$delta_attempted" || "$delta_attempted" == "" ]]; then
+        local snap_file
+        snap_file=$(ls -t "$REPORT_DIR"/metrics_phase7-post_*.txt 2>/dev/null | head -1)
+        if [[ -n "$snap_file" ]]; then
+            delta_attempted=$(grep "^foxing_delta_copy_attempted_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
+            delta_saved=$(grep "^foxing_delta_copy_bytes_saved_total" "$snap_file" 2>/dev/null | tail -1 | awk '{print $2}')
+        fi
     fi
 
     if [[ "${delta_attempted:-0}" == "0" ]]; then
@@ -1395,16 +1397,20 @@ phase8() {
     # Give hydration workers time to finish outstanding copies on NFS
     sleep 5
 
+    # Read pruning metric BEFORE stopping (endpoint still alive)
+    local dir_pruned
+    dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
+
     collect_metrics "phase8-post"
     stop_foxingd
 
-    # Read pruning metric from snapshot
-    local dir_pruned
-    dir_pruned=$(get_metric "foxing_hydration_dir_pruned_total")
-    local snap8
-    snap8=$(ls -t "$REPORT_DIR"/metrics_phase8-post_*.txt 2>/dev/null | head -1)
-    if [[ -n "$snap8" ]]; then
-        dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$snap8" 2>/dev/null | tail -1 | awk '{print $2}')
+    # If live read failed, fall back to snapshot
+    if [[ -z "$dir_pruned" || "$dir_pruned" == "" ]]; then
+        local snap8
+        snap8=$(ls -t "$REPORT_DIR"/metrics_phase8-post_*.txt 2>/dev/null | head -1)
+        if [[ -n "$snap8" ]]; then
+            dir_pruned=$(grep "^foxing_hydration_dir_pruned_total" "$snap8" 2>/dev/null | tail -1 | awk '{print $2}')
+        fi
     fi
 
     # Verify dir_pruned >= 3 (stable-a, stable-b, stable-c should be pruned)
