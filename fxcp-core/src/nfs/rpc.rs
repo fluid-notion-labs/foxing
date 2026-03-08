@@ -94,9 +94,10 @@ impl Default for StateId {
 impl StateId {
     /// The "current stateid" special value — tells the server to use the stateid
     /// from the most recent stateful operation (OPEN) in this compound.
-    /// RFC 8881 §16.2.3.1.2
+    /// RFC 5661 §16.2.3.1.2: seqid=1, other=all-zeros.
+    /// (NOT seqid=0xFFFFFFFF/other=all-0xFF, which is the anonymous/READ bypass stateid.)
     pub fn current() -> Self {
-        Self { seqid: 0xFFFFFFFF, other: [0xFF; 12] }
+        Self { seqid: 1, other: [0u8; 12] }
     }
 }
 
@@ -461,6 +462,7 @@ pub fn nfs4_error_name(code: u32) -> &'static str {
         10013 => "NFS4ERR_GRACE",
         10015 => "NFS4ERR_SHARE_DENIED",
         10016 => "NFS4ERR_WRONGSEC",
+        10025 => "NFS4ERR_BAD_STATEID",
         NFS4ERR_BADSESSION => "NFS4ERR_BADSESSION",
         NFS4ERR_BADSEQ => "NFS4ERR_BADSEQ",
         NFS4ERR_SEQ_MISORDERED => "NFS4ERR_SEQ_MISORDERED",

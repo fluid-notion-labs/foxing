@@ -7,6 +7,9 @@ authors = ["Joel Wirāmu Pauling <aenertia@aenertia.net>"]
 repository = "https://codeberg.org/aenertia/foxing"
 description = "Smart filesystem copy — rsync replacement with CoW/reflink support"
 
+[features]
+nfs-bypass = ["fxcp-core/nfs-bypass"]
+
 [[bin]]
 name = "fxcp"
 path = "src/main.rs"
