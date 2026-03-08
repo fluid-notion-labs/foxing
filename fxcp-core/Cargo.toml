@@ -8,7 +8,7 @@ repository = "https://codeberg.org/aenertia/foxing"
 description = "Core copy engine for foxing — smart filesystem copy with CoW/reflink/io_uring support"
 
 [features]
-default = []
+default = ["nfs-bypass"]
 debug_metrics = []
 nfs-bypass = []
 
