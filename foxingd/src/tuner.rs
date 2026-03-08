@@ -690,8 +690,10 @@ impl BbrTuner {
         };
         let bdp = effective_bw * smooth_rtt;
         let bw_safe = effective_bw.max(1.0);
+        let overall_min = segment_stall as f64 * 3.0;
+        let overall_max = (max_overall as f64).max(overall_min);
         let segment_overall = (bdp / bw_safe * 10.0)
-            .clamp(segment_stall as f64 * 3.0, max_overall as f64) as u64;
+            .clamp(overall_min, overall_max) as u64;
 
         // Post-copy metadata timeout: higher multiplier for Merkle computation
         let (base_post, rtt_mult_post) = match self.storage_class {

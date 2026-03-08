@@ -800,13 +800,23 @@ SEC("kprobe/__filemap_fdatawrite_range")
 int BPF_KPROBE(trace_filemap_fdatawrite_range, struct address_space *mapping, loff_t start, loff_t end, int sync_mode) {
     struct inode *inode = BPF_CORE_READ(mapping, host);
     if (!inode) return 0;
+
+    // Flush any aggregated writes for this inode — writeback means data is
+    // being committed to disk, so we should emit the accumulated write event.
+    // The dentry isn't available from address_space, but flush_pending_write
+    // will use whatever dentry was stashed by the original write probe.
+    flush_pending_write(inode, NULL);
+
     struct dirty_key key;
     key.inode_id = BPF_CORE_READ(inode, i_ino);
     key.page_idx = start >> 12;
     __u64 *ts = bpf_map_lookup_elem(&dirty_pages, &key);
     if (ts) {
+        // Already captured by write probe + flush above — skip duplicate
+        bpf_map_delete_elem(&dirty_pages, &key);
         return 0;
     }
+    // Writeback for a range we didn't see a write for — emit it directly
     __u64 len = 0;
     if (end >= start) {
         len = end - start + 1;
