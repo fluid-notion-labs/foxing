@@ -513,6 +513,9 @@ impl NfsCompoundClient {
 
         let msg = rpc::build_compound(xid, "fxcp", self.uid, self.gid, &self.machine, &ops);
 
+        debug!("NFS write compound: {} bytes, {} ops, handle={} bytes, data={} bytes",
+               msg.len(), ops.len(), parent_handle.len(), data.len());
+
         self.stream.write_all(&msg)?;
         self.stream.flush()?;
 

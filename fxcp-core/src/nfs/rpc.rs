@@ -224,25 +224,25 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
             enc.encode_u32(*seqid);          // seqid
             enc.encode_u32(*share_access);   // share_access
             enc.encode_u32(*share_deny);     // share_deny
-            // open_owner4: clientid + owner
-            enc.encode_u64(0);               // clientid (server assigns in session)
+            // open_owner4: clientid(8) + owner(opaque)
+            enc.encode_u64(0);               // clientid (0 = use session binding)
             enc.encode_opaque(owner);        // owner
-            // openhow4: OPEN4_CREATE + UNCHECKED
-            enc.encode_u32(OPEN4_CREATE);
-            enc.encode_u32(CREATEMODE4_UNCHECKED);
-            // createattrs: fattr4 with mode
-            // bitmap: word0=0, word1=bit1(mode)
+            // openhow4: opentype + createhow
+            enc.encode_u32(OPEN4_CREATE);    // opentype = OPEN4_CREATE
+            enc.encode_u32(CREATEMODE4_UNCHECKED); // createmode = UNCHECKED
+            // createattrs (fattr4): bitmap + attr_vals for UNCHECKED
+            // Minimal: just set mode
             enc.encode_u32(2);               // bitmap length (2 words)
-            enc.encode_u32(0);               // bitmap word 0
+            enc.encode_u32(0);               // bitmap word 0 (no attrs in word 0)
             enc.encode_u32(1 << (FATTR4_MODE - 32)); // bitmap word 1 (mode bit)
-            // attr_vals opaque
+            // attr_vals: opaque containing the attribute values
             let mut attr = XdrEncoder::new(8);
-            attr.encode_u32(*mode);
+            attr.encode_u32(*mode & 0o7777); // mode_masked4 (12 bits)
             let attr_bytes = attr.into_bytes();
             enc.encode_opaque(&attr_bytes);
-            // claim: CLAIM_NULL + filename
-            enc.encode_u32(CLAIM_NULL);
-            enc.encode_string(filename);
+            // open_claim4: claim_type + claim_data
+            enc.encode_u32(CLAIM_NULL);      // claim_type = CLAIM_NULL
+            enc.encode_string(filename);     // claim_file = component4
         }
         Nfs4Op::Write { stateid, offset, stable, data } => {
             enc.encode_u32(OP_WRITE);
