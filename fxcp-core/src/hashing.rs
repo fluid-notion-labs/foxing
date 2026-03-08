@@ -74,6 +74,31 @@ pub fn hash_file_full(path: &Path) -> Result<Option<Hash>> {
     Ok(Some(hasher.finalize()))
 }
 
+/// Lite hash from an in-memory buffer (head+tail sampling, same algorithm as `hash_file_lite`).
+pub fn hash_buffer_lite(data: &[u8], size: u64) -> Option<Hash> {
+    if !is_hashing_enabled() { return None; }
+    if size < get_lite_threshold_bytes() { return None; }
+
+    let mut hasher = Hasher::new();
+    hasher.update(&size.to_le_bytes());
+
+    let head_len = CHUNK_SIZE.min(data.len());
+    hasher.update(&data[..head_len]);
+
+    if size > CHUNK_SIZE as u64 * 2 {
+        let tail_start = data.len().saturating_sub(CHUNK_SIZE);
+        hasher.update(&data[tail_start..]);
+    }
+
+    Some(hasher.finalize())
+}
+
+/// Full BLAKE3 hash from an in-memory buffer (same algorithm as `hash_file_full`).
+pub fn hash_buffer_full(data: &[u8]) -> Option<Hash> {
+    if !is_hashing_enabled() { return None; }
+    Some(blake3::hash(data))
+}
+
 pub fn verify_incremental(src: &Path, dst: &Path, size: u64) -> Result<bool> {
     if !is_hashing_enabled() { return Ok(true); }
     if size < get_lite_threshold_bytes() { return Ok(true); }

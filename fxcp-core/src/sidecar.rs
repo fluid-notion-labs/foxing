@@ -73,6 +73,32 @@ impl SyncSignature {
         })
     }
 
+    /// Compute a signature from an in-memory buffer. Used by the NFS compound
+    /// bypass path where file data is already in memory.
+    pub fn compute_from_buffer(data: &[u8], mtime_sec: i64, mtime_nsec: i64) -> Self {
+        let size = data.len() as u64;
+        let (hash, merkle_root) = if hashing::is_hashing_enabled() {
+            if size >= hashing::get_lite_threshold_bytes() {
+                let lite = hashing::hash_buffer_lite(data, size)
+                    .map(|h| h.to_hex().to_string());
+                let full = hashing::hash_buffer_full(data)
+                    .map(|h| h.to_hex().to_string());
+                (lite, full)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        Self {
+            size, mtime_sec, mtime_nsec,
+            hash, merkle_root,
+            chunk_size: Some(hashing::CHUNK_SIZE as u64),
+            leaf_count: None,
+            version: Self::CURRENT_VERSION,
+        }
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         bincode::serialize(self).unwrap_or_default()
     }

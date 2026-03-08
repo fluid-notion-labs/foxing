@@ -94,6 +94,10 @@ pub struct SyncStats {
     pub errors: u64,
     pub sigs_stored: u64,
     pub dirs_hashed: u64,
+    #[cfg(feature = "nfs-bypass")]
+    pub files_nfs_bypass: u64,
+    #[cfg(feature = "nfs-bypass")]
+    pub bytes_nfs_bypass: u64,
 }
 
 // -----------------------------------------------------------------------
@@ -422,6 +426,35 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         crate::metrics::STORAGE_PHYSICAL_BLOCK_SIZE.set(dm.physical_block_size as f64);
     }
 
+    // NFS compound bypass: lazy-init TCP client if target is NFSv4.2
+    #[cfg(feature = "nfs-bypass")]
+    let mut nfs_client: Option<crate::nfs::NfsCompoundClient> = None;
+    #[cfg(feature = "nfs-bypass")]
+    let mut _nfs_bypass_disabled = false;
+    #[cfg(feature = "nfs-bypass")]
+    {
+        let nfs_bypass_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
+        if dst_caps.is_nfs.load(Ordering::Relaxed) && nfs_bypass_env != "0" {
+            match crate::nfs::mount::probe_nfs_bypass(&destination) {
+                Some(info) => {
+                    match crate::nfs::NfsCompoundClient::connect(&info) {
+                        Ok(client) => {
+                            info!("NFS bypass: connected to {} for compound RPCs", info.server_addr);
+                            nfs_client = Some(client);
+                        }
+                        Err(e) => {
+                            debug!("NFS bypass unavailable: {} — using VFS path", e);
+                            _nfs_bypass_disabled = true;
+                        }
+                    }
+                }
+                None => {
+                    debug!("NFS bypass: target not eligible (not v4.2 or kerberos)");
+                }
+            }
+        }
+    }
+
     let exclude_patterns: Vec<glob::Pattern> = opts.exclude.iter()
         .filter_map(|p| glob::Pattern::new(p).ok())
         .collect();
@@ -527,6 +560,55 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         let dst_is_nfs = dst_caps.is_nfs.load(Ordering::Relaxed);
         let is_sparse = file_size > 4096
             && (src_meta.blocks() as u64 * 512) < file_size / 2;
+
+        // Tier 0.5: NFSv4.2 compound RPC bypass (small files on NFS targets)
+        #[cfg(feature = "nfs-bypass")]
+        if dst_is_nfs && !is_sparse && file_size > 0
+            && file_size <= crate::nfs::NFS_BYPASS_MAX_SIZE
+            && nfs_client.is_some()
+        {
+            match std::fs::read(src_path) {
+                Ok(data) => {
+                    let client = nfs_client.as_mut().unwrap();
+                    let rel_parent = dst_path.parent()
+                        .and_then(|p| p.strip_prefix(&destination).ok())
+                        .unwrap_or(std::path::Path::new(""));
+                    let full_parent = destination.join(rel_parent);
+                    match client.get_or_resolve_handle(&full_parent) {
+                        Ok(handle) => {
+                            let fname = dst_path.file_name().unwrap().to_string_lossy();
+                            match client.write_file(
+                                &handle, &fname, &data,
+                                src_meta.mode(), src_meta.uid(), src_meta.gid(),
+                                (src_meta.mtime(), src_meta.mtime_nsec()),
+                            ) {
+                                Ok(()) => {
+                                    stats.files_nfs_bypass += 1;
+                                    stats.bytes_nfs_bypass += file_size;
+                                    if opts.generate_sigs {
+                                        let sig = sidecar::SyncSignature::compute_from_buffer(
+                                            &data, src_meta.mtime(), src_meta.mtime_nsec(),
+                                        );
+                                        let _ = sidecar::set_sync_signature(&dst_path, &sig);
+                                        stats.sigs_stored += 1;
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    debug!("NFS bypass write failed for {:?}: {} — VFS fallback", src_path, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("NFS handle resolve failed: {} — VFS fallback", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("NFS bypass read failed for {:?}: {} — VFS fallback", src_path, e);
+                }
+            }
+        }
 
         // Tier 1: Reflink/FICLONE
         if (same_device || dst_is_nfs) && file_size > 0 {
@@ -852,8 +934,13 @@ fn format_bytes(b: u64) -> String {
 
 /// Print a human-readable summary of sync results.
 pub fn print_summary(stats: &SyncStats) {
-    let total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_cfr + stats.bytes_small + stats.bytes_delta;
-    let total_files = stats.files_copied + stats.files_reflinked + stats.files_cfr + stats.files_small + stats.files_delta;
+    let mut total_bytes = stats.bytes_copied + stats.bytes_reflinked + stats.bytes_cfr + stats.bytes_small + stats.bytes_delta;
+    let mut total_files = stats.files_copied + stats.files_reflinked + stats.files_cfr + stats.files_small + stats.files_delta;
+    #[cfg(feature = "nfs-bypass")]
+    {
+        total_bytes += stats.bytes_nfs_bypass;
+        total_files += stats.files_nfs_bypass;
+    }
     println!("fxcp sync complete:");
     println!("  Files total:   {}", total_files);
     if stats.files_reflinked > 0 {
@@ -870,6 +957,10 @@ pub fn print_summary(stats: &SyncStats) {
     }
     if stats.files_delta > 0 {
         println!("  - delta:       {} ({:.1} MB)", stats.files_delta, stats.bytes_delta as f64 / 1024.0 / 1024.0);
+    }
+    #[cfg(feature = "nfs-bypass")]
+    if stats.files_nfs_bypass > 0 {
+        println!("  - NFS bypass:  {} ({:.1} MB, compound RPC)", stats.files_nfs_bypass, stats.bytes_nfs_bypass as f64 / 1024.0 / 1024.0);
     }
     println!("  Files skipped: {}", stats.files_skipped);
     if stats.files_deleted > 0 { println!("  Files deleted: {}", stats.files_deleted); }
