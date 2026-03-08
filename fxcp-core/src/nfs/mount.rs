@@ -140,8 +140,41 @@ pub fn probe_nfs_bypass(path: &Path) -> Option<NfsBypassInfo> {
 /// changes even if the device ID stays the same. This detects NFS remounts
 /// that `metadata().dev()` misses.
 pub fn get_mount_id(path: &Path) -> Option<u64> {
+    get_mount_id_from("/proc/self/mountinfo", path)
+}
+
+/// Check if a path is mounted in the global mount namespace (`/proc/mounts`).
+///
+/// Uses `/proc/mounts` which reflects the global namespace, NOT the calling
+/// process's namespace. This detects lazy unmounts (`umount -l`) that are
+/// invisible to `/proc/self/mountinfo` when the process holds the mount open.
+///
+/// Returns a synthetic mount ID derived from the device numbers in `/proc/mounts`.
+/// Returns 0 if the path is not mounted in the global namespace.
+pub fn get_global_mount_id(path: &Path) -> u64 {
+    // /proc/mounts format: device mountpoint fstype options dump pass
+    let mounts = match std::fs::read_to_string("/proc/mounts") {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let path_str = path.to_string_lossy();
+    for line in mounts.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 { continue; }
+        if fields[1] == path_str.as_ref() {
+            // Found exact mount point match — return a hash as synthetic ID
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            line.hash(&mut hasher);
+            return hasher.finish();
+        }
+    }
+    0 // Not found — mount is gone
+}
+
+fn get_mount_id_from(mountinfo_path: &str, path: &Path) -> Option<u64> {
     let canonical = path.canonicalize().ok()?;
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
     let mut best: Option<(usize, u64)> = None;
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();

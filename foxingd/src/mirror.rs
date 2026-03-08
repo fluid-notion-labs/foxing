@@ -545,25 +545,43 @@ impl Manager {
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
 
-                                // Mount ID check: detect NFS remount even when device ID
-                                // stays the same. /proc/self/mountinfo assigns a new mount
-                                // ID on each mount, even for the same server:export.
-                                let current_mount_id = fxcp_core::nfs::mount::get_mount_id(&tgt_cfg.path).unwrap_or(0);
-                                if current_mount_id != state.mount_id && state.mount_id != 0 && current_mount_id != 0 {
+                                // Mount check via /proc/mounts (global namespace): detects
+                                // lazy unmount even when this process holds the mount open.
+                                // /proc/self/mountinfo is invisible to lazy unmount because
+                                // the process's own mount namespace keeps the mount alive.
+                                let current_mount_id = fxcp_core::nfs::mount::get_global_mount_id(&tgt_cfg.path);
+
+                                if current_mount_id == 0 && state.mount_id != 0 {
+                                    // Mount disappeared from mountinfo (lazy unmount)
+                                    if state.available {
+                                        info!("Target {:?} disappeared from mountinfo (lazy unmount?) — pausing workers",
+                                              tgt_cfg.path);
+                                        tgt_cfg.paused.store(true, Ordering::SeqCst);
+                                        state.paused_since = Some(Instant::now());
+                                        state.available = false;
+                                    }
+                                } else if current_mount_id != 0 && state.mount_id == 0 {
+                                    // Mount reappeared after being gone — recovery
+                                    info!("Target {:?} reappeared in mountinfo (mount_id={}) — requesting recovery",
+                                          tgt_cfg.path, current_mount_id);
+                                    state.mount_id = current_mount_id;
+                                    state.baseline_dev = current_dev;
+                                    tgt_cfg.paused.store(false, Ordering::SeqCst);
+                                    state.paused_since = None;
+                                    state.available = true;
+                                    h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
+                                    last_full_scan = Instant::now().sub(Duration::from_secs(60));
+                                } else if current_mount_id != 0 && current_mount_id != state.mount_id && state.mount_id != 0 {
+                                    // Mount ID changed (different mount instance)
                                     info!("Target {:?} mount ID changed ({} → {}) — requesting recovery",
                                           tgt_cfg.path, state.mount_id, current_mount_id);
                                     state.mount_id = current_mount_id;
                                     state.baseline_dev = current_dev;
                                     if !state.available {
-                                        // Was unavailable, now remounted — unpause and recover
                                         tgt_cfg.paused.store(false, Ordering::SeqCst);
                                         state.paused_since = None;
+                                        state.available = true;
                                     }
-                                    // Don't clear outage journal — the targeted rescan path
-                                    // (line 436+) will process journaled paths first, which is
-                                    // faster than a full recovery walk for accumulated files.
-                                    // Also request recovery scan to catch anything the journal missed.
-                                    h.source.hydration.request_rescan.store(true, Ordering::SeqCst);
                                     h.source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
                                     last_full_scan = Instant::now().sub(Duration::from_secs(60));
                                 }
