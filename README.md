@@ -152,11 +152,14 @@ See [Architecture Diagrams](docs/ARCHITECTURE.md) for detailed graphviz diagrams
 fxcp and foxingd select the optimal copy method automatically:
 
 ```
+Tier 0.5: NFS compound RPC — userspace OPEN+WRITE+CLOSE in single round-trip (NFSv4.2, ≤16MB)
 Tier 1:   FICLONE          — instant CoW clone (btrfs/XFS/NFS 4.2 same-server)
 Tier 1.5: copy_file_range  — NFS 4.2 server-side copy (no data over wire)
 Tier 2:   sendfile          — kernel-optimized for small files (<64KB)
 Tier 3:   io_uring          — async pipelined for large/cross-device files
 ```
+
+Tier 0.5 (NFS bypass) automatically activates for NFSv4.2 targets with AUTH_SYS. It sends OPEN+WRITE+CLOSE as a single compound RPC over a persistent TCP session, reducing per-file NFS round-trips from 4+ to 1. This makes fxcp faster than rsync for small files on NFS (2.6-2.8x improvement over VFS path).
 
 Sparse files bypass Tiers 1.5 and 2 (both destroy holes) and go directly to Tier 3 with hole-aware I/O.
 

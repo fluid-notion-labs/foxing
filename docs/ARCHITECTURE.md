@@ -165,15 +165,45 @@ Small files (<64KB) are batched during hydration to reduce per-file overhead. In
 
 For large files (>64KB), the io_uring path is used with registered buffers for zero-copy async I/O.
 
-## NFS Bypass (Experimental, Feature-Gated)
+## NFS Bypass (Userspace Compound RPCs)
 
-The `nfs-bypass` feature (default OFF in 0.5.1) implements userspace NFSv4.2 compound RPCs to bypass VFS overhead for small-file writes to NFS targets.
+The NFS bypass (enabled by default) sends NFSv4.2 compound RPCs directly to the NFS server over a persistent TCP connection, bypassing the Linux VFS for small-file writes (≤16MB). This reduces per-file round-trips from 4+ (open, write, fsync, close through the kernel NFS client) to 1 (a single OPEN+WRITE+CLOSE compound).
 
-**Protocol stack:** TCP connect → EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE → PUTFH + LOOKUP + GETFH (directory handle resolution) → OPEN + WRITE + CLOSE compounds.
+![NFS Bypass](diagrams/nfs-bypass.svg)
 
-**Status:** The protocol stack works through PUTFH+LOOKUP+GETFH (directory handles resolve correctly). OPEN returns NFS4ERR_STALE_STATEID on some servers — investigation ongoing. VFS fallback ensures all files copy correctly when bypass is unavailable.
+### Session Establishment
 
-Enable with `cargo build --features nfs-bypass`.
+On startup, if the target is an NFSv4.2 mount with AUTH_SYS:
+
+1. **TCP connect** to NFS server port 2049 from a privileged source port (<1024)
+2. **EXCHANGE_ID** — register client identity, get `client_id`
+3. **CREATE_SESSION** — get `session_id` and slot table
+4. **RECLAIM_COMPLETE** — end grace period so OPEN works immediately
+
+### Per-File Compound
+
+Each file is written in a single compound RPC (one TCP round-trip):
+
+```
+SEQUENCE + PUTFH(parent_handle) + OPEN(create, filename) + WRITE(data, FILE_SYNC) + CLOSE
+```
+
+The WRITE uses the "current stateid" (RFC 5661 §16.2.3.1.2) to reference the OPEN's stateid without parsing the OPEN reply. Directory handles are resolved via PUTROOTFH+LOOKUP+GETFH and cached.
+
+### Performance Impact
+
+Small-file NFS copies improved 2.6-2.8x with bypass enabled:
+
+| Workload | VFS path | NFS bypass | Speedup |
+|----------|------:|------:|------:|
+| 1000 x 4KB files | 6731ms | 2430ms | **2.8x** |
+| 5000 tiny files | 31174ms | 12033ms | **2.6x** |
+
+fxcp is now **1.18x faster than rsync** for 1000 small files on NFS (previously 2.4x slower).
+
+### Fallback
+
+If bypass is unavailable (Kerberos auth, non-v4.2, connection failure) or any compound fails, the file falls through to the VFS copy tiers (FICLONE → copy_file_range → sendfile → io_uring). Disable with `FOXING_NFS_BYPASS=0`.
 
 ## Performance Characteristics
 

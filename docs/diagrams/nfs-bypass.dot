@@ -1,0 +1,86 @@
+// foxingd/fxcp NFS Bypass — Userspace Compound RPC Pipeline
+// Generate: dot -Tsvg nfs-bypass.dot -o nfs-bypass.svg
+digraph nfs_bypass {
+    rankdir=TB;
+    compound=true;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#e8f4fd"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Detection
+    subgraph cluster_detect {
+        label="Mount Detection";
+        style="filled"; fillcolor="#fff3e0";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        mountinfo [label="/proc/self/mountinfo\nParse NFS mounts\n(longest prefix match)", fillcolor="#ffcc80"];
+        check_v42 [label="Check NFSv4.2\nvers=4.2 in mount opts\nReject sec=krb5*", shape=diamond, fillcolor="#ffe082"];
+        resolve_addr [label="Resolve Server\nserver:export → IP:2049\nExtract export path", fillcolor="#ffcc80"];
+    }
+
+    mountinfo -> check_v42;
+    check_v42 -> resolve_addr [label="v4.2 + AUTH_SYS"];
+    check_v42 -> vfs_path [label="not eligible", style=dashed, color=gray];
+
+    // Session Bootstrap
+    subgraph cluster_session {
+        label="Session Bootstrap (once per sync)";
+        style="filled"; fillcolor="#e8eaf6";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        tcp_connect [label="TCP Connect\nPrivileged port (900-1023)\nfor NFS 'secure' exports", fillcolor="#9fa8da"];
+        exchange_id [label="EXCHANGE_ID\nRegister client identity\n→ client_id (u64)", fillcolor="#9fa8da"];
+        create_session [label="CREATE_SESSION\nGet session_id + slot table\n1 slot, AUTH_SYS callback", fillcolor="#9fa8da"];
+        reclaim [label="RECLAIM_COMPLETE\nEnd grace period\nOPEN works immediately", fillcolor="#9fa8da"];
+    }
+
+    resolve_addr -> tcp_connect;
+    tcp_connect -> exchange_id;
+    exchange_id -> create_session;
+    create_session -> reclaim;
+
+    // Handle Resolution
+    subgraph cluster_handles {
+        label="Directory Handle Resolution (cached)";
+        style="filled"; fillcolor="#f3e5f5";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        name_to_handle [label="name_to_handle_at(2)\nExtract kernel NFS handle\n(skip 14-byte header)", fillcolor="#ce93d8"];
+        lookup [label="SEQUENCE + PUTFH\n+ LOOKUP(component)\n+ GETFH", fillcolor="#ce93d8"];
+        cache [label="DashMap Cache\npath → filehandle\n(per-session lifetime)", shape=cylinder, fillcolor="#ba68c8"];
+    }
+
+    reclaim -> name_to_handle [label="mount point handle"];
+    name_to_handle -> lookup [label="wire filehandle"];
+    lookup -> cache;
+
+    // Per-file compound
+    subgraph cluster_compound {
+        label="Per-File Compound (1 TCP round-trip)";
+        style="filled"; fillcolor="#e8f5e9";
+        fontsize=12; fontname="Helvetica-Bold";
+
+        read_src [label="std::fs::read(src)\nEntire file into memory\n(≤16MB threshold)", fillcolor="#a5d6a7"];
+
+        compound [label="SEQUENCE\n+ PUTFH(parent_handle)\n+ OPEN(create, filename, mode)\n+ WRITE(current_stateid, data, FILE_SYNC)\n+ CLOSE(current_stateid)", fillcolor="#81c784"];
+
+        verify [label="Reply Status Check\nAll ops NFS4_OK?\nGrace retry (3x 500ms)", shape=diamond, fillcolor="#a5d6a7"];
+    }
+
+    cache -> read_src [label="parent handle"];
+    read_src -> compound [label="data + handle"];
+    compound -> verify;
+
+    // Outcomes
+    success [label="File Written\nvia NFS Bypass\n~2ms per file", shape=octagon, fillcolor="#c8e6c9"];
+    vfs_path [label="VFS Fallback\nTier 1→1.5→2→3\n(standard copy path)", shape=octagon, fillcolor="#fff9c4"];
+
+    verify -> success [label="NFS4_OK", color=green, penwidth=2];
+    verify -> vfs_path [label="any error", color=orange, style=dashed];
+
+    // Session recovery
+    session_err [label="Session Recovery\nReconnect TCP\nRe-establish session\nClear handle cache", fillcolor="#ef9a9a"];
+
+    verify -> session_err [label="BADSESSION\nBADSEQ", color=red, style=dashed];
+    session_err -> compound [label="retry", style=dashed];
+}

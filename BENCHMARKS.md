@@ -85,17 +85,25 @@ foxingd sync adds ~30-40% overhead over fxcp because it always generates foxingd
 
 ### Cross-Network Copy (XFS NVMe → NFS HDD)
 
-| Workload | Files | Size | cp | rsync | fxcp | foxingd sync | fxcp Method |
-|----------|------:|-----:|---:|------:|-----:|-------------:|:------------|
-| small_files | 1,000 | 4 MB | 1.7s | 2.6s | 5.8s | 8.8s | sendfile |
-| large_files | 1 | 10 MB | 35ms | 98ms | 94ms | 137ms | io_uring |
-| mixed | 500 | 128 MB | 1.1s | 3.1s | 4.8s | 7.4s | sendfile + io_uring |
-| single_large | 1 | 100 MB | 164ms | 288ms | 349ms | 461ms | io_uring |
-| many_tiny | 5,000 | 5 MB | 8.6s | 12.8s | 29.9s | 41.8s | sendfile |
+With NFS bypass enabled (default), fxcp sends OPEN+WRITE+CLOSE as a single compound RPC for files ≤16MB, reducing per-file NFS round-trips from 4+ to 1.
 
-**Analysis:** fxcp is slower than cp/rsync for small files on NFS because each file incurs per-file xattr overhead and the sendfile path doesn't batch NFS RPCs. For large files (single_large), fxcp is competitive with rsync (349ms vs 288ms — 1.2x). foxingd sync adds signature generation overhead.
+| Workload | Files | Size | cp | rsync | fxcp | rsync/fxcp | fxcp Method |
+|----------|------:|-----:|---:|------:|-----:|-----------:|:------------|
+| small_files | 1,000 | 4 MB | 1.8s | 2.9s | 2.4s | **1.18x** | NFS compound RPC |
+| large_files | 1 | 100 MB | 206ms | 330ms | 401ms | 0.82x | io_uring |
+| mixed | 500 | 128 MB | 1.4s | 2.9s | 6.0s | 0.48x | compound + io_uring |
+| many_tiny | 5,000 | ~150 KB | 9.5s | 13.5s | 12.0s | **1.11x** | NFS compound RPC |
 
-The NFS small-file bottleneck is per-file round-trip latency, not throughput. Improving this requires batching NFS operations (compound RPCs) which is not yet implemented.
+**Analysis:** With NFS bypass, fxcp is now faster than rsync for small files (1.18x for 1000x4KB, 1.11x for 5000 tiny). Large files (100MB) use io_uring and are competitive with rsync. Mixed workloads still show overhead because directory creation and large files go through VFS.
+
+### NFS Bypass Performance (before/after)
+
+| Workload | VFS path (no bypass) | NFS bypass | Speedup |
+|----------|------:|------:|------:|
+| 1,000 x 4KB files | 6731ms | **2430ms** | **2.8x** |
+| 5,000 tiny files | 31174ms | **12033ms** | **2.6x** |
+
+The bypass eliminates per-file VFS overhead by packing OPEN+WRITE+CLOSE into one TCP round-trip (~2ms per file vs ~6ms through the kernel NFS client).
 
 ### NFS Same-Server (server-side copy)
 
@@ -216,6 +224,7 @@ foxingd daemon -c config.toml              # Hydration scan → 0 files need syn
 fxcp and foxingd select the optimal copy method automatically:
 
 ```
+Tier 0.5: NFS compound RPC — userspace OPEN+WRITE+CLOSE in single round-trip (NFSv4.2, ≤16MB)
 Tier 1:   FICLONE          — instant CoW clone (btrfs/XFS/NFS 4.2 same-server)
 Tier 1.5: copy_file_range  — NFS 4.2 server-side copy / tmpfs fallback
 Tier 2:   sendfile          — kernel-optimized for small files (<64KB)
@@ -226,6 +235,7 @@ Sparse files bypass Tiers 1.5 and 2 (both destroy holes) and go directly to Tier
 
 | Detected Environment | Strategy |
 |---------------------|:---------|
+| NFS 4.2 cross-server (≤16MB) | Tier 0.5 (NFS compound RPC) |
 | Same btrfs/XFS device | Tier 1 (FICLONE) |
 | NFS 4.2 same server | Tier 1 (FICLONE) or Tier 1.5 (copy_file_range) |
 | tmpfs / ramfs | Tier 1.5 (copy_file_range) or Tier 2 (sendfile) |
