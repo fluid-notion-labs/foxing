@@ -1270,6 +1270,9 @@ async fn process_single_event_with_wal(
                             };
                             if let Err(e) = journal.append(&entry) {
                                 tracing::debug!("tombstone append failed: {}", e);
+                                metrics::TOMBSTONE_IO_ERRORS.inc();
+                            } else {
+                                metrics::TOMBSTONE_ENTRIES.set(journal.len() as f64);
                             }
                         }
                     }

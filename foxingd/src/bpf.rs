@@ -253,6 +253,18 @@ pub fn run(
                 Err(_) => {}
             }
         }
+        // iomap writeback probe: flushes write aggregator for XFS/ext4/btrfs
+        // when they use iomap writeback instead of __filemap_fdatawrite_range
+        match progs.trace_iomap_writeback.attach() {
+            Ok(link) => {
+                _held_links.push(link);
+                attached_count += 1;
+                debug!("BPF: Attached iomap_writeback_folio probe (XFS write flush)");
+            },
+            Err(_) => {
+                debug!("BPF: iomap_writeback_folio not available (non-fatal)");
+            }
+        }
     }
 
     let essential_probes = [

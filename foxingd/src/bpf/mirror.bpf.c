@@ -824,6 +824,18 @@ int BPF_KPROBE(trace_filemap_fdatawrite_range, struct address_space *mapping, lo
     return submit_event_raw(inode, NULL, EVENT_WRITE_RANGE, start, len, 0, 0);
 }
 
+// iomap writeback — used by XFS instead of __filemap_fdatawrite_range.
+// Flushes the write aggregator so XFS write events reach userspace.
+SEC("kprobe/iomap_writeback_folio")
+int BPF_KPROBE(trace_iomap_writeback, struct folio *folio) {
+    struct address_space *mapping = BPF_CORE_READ(folio, mapping);
+    if (!mapping) return 0;
+    struct inode *inode = BPF_CORE_READ(mapping, host);
+    if (!inode) return 0;
+    flush_pending_write(inode, NULL);
+    return 0;
+}
+
 SEC("kprobe/vfs_copy_file_range")
 int BPF_KPROBE(trace_copy_file_range, struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out, size_t len, unsigned int flags) {
     struct inode *inode = BPF_CORE_READ(file_out, f_inode);

@@ -318,6 +318,22 @@ lazy_static! {
     ).unwrap();
 }
 
+// --- [foxingd] Tombstone Journal ---
+lazy_static! {
+    pub static ref TOMBSTONE_ENTRIES: Gauge = register_gauge!(
+        "foxing_tombstone_entries",
+        "Current tombstone journal size (number of entries)"
+    ).unwrap();
+    pub static ref TOMBSTONE_REPLAYED: Counter = register_counter!(
+        "foxing_tombstone_replayed_total",
+        "Tombstone entries successfully replayed on target"
+    ).unwrap();
+    pub static ref TOMBSTONE_IO_ERRORS: Counter = register_counter!(
+        "foxing_tombstone_io_errors_total",
+        "Failures while appending to the tombstone journal"
+    ).unwrap();
+}
+
 // --- [foxingd] Debug ---
 #[cfg(feature = "debug_metrics")]
 lazy_static! {
