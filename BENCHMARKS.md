@@ -339,3 +339,37 @@ python3 tests/harness.py --benchmark --compare tests/baseline.json
 ```
 
 The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system time, context switches, and disk I/O via GNU time and `/proc/diskstats`.
+
+## Mean Time to Consistency (MTTC)
+
+How long from a source modification until the target is fully consistent (fxcp -a completes with content verified). Measures include fxcp startup, filesystem detection, copy, and fsync on target.
+
+**Platform:** fox-test VM (16 vCPU Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5)
+**Source:** XFS on virtio-blk (NVMe-backed), **Iterations:** 5 (median)
+
+| Workload | XFS-to-XFS | XFS-to-NFS | NFS-to-NFS | XFS-to-tmpfs | XFS-same |
+|----------|------:|------:|------:|------:|------:|
+| single 4KB | 69ms | 82ms | 88ms | 55ms | 65ms |
+| single 1MB | 73ms | 89ms | 99ms | 63ms | 64ms |
+| single 100MB | 217ms | 398ms | 728ms | 212ms | 108ms |
+| modify 4KB | 70ms | 88ms | 93ms | 56ms | 62ms |
+| modify 1MB | 76ms | 109ms | 118ms | 62ms | 70ms |
+| append 4KB | 70ms | 110ms | 93ms | 59ms | 64ms |
+| metadata | 71ms | 113ms | 88ms | 59ms | 60ms |
+| rename | 72ms | 110ms | 93ms | 57ms | 62ms |
+| batch 100x4KB | 96ms | 407ms | 543ms | 80ms | 90ms |
+| batch 10x10MB | 309ms | 1045ms | 1426ms | 280ms | 307ms |
+
+**Topologies:**
+- **XFS-to-XFS**: Cross-device local copy (vdb→vdc, sendfile/io_uring)
+- **XFS-to-NFS**: Network copy to NFS 4.2 HDD-backed target (NFS bypass for small files, io_uring for large)
+- **NFS-to-NFS**: Same-server copy (FICLONE server-side for large files, NFS bypass for small)
+- **XFS-to-tmpfs**: Memory-backed target (copy_file_range/sendfile, no xattr support)
+- **XFS-same**: Same-device copy (FICLONE reflink — instant CoW for large files)
+
+**Key observations:**
+- **Fixed overhead ~55-70ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
+- **XFS-same 100MB = 108ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
+- **NFS single 4KB = 82ms**: NFS bypass compound RPC adds only ~13ms over local XFS (82ms vs 69ms)
+- **NFS batch 100x4KB = 407ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
+- **NFS-to-NFS 100MB = 728ms**: Server-side FICLONE but NFS metadata overhead on both source reads and target writes
