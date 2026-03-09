@@ -37,7 +37,16 @@
 
 fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 15-21ms single-file replication latency.
 
-See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices and tool comparisons.
+See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices, tool comparisons, and [visual benchmarks](docs/graphs/).
+
+### v0.6.0 Highlights
+
+- **Adaptive dir-hash pruning** — resync skips unchanged directory subtrees (9-11x faster than rsync at 10K files)
+- **Adaptive Merkle chunks** — signatures scale with file size (no >130MB cliff)
+- **NFS batch_stat prescan** — compound RPCs bulk-fetch target metadata
+- **Targeted recovery scan** — O(journal) with dir-hash signature pruning
+- **Worker-side mount detection** — 500ms lazy unmount detection (was 10s)
+- **ENOSPC Safe Stall** — survives disk pressure without crash
 
 ## Quick Start: fxcp (No Root, No BPF)
 

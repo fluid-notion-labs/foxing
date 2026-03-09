@@ -142,7 +142,9 @@ The **targeted_rescan** processes the outage journal first (fast, only journaled
 
 ### Tree Pruning (Directory Merkle Hashes)
 
-Each source directory hash = BLAKE3(sorted child names + metadata). Stored as xattr on target directories. On rescan, matching hashes skip entire subtrees — O(dirs) not O(files).
+Each source directory hash = BLAKE3(sorted child names + metadata). Stored as xattr on target directories. On rescan, matching hashes skip entire subtrees — O(dirs) not O(files). Both fxcp and foxingd use this pruning.
+
+**Double-stat elimination (v0.6.0):** During the WalkDir traversal, child metadata (size, mtime, type) is aggregated into a per-directory HashMap. The pruning phase computes dir hashes from this pre-aggregated data instead of re-reading the directory, eliminating ~50% of stat syscalls on large trees.
 
 ### File Verification (sync_file_needed)
 
@@ -156,7 +158,9 @@ Tiered verification to minimize I/O:
 
 ### Delta Copy
 
-For files >1MB with stored Merkle signatures, `MerkleTree::diff()` identifies changed 64KB chunks. Only dirty chunks are copied if <50% of file is modified. 97% data reduction vs full copy for typical single-chunk modifications.
+For files >1MB with stored Merkle signatures, `MerkleTree::diff()` identifies changed chunks. Only dirty chunks are copied if <50% of file is modified. 97% data reduction vs full copy for typical single-chunk modifications.
+
+**Adaptive chunk size (v0.6.0):** `calculate_adaptive_chunk_size()` scales chunk size from 64KB (small files) to 4MB+ (multi-GB files), capping at ~1800 leaves to ensure the MerkleSignature fits within the 64KB Linux xattr limit. This prevents silent signature storage failures on files >130MB that previously caused fallback to full copy.
 
 ## Unified Binary & Symlink Dispatch
 

@@ -25,7 +25,7 @@ digraph hydration {
         style="filled"; fillcolor="#e8eaf6";
         fontsize=12; fontname="Helvetica-Bold";
 
-        full_scan [label="Full Scan\n1. WalkDir source tree\n2. Tree pruning (Merkle dir hash)\n3. NFS batch_stat prescan\n4. Signature verification\n5. Queue mismatched files", fillcolor="#9fa8da"];
+        full_scan [label="Full Scan\n1. WalkDir + metadata aggregation\n   (eliminates double-stat)\n2. Tree pruning (Merkle dir hash)\n3. NFS batch_stat prescan\n4. Signature verification\n5. Queue mismatched files", fillcolor="#9fa8da"];
         recovery [label="Recovery Scan\n1. Bump generation counter\n2. Clear ALL dir hashes on target\n3. NFS batch_stat prescan\n4. Full scan WITHOUT pruning", fillcolor="#ef9a9a"];
         targeted [label="Targeted Rescan\n1. Read outage journal\n2. Check only logged paths\n3. Size+mtime comparison\n4. Queue missing/changed", fillcolor="#a5d6a7"];
     }
@@ -108,7 +108,7 @@ digraph hydration {
         fontsize=12; fontname="Helvetica-Bold";
 
         smart_copy [label="SmartCopier\nTier 0.5: NFS compound RPC (≤16MB)\nTier 1: FICLONE (CoW)\nTier 1.5: copy_file_range (NFS)\nTier 2: sendfile (<64KB)\nTier 3: io_uring (large files)", fillcolor="#a5d6a7"];
-        delta_copy [label="Delta Copy\nMerkle diff → DirtyRanges\nCopy only changed 64KB chunks\n(<50% dirty threshold)", fillcolor="#81c784"];
+        delta_copy [label="Delta Copy\nMerkle diff → DirtyRanges\nAdaptive chunk size (64KB-4MB)\nCopy only dirty chunks\n(<50% dirty threshold)", fillcolor="#81c784"];
         postcopy [label="Post-Copy\nMetadata sync\nMerkle signature store\nSync signature cache", fillcolor="#a5d6a7"];
     }
 

@@ -4,6 +4,14 @@
 **Date:** 2026-03-09
 **Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
 
+## v0.6.0 Performance Features
+
+- **Adaptive Merkle chunks**: Chunk size scales with file size (64KB–4MB), keeping signatures under the 64KB xattr limit. Files >130MB no longer silently fall back to full copy.
+- **Double-stat elimination**: WalkDir metadata is aggregated during traversal, eliminating redundant `stat` syscalls in directory hash computation (~50% reduction).
+- **Dir-hash adaptive pruning** (fxcp + foxingd): Unchanged directories are skipped entirely during resync — O(dirs) instead of O(files). 9-11x faster than rsync at 10K files.
+- **NFS batch_stat prescan**: Compound RPCs bulk-fetch SIZE+TIME_MODIFY for target files (7 per compound), skipping VFS stat round-trips.
+- **`hash_file_lite` read_at**: Uses `pread(2)` instead of `seek()` — thread-safe, no zero-init overhead.
+
 ## Binary Comparison
 
 | Binary | Size | BPF Deps | Root Required | Notes |
@@ -84,6 +92,8 @@ foxingd sync adds overhead over fxcp because it generates foxingd-compatible sig
 | rsync | 543ms | **110 MB/s** |
 
 ### Cross-Network Copy (XFS NVMe → NFS HDD)
+
+![NFS Performance Comparison](docs/graphs/nfs-comparison.svg)
 
 With NFS bypass enabled (default), fxcp sends OPEN+WRITE+CLOSE as a single compound RPC for files ≤16MB, reducing per-file NFS round-trips from 4+ to 1.
 
@@ -200,6 +210,8 @@ foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) n
 
 fxcp now uses the same BLAKE3 dir-hash pruning as foxingd. On resync, unchanged directory subtrees are skipped entirely — O(dirs) instead of O(files).
 
+![Pruning Scaling](docs/graphs/pruning-scaling.svg)
+
 | Files | Dirs | Cold Sync rsync | Cold Sync fxcp | Resync rsync | Resync fxcp | 1-file-mod rsync | 1-file-mod fxcp |
 |------:|-----:|------:|------:|------:|------:|------:|------:|
 | 500 | 5 | 2.4s | **1.6s** (1.6x) | 257ms | **117ms** (2.2x) | 266ms | 484ms |
@@ -240,6 +252,8 @@ fxcp now uses the same BLAKE3 dir-hash pruning as foxingd. On resync, unchanged 
 
 ### Phase 1: fxcp One-Shot
 
+![MTTC Heatmap](docs/graphs/mttc-heatmap.svg)
+
 How long from a source modification until the target is fully consistent (fxcp -a completes with content verified). Measures include fxcp startup, filesystem detection, copy, and fsync on target.
 
 **Platform:** fox-test VM (16 vCPU Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5)
@@ -273,6 +287,8 @@ How long from a source modification until the target is fully consistent (fxcp -
 - **NFS-to-NFS 100MB = 1611ms**: Server-side copy but NFS metadata overhead varies with server load
 
 ### Phase 2: foxingd Daemon (BPF Event-Driven)
+
+![Daemon Latency](docs/graphs/daemon-latency.svg)
 
 **Mode:** foxingd daemon with eBPF event capture, target pre-synced with `--generate-sigs`
 **Latency:** Source write to target file consistent (polled at 10ms resolution)
@@ -437,7 +453,17 @@ python3 tests/harness.py --benchmark --compare tests/baseline.json
 
 The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system time, context switches, and disk I/O via GNU time and `/proc/diskstats`.
 
+### Regenerating Graphs
+
+```bash
+# Requires: python3-matplotlib python3-pandas python3-seaborn
+python3 tests/generate-graphs.py
+# Output: docs/graphs/*.svg + docs/graphs/*.png
+```
+
 ## Comparison with Other Replication Tools
+
+![Tool Comparison](docs/graphs/tool-comparison.svg)
 
 ### vs rsync
 
