@@ -846,9 +846,9 @@ phase5() {
     clean_target
     mkdir -p "$test_dir"
 
-    # 100MB instead of 500MB — faster to generate and still tests the path
-    log "Creating 100MB file..."
-    dd if=/dev/urandom of="$test_dir/bigfile.dat" bs=1M count=100 2>/dev/null
+    # 500MB to ensure SIGKILL arrives during copy (100MB copies in <3s on NFS)
+    log "Creating 500MB file..."
+    dd if=/dev/urandom of="$test_dir/bigfile.dat" bs=1M count=500 2>/dev/null
     local src_hash
     src_hash=$(sha256sum "$test_dir/bigfile.dat" | awk '{print $1}')
     log "Source hash: ${src_hash:0:16}..."
@@ -871,15 +871,15 @@ phase5() {
         copies=$(get_copy_count)
         local repair
         repair=$(get_metric "foxing_events_repair_completed_total")
-        log "  t+${elapsed}s: ${tgt_mb}MB/100MB copies=${copies} repairs=${repair:-0}"
+        log "  t+${elapsed}s: ${tgt_mb}MB/500MB copies=${copies} repairs=${repair:-0}"
 
-        if [[ $tgt_size -gt 5242880 ]] && [[ $tgt_size -lt 104857600 ]]; then
+        if [[ $tgt_size -gt 5242880 ]] && [[ $tgt_size -lt 524288000 ]]; then
             partial=true
             log "Partial sync at ${tgt_mb}MB — killing foxingd"
             break
         fi
         # Check if fully synced already
-        [[ $tgt_size -ge 104857600 ]] && { log "Fully synced before kill"; signals="${signals}full_sync_before_kill "; break; }
+        [[ $tgt_size -ge 524288000 ]] && { log "Fully synced before kill"; signals="${signals}full_sync_before_kill "; break; }
     done
 
     collect_metrics "phase5-pre-kill"
@@ -912,8 +912,8 @@ phase5() {
         copies=$(get_copy_count)
         local repair
         repair=$(get_metric "foxing_events_repair_completed_total")
-        log "  t+${elapsed}s: ${tgt_size}B / 104857600B copies=${copies} repairs=${repair:-0}"
-        [[ $tgt_size -ge 104857600 ]] && break
+        log "  t+${elapsed}s: ${tgt_size}B / 524288000B copies=${copies} repairs=${repair:-0}"
+        [[ $tgt_size -ge 524288000 ]] && break
         if [[ $tgt_size -eq $last_size ]]; then
             stall_elapsed=$((stall_elapsed + 5))
             [[ $stall_elapsed -ge $STALL_TIMEOUT ]] && { signal "STALL on resume"; signals="${signals}resume_STALLED "; diagnose_stall "${FOXINGD_PID:-}" "phase5"; break; }
@@ -951,78 +951,145 @@ phase6() {
     local phase_start=$(date +%s)
     log ""
     log "============================================"
-    log "PHASE 6: Disk Pressure (CircuitBreaker + Muted)"
+    log "PHASE 6: Disk Pressure (ENOSPC + Safe Stall)"
     log "============================================"
 
     local signals=""
     local result="PASS"
     local test_dir="$SOURCE/adversarial-pressure"
+    local PRESSURE_DEV="/dev/vdg"
+    local PRESSURE_MNT="/mnt/pressure-target"
 
-    ensure_foxingd || return
+    stop_foxingd
 
-    local tgt_avail_bytes
-    tgt_avail_bytes=$(df --output=avail -B1 "$TARGET" | tail -1)
-    local tgt_avail_mb=$((tgt_avail_bytes / 1048576))
-    log "NFS available: ${tgt_avail_mb}MB"
-
-    local fill_mb=$((tgt_avail_mb - 256))
-    if [[ $fill_mb -le 0 ]]; then
-        record_result 6 "Disk Pressure" "SKIP" "0" "target_too_full"
-        return
-    fi
-    if [[ $fill_mb -gt 10240 ]]; then
-        log "SKIP: NFS share too large (${tgt_avail_mb}MB) for safe pressure test"
-        record_result 6 "Disk Pressure" "SKIP" "0" "nfs_too_large=${tgt_avail_mb}MB"
+    # Check for pressure disk (512MB XFS, attached via virsh)
+    if [[ ! -b "$PRESSURE_DEV" ]]; then
+        log "SKIP: Pressure disk $PRESSURE_DEV not attached (virsh attach-disk)"
+        record_result 6 "Disk Pressure" "SKIP" "0" "no_pressure_disk"
         return
     fi
 
-    log "Filling ${fill_mb}MB..."
-    dd if=/dev/zero of="$TARGET/.fill_pressure_test" bs=1M count="$fill_mb" 2>/dev/null || true
-    log "Post-fill: $(($(df --output=avail -B1 "$TARGET" | tail -1) / 1048576))MB free"
+    # Format and mount fresh
+    mkfs.xfs -f "$PRESSURE_DEV" > /dev/null 2>&1
+    mkdir -p "$PRESSURE_MNT"
+    mount "$PRESSURE_DEV" "$PRESSURE_MNT"
+    local avail_mb=$(($(df --output=avail -B1 "$PRESSURE_MNT" | tail -1) / 1048576))
+    log "Pressure target: ${avail_mb}MB available on $PRESSURE_DEV"
 
+    # Create foxingd config with pressure target
+    local P6_CONFIG="/tmp/foxingd-pressure.toml"
+    cat > "$P6_CONFIG" <<TOMLEOF
+metrics_port = 9100
+worker_count = 4
+
+[[sources]]
+path = "$SOURCE"
+  [[sources.targets]]
+  path = "$PRESSURE_MNT"
+  profile = "Auto"
+  initial_sync = true
+  enable_versioning = false
+TOMLEOF
+
+    # Generate source data larger than target (600MB > ~414MB available)
+    clean_source
     mkdir -p "$test_dir"
-    for i in $(seq 1 50); do
-        dd if=/dev/urandom of="$test_dir/pressure_${i}.dat" bs=4096 count=10 2>/dev/null
+    log "Generating 600MB source data (target has ${avail_mb}MB)..."
+    for i in $(seq 1 60); do
+        dd if=/dev/urandom of="$test_dir/pressure_${i}.dat" bs=1M count=10 2>/dev/null
     done
 
-    local saw_muted=false
-    for tick in $(seq 1 12); do
+    # Start foxingd with pressure target
+    log "Starting foxingd with pressure target..."
+    "$FOXINGD" daemon -c "$P6_CONFIG" >> "$REPORT_DIR/foxingd.log" 2>&1 &
+    FOXINGD_PID=$!
+    sleep 2
+
+    if ! curl -sf "$METRICS_URL" > /dev/null 2>&1; then
+        log "FAIL: foxingd did not start"
+        record_result 6 "Disk Pressure" "FAIL" "$(($(date +%s) - phase_start))" "foxingd_start_failed"
+        umount "$PRESSURE_MNT" 2>/dev/null
+        return
+    fi
+
+    # Monitor for ENOSPC handling
+    local saw_enospc=false
+    local files_copied=0
+    for tick in $(seq 1 24); do
         sleep 5
-        local states
-        states=$(get_tuner_states)
-        if echo "$states" | grep -q ' 3$\| 3\.0$'; then
-            saw_muted=true
-            log "  t+$((tick*5))s: MUTED detected!"
+        local copies
+        copies=$(get_copy_count)
+        local dropped
+        dropped=$(get_metric "foxing_events_dropped")
+        local tgt_files
+        tgt_files=$(find "$PRESSURE_MNT/adversarial-pressure" -type f 2>/dev/null | wc -l)
+        local tgt_avail
+        tgt_avail=$(($(df --output=avail -B1 "$PRESSURE_MNT" | tail -1) / 1048576))
+        log "  t+$((tick*5))s: target=${tgt_files}/60 copies=${copies} dropped=${dropped:-0} avail=${tgt_avail}MB"
+
+        files_copied=$tgt_files
+
+        # Check if target is full
+        if [[ $tgt_avail -lt 10 ]]; then
+            saw_enospc=true
+            log "  ENOSPC: target disk full (${tgt_avail}MB free)"
             break
         fi
-        local st
-        st=$(echo "$states" | head -1 | awk '{print $2}')
-        log "  t+$((tick*5))s: tuner=$st"
-    done
 
-    collect_metrics "phase6-during-pressure"
-
-    $saw_muted && pass "Muted state detected" || { signal "No Muted state"; signals="${signals}no_muted "; }
-
-    log "Releasing pressure..."
-    rm -f "$TARGET/.fill_pressure_test"
-
-    if $saw_muted; then
-        local recovered=false
-        for tick in $(seq 1 6); do
-            sleep 5
-            local states
-            states=$(get_tuner_states)
-            if ! echo "$states" | grep -q ' 3$\| 3\.0$'; then
-                recovered=true
-                log "  Recovered from Muted"
+        # If copies stopped progressing, check for safe stall
+        if [[ $tick -gt 4 ]] && [[ $tgt_files -gt 0 ]] && [[ $tgt_files -lt 60 ]]; then
+            local copy_errs
+            copy_errs=$(get_metric "foxing_copy_timeout_total")
+            if [[ "${copy_errs:-0}" != "0" ]] || [[ $tgt_avail -lt 50 ]]; then
+                saw_enospc=true
+                log "  ENOSPC pressure detected (${tgt_avail}MB free, errors=${copy_errs:-0})"
                 break
             fi
-        done
-        $recovered && pass "Recovered from Muted" || { fail "No recovery"; signals="${signals}no_recovery "; result="FAIL"; }
+        fi
+    done
+
+    collect_metrics "phase6-pressure"
+
+    if $saw_enospc; then
+        pass "ENOSPC detected (${files_copied}/60 files copied before pressure)"
+
+        # Verify foxingd is still alive (Safe Stall, not crash)
+        if kill -0 "$FOXINGD_PID" 2>/dev/null; then
+            pass "foxingd survived ENOSPC (PID $FOXINGD_PID alive)"
+        else
+            fail "foxingd crashed during ENOSPC"
+            signals="${signals}crashed_on_enospc "
+            result="FAIL"
+        fi
+
+        # Release pressure: delete some files and check if replication resumes
+        log "Releasing pressure (deleting 20 target files)..."
+        find "$PRESSURE_MNT/adversarial-pressure" -name "*.dat" -type f | head -20 | xargs rm -f 2>/dev/null
+        sleep 10
+        local post_copies
+        post_copies=$(get_copy_count)
+        if [[ $post_copies -gt $files_copied ]]; then
+            pass "Replication resumed after space freed"
+        else
+            signal "No resume after space freed"
+            signals="${signals}no_resume "
+        fi
+    else
+        signal "No ENOSPC detected"
+        signals="${signals}no_enospc "
+        # Still pass if all files copied (target was big enough)
+        if [[ $files_copied -ge 60 ]]; then
+            pass "All 60 files copied (no pressure — target too large?)"
+        fi
     fi
 
-    collect_metrics "phase6-post"
+    # Cleanup
+    stop_foxingd
+    umount "$PRESSURE_MNT" 2>/dev/null
+    rm -f "$P6_CONFIG"
+
+    # Restart foxingd with original config for remaining phases
+    start_foxingd || true
 
     local phase_end=$(date +%s)
     record_result 6 "Disk Pressure" "$result" "$((phase_end - phase_start))" "$signals"
