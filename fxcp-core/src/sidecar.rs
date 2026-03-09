@@ -67,7 +67,7 @@ impl SyncSignature {
             mtime_nsec: meta.mtime_nsec(),
             hash,
             merkle_root,
-            chunk_size: Some(hashing::CHUNK_SIZE as u64),
+            chunk_size: Some(hashing::calculate_adaptive_chunk_size(size)),
             leaf_count: None,
             version: Self::CURRENT_VERSION,
         })
@@ -93,7 +93,7 @@ impl SyncSignature {
         Self {
             size, mtime_sec, mtime_nsec,
             hash, merkle_root,
-            chunk_size: Some(hashing::CHUNK_SIZE as u64),
+            chunk_size: Some(hashing::calculate_adaptive_chunk_size(size)),
             leaf_count: None,
             version: Self::CURRENT_VERSION,
         }

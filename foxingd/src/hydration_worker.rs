@@ -555,7 +555,9 @@ impl Hydrator {
 
         let mut dirs = Vec::new();
         let mut files = Vec::new();
-        
+        // QW2: Aggregate child metadata during walkdir to avoid double-stat in pruning
+        let mut dir_children_meta: HashMap<PathBuf, Vec<(String, [u8; 32])>> = HashMap::new();
+
         let walker = WalkDir::new(&self.source.path).sort_by_file_name();
         let high_watermark = (self.global_buffer_limit * 20).clamp(2000, 100_000);
 
@@ -590,6 +592,26 @@ impl Hydrator {
             match entry_res {
                 Ok(entry) => {
                     let path = entry.path().to_path_buf();
+
+                    // QW2: Aggregate metadata for parent directory hash (avoids re-stat)
+                    if let Ok(meta) = entry.metadata() {
+                        if let Some(parent) = path.parent() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !(name.starts_with('.') && name.ends_with(".foxing_meta"))
+                                && !name.starts_with(".foxing")
+                            {
+                                let mut hasher = blake3::Hasher::new();
+                                hasher.update(&meta.len().to_le_bytes());
+                                hasher.update(&meta.mtime().to_le_bytes());
+                                hasher.update(&meta.mtime_nsec().to_le_bytes());
+                                hasher.update(if meta.is_dir() { b"d" } else { b"f" });
+                                dir_children_meta.entry(parent.to_path_buf())
+                                    .or_default()
+                                    .push((name, *hasher.finalize().as_bytes()));
+                            }
+                        }
+                    }
+
                     if entry.file_type().is_dir() {
                         dirs.push(path);
                     } else if entry.file_type().is_file() {
@@ -649,10 +671,11 @@ impl Hydrator {
             // File modifications inside subdirectories don't update parent dir mtime,
             // so cascading from parent to child would miss changes.
 
-            // Compute current source dir hash from stat metadata
-            let src_hash = match Self::compute_current_dir_hash(src_dir) {
-                Some(h) => h,
-                None => continue, // Empty or unreadable — don't prune
+            // QW2: Use pre-aggregated metadata from walkdir pass (avoids double-stat)
+            let src_hash = if let Some(mut children) = dir_children_meta.remove(src_dir) {
+                fxcp_core::hashing::compute_dir_hash(&mut children)
+            } else {
+                continue; // Empty or unreadable — don't prune
             };
 
             // Check against all targets
@@ -829,9 +852,15 @@ impl Hydrator {
         self.flush_buffer(job_buffer);
 
         // Store dir hashes on targets for future pruning
+        // QW2: Use pre-aggregated metadata where available (avoids re-stat)
         for (src_dir, rel_dir) in &dir_mappings {
             if pruned_dirs.contains(rel_dir) { continue; } // Already stored
-            if let Some(hash) = Self::compute_current_dir_hash(src_dir) {
+            let hash = if let Some(mut children) = dir_children_meta.remove(src_dir) {
+                Some(fxcp_core::hashing::compute_dir_hash(&mut children))
+            } else {
+                Self::compute_current_dir_hash(src_dir)
+            };
+            if let Some(hash) = hash {
                 for target in targets_ref {
                     let target_dir = target.path.join(rel_dir);
                     if target_dir.exists() {
@@ -1814,7 +1843,8 @@ pub async fn process_hydration_job(
             if let Some(target_merkle_sig) = fxcp_core::sidecar::get_merkle_signature(&current_target_path) {
                 // Build source Merkle tree
                 let src_clone = current_source_path.clone();
-                let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
+                let file_size = std::fs::metadata(&src_clone).map(|m| m.len()).unwrap_or(0);
+                let chunk_size = fxcp_core::hashing::calculate_adaptive_chunk_size(file_size);
 
                 let src_tree_result = tokio::task::spawn_blocking(move || {
                     fxcp_core::hashing::MerkleTree::from_file(&src_clone, chunk_size)
@@ -2005,7 +2035,7 @@ pub async fn process_hydration_job(
                 // WI-5: Skip sync_xattrs when source has no user.* xattrs.
                 let src_post = current_source_path.clone();
                 let dst_post = current_target_path.clone();
-                let chunk_size = fxcp_core::hashing::CHUNK_SIZE as u64;
+                let chunk_size = fxcp_core::hashing::calculate_adaptive_chunk_size(file_size);
                 let is_large = file_size > HYDRATION_SMALL_FILE_THRESHOLD;
                 let needs_merkle = file_size > MERKLE_DELTA_THRESHOLD;
 

@@ -795,7 +795,7 @@ pub fn store_foxing_signatures(dst: &Path) -> crate::Result<()> {
     sidecar::set_sync_signature(dst, &sig)?;
     let file_size = std::fs::metadata(dst)?.len();
     if file_size > (hashing::CHUNK_SIZE * 4) as u64 {
-        let tree = MerkleTree::from_file(dst, hashing::CHUNK_SIZE as u64)?;
+        let tree = MerkleTree::from_file(dst, hashing::calculate_adaptive_chunk_size(dst.metadata()?.len()))?;
         let merkle_sig = tree.to_signature();
         sidecar::set_merkle_signature(dst, &merkle_sig)?;
     }
@@ -840,7 +840,7 @@ async fn try_delta_copy(
     copier: &mut SmartCopier,
     src: &Path, dst: &Path, file_size: u64,
 ) -> crate::Result<Option<CopyStats>> {
-    let chunk_size = hashing::CHUNK_SIZE as u64;
+    let chunk_size = hashing::calculate_adaptive_chunk_size(file_size);
     let src_tree = MerkleTree::from_file(src, chunk_size)?;
     let dst_tree = MerkleTree::from_file(dst, chunk_size)?;
     if src_tree.root == dst_tree.root {

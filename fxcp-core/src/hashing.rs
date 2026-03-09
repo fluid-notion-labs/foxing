@@ -4,7 +4,8 @@
 // fxcp-core/src/hashing.rs — BLAKE3 hashing, Merkle tree, delta detection, directory hashing
 
 use blake3::{Hasher, Hash};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::fs::File;
 use crate::error::{Result};
@@ -13,7 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Default 128KB
 static LITE_HASH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(128 * 1024);
-pub const CHUNK_SIZE: usize = 65536; // 64KB chunks for incremental hashing
+/// Minimum chunk size for Merkle tree (64KB). Adaptive chunk_size scales up for large files.
+pub const MIN_CHUNK_SIZE: usize = 65536;
+/// Keep backward compat for callers using CHUNK_SIZE directly
+pub const CHUNK_SIZE: usize = MIN_CHUNK_SIZE;
+/// Max Merkle leaves that fit in a 64KB xattr (64KB / 32 bytes per hash, with overhead margin)
+pub const MAX_LEAVES_PER_XATTR: u64 = 1800;
 
 static HASHING_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -33,27 +39,38 @@ pub fn get_lite_threshold_bytes() -> u64 {
     LITE_HASH_THRESHOLD_BYTES.load(Ordering::Relaxed)
 }
 
+/// Calculate adaptive chunk size that keeps MerkleSignature under the 64KB xattr limit.
+/// For files ≤~115MB, uses the default 64KB chunk. For larger files, scales up to
+/// maintain ≤1800 leaves (1800 × 32 = 57,600 bytes, well under 64KB).
+pub fn calculate_adaptive_chunk_size(file_size: u64) -> u64 {
+    if file_size == 0 {
+        return MIN_CHUNK_SIZE as u64;
+    }
+    let desired = file_size.div_ceil(MAX_LEAVES_PER_XATTR);
+    std::cmp::max(MIN_CHUNK_SIZE as u64, desired).next_power_of_two()
+}
+
 pub fn hash_file_lite(path: &Path, size: u64) -> Result<Option<Hash>> {
     if !is_hashing_enabled() { return Ok(None); }
     if size < get_lite_threshold_bytes() { return Ok(None); }
-    
+
     let _timer = metrics::HASH_COMPUTATION_DURATION.start_timer();
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let mut hasher = Hasher::new();
-    
-    // Sample: Head (64KB) + Tail (64KB) + Metadata
-    let mut buf = vec![0u8; CHUNK_SIZE];
     hasher.update(&size.to_le_bytes());
-    
-    let n = file.read(&mut buf)?;
-    hasher.update(&buf[..n]);
-    
-    if size > CHUNK_SIZE as u64 * 2 {
-        file.seek(SeekFrom::End(-(CHUNK_SIZE as i64)))?;
-        let n = file.read(&mut buf)?;
-        hasher.update(&buf[..n]);
+
+    // Use read_at (pread) to avoid stateful seeks and zero-init overhead
+    let mut buf = vec![0u8; MIN_CHUNK_SIZE];
+
+    let head_read = file.read_at(&mut buf, 0).unwrap_or(0);
+    hasher.update(&buf[..head_read]);
+
+    if size > MIN_CHUNK_SIZE as u64 * 2 {
+        let tail_offset = size - MIN_CHUNK_SIZE as u64;
+        let tail_read = file.read_at(&mut buf, tail_offset).unwrap_or(0);
+        hasher.update(&buf[..tail_read]);
     }
-    
+
     Ok(Some(hasher.finalize()))
 }
 
