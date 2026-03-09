@@ -391,6 +391,7 @@ impl Manager {
                 mount_id: u64,
                 available: bool,
                 paused_since: Option<Instant>,
+                mount_epoch: String,
             }
             let mut mount_states: HashMap<PathBuf, MountState> = HashMap::new();
             for h in hydrators_arc.iter() {
@@ -401,11 +402,18 @@ impl Manager {
                     if !available {
                         tgt_cfg.paused.store(true, Ordering::SeqCst);
                     }
+                    // Write mount epoch file — workers verify this to detect stale mounts
+                    let epoch = uuid::Uuid::new_v4().to_string();
+                    if available {
+                        let epoch_path = tgt_cfg.path.join(".foxing_mount_epoch");
+                        let _ = std::fs::write(&epoch_path, &epoch);
+                    }
                     mount_states.insert(tgt_cfg.path.clone(), MountState {
                         baseline_dev: dev,
                         mount_id: mid,
                         available,
                         paused_since: if available { None } else { Some(Instant::now()) },
+                        mount_epoch: epoch,
                     });
                 }
             }
@@ -483,6 +491,7 @@ impl Manager {
                             for tgt_cfg in &h.targets {
                                 let state = mount_states.entry(tgt_cfg.path.clone()).or_insert(MountState {
                                     baseline_dev: 0, mount_id: 0, available: false, paused_since: Some(Instant::now()),
+                                    mount_epoch: String::new(),
                                 });
 
                                 // 0. Global mount check: detect lazy unmount (umount -l)
@@ -507,6 +516,10 @@ impl Manager {
                                     tgt_cfg.paused.store(false, Ordering::SeqCst);
                                     state.paused_since = None;
                                     state.available = true;
+                                    // Write new mount epoch for the fresh mount
+                                    let new_epoch = uuid::Uuid::new_v4().to_string();
+                                    let _ = std::fs::write(tgt_cfg.path.join(".foxing_mount_epoch"), &new_epoch);
+                                    state.mount_epoch = new_epoch;
                                     // Update baseline_dev to the NEW mount's device
                                     let new_dev = std::fs::metadata(&tgt_cfg.path).map(|m| m.dev()).unwrap_or(0);
                                     state.baseline_dev = new_dev;

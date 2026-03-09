@@ -465,6 +465,8 @@ impl TargetConfig {
         let internal_excludes = vec![
             ".foxing_reflink_probe*".to_string(),
             ".foxing_latency_probe*".to_string(),
+            ".foxing_mount_epoch".to_string(),
+            ".foxing_mount_probe".to_string(),
             "*.tmp.*".to_string(),
             "*.swap_tmp".to_string(),
         ];

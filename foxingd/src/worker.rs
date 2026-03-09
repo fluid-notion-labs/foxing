@@ -274,6 +274,10 @@ pub async fn run_worker(
     let mut dirty_tracker: HashSet<u64> = HashSet::new();
     
     let mut flush_interval = tokio::time::interval(Duration::from_micros(tuner.current_flush_us));
+    // Worker-side mount check: detect lazy unmount within 500ms instead of waiting
+    // for the 10s health probe. Reads /proc/mounts (~5µs), negligible overhead.
+    let mut mount_check_interval = tokio::time::interval(Duration::from_millis(500));
+    mount_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tune_interval = tokio::time::interval(Duration::from_micros(constants::WORKER_TUNE_INTERVAL_US));
     tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut retry_interval = tokio::time::interval(Duration::from_millis(constants::WORKER_RETRY_QUEUE_BASE_BACKOFF_MS));
@@ -715,6 +719,18 @@ pub async fn run_worker(
             // Idle detection: when no events and no work pending, sleep to avoid spinning.
             // The event_rx.recv() below will properly wake when events arrive.
             _ = tune_interval.tick(), if !coalescer.is_empty() || !retry_queue.is_empty() => {}
+
+            // Worker-side mount check: detect lazy unmount within 500ms
+            // instead of waiting for the 10s health probe interval.
+            _ = mount_check_interval.tick() => {
+                if !target_cfg.paused.load(Ordering::Relaxed) {
+                    if !fxcp_core::nfs::mount::is_mount_present_global(&target_cfg.path) {
+                        warn!("Worker {}: lazy unmount detected (/proc/mounts) — pausing immediately", worker_id);
+                        target_cfg.paused.store(true, Ordering::SeqCst);
+                        source.hydration.request_recovery_scan.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
 
             // Bulk tin: lowest priority, goes through coalescer for write aggregation
             Some(evt) = tinned_rx.bulk.recv() => {
