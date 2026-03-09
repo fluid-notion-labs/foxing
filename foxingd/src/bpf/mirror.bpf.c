@@ -321,9 +321,15 @@ static __always_inline int submit_event_raw(struct inode *inode, struct dentry *
         __u64 key = BPF_CORE_READ(inode, i_ino);
         struct pending_write *pw = bpf_map_lookup_elem(&write_aggregator, &key);
         if (pw) {
-            if (pw->start_offset + pw->length == offset && 
+            // Time-based flush: if accumulated write is older than 50ms,
+            // emit it regardless of contiguity. Prevents writes from being
+            // trapped in the aggregator when kernel writeback is delayed
+            // (common on kernel 6.18+ where vfs_write_iter is removed).
+            __u64 age_ns = final_ts - pw->last_ts;
+            if (age_ns < 50000000ULL &&
+                pw->start_offset + pw->length == offset &&
                 pw->length + length <= MAX_AGGREGATE_BYTES &&
-                pw->flags == flags) { 
+                pw->flags == flags) {
                 pw->length += length;
                 pw->last_ts = final_ts;
                 return 0;
