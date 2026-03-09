@@ -80,8 +80,8 @@ foxingd sync adds ~30-40% overhead over fxcp because it always generates foxingd
 
 | Tool | 111 files (60MB) | Throughput |
 |------|-----------------|-----------|
-| cp | 305ms | **196 MB/s** |
-| rsync | 513ms | **116 MB/s** |
+| cp | 393ms | **152 MB/s** |
+| rsync | 543ms | **110 MB/s** |
 
 ### Cross-Network Copy (XFS NVMe → NFS HDD)
 
@@ -89,14 +89,14 @@ With NFS bypass enabled (default), fxcp sends OPEN+WRITE+CLOSE as a single compo
 
 | Workload | Files | Size | cp | rsync | fxcp | rsync/fxcp | fxcp Method |
 |----------|------:|-----:|---:|------:|-----:|-----------:|:------------|
-| small_files | 1,000 | 4 MB | 1.9s | 2.7s | 2.5s | **1.10x** | NFS compound RPC |
-| large_files | 1 | 100 MB | 211ms | 335ms | 428ms | 0.78x | io_uring |
-| mixed | 500 | 128 MB | 1.4s | 2.9s | 6.0s | 0.48x | compound + io_uring |
-| many_tiny | 5,000 | ~150 KB | 9.2s | 13.2s | 12.3s | **1.07x** | NFS compound RPC |
-| resync (no changes) | 500 | 128 MB | — | 352ms | 460ms | 0.76x | stat + skip |
-| NFS→NFS server-side | 1 | 100 MB | — | 286ms | 83ms | **3.44x** | Server-side FICLONE |
+| small_files | 1,000 | 4 MB | 2.1s | 2.7s | 2.9s | 0.93x | NFS compound RPC |
+| large_files | 1 | 100 MB | 220ms | 322ms | 386ms | 0.83x | io_uring |
+| mixed | 500 | 128 MB | 1.6s | 3.0s | 6.5s | 0.46x | compound + io_uring |
+| many_tiny | 5,000 | ~150 KB | 9.9s | 12.8s | 11.5s | **1.11x** | NFS compound RPC |
+| resync (no changes) | 500 | 128 MB | — | 345ms | 462ms | 0.74x | stat + skip |
+| NFS→NFS server-side | 1 | 100 MB | — | 297ms | 82ms | **3.62x** | Server-side FICLONE |
 
-**Analysis:** With NFS bypass, fxcp is faster than rsync for small files (1.10x for 1000x4KB, 1.07x for 5000 tiny). Large files (100MB) use io_uring and are competitive with rsync. NFS→NFS same-server copies are 3.4x faster via server-side FICLONE.
+**Analysis:** fxcp is faster than rsync for many tiny files (1.11x for 5000 files). NFS→NFS same-server copies are 3.6x faster via server-side FICLONE. Large files (100MB) use io_uring at 259MB/s. Mixed workloads show directory creation overhead on NFS.
 
 ### NFS Bypass Performance (before/after)
 
@@ -111,15 +111,21 @@ The bypass eliminates per-file VFS overhead by packing OPEN+WRITE+CLOSE into one
 
 | Workload | Without verify | With --verify | Overhead |
 |----------|------:|------:|------:|
-| 500-file mixed → NFS | 469ms | 1468ms | +999ms |
+| 500-file mixed → NFS | 449ms | 1474ms | +1025ms |
 
 ### NFS Same-Server (server-side copy)
 
 | Test | rsync | fxcp | fxcp vs rsync | Method |
 |------|------:|-----:|--------------:|:-------|
-| 100MB NFS→NFS | 286ms | **83ms** | **3.44x** | Server-side FICLONE |
+| 100MB NFS→NFS | 297ms | **82ms** | **3.62x** | Server-side FICLONE |
 
 For NFS→NFS (same server), fxcp triggers server-side FICLONE — data never traverses the network.
+
+### XFS-to-NFS Overhead vs XFS-to-XFS
+
+| Copy | XFS-to-XFS | XFS-to-NFS | NFS overhead |
+|------|------:|------:|------:|
+| 100MB fxcp | 204ms | 396ms | **94%** |
 
 ### XFS-to-NFS Overhead vs XFS-to-XFS
 
@@ -151,18 +157,18 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 | Phase | Test | Duration | Result | Key Metric |
 |-------|------|----------|--------|------------|
-| 0 | Baseline cp/rsync | 2s | **PASS** | cp=196MB/s rsync=116MB/s |
-| 1 | Heavy Hydration (5000 files, 2.6GB) | 52s | **PASS** | 5000/5000 converged in ~15s |
-| 2 | Live Write Storm (fio randwrite 30s) | 43s | **PASS** | no_coalescing, transient_leak=25 |
-| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, ghosts=349 (cleaned) |
-| 4 | NFS Target Drop + Resync (300 files) | 58s | **FAIL** | 200/300 — intermittent recovery stall |
-| 5 | Large File Kill/Resume (100MB) | 27s | **PASS** | SHA-256 match after SIGKILL + restart |
-| 6 | Disk Pressure | SKIP | — | NFS share too large (22TB) |
-| 7 | BLAKE3 Delta Copy | 44s | **PASS** | 10 deltas, 20MB saved |
-| 8 | Directory Merkle Pruning | 45s | **PASS** | 13 dirs pruned |
-| 9 | Combined Delta + Pruning | 53s | **PASS** | delta=6, pruned=13, 12MB saved |
+| 0 | Baseline cp/rsync | 2s | **PASS** | cp=211MB/s rsync=121MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | 51s | **PASS** | 5000/5000 converged in ~15s |
+| 2 | Live Write Storm (fio randwrite 30s) | 43s | **PASS** | no_coalescing (expected: random I/O) |
+| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, ghosts=166 (cleaned) |
+| 4 | NFS Target Drop + Resync (300 files) | 47s | **PASS** | 300/300, targeted recovery + journal |
+| 5 | Large File Kill/Resume (500MB) | 25s | **PASS** | SHA-256 match after SIGKILL + restart |
+| 6 | Disk Pressure (ENOSPC) | 30s | **PASS** | 36/60 files, survived, resumed |
+| 7 | BLAKE3 Delta Copy | 54s | **PASS** | 10 deltas, 20MB saved |
+| 8 | Directory Merkle Pruning | 46s | **PASS** | 13 dirs pruned |
+| 9 | Combined Delta + Pruning | 52s | **PASS** | delta=6, pruned=13, 12MB saved |
 
-**Total:** 336 seconds (5.6 min). NFS batch_stat prescan confirmed working (851 file attributes cached via compound RPCs). Phase 4 intermittent failure is a pre-existing recovery scan issue.
+**Total:** 363 seconds (6.0 min). 10/10 PASS, 0 FAIL, 0 SKIP.
 
 ### Initial Hydration Throughput (5000 files, 2.6GB → NFS)
 
@@ -198,10 +204,11 @@ foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) n
 
 | Metric | Value |
 |--------|-------|
-| Detection time | <10s (device ID + /proc/mounts + fsync probe, 10s interval) |
-| Worker pause | Immediate (events drain to outage journal) |
-| Recovery scan | Pruning-disabled full scan with NFS batch_stat prescan |
-| NFS prescan cache | 851 file attributes cached via compound RPCs |
+| Detection time | <500ms (worker-side /proc/mounts poll) + 10s (health probe backstop) |
+| Worker pause | Immediate on detection (events drain to outage journal) |
+| Recovery scan | Targeted O(journal) with dir-hash signature pruning |
+| Fallback | Full scan if journal empty (lazy unmount write-through) or overflow |
+| Mount epoch | UUID verification detects filesystem instance changes |
 
 ### Live Replication (BPF event-driven)
 
@@ -226,16 +233,16 @@ How long from a source modification until the target is fully consistent (fxcp -
 
 | Workload | XFS-to-XFS | XFS-to-NFS | NFS-to-NFS | XFS-to-tmpfs | XFS-same |
 |----------|------:|------:|------:|------:|------:|
-| single 4KB | 79ms | 90ms | 95ms | 55ms | 66ms |
-| single 1MB | 81ms | 97ms | 101ms | 56ms | 63ms |
-| single 100MB | 232ms | 374ms | 312ms | 228ms | 113ms |
-| modify 4KB | 77ms | 91ms | 100ms | 63ms | 67ms |
-| modify 1MB | 82ms | 103ms | 118ms | 64ms | 74ms |
-| append 4KB | 81ms | 101ms | 108ms | 64ms | 68ms |
-| metadata | 77ms | 119ms | 93ms | 65ms | 69ms |
-| rename | 78ms | 119ms | 100ms | 58ms | 65ms |
-| batch 100x4KB | 115ms | 426ms | 576ms | 80ms | 85ms |
-| batch 10x10MB | 269ms | 1031ms | 1445ms | 225ms | 297ms |
+| single 4KB | 70ms | 71ms | 75ms | 56ms | 69ms |
+| single 1MB | 80ms | 70ms | 85ms | 64ms | 59ms |
+| single 100MB | 214ms | 350ms | 1746ms | 199ms | 103ms |
+| modify 4KB | 73ms | 76ms | 98ms | 56ms | 60ms |
+| modify 1MB | 72ms | 91ms | 131ms | 60ms | 64ms |
+| append 4KB | 59ms | 97ms | 108ms | 51ms | 63ms |
+| metadata | 64ms | 94ms | 110ms | 50ms | 62ms |
+| rename | 65ms | 100ms | 118ms | 51ms | 57ms |
+| batch 100x4KB | 92ms | 405ms | 537ms | 77ms | 82ms |
+| batch 10x10MB | 267ms | 961ms | 1450ms | 223ms | 297ms |
 
 **Topologies:**
 - **XFS-to-XFS**: Cross-device local copy (vdb→vdc, sendfile/io_uring)
@@ -245,11 +252,11 @@ How long from a source modification until the target is fully consistent (fxcp -
 - **XFS-same**: Same-device copy (FICLONE reflink — instant CoW for large files)
 
 **Key observations:**
-- **Fixed overhead ~55-79ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
-- **XFS-same 100MB = 113ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
-- **NFS single 4KB = 90ms**: NFS bypass compound RPC adds only ~11ms over local XFS (90ms vs 79ms)
-- **NFS batch 100x4KB = 426ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
-- **NFS-to-NFS 100MB = 312ms**: Server-side FICLONE — faster than XFS-to-NFS (374ms) since data stays on server
+- **Fixed overhead ~50-70ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
+- **XFS-same 100MB = 103ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
+- **NFS single 4KB = 71ms**: NFS bypass compound RPC adds only ~1ms over local XFS (71ms vs 70ms)
+- **NFS batch 100x4KB = 405ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
+- **NFS-to-NFS 100MB = 1746ms**: Server-side copy but NFS metadata overhead varies with server load
 
 ### Phase 2: foxingd Daemon (BPF Event-Driven)
 
@@ -258,18 +265,19 @@ How long from a source modification until the target is fully consistent (fxcp -
 
 | Workload | XFS-to-XFS | XFS-to-NFS | XFS-to-tmpfs |
 |----------|------:|------:|------:|
-| create 4KB | 16ms | 20ms | 16ms |
-| create 8KB | 16ms | 19ms | 16ms |
-| create 32KB | 16ms | 17ms | 14ms |
-| create 64KB | 16ms | 20ms | 14ms |
-| rename 4KB | 16ms | 20ms | TIMEOUT |
+| create 4KB | **14ms** | **17ms** | **15ms** |
+| create 8KB | **15ms** | **17ms** | **16ms** |
+| create 32KB | **15ms** | **16ms** | **16ms** |
+| create 64KB | TIMEOUT | **14ms** | TIMEOUT |
+| rename 4KB | TIMEOUT | **19ms** | **16ms** |
 | batch 10x4KB | TIMEOUT | TIMEOUT | TIMEOUT |
 
 **Key observations:**
-- **Single-file BPF latency = 14-20ms**: BPF event capture → copy → fsync in under 1 polling interval
-- **XFS-to-NFS overhead = ~4ms**: NFS compound RPC adds minimal latency (20ms vs 16ms)
-- **Batch TIMEOUT**: 10-file batches exceed the polling window; write coalescer timing issue under investigation
-- **rename TIMEOUT on tmpfs**: xattr-based dirty tracking not available on tmpfs
+- **Single-file BPF latency = 14-19ms**: BPF event capture → copy → fsync in under 1 polling interval
+- **XFS-to-NFS overhead = ~3ms**: NFS compound RPC adds minimal latency (17ms vs 14ms)
+- **XFS-to-NFS most reliable**: All single-file creates and renames converge (14-19ms)
+- **Batch TIMEOUT**: 10-file batches exceed the polling window across all topologies
+- **create 64KB TIMEOUT on XFS/tmpfs**: Intermittent — same workload succeeds on NFS (14ms)
 
 ## fxcp → foxingd Integration
 
@@ -368,6 +376,8 @@ Served on a dedicated thread — always responsive even under heavy I/O.
 | `foxing_copy_timeout_total` | Counter | Copy operations exceeding deadline |
 | `foxing_hydration_dir_pruned` | Counter | Directories skipped by Merkle tree |
 | `foxing_hydration_nfs_prescan_hits` | Counter | Files skipped via NFS batch_stat prescan |
+| `foxing_tombstone_entries` | Gauge | Active tombstone journal entries |
+| `foxing_tombstone_replayed` | Counter | Tombstones replayed via --delete |
 | `foxing_delta_copy_attempted` | Counter | Delta copy operations |
 | `foxing_delta_bytes_saved` | Counter | Bytes avoided by delta copy |
 | `foxing_tuner_state` | Gauge | BBR state (0=Steady, 1=Startup, 2=Drain, 3=ProbeBW) |

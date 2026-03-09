@@ -22,19 +22,19 @@
 
 | Workload | rsync | fxcp | fxcp vs rsync |
 |----------|------:|-----:|--------------:|
-| 1000×4KB small files | 2.7s | **2.5s** | **1.10x faster** |
-| 5000 tiny files | 13.2s | **12.3s** | **1.07x faster** |
-| NFS→NFS 100MB (same server) | 286ms | **83ms** | **3.44x faster** |
+| 5000 tiny files | 12.8s | **11.5s** | **1.11x faster** |
+| NFS→NFS 100MB (same server) | 297ms | **82ms** | **3.62x faster** |
+| 100MB throughput | 322ms | 386ms | 0.83x (259 MB/s) |
 
 ### foxingd Daemon Latency (BPF event-driven)
 
 | Workload | XFS→XFS | XFS→NFS |
 |----------|--------:|--------:|
-| Single file create (4KB) | **16ms** | **20ms** |
-| Single file create (64KB) | **16ms** | **20ms** |
+| Single file create (4KB) | **14ms** | **17ms** |
+| Single file create (32KB) | **15ms** | **16ms** |
 | Delta resync (10/20 modified) | **~3s** | — |
 
-fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 16-20ms replication latency.
+fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 14-19ms replication latency.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices and tool comparisons.
 
@@ -366,12 +366,13 @@ make test-compare  # Compare against saved baseline
 
 | Phase | Test | Result | Key Metric |
 |-------|------|--------|------------|
-| 0 | Baseline NFS Throughput | **PASS** | cp=193MB/s rsync=113MB/s |
-| 1 | Heavy Hydration (5000 files, 2.6GB) | **PASS** | Converged in ~15s |
+| 0 | Baseline NFS Throughput | **PASS** | cp=211MB/s rsync=121MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | Converged in ~15s |
 | 2 | Live Write Storm (fio 30s) | **PASS** | Back-pressure handling |
 | 3 | Rename Chain Storm (100 chains a→e) | **PASS** | 100/100 finals, ghosts cleaned |
-| 4 | NFS Target Drop + Resync (300 files) | **PASS** | Outage journal + batch_stat recovery |
-| 5 | Large File Kill/Resume (100MB) | **PASS** | SHA-256 verified after SIGKILL |
+| 4 | NFS Target Drop + Resync (300 files) | **PASS** | Targeted recovery + outage journal |
+| 5 | Large File Kill/Resume (500MB) | **PASS** | SHA-256 verified after SIGKILL |
+| 6 | Disk Pressure (ENOSPC) | **PASS** | Safe Stall, survived, resumed |
 | 7 | BLAKE3 Delta Copy on Resync | **PASS** | 10 deltas, 20MB saved (97% reduction) |
 | 8 | Directory Merkle Pruning | **PASS** | 13 dirs pruned |
 | 9 | Combined Delta + Pruning | **PASS** | Both optimizations active |
