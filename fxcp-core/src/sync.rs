@@ -88,6 +88,7 @@ pub struct SyncStats {
     pub files_delta: u64,
     pub files_deleted: u64,
     pub dirs_created: u64,
+    pub dirs_pruned: u64,
     pub bytes_copied: u64,
     pub bytes_reflinked: u64,
     pub bytes_cfr: u64,
@@ -473,6 +474,9 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         .follow_links(false)
         .sort_by_file_name();
 
+    // Dir-hash pruning: skip unchanged directory subtrees
+    let mut pruned_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -490,6 +494,18 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         let dst_path = destination.join(rel);
 
         if entry.file_type().is_dir() {
+            // Dir-hash pruning: if target dir has a stored hash matching source, skip subtree
+            if dst_path.exists() && !rel.as_os_str().is_empty() {
+                if let Some(src_hash) = crate::hashing::compute_dir_hash_from_path(src_path) {
+                    if let Some(dst_hash) = crate::sidecar::get_dir_hash(&dst_path) {
+                        if src_hash == dst_hash {
+                            pruned_dirs.insert(rel.to_path_buf());
+                            stats.dirs_pruned += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
             if !dst_path.exists() {
                 if opts.dry_run {
                     info!("mkdir {:?}", dst_path);
@@ -502,6 +518,12 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         }
 
         if !entry.file_type().is_file() { continue; }
+
+        // Skip files in pruned directory subtrees
+        if pruned_dirs.iter().any(|p| rel.starts_with(p)) {
+            stats.files_skipped += 1;
+            continue;
+        }
 
         let src_meta = match std::fs::metadata(src_path) {
             Ok(m) => m,
@@ -729,7 +751,9 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
     }
 
     // Generate directory hashes for foxingd tree pruning
-    if opts.generate_sigs && !opts.dry_run {
+    // Always store dir hashes for non-pruned directories so future syncs can prune.
+    // File signatures (SyncSignature + MerkleSignature) only stored with --generate-sigs.
+    if !opts.dry_run {
         let dir_walker = walkdir::WalkDir::new(&destination)
             .contents_first(true)
             .follow_links(false);
@@ -737,6 +761,8 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
             if entry.file_type().is_dir() {
                 let dst_dir = entry.path();
                 if let Ok(rel) = dst_dir.strip_prefix(&destination) {
+                    // Skip dirs that were already pruned (hash is still valid)
+                    if pruned_dirs.contains(rel) { continue; }
                     let src_dir = source.join(rel);
                     if src_dir.is_dir() {
                         if let Some(hash) = hashing::compute_dir_hash_from_path(&src_dir) {
@@ -748,9 +774,11 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
                 }
             }
         }
-        if stats.sigs_stored > 0 || stats.dirs_hashed > 0 {
-            info!("{} file signatures + {} directory hashes stored (foxingd-compatible)",
-                  stats.sigs_stored, stats.dirs_hashed);
+        if stats.dirs_hashed > 0 || stats.dirs_pruned > 0 {
+            info!("{} dir hashes stored, {} dirs pruned", stats.dirs_hashed, stats.dirs_pruned);
+        }
+        if opts.generate_sigs && stats.sigs_stored > 0 {
+            info!("{} file signatures stored (foxingd-compatible)", stats.sigs_stored);
         }
     }
 
@@ -1033,6 +1061,7 @@ pub fn print_summary(stats: &SyncStats) {
     println!("  Files skipped: {}", stats.files_skipped);
     if stats.files_deleted > 0 { println!("  Files deleted: {}", stats.files_deleted); }
     println!("  Dirs created:  {}", stats.dirs_created);
+    if stats.dirs_pruned > 0 { println!("  Dirs pruned:   {} (unchanged, skipped)", stats.dirs_pruned); }
     println!("  Bytes total:   {} ({:.1} MB)", total_bytes, total_bytes as f64 / 1024.0 / 1024.0);
     if stats.files_verified > 0 { println!("  Verified:      {} (BLAKE3)", stats.files_verified); }
     if stats.verify_failures > 0 { println!("  Verify FAIL:   {}", stats.verify_failures); }
