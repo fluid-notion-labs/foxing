@@ -200,6 +200,24 @@ foxingd transfers only the modified 64KB chunks via BLAKE3 Merkle diff. 97% data
 
 foxingd skips entire directory subtrees via 32-byte BLAKE3 dir hashes. O(dirs) not O(files).
 
+### Dir-Hash Adaptive Pruning at Scale (fxcp vs rsync, XFS → NFS)
+
+fxcp now uses the same BLAKE3 dir-hash pruning as foxingd. On resync, unchanged directory subtrees are skipped entirely — O(dirs) instead of O(files).
+
+| Files | Dirs | Cold Sync rsync | Cold Sync fxcp | Resync rsync | Resync fxcp | 1-file-mod rsync | 1-file-mod fxcp |
+|------:|-----:|------:|------:|------:|------:|------:|------:|
+| 500 | 5 | 2.4s | **1.6s** (1.6x) | 257ms | **117ms** (2.2x) | 266ms | 484ms |
+| 2,000 | 20 | 10.1s | **5.3s** (1.9x) | 849ms | **200ms** (4.2x) | 810ms | **608ms** (1.3x) |
+| 5,000 | 50 | 25.1s | **13.1s** (1.9x) | 1.95s | **369ms** (5.3x) | 1.90s | **698ms** (2.7x) |
+| 10,000 | 100 | 51.9s | **24.8s** (2.1x) | 5.33s | **573ms** (9.3x) | 4.80s | **933ms** (5.1x) |
+| 10,000 | 50 | 45.1s | **25.9s** (1.7x) | 4.88s | **423ms** (11.5x) | 4.79s | **1.06s** (4.5x) |
+
+**Scaling behaviour:**
+- **Cold sync**: 1.6-2.1x faster than rsync (NFS compound bypass)
+- **Resync (no changes)**: Pruning advantage grows with file count — **9-11x** at 10K files
+- **1-file modified**: Only the changed directory is walked — **5x** at 10K files
+- **Fewer dirs = better ratio**: 50×200 (11.5x) beats 100×100 (9.3x) because each prune skips more files
+
 ### Mount Recovery (NFS drop + resync)
 
 | Metric | Value |
