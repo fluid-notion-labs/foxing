@@ -371,6 +371,7 @@ pub async fn run_worker(
                 warn!("Worker {}: Outage journal overflow ({} entries) — will trigger full scan on resume",
                       worker_id, target_cfg.outage_journal.len());
                 target_cfg.outage_journal.clear();
+                target_cfg.outage_journal_overflowed.store(true, Ordering::SeqCst);
             }
             continue;
         }

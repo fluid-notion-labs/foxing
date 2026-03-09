@@ -432,24 +432,15 @@ impl Manager {
                         if now.duration_since(last_full_scan) > Duration::from_secs(5) {
                             last_full_scan = now;
                             if recovery {
-                                info!("Hydration: Recovery scan (no pruning) for {:?}", h.source.path);
                                 let h_clone = h.clone();
-                                let journal_targets: Vec<_> = h.targets.iter()
-                                    .filter(|t| !t.outage_journal.is_empty())
-                                    .cloned()
-                                    .collect();
+                                let journal_overflow = h.targets.iter()
+                                    .any(|t| t.outage_journal_overflowed.swap(false, Ordering::SeqCst));
+                                info!("Hydration: Recovery for {:?} (journal_overflow={})",
+                                      h.source.path, journal_overflow);
                                 h.source.hydration.active.store(true, Ordering::SeqCst);
                                 std::thread::spawn(move || {
-                                    // Process outage journal first (fast, targeted)
-                                    if !journal_targets.is_empty() {
-                                        info!("Hydration: Processing {} outage journals before recovery scan",
-                                              journal_targets.len());
-                                        for tgt in &journal_targets {
-                                            h_clone.targeted_rescan(&tgt.outage_journal, tgt);
-                                        }
-                                    }
-                                    // Then full recovery scan (slow, comprehensive)
-                                    h_clone.recovery_scan();
+                                    h_clone.targeted_recovery_scan(journal_overflow);
+                                    h_clone.source.hydration.active.store(false, Ordering::SeqCst);
                                     Ok::<(), FoxingError>(())
                                 });
                             } else {

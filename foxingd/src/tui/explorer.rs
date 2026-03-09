@@ -220,6 +220,7 @@ impl ExplorerState {
             force_retention_regexes: vec![],
             label: "".into(),
             paused: Arc::new(AtomicBool::new(false)),
+            outage_journal_overflowed: Arc::new(AtomicBool::new(false)),
             outage_journal: Arc::new(dashmap::DashSet::new()),
             tombstone_journal: None,
         };

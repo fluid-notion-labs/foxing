@@ -376,6 +376,8 @@ pub struct TargetConfig {
     #[serde(skip, default)]
     pub paused: Arc<AtomicBool>,
     #[serde(skip, default)]
+    pub outage_journal_overflowed: Arc<AtomicBool>,
+    #[serde(skip, default)]
     pub outage_journal: Arc<dashmap::DashSet<PathBuf>>,
     #[serde(skip)]
     pub tombstone_journal: Option<Arc<fxcp_core::tombstone::TombstoneJournal>>,
@@ -423,6 +425,7 @@ impl Default for TargetConfig {
             force_retention_regexes: vec![],
             label: "".into(),
             paused: Arc::new(AtomicBool::new(false)),
+            outage_journal_overflowed: Arc::new(AtomicBool::new(false)),
             outage_journal: Arc::new(dashmap::DashSet::new()),
             tombstone_journal: None,
         }

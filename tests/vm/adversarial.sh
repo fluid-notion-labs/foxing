@@ -726,9 +726,9 @@ phase4() {
     local result="PASS"
     local test_dir="$SOURCE/adversarial-resync"
 
-    # Clean slate: stop foxingd and clear all data from previous phases.
-    # Recovery scan duration scales with source file count — stale data
-    # from phases 1-3 would consume the 30s stall window.
+    # Fresh foxingd instance: lazy unmount write-through (successful copies to
+    # detached mount) results in empty outage journals, triggering full-scan
+    # fallback. With a fresh instance, the full scan only covers Phase 4 data.
     stop_foxingd
     clean_source
     clean_target

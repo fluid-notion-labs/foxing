@@ -291,29 +291,153 @@ impl Hydrator {
 
     /// Recovery scan: clear stored dir hashes on target then full scan.
     /// This forces all directories to be re-verified instead of pruned.
-    pub fn recovery_scan(&self) {
-        // Bump generation to invalidate stale bulk jobs from the previous scan.
-        // Workers will skip any queued jobs with an older generation, ensuring
-        // the recovery scan's fresh jobs are processed promptly.
+    /// Targeted recovery scan: process only outage journal entries, using dir-hash
+    /// signatures to prune unchanged directories. Falls back to full scan on overflow.
+    pub fn targeted_recovery_scan(&self, journal_overflow: bool) {
+        // Bump generation to invalidate stale bulk jobs
         {
             let bulk_job_queue = self.source.bulk_job_queue.lock();
             if let Some(queue) = bulk_job_queue.as_ref() {
                 queue.bump_generation();
             }
         }
-        info!("Hydration: Recovery scan — clearing stored dir hashes on targets");
-        for target in &self.targets {
-            // Walk target and clear stored dir hashes so pruning is defeated
-            if let Ok(walker) = walkdir::WalkDir::new(&target.path).into_iter()
-                .filter_map(|e| e.ok())
-                .try_for_each(|entry| {
-                    if entry.file_type().is_dir() {
-                        let _ = fxcp_core::sidecar::clear_dir_hash(entry.path());
-                    }
-                    Ok::<(), ()>(())
-                }) { let _ = walker; }
+
+        // Check if ALL targets have empty journals — if recovery was requested
+        // but journals are empty, lazy unmount write-through likely occurred
+        // (copies to detached mount succeeded silently). Fall back to full scan.
+        let all_journals_empty = self.targets.iter().all(|t| t.outage_journal.is_empty());
+        if journal_overflow || all_journals_empty {
+            if all_journals_empty {
+                info!("Hydration: All journals empty despite recovery request — lazy unmount write-through suspected, falling back to full scan");
+            } else {
+                info!("Hydration: Journal overflow — falling back to full recovery scan");
+            }
+            for target in &self.targets {
+                if let Ok(walker) = walkdir::WalkDir::new(&target.path).into_iter()
+                    .filter_map(|e| e.ok())
+                    .try_for_each(|entry| {
+                        if entry.file_type().is_dir() {
+                            let _ = fxcp_core::sidecar::clear_dir_hash(entry.path());
+                        }
+                        Ok::<(), ()>(())
+                    }) { let _ = walker; }
+            }
+            self.full_scan(false);
+            return;
         }
-        self.full_scan(false);
+
+        for target in &self.targets {
+            let journal = &target.outage_journal;
+            let journal_size = journal.len();
+
+            if journal_size == 0 {
+                info!("Hydration: Empty journal for {:?} — no recovery needed", target.path);
+                continue;
+            }
+
+            info!("Hydration: Targeted recovery for {} journaled paths → {:?}",
+                  journal_size, target.path);
+
+            // 1. Collect and clear journal
+            let paths: Vec<PathBuf> = journal.iter().map(|r| r.key().clone()).collect();
+            journal.clear();
+
+            // 2. Group by parent directory for signature-based pruning
+            let mut by_parent: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+            for p in paths {
+                let parent = p.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
+                by_parent.entry(parent).or_default().push(p);
+            }
+
+            let mut queued = 0u64;
+            let mut dirs_pruned = 0u64;
+            let queue = self.source.bulk_job_queue.lock();
+            let sender = queue.as_ref();
+
+            for (parent, children) in &by_parent {
+                let src_dir = self.source.path.join(parent);
+                let tgt_dir = target.path.join(parent);
+
+                // 3. Dir-hash signature pruning: skip directories already consistent
+                if src_dir.exists() && tgt_dir.exists() {
+                    if let Some(src_hash) = Self::compute_current_dir_hash(&src_dir) {
+                        if let Some(tgt_hash) = fxcp_core::sidecar::get_dir_hash(&tgt_dir) {
+                            if src_hash == tgt_hash {
+                                debug!("Targeted recovery: pruned {} journal entries for {:?} (dir hash match)",
+                                       children.len(), parent);
+                                dirs_pruned += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // 4. Ensure target directory exists
+                if !tgt_dir.exists() {
+                    let _ = fs::create_dir_all(&tgt_dir);
+                }
+
+                // 5. Process children: size+mtime comparison
+                for rel_path in children {
+                    if self.source.hydration.shutdown_requested.load(Ordering::Relaxed) { break; }
+                    let source_path = self.source.path.join(rel_path);
+                    if !source_path.exists() { continue; }
+
+                    let target_path = target.path.join(rel_path);
+                    let needs_sync = match (source_path.metadata(), target_path.metadata()) {
+                        (Ok(s), Ok(t)) => {
+                            s.len() != t.len() || s.mtime() != t.mtime()
+                        }
+                        (Ok(_), Err(_)) => true,
+                        _ => false,
+                    };
+
+                    if needs_sync {
+                        if let Some(s) = sender {
+                            let ino = source_path.metadata().map(|m| m.ino()).ok();
+                            s.try_submit_job_sync(rel_path.clone(), target.clone(), ino);
+                            queued += 1;
+                        }
+                    }
+                }
+
+                // 6. Heal dir hash for modified directories
+                if src_dir.exists() {
+                    if let Some(hash) = Self::compute_current_dir_hash(&src_dir) {
+                        let _ = fxcp_core::sidecar::set_dir_hash(&tgt_dir, &hash);
+                    } else {
+                        let _ = fxcp_core::sidecar::clear_dir_hash(&tgt_dir);
+                    }
+                }
+            }
+
+            // 7. Source walk for journaled directories: catch lazy unmount write-through.
+            // Files written to a lazily-unmounted mount succeed silently but are lost
+            // on remount. Walk source directories that had journal entries to find any
+            // files that don't exist on the new target.
+            let mut walk_queued = 0u64;
+            for (parent, _) in &by_parent {
+                let src_dir = self.source.path.join(parent);
+                let tgt_dir = target.path.join(parent);
+                if !src_dir.exists() { continue; }
+                if let Ok(entries) = fs::read_dir(&src_dir) {
+                    for entry in entries.flatten() {
+                        let rel = parent.join(entry.file_name());
+                        let tgt_path = tgt_dir.join(entry.file_name());
+                        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && !tgt_path.exists() {
+                            if let Some(s) = sender {
+                                let ino = entry.metadata().map(|m| m.ino()).ok();
+                                s.try_submit_job_sync(rel, target.clone(), ino);
+                                walk_queued += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!("Hydration: Targeted recovery — {} journal queued, {} walk queued, {} dirs pruned",
+                  queued, walk_queued, dirs_pruned);
+        }
     }
 
     /// Pre-scan NFS targets using batch_stat compounds to bulk-fetch size+mtime.
