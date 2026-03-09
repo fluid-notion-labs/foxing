@@ -1,7 +1,7 @@
 # Foxing Performance Benchmarks
 
 **Version:** 0.6.0
-**Date:** 2026-03-08
+**Date:** 2026-03-09
 **Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
 
 ## Binary Comparison
@@ -17,7 +17,7 @@ foxingd is a complete superset of fxcp — when symlinked as `fxcp`, it behaves 
 
 ## Resource Usage
 
-Measured on fox-test VM (Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5):
+Measured on fox-test VM (Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5, v0.5.x):
 
 | Metric | fxcp | foxingd sync | rsync | cp |
 |--------|-----:|-------------:|------:|---:|
@@ -31,7 +31,7 @@ fxcp has the lowest RSS of all tools (~1MB). foxingd sync shares the same copy e
 
 ## Cold Copy Performance (btrfs-over-LUKS2, local same-device)
 
-**Platform:** AMD Ryzen AI 9 HX 370 (24 threads), 92GB RAM, btrfs on dm-crypt, NVMe
+**Platform:** AMD Ryzen AI 9 HX 370 (24 threads), 92GB RAM, btrfs on dm-crypt, NVMe (separate host, v0.5.x)
 **Method:** Same-device copy — FICLONE reflink available
 
 | Workload | Files | Size | rsync | cp | fxcp | fxcp vs rsync | fxcp Method |
@@ -69,7 +69,7 @@ fxcp has the lowest RSS of all tools (~1MB). foxingd sync shares the same copy e
 | single_large | 1 | 100 MB | 67ms | 163ms | 224ms | 311ms | io_uring |
 | many_tiny | 5,000 | 5 MB | 491ms | 443ms | 612ms | 668ms | sendfile |
 
-foxingd sync adds ~30-40% overhead over fxcp because it always generates foxingd-compatible signatures (SyncSignature + MerkleSignature + dir_hash xattrs).
+foxingd sync adds overhead over fxcp because it generates foxingd-compatible signatures (SyncSignature + MerkleSignature + dir_hash xattrs). In v0.6.0, fxcp also stores dir hashes automatically for adaptive pruning.
 
 ## NFS 4.2 Performance (XFS→NFS, NVMe→HDD)
 
@@ -127,13 +127,9 @@ For NFS→NFS (same server), fxcp triggers server-side FICLONE — data never tr
 |------|------:|------:|------:|
 | 100MB fxcp | 204ms | 396ms | **94%** |
 
-### XFS-to-NFS Overhead vs XFS-to-XFS
-
-| Copy | XFS-to-XFS | XFS-to-NFS | NFS overhead |
-|------|------:|------:|------:|
-| 100MB fxcp | 235ms | 406ms | **72.7%** |
-
 ## Delta Copy Performance (btrfs-over-LUKS2, local)
+
+**Platform:** AMD Ryzen AI 9 HX 370, btrfs on dm-crypt, NVMe (separate host, v0.5.x)
 
 After mutating 10% of source files (modify, add, delete), re-sync to existing target.
 
@@ -149,7 +145,7 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 ## foxingd Daemon Performance (XFS→NFS)
 
-### Adversarial Test Results (v0.6.0, 9 phases)
+### Adversarial Test Results (v0.6.0, 10 phases)
 
 **VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
 **Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
@@ -299,17 +295,21 @@ How long from a source modification until the target is fully consistent (fxcp -
 
 ## fxcp → foxingd Integration
 
-`fxcp --generate-sigs` writes the same xattr/sidecar signatures that foxingd uses for fast resync:
+fxcp writes xattr/sidecar signatures compatible with foxingd:
 
-| Signature | xattr Key | Purpose |
-|-----------|-----------|---------|
-| SyncSignature | `user.foxing.sig` | Size + mtime + BLAKE3 lite hash + Merkle root |
-| MerkleSignature | `user.foxing.merkle` | 64KB chunk leaf hashes for delta copy |
-| Dir hash | `user.foxing.dir_hash` | BLAKE3 directory fingerprint for tree pruning |
+| Signature | xattr Key | Written by | Purpose |
+|-----------|-----------|------------|---------|
+| Dir hash | `user.foxing.dir_hash` | `fxcp -a` (always) | BLAKE3 directory fingerprint for adaptive pruning |
+| SyncSignature | `user.foxing.sig` | `fxcp --generate-sigs` | Size + mtime + BLAKE3 lite hash + Merkle root |
+| MerkleSignature | `user.foxing.merkle` | `fxcp --generate-sigs` | 64KB chunk leaf hashes for delta copy |
+
+Dir hashes are stored automatically on every sync (v0.6.0+), enabling adaptive pruning on subsequent runs. File-level signatures require `--generate-sigs`.
 
 **Workflow:**
 ```bash
-fxcp -a --generate-sigs /source /target   # Fast initial seed
+fxcp -a /source /target                   # Copies files + stores dir hashes
+fxcp -a /source /target                   # Resync: prunes unchanged dirs (9-11x faster)
+fxcp -a --generate-sigs /source /target   # Also stores file signatures for foxingd
 foxingd daemon -c config.toml              # Hydration scan → 0 files need sync
 ```
 
@@ -443,22 +443,22 @@ The benchmark harness captures per-tool telemetry: Peak RSS, CPU%, user/system t
 
 | Metric | rsync | foxing |
 |--------|-------|--------|
-| **Change detection** | Full file walk + mtime/size | BPF kernel events (O(1), ~16ms) |
+| **Change detection** | Full file walk + mtime/size | BPF kernel events (O(1), ~17ms) |
 | **Delta transfer** | Rolling checksum (reads whole file) | BLAKE3 Merkle tree (64KB chunks, reads only dirty) |
-| **Small files NFS** | 2.7s (1000×4KB) | 2.5s (NFS compound RPC) — **1.10x** |
-| **Server-side copy** | None (always transfers data) | FICLONE (NFS→NFS same server) — **3.44x** |
+| **Many tiny files NFS** | 12.8s (5000 files) | 11.5s (NFS compound RPC) — **1.11x** |
+| **Server-side copy** | None (always transfers data) | FICLONE (NFS→NFS same server) — **3.62x** |
 | **Data reduction** | ~50% (changed files only) | **97%** (chunk-level delta) |
-| **Resume after crash** | Full re-scan + checksum | Dir Merkle hash O(dirs) — **>24x** |
+| **Resync (no changes)** | O(files) stat walk | O(dirs) dir-hash pruning — **9-11x** at 10K files |
 | **Memory** | 7.5MB RSS | 1MB RSS — **7.5x less** |
 
-rsync is faster for single large files (335ms vs 428ms for 100MB) due to optimized streaming. foxing wins on small-file NFS (compound RPC bypass), delta efficiency (97% reduction), and continuous replication (16ms vs batch-scheduled).
+rsync is faster for single large files (322ms vs 386ms for 100MB) due to optimized streaming. foxing wins on tiny-file NFS (compound RPC), resync pruning (9-11x at scale), delta efficiency (97% reduction), and continuous replication (15-21ms BPF-driven).
 
 ### vs lsyncd (inotify + rsync)
 
 | Metric | lsyncd | foxing |
 |--------|--------|--------|
 | **Event source** | inotify (userspace, ~128K watch limit) | eBPF (kernel-space, unlimited) |
-| **Latency** | 1-5s (batch delay + rsync fork) | **16-20ms** (BPF → copy → fsync) |
+| **Latency** | 1-5s (batch delay + rsync fork) | **15-21ms** (BPF → copy → fsync) |
 | **Copy method** | rsync fork per batch (~7.5MB each) | In-process tiered copy (1MB RSS) |
 | **Rename handling** | Delete + recopy | Direct rename propagation |
 
@@ -469,7 +469,7 @@ foxing is 50-300x lower latency than lsyncd. lsyncd requires inotify watches per
 | Metric | DRBD | foxing |
 |--------|------|--------|
 | **Level** | Block device (sector-level) | Filesystem (file-level) |
-| **Consistency** | Synchronous (Protocol C) | Eventual (~16ms single file) |
+| **Consistency** | Synchronous (Protocol C) | Eventual (~17ms single file) |
 | **Topology** | Primary-secondary (1:1) | 1:N (one source, many targets) |
 | **Cross-filesystem** | No (same block device) | Yes (XFS→NFS, btrfs→ext4, etc.) |
 
@@ -489,15 +489,17 @@ foxing is NOT a distributed filesystem — it's a unidirectional replication eng
 ### Summary: Where Foxing Wins and Loses
 
 **Wins:**
-- Small-file NFS replication (compound RPC bypass, 1 round-trip per file)
+- Resync pruning (dir-hash skip unchanged subtrees — 9-11x at 10K files)
+- Tiny-file NFS replication (compound RPC bypass — 1.11x for 5000 files)
 - Delta efficiency (97% data reduction via BLAKE3 Merkle, 64KB chunks)
-- Event latency (16-20ms BPF-driven, not polling)
+- Event latency (15-21ms BPF-driven, not polling)
 - Recovery speed (<1s dir Merkle resume, <10s NFS journal recovery)
-- Server-side NFS copy (3.44x vs rsync via FICLONE)
+- Server-side NFS copy (3.62x vs rsync via FICLONE)
 - Memory footprint (1MB RSS vs rsync 7.5MB)
 
 **Loses:**
-- Large single files (rsync streaming 22% faster for 100MB)
+- Large single files (rsync streaming ~17% faster for 100MB)
+- 1000 small files to NFS (rsync 7% faster — fxcp per-file probe overhead)
 - Mixed workloads to NFS (directory creation overhead)
 - No bidirectional sync (unidirectional only)
 - Binary size (290MB foxingd vs 0.7MB rsync)
