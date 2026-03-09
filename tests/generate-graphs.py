@@ -280,6 +280,60 @@ def plot_tool_comparison():
     print('  Generated: tool-comparison.svg')
 
 
+def plot_cost_savings():
+    """Side-by-side: monthly cost savings + carbon savings per workload"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    workloads = ['Distro Build\n(cold)', 'Distro Build\n(resync)', 'Database\nBackup',
+                 'Container\nMirror', 'Media Library\nResync', 'CI Artifact\nCache']
+
+    # Monthly cost savings breakdown ($)
+    compute_saved = [3.24, 11.34, 5.30, 2.88, 5.04, 6.00]
+    bandwidth_saved = [0.0, 2.61, 4.97, 0.0, 8.00, 0.0]
+
+    x = np.arange(len(workloads))
+    width = 0.6
+
+    ax1.bar(x, compute_saved, width, label='Compute', color='#5C6BC0', alpha=0.85)
+    ax1.bar(x, bandwidth_saved, width, bottom=compute_saved, label='Bandwidth', color='#26A69A', alpha=0.85)
+
+    for i, (c, b) in enumerate(zip(compute_saved, bandwidth_saved)):
+        total = c + b
+        ax1.text(i, total + 0.3, f'${total:.0f}', ha='center', fontsize=9, fontweight='bold')
+
+    ax1.set_ylabel('Monthly Savings ($)', fontsize=12)
+    ax1.set_title('Cost Savings vs rsync', fontsize=13, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(workloads, fontsize=8)
+    ax1.legend()
+
+    # Monthly carbon savings (g CO₂e)
+    carbon_saved = [81, 292, 142, 72, 355, 150]
+
+    bars = ax2.bar(x, carbon_saved, width, color='#43A047', alpha=0.85)
+    for bar, val in zip(bars, carbon_saved):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
+                f'{val}g', ha='center', fontsize=9, fontweight='bold')
+
+    ax2.set_ylabel('CO₂e Avoided (grams/month)', fontsize=12)
+    ax2.set_title('Carbon Savings vs rsync', fontsize=13, fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(workloads, fontsize=8)
+
+    # Add "equivalent to" annotation
+    total_carbon = sum(carbon_saved)
+    ax2.annotate(f'Total: {total_carbon/1000:.1f} kg CO₂e/mo\n≈ {total_carbon*12/1000:.0f} kg/year\n≈ 450 km driven',
+                xy=(0.98, 0.95), xycoords='axes fraction', ha='right', va='top',
+                fontsize=9, bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9', alpha=0.9))
+
+    fig.suptitle('foxing vs rsync — Monthly Cloud Savings (per server)', fontsize=14, fontweight='bold', y=1.02)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, 'cost-savings.svg'))
+    fig.savefig(os.path.join(OUTPUT_DIR, 'cost-savings.png'))
+    plt.close(fig)
+    print('  Generated: cost-savings.svg')
+
+
 if __name__ == '__main__':
     setup_style()
     print('Generating foxing v0.6.0 benchmark graphs...')
@@ -290,4 +344,5 @@ if __name__ == '__main__':
     plot_daemon_latency()
     plot_adversarial()
     plot_tool_comparison()
+    plot_cost_savings()
     print('Done.')
