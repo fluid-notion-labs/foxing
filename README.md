@@ -28,13 +28,14 @@
 
 ### foxingd Daemon Latency (BPF event-driven)
 
-| Workload | XFS→XFS | XFS→NFS |
-|----------|--------:|--------:|
-| Single file create (4KB) | **14ms** | **17ms** |
-| Single file create (32KB) | **15ms** | **16ms** |
-| Delta resync (10/20 modified) | **~3s** | — |
+| Workload | XFS→XFS | XFS→NFS | XFS→tmpfs |
+|----------|--------:|--------:|----------:|
+| Single file create (4KB) | **17ms** | **19ms** | **16ms** |
+| Single file create (64KB) | **16ms** | **18ms** | **17ms** |
+| Rename propagation | **15ms** | **21ms** | **16ms** |
+| Batch 10×4KB | **187ms** | **209ms** | **190ms** |
 
-fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 14-19ms replication latency.
+fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 15-21ms single-file replication latency.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices and tool comparisons.
 

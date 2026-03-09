@@ -422,11 +422,15 @@ run_p2_workload() {
 
     for i in $(seq 1 "$iters"); do
         export P2_ITER="$i"
+        # Clean between iterations: remove test files from both sides
+        # to prevent BPF event deduplication and hydration state interference
+        find "$src" -name "p2*_${i}.*" -delete 2>/dev/null
+        find "$dst" -name "p2*_${i}.*" -delete 2>/dev/null
         # Run setup (creates pre-existing files for modify workloads)
         eval "$setup_cmd"
-        # Let daemon sync the setup files
-        sleep 2
+        # Let daemon sync the setup files and settle
         sync
+        sleep 1
 
         # Execute source modification + start timer simultaneously
         local start
@@ -434,7 +438,7 @@ run_p2_workload() {
         eval "$action_cmd"
         # Time until target matches (verify polls until consistent)
         local ms
-        ms=$(eval "$verify_cmd") || { times+=(30000); continue; }
+        ms=$(eval "$verify_cmd") || { echo "TIMEOUT" >&2; times+=(30000); continue; }
         times+=("$ms")
     done
 

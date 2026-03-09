@@ -233,16 +233,16 @@ How long from a source modification until the target is fully consistent (fxcp -
 
 | Workload | XFS-to-XFS | XFS-to-NFS | NFS-to-NFS | XFS-to-tmpfs | XFS-same |
 |----------|------:|------:|------:|------:|------:|
-| single 4KB | 70ms | 71ms | 75ms | 56ms | 69ms |
-| single 1MB | 80ms | 70ms | 85ms | 64ms | 59ms |
-| single 100MB | 214ms | 350ms | 1746ms | 199ms | 103ms |
-| modify 4KB | 73ms | 76ms | 98ms | 56ms | 60ms |
-| modify 1MB | 72ms | 91ms | 131ms | 60ms | 64ms |
-| append 4KB | 59ms | 97ms | 108ms | 51ms | 63ms |
-| metadata | 64ms | 94ms | 110ms | 50ms | 62ms |
-| rename | 65ms | 100ms | 118ms | 51ms | 57ms |
-| batch 100x4KB | 92ms | 405ms | 537ms | 77ms | 82ms |
-| batch 10x10MB | 267ms | 961ms | 1450ms | 223ms | 297ms |
+| single 4KB | 75ms | 85ms | 91ms | 62ms | 69ms |
+| single 1MB | 76ms | 90ms | 96ms | 64ms | 67ms |
+| single 100MB | 206ms | 362ms | 1611ms | 201ms | 112ms |
+| modify 4KB | 73ms | 89ms | 93ms | 61ms | 64ms |
+| modify 1MB | 75ms | 95ms | 107ms | 66ms | 77ms |
+| append 4KB | 71ms | 104ms | 97ms | 62ms | 75ms |
+| metadata | 72ms | 116ms | 91ms | 64ms | 68ms |
+| rename | 74ms | 113ms | 100ms | 62ms | 63ms |
+| batch 100x4KB | 100ms | 415ms | 552ms | 77ms | 88ms |
+| batch 10x10MB | 264ms | 953ms | 1564ms | 248ms | 298ms |
 
 **Topologies:**
 - **XFS-to-XFS**: Cross-device local copy (vdb→vdc, sendfile/io_uring)
@@ -252,11 +252,11 @@ How long from a source modification until the target is fully consistent (fxcp -
 - **XFS-same**: Same-device copy (FICLONE reflink — instant CoW for large files)
 
 **Key observations:**
-- **Fixed overhead ~50-70ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
-- **XFS-same 100MB = 103ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
-- **NFS single 4KB = 71ms**: NFS bypass compound RPC adds only ~1ms over local XFS (71ms vs 70ms)
-- **NFS batch 100x4KB = 405ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
-- **NFS-to-NFS 100MB = 1746ms**: Server-side copy but NFS metadata overhead varies with server load
+- **Fixed overhead ~60-75ms**: fxcp startup + probe_capabilities + io_uring ring creation dominates small-file MTTC across all topologies
+- **XFS-same 100MB = 112ms**: FICLONE reflink is metadata-only — 100MB copies in ~40ms after startup overhead
+- **NFS single 4KB = 85ms**: NFS bypass compound RPC adds ~10ms over local XFS (85ms vs 75ms)
+- **NFS batch 100x4KB = 415ms**: ~4ms per file via NFS bypass compounds (vs ~6ms without bypass)
+- **NFS-to-NFS 100MB = 1611ms**: Server-side copy but NFS metadata overhead varies with server load
 
 ### Phase 2: foxingd Daemon (BPF Event-Driven)
 
@@ -265,19 +265,19 @@ How long from a source modification until the target is fully consistent (fxcp -
 
 | Workload | XFS-to-XFS | XFS-to-NFS | XFS-to-tmpfs |
 |----------|------:|------:|------:|
-| create 4KB | **14ms** | **17ms** | **15ms** |
-| create 8KB | **15ms** | **17ms** | **16ms** |
-| create 32KB | **15ms** | **16ms** | **16ms** |
-| create 64KB | TIMEOUT | **14ms** | TIMEOUT |
-| rename 4KB | TIMEOUT | **19ms** | **16ms** |
-| batch 10x4KB | TIMEOUT | TIMEOUT | TIMEOUT |
+| create 4KB | **17ms** | **19ms** | **16ms** |
+| create 8KB | **16ms** | **18ms** | **17ms** |
+| create 32KB | **17ms** | **18ms** | **17ms** |
+| create 64KB | **16ms** | **18ms** | **17ms** |
+| rename 4KB | **15ms** | **21ms** | **16ms** |
+| batch 10x4KB | **187ms** | **209ms** | **190ms** |
 
 **Key observations:**
-- **Single-file BPF latency = 14-19ms**: BPF event capture → copy → fsync in under 1 polling interval
-- **XFS-to-NFS overhead = ~3ms**: NFS compound RPC adds minimal latency (17ms vs 14ms)
-- **XFS-to-NFS most reliable**: All single-file creates and renames converge (14-19ms)
-- **Batch TIMEOUT**: 10-file batches exceed the polling window across all topologies
-- **create 64KB TIMEOUT on XFS/tmpfs**: Intermittent — same workload succeeds on NFS (14ms)
+- **Single-file BPF latency = 15-21ms**: BPF event capture → copy → fsync in ~1 polling interval
+- **XFS-to-NFS overhead = ~3ms**: NFS compound RPC adds minimal latency (19ms vs 17ms)
+- **All single creates + renames converge**: 15-21ms across all topologies
+- **Batch 10×4KB = 187-209ms**: ~19-21ms per file, linear scaling with BPF event processing
+- **rename = 15-21ms**: Rename propagation as fast as create (no recopy needed)
 
 ## fxcp → foxingd Integration
 
