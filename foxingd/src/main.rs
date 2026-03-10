@@ -63,7 +63,7 @@ path = "/mnt/source"
 #[command(name = "foxing")]
 #[command(version, about = "High-Performance Filesystem Replication Daemon", long_about = None)]
 #[command(after_help = CONFIG_HELP)]
-struct Cli {
+pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count, help = "Increase verbosity (-v: Debug, -vv: Trace)")]
     verbose: u8,
     #[arg(long, help = "Launch the interactive TUI (Setup Wizard or Daemon Monitor)")]
@@ -73,7 +73,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub enum Commands {
     Daemon {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
@@ -119,7 +119,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum SnapshotCommands {
+pub enum SnapshotCommands {
     List { path: String },
     Revert { path: String, epoch: u64 },
     Copy { path: String, epoch: u64, destination: String },

@@ -1,0 +1,42 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+export RUSTUP_HOME=$(CURDIR)/debian/.rustup
+export CARGO_HOME=$(CURDIR)/debian/.cargo
+export PATH := $(CARGO_HOME)/bin:$(PATH)
+
+override_dh_auto_configure:
+	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+	    sh -s -- -y --default-toolchain nightly --profile minimal --no-modify-path
+	rustup component add rustfmt
+
+override_dh_auto_build:
+	cargo build --release --workspace --offline
+	cargo run -p xtask --offline -- all
+
+override_dh_auto_install:
+	install -Dpm 755 target/release/fxcp debian/fxcp/usr/bin/fxcp
+	install -Dpm 755 target/release/foxingd debian/foxingd/usr/bin/foxingd
+	install -Dpm 644 config.toml.example debian/foxingd/etc/foxing/config.toml.example
+	install -Dpm 644 dist/systemd/foxingd.service debian/foxingd/lib/systemd/system/foxingd.service
+	install -Dpm 644 dist/systemd/foxingd-sysusers.conf debian/foxingd/usr/lib/sysusers.d/foxingd.conf
+	install -Dpm 644 dist/systemd/foxingd-tmpfiles.conf debian/foxingd/usr/lib/tmpfiles.d/foxingd.conf
+	install -Dpm 644 dist/man/fxcp.1 debian/fxcp/usr/share/man/man1/fxcp.1
+	install -Dpm 644 dist/man/foxingd.1 debian/foxingd/usr/share/man/man1/foxingd.1
+	install -Dpm 644 dist/completions/fxcp.bash debian/fxcp/usr/share/bash-completion/completions/fxcp
+	install -Dpm 644 dist/completions/foxingd.bash debian/foxingd/usr/share/bash-completion/completions/foxingd
+	install -Dpm 644 dist/completions/fxcp.zsh debian/fxcp/usr/share/zsh/site-functions/_fxcp
+	install -Dpm 644 dist/completions/foxingd.zsh debian/foxingd/usr/share/zsh/site-functions/_foxingd
+	install -Dpm 644 dist/completions/fxcp.fish debian/fxcp/usr/share/fish/vendor_completions.d/fxcp.fish
+	install -Dpm 644 dist/completions/foxingd.fish debian/foxingd/usr/share/fish/vendor_completions.d/foxingd.fish
+
+override_dh_auto_test:
+	true
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf debian/.rustup debian/.cargo
+
+override_dh_strip:
+	true

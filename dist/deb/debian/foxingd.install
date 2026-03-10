@@ -1,0 +1,5 @@
+usr/bin/foxingd
+etc/foxing/config.toml.example
+lib/systemd/system/foxingd.service
+usr/lib/sysusers.d/foxingd.conf
+usr/lib/tmpfiles.d/foxingd.conf

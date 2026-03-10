@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: foxing
+Upstream-Contact: Joel Wiramu Pauling <aenertia@aenertia.net>
+Source: https://codeberg.org/aenertia/foxing
+
+Files: *
+Copyright: 2025 Joel Wiramu Pauling <aenertia@aenertia.net>
+License: GPL-2.0-or-later

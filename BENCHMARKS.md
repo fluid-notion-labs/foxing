@@ -1,8 +1,9 @@
 # Foxing Performance Benchmarks
 
 **Version:** 0.6.0
-**Date:** 2026-03-09
-**Rust:** nightly (1.96+), edition 2024, release profile (opt-level 3, debuginfo)
+**Date:** 2026-03-10
+**Rust:** nightly (1.96+), edition 2024
+**Build profiles:** `release` (opt-level 3, strip, thin LTO) · `release-debug` (same + debuginfo, no strip)
 
 ## v0.6.0 Performance Features
 
@@ -14,14 +15,20 @@
 
 ## Binary Comparison
 
-| Binary | Size | BPF Deps | Root Required | Notes |
-|--------|-----:|:--------:|:-------------:|-------|
-| fxcp | 142 MB | No | No | Standalone CLI; also obtainable via `ln -sf foxingd fxcp` |
-| foxingd | 290 MB | Yes (libbpf) | Yes (eBPF) | Superset of fxcp (symlink dispatch) |
-| rsync | 0.7 MB | No | No | Reference tool |
-| cp | 0.1 MB | No | No | Reference tool |
+| Binary | Stripped | Debug | BPF Deps | Root Required | Notes |
+|--------|--------:|------:|:--------:|:-------------:|-------|
+| fxcp | **5.6 MB** | 74 MB | No | No | Standalone CLI; also obtainable via `ln -sf foxingd fxcp` |
+| foxingd | **16 MB** | 225 MB | Yes (libbpf) | Yes (eBPF) | Superset of fxcp (symlink dispatch) |
+| rsync | 0.7 MB | — | No | No | Reference tool |
+| cp | 0.1 MB | — | No | No | Reference tool |
 
-foxingd is a complete superset of fxcp — when symlinked as `fxcp`, it behaves identically to the standalone binary. Users who don't need BPF/TUI/daemon can build fxcp alone (`cargo build -p fxcp`) for a 48% smaller binary.
+The `release` profile (default) produces stripped binaries with thin LTO. The `release-debug` profile preserves debug symbols for profiling and debuginfo packages.
+
+foxingd is a complete superset of fxcp — when symlinked as `fxcp`, it behaves identically to the standalone binary. Users who don't need BPF/TUI/daemon can build fxcp alone (`cargo build -p fxcp`) for a 65% smaller binary.
+
+### Packaging
+
+Distribution packages are available for Fedora (COPR) and Debian/Ubuntu (.deb). Packages include man pages (`fxcp.1`, `foxingd.1`), bash/zsh/fish shell completions, and systemd service units. Supported architectures: x86_64, aarch64.
 
 ## Resource Usage
 
@@ -528,7 +535,7 @@ foxing is NOT a distributed filesystem — it's a unidirectional replication eng
 - 1000 small files to NFS (rsync 7% faster — fxcp per-file probe overhead)
 - Mixed workloads to NFS (directory creation overhead)
 - No bidirectional sync (unidirectional only)
-- Binary size (290MB foxingd vs 0.7MB rsync)
+- Binary size (16MB foxingd stripped vs 0.7MB rsync)
 - Root required for foxingd (CAP_BPF + CAP_NET_BIND_SERVICE)
 
 ## Cloud Cost & Carbon Savings

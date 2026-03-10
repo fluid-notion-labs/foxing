@@ -106,7 +106,29 @@ foxingd status
 foxingd metrics
 ```
 
-## Building
+## Installation
+
+### Fedora / RHEL (COPR)
+
+```bash
+# Enable the COPR repository
+sudo dnf copr enable aenertia/foxing
+
+# Install fxcp only (no BPF/root needed)
+sudo dnf install fxcp
+
+# Install the daemon (requires kernel 6.12+)
+sudo dnf install foxingd
+
+# Enable and start the daemon
+sudo systemctl enable --now foxingd
+```
+
+### Debian / Ubuntu
+
+`.deb` packages are available — see [Releases](https://codeberg.org/aenertia/foxing/releases).
+
+### From Source
 
 ```bash
 # fxcp only (no BPF deps needed)
@@ -117,21 +139,40 @@ cargo build --release -p foxingd
 
 # Full workspace
 cargo build --release --workspace
+
+# Install (binaries, man pages, shell completions, systemd units)
+make install DESTDIR=/usr/local
 ```
 
 ### Requirements
 
 - **Kernel:** Linux 6.12+ (BPF `security_inode_create` + `d_instantiate` fallbacks)
-- **Build Tools:** `cargo`, `clang`, `llvm`, `bpftool`, `libbpf-dev`
+- **Architectures:** x86_64, aarch64
+- **Build Tools:** `cargo` (nightly), `clang`, `llvm`, `bpftool`, `libbpf-dev`
 - **Target Filesystem:** XFS, btrfs, ext4, F2FS, NFS 4.2 (for reflink/CoW support)
+
+### Shell Completions
+
+Completions are installed automatically with packages. For source builds:
+
+```bash
+# Generate and install manually
+cargo run -p xtask -- completions
+source dist/completions/fxcp.bash    # bash
+source dist/completions/foxingd.bash
+```
+
+Zsh and fish completions are also generated.
 
 ## Workspace Structure
 
 ```
 foxing/
 ├── fxcp-core/     Smart copy engine library (io_uring, reflink, Merkle, NFS bypass)
-├── fxcp/          Standalone CLI binary (~142MB, no BPF)
-├── foxingd/       eBPF replication daemon (~290MB, requires libbpf)
+├── fxcp/          Standalone CLI binary (5.6 MB stripped, no BPF)
+├── foxingd/       eBPF replication daemon (16 MB stripped, requires libbpf)
+├── xtask/         Build tooling (man page + completion generation)
+├── dist/          Packaging (RPM spec, deb, systemd units)
 ├── tests/         Regression harness + adversarial test suite
 └── docs/          Architecture, diagrams, configuration reference
 ```
