@@ -1,5 +1,5 @@
 [workspace]
-members = ["fxcp-core", "foxingd", "fxcp"]
+members = ["fxcp-core", "foxingd", "fxcp", "xtask"]
 resolver = "2"
 
 [profile.dev]
@@ -9,5 +9,11 @@ lto = false
 
 [profile.release]
 opt-level = 3
+debug = false
+strip = true
+lto = "thin"
+
+[profile.release-debug]
+inherits = "release"
 debug = true
 strip = false

@@ -23,3 +23,7 @@ Cargo.lock
 
 #linux headers are generated from build hosts headers it doesn't need to be in repo
 **/vmlinux.h
+
+# Generated artifacts
+dist/man/
+dist/completions/

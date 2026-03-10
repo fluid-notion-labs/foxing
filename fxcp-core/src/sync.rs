@@ -124,49 +124,53 @@ pub async fn run(opts: SyncOptions) -> crate::Result<SyncStats> {
 }
 
 // -----------------------------------------------------------------------
+// CLI definition (public for man page / completion generation)
+// -----------------------------------------------------------------------
+
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
+pub struct FxcpCli {
+    /// Source path (use '-' for stdin)
+    pub source: PathBuf,
+    /// Destination path
+    pub destination: PathBuf,
+    #[arg(short = 'a', long, help = "Archive mode (recursive, preserve attributes)")]
+    pub archive: bool,
+    #[arg(short = 'r', long, help = "Recursive copy (implied by -a)")]
+    pub recursive: bool,
+    #[arg(short = 'v', long, help = "BLAKE3 verification after copy")]
+    pub verify: bool,
+    #[arg(long, help = "Delete files in target not present in source")]
+    pub delete: bool,
+    #[arg(short = 'n', long, help = "Dry run — show what would be copied")]
+    pub dry_run: bool,
+    #[arg(short = 'e', long, help = "Exclude pattern (glob)")]
+    pub exclude: Vec<String>,
+    #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
+    pub cleanup: bool,
+    #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
+    pub size: Option<u64>,
+    #[arg(long, help = "Interval in seconds to create CoW checkpoints of stdin stream")]
+    pub checkpoint_interval: Option<u64>,
+    #[arg(long, default_value = "5", help = "Number of stream checkpoints to keep")]
+    pub checkpoint_keep: usize,
+    #[arg(long, help = "Use zero-copy splice (mutually exclusive with sparse detection)")]
+    pub zero_copy: bool,
+    #[arg(long, default_value_t = false, help = "Increase verbosity")]
+    pub debug: bool,
+    #[arg(long, help = "Generate foxingd-compatible sync signatures (xattr/sidecar) for fast resync")]
+    pub generate_sigs: bool,
+}
+
+// -----------------------------------------------------------------------
 // CLI entry point (for symlink dispatch from foxingd)
 // -----------------------------------------------------------------------
 
 /// Parse CLI args and run — used when foxingd is called as `fxcp` via symlink.
 pub fn cli_main() -> anyhow::Result<()> {
-    use clap::Parser;
-
-    #[derive(Parser)]
-    #[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
-    struct Cli {
-        /// Source path (use '-' for stdin)
-        source: PathBuf,
-        /// Destination path
-        destination: PathBuf,
-        #[arg(short = 'a', long, help = "Archive mode (recursive, preserve attributes)")]
-        archive: bool,
-        #[arg(short = 'r', long, help = "Recursive copy (implied by -a)")]
-        recursive: bool,
-        #[arg(short = 'v', long, help = "BLAKE3 verification after copy")]
-        verify: bool,
-        #[arg(long, help = "Delete files in target not present in source")]
-        delete: bool,
-        #[arg(short = 'n', long, help = "Dry run — show what would be copied")]
-        dry_run: bool,
-        #[arg(short = 'e', long, help = "Exclude pattern (glob)")]
-        exclude: Vec<String>,
-        #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
-        cleanup: bool,
-        #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
-        size: Option<u64>,
-        #[arg(long, help = "Interval in seconds to create CoW checkpoints of stdin stream")]
-        checkpoint_interval: Option<u64>,
-        #[arg(long, default_value = "5", help = "Number of stream checkpoints to keep")]
-        checkpoint_keep: usize,
-        #[arg(long, help = "Use zero-copy splice (mutually exclusive with sparse detection)")]
-        zero_copy: bool,
-        #[arg(long, default_value_t = false, help = "Increase verbosity")]
-        debug: bool,
-        #[arg(long, help = "Generate foxingd-compatible sync signatures (xattr/sidecar) for fast resync")]
-        generate_sigs: bool,
-    }
-
-    let cli = Cli::parse();
+    let cli = FxcpCli::parse();
 
     let filter = if cli.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()

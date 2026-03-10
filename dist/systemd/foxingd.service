@@ -1,0 +1,34 @@
+[Unit]
+Description=Foxing eBPF Filesystem Replication Daemon
+Documentation=https://codeberg.org/aenertia/foxing
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/foxingd daemon --config /etc/foxing/config.toml
+Restart=on-failure
+RestartSec=5
+
+# BPF capabilities (kernel 6.12+ required)
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN
+NoNewPrivileges=yes
+
+# Hardening — source/target paths are site-specific;
+# admins should add them to ReadWritePaths= via a drop-in override.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/foxing /var/log/foxing
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=foxingd
+
+# BPF maps require unlimited locked memory
+LimitMEMLOCK=infinity
+# Support high queue depths (queue_max up to 2M)
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

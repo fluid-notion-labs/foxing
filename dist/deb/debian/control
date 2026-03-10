@@ -1,0 +1,34 @@
+Source: foxing
+Section: utils
+Priority: optional
+Maintainer: Joel Wiramu Pauling <aenertia@aenertia.net>
+Build-Depends: debhelper-compat (= 13),
+               clang,
+               llvm,
+               libbpf-dev,
+               bpftool,
+               libssl-dev,
+               libelf-dev,
+               zlib1g-dev,
+               pkg-config,
+               curl
+Standards-Version: 4.6.2
+Homepage: https://codeberg.org/aenertia/foxing
+Rules-Requires-Root: no
+
+Package: fxcp
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Smart filesystem copy tool with CoW/reflink support
+ fxcp is a smart filesystem copy tool — an rsync replacement with
+ CoW/reflink, io_uring, BLAKE3 delta detection, and adaptive tuning.
+ Does not require root or BPF.
+
+Package: foxingd
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, bpftool
+Description: eBPF filesystem replication daemon
+ foxingd is an eBPF-powered filesystem replication daemon that watches
+ filesystem events via BPF kprobes and replicates changes to one or more
+ targets with adaptive tuning, versioning, and Prometheus metrics.
+ Requires Linux kernel 6.12+ with BTF support.
