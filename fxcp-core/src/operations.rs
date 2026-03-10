@@ -865,9 +865,9 @@ pub fn btrfs_create_snapshot(src_fd: RawFd, dest_dir: &Path, name: &str) -> Resu
 
     unsafe {
         std::ptr::copy_nonoverlapping(
-            cname.as_ptr(), 
-            args.name.as_mut_ptr() as *mut i8, 
-            cname.as_bytes().len()
+            cname.as_bytes_with_nul().as_ptr(),
+            args.name.as_mut_ptr().cast::<u8>(),
+            cname.as_bytes_with_nul().len()
         );
     }
 
@@ -896,9 +896,9 @@ pub fn btrfs_create_subvol(dest_dir: &Path, name: &str) -> Result<()> {
 
     unsafe {
         std::ptr::copy_nonoverlapping(
-            cname.as_ptr(), 
-            args.name.as_mut_ptr() as *mut i8, 
-            cname.as_bytes().len()
+            cname.as_bytes_with_nul().as_ptr(),
+            args.name.as_mut_ptr().cast::<u8>(),
+            cname.as_bytes_with_nul().len()
         );
     }
 
