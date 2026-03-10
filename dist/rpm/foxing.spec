@@ -44,6 +44,7 @@ Does not require root or BPF.
 # ---- Subpackage: foxingd ----
 %package -n foxingd
 Summary:        eBPF filesystem replication daemon
+Conflicts:      fxcp
 Requires:       openssl-libs
 Requires:       elfutils-libelf
 Requires:       zlib
@@ -59,6 +60,7 @@ Requires(postun): systemd
 foxingd is an eBPF-powered filesystem replication daemon that watches
 filesystem events via BPF kprobes and replicates changes to one or more
 targets with adaptive tuning, versioning, and Prometheus metrics.
+foxingd is a superset of fxcp — it provides fxcp via symlink dispatch.
 Requires Linux kernel 6.12+ with BTF support.
 
 %prep
@@ -93,6 +95,7 @@ cargo run -p xtask --offline -- all
 %install
 install -Dpm 755 target/release/fxcp %{buildroot}%{_bindir}/fxcp
 install -Dpm 755 target/release/foxingd %{buildroot}%{_bindir}/foxingd
+ln -sf foxingd %{buildroot}%{_bindir}/fxcp
 install -Dpm 644 config.toml.example %{buildroot}%{_sysconfdir}/foxing/config.toml.example
 install -Dpm 644 dist/systemd/foxingd.service %{buildroot}%{_unitdir}/foxingd.service
 install -Dpm 644 dist/systemd/foxingd-sysusers.conf %{buildroot}%{_sysusersdir}/foxingd.conf
@@ -136,16 +139,21 @@ install -Dpm 644 dist/completions/foxingd.fish %{buildroot}%{_datadir}/fish/vend
 %license LICENSE
 %doc README.md config.toml.example
 %{_bindir}/foxingd
+%{_bindir}/fxcp
 %dir %{_sysconfdir}/foxing
 %config(noreplace) %{_sysconfdir}/foxing/config.toml.example
 %{_unitdir}/foxingd.service
 %{_sysusersdir}/foxingd.conf
 %{_tmpfilesdir}/foxingd.conf
 %{_mandir}/man1/foxingd.1*
+%{_mandir}/man1/fxcp.1*
 %{_datadir}/bash-completion/completions/foxingd
+%{_datadir}/bash-completion/completions/fxcp
 %{_datadir}/zsh/site-functions/_foxingd
+%{_datadir}/zsh/site-functions/_fxcp
 %{_datadir}/fish/vendor_completions.d/foxingd.fish
+%{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
-* Tue Mar 10 2026 Joel Wiramu Pauling <aenertia@aenertia.net> - 0.6.0-1
+* Tue Mar 10 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.6.0-1
 - Initial package

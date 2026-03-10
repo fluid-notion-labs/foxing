@@ -1,7 +1,7 @@
 Source: foxing
 Section: utils
 Priority: optional
-Maintainer: Joel Wiramu Pauling <aenertia@aenertia.net>
+Maintainer: Joel Wirāmu Pauling <aenertia@aenertia.net>
 Build-Depends: debhelper-compat (= 13),
                clang,
                llvm,
@@ -27,8 +27,10 @@ Description: Smart filesystem copy tool with CoW/reflink support
 Package: foxingd
 Architecture: amd64 arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, bpftool
+Conflicts: fxcp
 Description: eBPF filesystem replication daemon
  foxingd is an eBPF-powered filesystem replication daemon that watches
  filesystem events via BPF kprobes and replicates changes to one or more
  targets with adaptive tuning, versioning, and Prometheus metrics.
+ foxingd is a superset of fxcp — it provides fxcp via symlink dispatch.
  Requires Linux kernel 6.12+ with BTF support.
