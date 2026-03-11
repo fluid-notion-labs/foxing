@@ -437,7 +437,15 @@ impl Hydrator {
 
             info!("Hydration: Targeted recovery — {} journal queued, {} walk queued, {} dirs pruned",
                   queued, walk_queued, dirs_pruned);
+
         }
+
+        // Always follow targeted recovery with a full scan to catch files written
+        // during the outage that weren't captured in the journal (BPF ring buffer
+        // overflow, events created after workers paused, etc.)
+        info!("Hydration: Post-recovery full scan to catch unjournaled changes");
+        std::thread::sleep(std::time::Duration::from_secs(2)); // let pending jobs drain
+        self.full_scan(false);
     }
 
     /// Pre-scan NFS targets using batch_stat compounds to bulk-fetch size+mtime.
@@ -869,6 +877,36 @@ impl Hydrator {
                         }
                     }
                 }
+            }
+        }
+
+        // Delete stale target files not present on source (like --delete)
+        for target in targets_ref {
+            if target.paused.load(Ordering::Relaxed) { continue; }
+            let target_walker = walkdir::WalkDir::new(&target.path)
+                .follow_links(false)
+                .contents_first(true);  // children before parents for rmdir
+            let mut stale_deleted = 0u64;
+            for entry in target_walker {
+                let entry = match entry { Ok(e) => e, Err(_) => continue };
+                let rel = match entry.path().strip_prefix(&target.path) { Ok(r) => r, Err(_) => continue };
+                if rel.as_os_str().is_empty() { continue; }
+                let name = rel.to_string_lossy();
+                // Skip foxing metadata and atomics
+                if name.contains(".foxing") || name.contains(".tmp.") || name.ends_with(".swap_tmp") { continue; }
+                let src_equivalent = source_path.join(rel);
+                if !src_equivalent.exists() {
+                    if entry.file_type().is_dir() {
+                        let _ = std::fs::remove_dir(entry.path());
+                    } else {
+                        debug!("Hydration cleanup: removing stale {:?}", rel);
+                        let _ = std::fs::remove_file(entry.path());
+                        stale_deleted += 1;
+                    }
+                }
+            }
+            if stale_deleted > 0 {
+                info!("Hydration: Removed {} stale files from {:?}", stale_deleted, target.path);
             }
         }
 
