@@ -1,3 +1,12 @@
+foxing (0.7.0-1) unstable; urgency=low
+
+  * fxcp: multi-source CLI (fxcp src1 src2 dest/)
+  * fxcp: --include, --exclude-from, --include-from filtering
+  * foxingd: hydration deletes stale target files on resync
+  * foxingd: post-recovery full scan for unjournaled changes
+
+ -- Joel Wirāmu Pauling <aenertia@aenertia.net>  Thu, 12 Mar 2026 00:00:00 +1300
+
 foxing (0.6.1-1) unstable; urgency=low
 
   * Expand architecture support: ppc64el, s390x, riscv64
