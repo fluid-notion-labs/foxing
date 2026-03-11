@@ -103,7 +103,6 @@ cargo run -p xtask --offline -- all
 %install
 install -Dpm 755 target/release/fxcp %{buildroot}%{_bindir}/fxcp
 install -Dpm 755 target/release/foxingd %{buildroot}%{_bindir}/foxingd
-ln -sf foxingd %{buildroot}%{_bindir}/fxcp
 install -Dpm 644 config.toml.example %{buildroot}%{_sysconfdir}/foxing/config.toml.example
 install -Dpm 644 dist/systemd/foxingd.service %{buildroot}%{_unitdir}/foxingd.service
 install -Dpm 644 dist/systemd/foxingd-sysusers.conf %{buildroot}%{_sysusersdir}/foxingd.conf
@@ -127,9 +126,15 @@ install -Dpm 644 dist/completions/foxingd.fish %{buildroot}%{_datadir}/fish/vend
 %post -n foxingd
 %systemd_post foxingd.service
 %tmpfiles_create foxingd.conf
+# Create fxcp symlink (foxingd is a superset)
+ln -sf foxingd %{_bindir}/fxcp 2>/dev/null || :
 
 %preun -n foxingd
 %systemd_preun foxingd.service
+# Remove fxcp symlink if it points to foxingd
+if [ "$(readlink %{_bindir}/fxcp 2>/dev/null)" = "foxingd" ]; then
+    rm -f %{_bindir}/fxcp
+fi
 
 %postun -n foxingd
 %systemd_postun_with_restart foxingd.service
@@ -147,7 +152,7 @@ install -Dpm 644 dist/completions/foxingd.fish %{buildroot}%{_datadir}/fish/vend
 %license LICENSE
 %doc README.md config.toml.example
 %{_bindir}/foxingd
-%{_bindir}/fxcp
+%ghost %{_bindir}/fxcp
 %dir %{_sysconfdir}/foxing
 %config(noreplace) %{_sysconfdir}/foxing/config.toml.example
 %{_unitdir}/foxingd.service
