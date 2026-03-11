@@ -297,7 +297,6 @@ pub fn run(
         ("trace_vfs_lock_file", &progs.trace_vfs_lock_file),
         ("trace_flock_lock_inode_wait", &progs.trace_flock_lock_inode_wait),
         ("trace_flock_lock_inode", &progs.trace_flock_lock_inode),
-        ("trace_clone_file_range", &progs.trace_clone_file_range),
         ("trace_filemap_fdatawrite_range", &progs.trace_filemap_fdatawrite_range),
     ];
 
@@ -310,6 +309,26 @@ pub fn run(
             }
             Err(e) => {
                 debug!("BPF: Skipped probe {} (Kernel unsupported/Module missing): {}", name, e);
+            }
+        }
+    }
+
+    // s390x: 6-param kprobes excluded from BPF (libbpf __PT_PARM6_REG unsupported)
+    #[cfg(not(target_arch = "s390x"))]
+    {
+        let six_param_probes = [
+            ("trace_clone_file_range", &progs.trace_clone_file_range),
+        ];
+        for (name, prog) in six_param_probes.iter() {
+            match prog.attach() {
+                Ok(link) => {
+                    _held_links.push(link);
+                    attached_count += 1;
+                    debug!("BPF: Attached probe {}", name);
+                }
+                Err(e) => {
+                    debug!("BPF: Skipped probe {} (Kernel unsupported/Module missing): {}", name, e);
+                }
             }
         }
     }

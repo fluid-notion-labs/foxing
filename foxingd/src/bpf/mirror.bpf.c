@@ -842,6 +842,10 @@ int BPF_KPROBE(trace_iomap_writeback, struct folio *folio) {
     return 0;
 }
 
+// s390x libbpf only supports 5 kprobe params (__PT_PARM6_REG is unsupported).
+// These probes take 6 params, so we skip them on s390x — copy_file_range and
+// clone_file_range events will be detected via the write path fallback instead.
+#ifndef __TARGET_ARCH_s390
 SEC("kprobe/vfs_copy_file_range")
 int BPF_KPROBE(trace_copy_file_range, struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out, size_t len, unsigned int flags) {
     struct inode *inode = BPF_CORE_READ(file_out, f_inode);
@@ -855,5 +859,6 @@ int BPF_KPROBE(trace_clone_file_range, struct file *file_in, loff_t pos_in, stru
     struct dentry *dentry = BPF_CORE_READ(file_out, f_path.dentry);
     return submit_event(inode, dentry, EVENT_CLONE, pos_out, len, remap_flags);
 }
+#endif /* !__TARGET_ARCH_s390 */
 
 char LICENSE[] SEC("license") = "GPL";

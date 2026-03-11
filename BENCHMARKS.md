@@ -1,6 +1,6 @@
 # Foxing Performance Benchmarks
 
-**Version:** 0.6.0
+**Version:** 0.6.1
 **Date:** 2026-03-10
 **Rust:** nightly (1.96+), edition 2024
 **Build profiles:** `release` (opt-level 3, strip, thin LTO) · `release-debug` (same + debuginfo, no strip)

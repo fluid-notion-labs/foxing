@@ -1,3 +1,12 @@
+foxing (0.6.1-1) unstable; urgency=low
+
+  * Expand architecture support: ppc64el, s390x, riscv64
+  * Fix aarch64 build: portable pointer types in btrfs ioctls
+  * Add fxcp symlink in foxingd package
+  * Add man pages, shell completions (bash/zsh/fish)
+
+ -- Joel Wirāmu Pauling <aenertia@aenertia.net>  Tue, 11 Mar 2026 00:00:00 +1300
+
 foxing (0.6.0-1) unstable; urgency=low
 
   * Initial release.

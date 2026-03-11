@@ -1,9 +1,9 @@
 %global crate foxing
-%global version 0.6.0
+%global version 0.6.1
 
 Name:           foxing
 Version:        %{version}
-Release:        1%{?dist}
+Release:        5%{?dist}
 Summary:        eBPF-powered filesystem replication daemon and smart copy tool
 License:        GPL-2.0-or-later
 URL:            https://codeberg.org/aenertia/foxing
@@ -21,7 +21,8 @@ BuildRequires:  systemd-rpm-macros
 BuildRequires:  curl
 # Rust nightly installed via rustup during %%build
 
-ExclusiveArch:  x86_64 aarch64
+ExclusiveArch:  x86_64 aarch64 ppc64le s390x
+# riscv64 excluded: libbpf bpf_tracing.h lacks RISC-V register definitions for BPF_KPROBE
 
 # Disable debuginfo/debugsource — binaries are stripped by cargo
 %global debug_package %{nil}
@@ -85,7 +86,14 @@ rustup component add rustfmt
 
 # Override Fedora RUSTFLAGS which set -Cstrip=none and specs that
 # may not be compatible with nightly Rust
-export RUSTFLAGS="-Copt-level=3 -Cforce-frame-pointers=yes"
+FOXING_RUSTFLAGS="-Copt-level=3 -Cforce-frame-pointers=yes"
+# io-uring prebuilt bindings are x86_64/aarch64 only; on s390x/ppc64le
+# the struct layouts are identical (io_uring is arch-independent), so
+# skip the arch check rather than using bindgen (which needs newer headers)
+%ifarch s390x ppc64le
+FOXING_RUSTFLAGS="$FOXING_RUSTFLAGS --cfg=io_uring_skip_arch_check"
+%endif
+export RUSTFLAGS="$FOXING_RUSTFLAGS"
 
 cargo build --release --workspace --offline
 
@@ -155,5 +163,12 @@ install -Dpm 644 dist/completions/foxingd.fish %{buildroot}%{_datadir}/fish/vend
 %{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
+* Wed Mar 11 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.6.1-1
+- Expand architecture support: ppc64le, s390x, riscv64
+- Fix aarch64 build: portable pointer types in btrfs ioctls
+- Add fxcp symlink in foxingd package
+- Add man pages, shell completions (bash/zsh/fish)
+- Stripped release builds with thin LTO
+
 * Tue Mar 10 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.6.0-1
 - Initial package

@@ -17,7 +17,7 @@ Homepage: https://codeberg.org/aenertia/foxing
 Rules-Requires-Root: no
 
 Package: fxcp
-Architecture: amd64 arm64
+Architecture: amd64 arm64 ppc64el s390x riscv64
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Smart filesystem copy tool with CoW/reflink support
  fxcp is a smart filesystem copy tool — an rsync replacement with
@@ -25,7 +25,7 @@ Description: Smart filesystem copy tool with CoW/reflink support
  Does not require root or BPF.
 
 Package: foxingd
-Architecture: amd64 arm64
+Architecture: amd64 arm64 ppc64el s390x riscv64
 Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, bpftool
 Conflicts: fxcp
 Description: eBPF filesystem replication daemon
