@@ -47,11 +47,18 @@ impl VersionIndex {
         }
     }
     pub fn index_directory(&self) {
-        let versions_dir = self.root.join(".mirror").join(".versions");
-        if !versions_dir.exists() {
-            self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
+        let versions_dir = self.root.join(".foxing_versions").join("live");
+        // Backward compat: fall back to legacy path
+        let versions_dir = if versions_dir.exists() {
+            versions_dir
+        } else {
+            let legacy = self.root.join(".mirror").join(".versions");
+            if !legacy.exists() {
+                self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            legacy
+        };
         info!("VersionIndex: Starting background scan of {:?}", versions_dir);
         let start = std::time::Instant::now();
         

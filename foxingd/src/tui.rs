@@ -725,7 +725,10 @@ impl TuiApp {
             index.index_directory();
             index.wait_for_scan();
             let mut versions = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(target_path.join(".mirror").join(".versions")) {
+            let live_dir = target_path.join(".foxing_versions").join("live");
+            let legacy_dir = target_path.join(".mirror").join(".versions");
+            let ver_dir = if live_dir.exists() { live_dir } else { legacy_dir };
+            if let Ok(entries) = std::fs::read_dir(ver_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if let Ok(meta) = entry.metadata() {

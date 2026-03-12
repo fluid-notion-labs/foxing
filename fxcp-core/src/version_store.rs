@@ -14,6 +14,7 @@ use serde::{Serialize, Deserialize};
 use tracing::{info, warn, debug};
 
 const VERSIONS_DIR: &str = ".foxing_versions";
+const LIVE_DIR: &str = "live";
 const INDEX_FILE: &str = "index.json";
 const SUMMARY_FILE: &str = "summary.json";
 const TREE_DIR: &str = "tree";
