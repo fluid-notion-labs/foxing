@@ -1521,13 +1521,28 @@ pub async fn run_hydration_worker_loop(
                     continue;
                 }
 
+                // Storm detection: skip jobs for inodes with pending renames
+                if let Some(ino) = job.inode {
+                    let pending = crate::event::get_pending_renames(ino);
+                    if pending > 0 {
+                        tracing::debug!("Hydration Worker {}: storm-deferred inode {} ({} pending renames)",
+                                       worker_id, ino, pending);
+                        jobs_skipped += 1;
+                        pending_count.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                }
+
                 // Batch drain: collect additional small-file jobs from channel
-                // Filter out stale-generation jobs during drain
+                // Filter out stale-generation jobs and storm-deferred jobs during drain
                 let mut batch = vec![job.clone()];
                 while batch.len() < 64 {
                     match rx.try_recv() {
                         Ok(j) => {
                             if j.generation < current_gen {
+                                jobs_skipped += 1;
+                                pending_count.fetch_sub(1, Ordering::SeqCst);
+                            } else if j.inode.map(|ino| crate::event::get_pending_renames(ino) > 0).unwrap_or(false) {
                                 jobs_skipped += 1;
                                 pending_count.fetch_sub(1, Ordering::SeqCst);
                             } else {
@@ -1552,8 +1567,23 @@ pub async fn run_hydration_worker_loop(
                             if let Some(parent) = dst.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
+                            // Re-verify source exists immediately before copy
+                            // (catches renames that happen between batch collection and copy)
+                            if !src.exists() {
+                                jobs_skipped += 1;
+                                pending_count.fetch_sub(1, Ordering::SeqCst);
+                                continue;
+                            }
                             match std::fs::copy(&src, &dst) {
                                 Ok(bytes) => {
+                                    // Check if source was renamed during copy (ghost prevention).
+                                    // Use symlink_metadata to avoid fd caching — checks actual path.
+                                    if std::fs::symlink_metadata(&src).is_err() {
+                                        let _ = std::fs::remove_file(&dst);
+                                        jobs_skipped += 1;
+                                        pending_count.fetch_sub(1, Ordering::SeqCst);
+                                        continue;
+                                    }
                                     // Apply metadata
                                     let _ = fxcp_core::security::apply_metadata(&src, &dst);
                                     crate::metrics::EVENTS_REPAIR_COMPLETED.inc();
