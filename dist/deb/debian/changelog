@@ -1,3 +1,13 @@
+foxing (0.7.1-1) unstable; urgency=low
+
+  * fxcp snap: dirvish-style point-in-time snapshots with JSON index
+  * fxcp snap prune: maintenance by age, count, and size
+  * fxcp --snapshot: reflink versioning during copy
+  * fxcp --throttle: PSI-based system stress pacing
+  * Machine-readable --json output for web UI integration
+
+ -- Joel Wirāmu Pauling <aenertia@aenertia.net>  Wed, 12 Mar 2026 00:00:00 +1300
+
 foxing (0.7.0-1) unstable; urgency=low
 
   * fxcp: multi-source CLI (fxcp src1 src2 dest/)
