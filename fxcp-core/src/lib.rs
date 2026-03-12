@@ -19,6 +19,8 @@ pub mod versioning;
 pub mod consistency;
 pub mod filter;
 pub mod version_store;
+#[cfg(feature = "tui")]
+pub mod browser;
 pub mod sync;
 pub mod tombstone;
 #[cfg(feature = "nfs-bypass")]

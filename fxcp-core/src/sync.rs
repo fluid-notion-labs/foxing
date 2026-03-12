@@ -326,6 +326,13 @@ pub enum SnapCommand {
         #[arg(short, long, default_value = ".")]
         output: String,
     },
+    /// Interactive MC-style dual-pane browser for snapshots and archives
+    #[cfg(feature = "tui")]
+    Browse {
+        /// Directory with .foxing_versions or .fxar archive file
+        #[arg(default_value = ".")]
+        path: String,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -681,6 +688,12 @@ fn cli_snap_main() -> anyhow::Result<()> {
                     info!("Restored: {}", dest.display());
                 }
             }
+        }
+        #[cfg(feature = "tui")]
+        SnapCommand::Browse { path } => {
+            let p = std::path::PathBuf::from(&path);
+            let mut app = crate::browser::BrowserApp::new(&p);
+            app.run().map_err(|e| anyhow::anyhow!("TUI error: {}", e))?;
         }
     }
     Ok(())

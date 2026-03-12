@@ -15,5 +15,5 @@ name = "fxcp"
 path = "src/main.rs"
 
 [dependencies]
-fxcp-core = { path = "../fxcp-core" }
+fxcp-core = { path = "../fxcp-core", features = ["tui"] }
 anyhow = "1.0.100"

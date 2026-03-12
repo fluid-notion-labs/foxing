@@ -11,6 +11,7 @@ description = "Core copy engine for foxing — smart filesystem copy with CoW/re
 default = ["nfs-bypass"]
 debug_metrics = []
 nfs-bypass = []
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "fs", "sync", "signal", "time", "net"] }
@@ -50,6 +51,8 @@ clap = { version = "4.5.53", features = ["derive"] }
 pathdiff = "0.2"
 tar = "0.4"
 xz2 = "0.1"
+ratatui = { version = "0.26", optional = true }
+crossterm = { version = "0.27", features = ["event-stream"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
