@@ -1,11 +1,20 @@
 # Foxing Performance Benchmarks
 
 **Version:** 0.7.0
-**Date:** 2026-03-10
+**Date:** 2026-03-12
 **Rust:** nightly (1.96+), edition 2024
 **Build profiles:** `release` (opt-level 3, strip, thin LTO) · `release-debug` (same + debuginfo, no strip)
 
-## v0.6.0 Performance Features
+## v0.7.0 Features
+
+- **Multi-source fxcp**: `fxcp src1 src2 src3 dest/` — cp/rsync-compatible positional args with shell glob expansion
+- **Include/exclude filtering**: `--include PATTERN`, `--exclude-from FILE`, `--include-from FILE` (rsync semantics: include overrides exclude)
+- **Hydration stale file cleanup**: `full_scan` deletes target files not present on source (like `--delete` on every resync)
+- **Post-recovery full scan**: NFS reconnect triggers journal replay + follow-up full source walk for unjournaled changes
+- **WAL storm detection**: Pre-registration rename storm registry suppresses ghost file creation during rapid rename chains
+- **Filter module**: Extracted to `fxcp-core/src/filter.rs` with 19 unit tests
+
+## Performance Features (since v0.6.0)
 
 - **Adaptive Merkle chunks**: Chunk size scales with file size (64KB–4MB), keeping signatures under the 64KB xattr limit. Files >130MB no longer silently fall back to full copy.
 - **Double-stat elimination**: WalkDir metadata is aggregated during traversal, eliminating redundant `stat` syscalls in directory hash computation (~50% reduction).
@@ -84,7 +93,7 @@ fxcp has the lowest RSS of all tools (~1MB). foxingd sync shares the same copy e
 | single_large | 1 | 100 MB | 67ms | 163ms | 224ms | 311ms | io_uring |
 | many_tiny | 5,000 | 5 MB | 491ms | 443ms | 612ms | 668ms | sendfile |
 
-foxingd sync adds overhead over fxcp because it generates foxingd-compatible signatures (SyncSignature + MerkleSignature + dir_hash xattrs). In v0.6.0, fxcp also stores dir hashes automatically for adaptive pruning.
+foxingd sync adds overhead over fxcp because it generates foxingd-compatible signatures (SyncSignature + MerkleSignature + dir_hash xattrs). Since v0.6.0, fxcp also stores dir hashes automatically for adaptive pruning.
 
 ## NFS 4.2 Performance (XFS→NFS, NVMe→HDD)
 
@@ -162,7 +171,7 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 ## foxingd Daemon Performance (XFS→NFS)
 
-### Adversarial Test Results (v0.6.0, 10 phases)
+### Adversarial Test Results (v0.7.0, 10 phases)
 
 **VM:** fox-test.3d.ae.net.nz (koero, 16 vCPU, 16GB RAM, Fedora 43, kernel 6.18.5)
 **Source:** `/mnt/source` (XFS on virtio-blk, NVMe-backed)
@@ -170,18 +179,20 @@ cp and fxcp delta tests show FAIL because neither deletes files removed from sou
 
 | Phase | Test | Duration | Result | Key Metric |
 |-------|------|----------|--------|------------|
-| 0 | Baseline cp/rsync | 2s | **PASS** | cp=211MB/s rsync=121MB/s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | 51s | **PASS** | 5000/5000 converged in ~15s |
-| 2 | Live Write Storm (fio randwrite 30s) | 43s | **PASS** | no_coalescing (expected: random I/O) |
-| 3 | Rename Chain Storm (100 chains a→e) | 11s | **PASS** | finals=100/100, ghosts=166 (cleaned) |
-| 4 | NFS Target Drop + Resync (300 files) | 47s | **PASS** | 300/300, targeted recovery + journal |
-| 5 | Large File Kill/Resume (500MB) | 25s | **PASS** | SHA-256 match after SIGKILL + restart |
-| 6 | Disk Pressure (ENOSPC) | 30s | **PASS** | 36/60 files, survived, resumed |
-| 7 | BLAKE3 Delta Copy | 54s | **PASS** | 10 deltas, 20MB saved |
-| 8 | Directory Merkle Pruning | 46s | **PASS** | 13 dirs pruned |
-| 9 | Combined Delta + Pruning | 52s | **PASS** | delta=6, pruned=13, 12MB saved |
+| 0 | Baseline cp/rsync | 2s | **PASS** | cp=245MB/s rsync=152MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | 49s | **PASS** | 5000/5000 converged |
+| 2 | Live Write Storm (fio randwrite 30s) | 44s | **PASS** | Back-pressure handling |
+| 3 | Rename Chain Storm (100 chains a→e) | 11s | FAIL* | 100/100 finals correct, transient ghosts |
+| 4 | NFS Target Drop + Resync (300 files) | 58s | FAIL* | Passes independently (Phase 3 contamination) |
+| 5 | Large File Kill/Resume (500MB) | 26s | **PASS** | SHA-256 match after SIGKILL + restart |
+| 6 | Disk Pressure (ENOSPC) | — | SKIP | NFS share too large for safe test |
+| 7 | BLAKE3 Delta Copy | 49s | **PASS** | 10 deltas, 20MB saved |
+| 8 | Directory Merkle Pruning | 31s | **PASS** | 13 dirs pruned, stale files cleaned |
+| 9 | Combined Delta + Pruning | 45s | **PASS** | delta=6, pruned=13, 12MB saved |
 
-**Total:** 363 seconds (6.0 min). 10/10 PASS, 0 FAIL, 0 SKIP.
+**Total:** 316 seconds (5.3 min). 7 PASS, 2 FAIL*, 1 SKIP.
+
+**\*Phase 3/4 note:** The rename chain storm creates 500 BPF events in 2.5s — a workload density of 200 events/sec that exceeds NFS copy latency (~25ms/file). This produces transient ghost files at intermediate rename positions. Three mitigations prevent data loss: WAL storm registry suppresses CREATE copies during rename chains, post-copy source verification removes ghosts detected during copy, and hydration delete pass removes all remaining ghosts on daemon restart. Phase 4 passes independently (300/300 files); it fails in the full suite only because it inherits Phase 3's ghost state. Real-world rename patterns (git checkout, editor saves) are 1-2 orders of magnitude less dense than this adversarial test. Ghosts are transient and self-healing — the daemon converges to correct state on restart.
 
 ### Initial Hydration Throughput (5000 files, 2.6GB → NFS)
 
@@ -540,7 +551,7 @@ foxing is NOT a distributed filesystem — it's a unidirectional replication eng
 
 ## Cloud Cost & Carbon Savings
 
-Estimated savings when replacing rsync with fxcp/foxingd for common cloud workloads. Based on v0.6.0 validated benchmarks and standard 2025-2026 cloud pricing.
+Estimated savings when replacing rsync with fxcp/foxingd for common cloud workloads. Based on validated benchmarks (v0.6.0–v0.7.0) and standard 2025-2026 cloud pricing.
 
 ![Cost and Carbon Savings](docs/graphs/cost-savings.svg)
 

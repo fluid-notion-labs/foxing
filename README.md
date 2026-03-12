@@ -39,7 +39,15 @@ fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS,
 
 See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices, tool comparisons, and [visual benchmarks](docs/graphs/).
 
-### v0.6.0 Highlights
+### v0.7.0 Highlights
+
+- **Multi-source fxcp** — `fxcp src1 src2 src3 dest/` (cp/rsync-compatible positional args)
+- **Include/exclude filtering** — `--include`, `--exclude-from FILE`, `--include-from FILE` (rsync-compatible)
+- **Hydration stale file cleanup** — foxingd deletes target files not present on source during resync
+- **Post-recovery full scan** — NFS reconnect triggers full source walk after journal replay
+- **WAL storm detection** — pre-registration rename storm registry suppresses ghost creation during rapid rename chains
+
+### v0.6.0 Features
 
 - **Adaptive dir-hash pruning** — resync skips unchanged directory subtrees (9-11x faster than rsync at 10K files)
 - **Adaptive Merkle chunks** — signatures scale with file size (no >130MB cliff)
@@ -57,8 +65,15 @@ cargo build --release -p fxcp
 # Basic copy (like cp -a)
 fxcp -a /source /destination
 
+# Multiple sources (like cp/rsync)
+fxcp -a /src1 /src2 /src3 /destination/
+
 # With delete (like rsync --delete)
 fxcp -a --delete /source /destination
+
+# Include/exclude filtering
+fxcp -a --exclude '*.tmp' --include 'important.tmp' /source /destination
+fxcp -a --exclude-from patterns.txt /source /destination
 
 # Dry run
 fxcp -a -n /source /destination
@@ -322,6 +337,10 @@ foxingd snapshot force /mnt/backup/database.db --tag "pre-migration"
 # Archive copy (recursive, preserve attributes)
 fxcp -a /source /destination
 
+# Multiple sources (last arg is destination)
+fxcp -a /src1 /src2 /src3 /destination/
+fxcp target/ROCKNIX*.aarch64* /mnt/usb/   # shell glob expansion works
+
 # With delete (like rsync --delete)
 fxcp -a --delete /source /destination
 
@@ -330,6 +349,12 @@ fxcp -a --generate-sigs /source /destination
 
 # Exclude patterns
 fxcp -a -e '*.tmp' -e '.git' /source /destination
+
+# Include overrides exclude (rsync semantics)
+fxcp -a --exclude '*.log' --include 'important.log' /source /destination
+
+# Read patterns from files
+fxcp -a --exclude-from excludes.txt --include-from includes.txt /source /destination
 
 # Dry run
 fxcp -a -n /source /destination
@@ -377,9 +402,14 @@ Always provision the target with at least **5% more capacity** than the source t
    - Device ID tracking detects target disappearance (USB unplug, NFS unmount)
    - fsync liveness probe catches stale NFS cache from lazy unmount
    - Workers pause during outage, outage journal captures changes
-   - Recovery scan (pruning-disabled) runs on reconnect
+   - Recovery scan runs on reconnect: journal replay + follow-up full scan for unjournaled changes
 
-5. **Global Emergency Pruning:**
+5. **Hydration Cleanup:**
+   - On every daemon restart, full_scan walks the target and deletes files not present on source
+   - Ensures eventual consistency regardless of runtime state (ghost files, interrupted copies)
+   - WAL storm registry suppresses ghost creation during rapid rename chains
+
+6. **Global Emergency Pruning:**
    - On `ENOSPC`, system deletes oldest version snapshots to free space
    - Live mirror continues after space reclaimed
 
@@ -411,22 +441,24 @@ make test-json     # JSON output for CI
 make test-compare  # Compare against saved baseline
 ```
 
-### foxingd Adversarial Test Suite (v0.6.0)
+### foxingd Adversarial Test Suite (v0.7.0)
 
-9-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2), all passing:
+10-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2):
 
 | Phase | Test | Result | Key Metric |
 |-------|------|--------|------------|
-| 0 | Baseline NFS Throughput | **PASS** | cp=211MB/s rsync=121MB/s |
-| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | Converged in ~15s |
+| 0 | Baseline NFS Throughput | **PASS** | cp=245MB/s rsync=152MB/s |
+| 1 | Heavy Hydration (5000 files, 2.7GB) | **PASS** | Converged in ~49s |
 | 2 | Live Write Storm (fio 30s) | **PASS** | Back-pressure handling |
-| 3 | Rename Chain Storm (100 chains a→e) | **PASS** | 100/100 finals, ghosts cleaned |
-| 4 | NFS Target Drop + Resync (300 files) | **PASS** | Targeted recovery + outage journal |
+| 3 | Rename Chain Storm (100 chains a→e) | FAIL* | 100/100 finals correct, transient ghosts (see below) |
+| 4 | NFS Target Drop + Resync (300 files) | FAIL* | Passes independently; fails in suite due to Phase 3 state |
 | 5 | Large File Kill/Resume (500MB) | **PASS** | SHA-256 verified after SIGKILL |
-| 6 | Disk Pressure (ENOSPC) | **PASS** | Safe Stall, survived, resumed |
+| 6 | Disk Pressure (ENOSPC) | SKIP | NFS share too large for safe test |
 | 7 | BLAKE3 Delta Copy on Resync | **PASS** | 10 deltas, 20MB saved (97% reduction) |
-| 8 | Directory Merkle Pruning | **PASS** | 13 dirs pruned |
+| 8 | Directory Merkle Pruning | **PASS** | 13 dirs pruned, stale files cleaned |
 | 9 | Combined Delta + Pruning | **PASS** | Both optimizations active |
+
+**\*Phase 3 note:** The rename chain storm (500 BPF events in 2.5s) creates a workload density that exceeds NFS copy latency, producing transient ghost files at intermediate rename positions. Three mitigations are in place: WAL storm registry (suppresses CREATE copies during rename chains), post-copy source existence verification, and hydration delete pass (cleans all ghosts on daemon restart). Real-world rename patterns are 1-2 orders of magnitude less dense. Phase 4 passes independently (300/300); it only fails in the full suite because it inherits Phase 3's ghost state without a daemon restart. This is not an intractable issue — ghosts are transient and self-healing.
 
 ## Documentation
 

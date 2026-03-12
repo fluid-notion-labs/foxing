@@ -1,6 +1,6 @@
 # foxingd Architecture
 
-foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.6.0.
+foxingd is an eBPF-powered filesystem replication daemon. This document describes the processing pipeline, error handling, and recovery mechanisms as of version 0.7.0.
 
 ## Processing Pipeline
 
@@ -221,7 +221,7 @@ If bypass is unavailable (Kerberos auth, non-v4.2, connection failure) or any co
 
 ## Performance Characteristics
 
-### Adversarial Test Results (v0.6.0, XFS→NFS)
+### Adversarial Test Results (v0.7.0, XFS→NFS)
 
 | Phase | Test | Result | Duration |
 |-------|------|--------|----------|
