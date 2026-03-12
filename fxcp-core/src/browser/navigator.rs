@@ -123,3 +123,55 @@ impl FileNavigator {
         self.entries.get(self.selected)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_navigator_opens_real_dir() {
+        let nav = FileNavigator::new(std::path::Path::new("/tmp"));
+        assert!(!nav.entries.is_empty());
+        assert_eq!(nav.title, "/tmp");
+    }
+
+    #[test]
+    fn test_navigator_move_up_down() {
+        let mut nav = FileNavigator::new(std::path::Path::new("/tmp"));
+        let initial = nav.selected;
+        nav.move_down();
+        if nav.entries.len() > 1 {
+            assert_eq!(nav.selected, initial + 1);
+        }
+        nav.move_up();
+        assert_eq!(nav.selected, initial);
+    }
+
+    #[test]
+    fn test_navigator_move_up_at_zero() {
+        let mut nav = FileNavigator::new(std::path::Path::new("/tmp"));
+        nav.selected = 0;
+        nav.move_up();
+        assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn test_navigator_parent_entry() {
+        let nav = FileNavigator::new(std::path::Path::new("/tmp"));
+        assert!(nav.entries.iter().any(|e| e.name == ".."));
+    }
+
+    #[test]
+    fn test_navigator_dirs_before_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("aaa_dir")).unwrap();
+        std::fs::write(dir.path().join("bbb_file.txt"), "test").unwrap();
+        let nav = FileNavigator::new(dir.path());
+        // After "..", dirs come before files
+        let non_parent: Vec<_> = nav.entries.iter().filter(|e| e.name != "..").collect();
+        if non_parent.len() >= 2 {
+            assert!(non_parent[0].is_dir);
+            assert!(!non_parent[1].is_dir);
+        }
+    }
+}

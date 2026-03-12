@@ -543,7 +543,11 @@ fn cli_snap_main() -> anyhow::Result<()> {
             let p = std::path::PathBuf::from(&path);
             let store = crate::version_store::VersionStore::open(&p);
             let snapshots = store.list_snapshots();
-            let stats = crate::version_store::compute_store_stats(&snapshots);
+            let versions_root = p.join(".foxing_versions");
+            let stats = crate::version_store::compute_store_stats(
+                &snapshots,
+                if versions_root.exists() { Some(&versions_root) } else { None }
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
             } else {
