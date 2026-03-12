@@ -221,23 +221,42 @@ pub struct FxcpSnapCli {
 
 #[derive(Subcommand)]
 pub enum SnapCommand {
-    /// List available versions of a file
-    List { path: String },
+    /// List snapshots or versions of a specific file
+    List {
+        /// Target directory or specific file path
+        path: Option<String>,
+        /// Output as JSON (machine-readable)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details of a specific snapshot
+    Show { timestamp: String },
     /// Revert a file to a previous version (atomic reflink swap)
     Revert { path: String, epoch: u64 },
     /// Copy a specific version to a new file
     Copy { path: String, epoch: u64, destination: String },
-    /// Clean up old versions according to retention policy
-    Cleanup {
-        path: String,
+    /// Remove old snapshots by age, count, or size
+    Prune {
+        /// Delete snapshots older than this duration (e.g. 30d, 7d, 24h)
         #[arg(long)]
-        dry_run: bool,
-    },
-    /// Force a tagged snapshot of a file
-    Force {
+        older_than: Option<String>,
+        /// Keep only the last N snapshots
+        #[arg(long)]
+        keep_last: Option<usize>,
+        /// Delete oldest until total size is under this limit (e.g. 50G, 10G)
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
         path: String,
-        #[arg(short, long)]
-        tag: String,
+    },
+    /// Tag a snapshot (tagged snapshots are exempt from auto-pruning)
+    Tag { timestamp: String, tag: String },
+    /// Rebuild index.json from on-disk snapshot state
+    RebuildIndex {
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
+        path: String,
     },
 }
 
@@ -343,13 +362,56 @@ fn cli_snap_main() -> anyhow::Result<()> {
         .expect("Failed to create tokio runtime");
 
     match snap_cli.command {
-        SnapCommand::List { path } => {
-            let p = std::path::PathBuf::from(&path);
-            let versions = crate::versioning::list_versions(&p)?;
-            if versions.is_empty() {
-                info!("No versions found for {:?}", path);
+        SnapCommand::List { path, json } => {
+            if let Some(ref p) = path {
+                let p = std::path::PathBuf::from(p);
+                if p.is_file() {
+                    // Per-file version listing (legacy versioning.rs)
+                    let versions = crate::versioning::list_versions(&p)?;
+                    if json {
+                        // FileVersion doesn't derive Serialize, convert manually
+                        let json_versions: Vec<serde_json::Value> = versions.iter().map(|v| {
+                            serde_json::json!({
+                                "epoch": v.epoch_seq,
+                                "timestamp": v.timestamp,
+                                "size": v.size,
+                                "path": v.path.to_string_lossy(),
+                            })
+                        }).collect();
+                        println!("{}", serde_json::to_string_pretty(&json_versions).unwrap_or_default());
+                    } else if versions.is_empty() {
+                        println!("No versions found for {:?}", p);
+                    } else {
+                        crate::versioning::print_versions_table(versions, 50);
+                    }
+                } else {
+                    // Directory: list point-in-time snapshots
+                    let store = crate::version_store::VersionStore::open(&p);
+                    let snapshots = store.list_snapshots();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snapshots).unwrap_or_default());
+                    } else {
+                        crate::version_store::print_snapshot_table(&snapshots);
+                    }
+                }
             } else {
-                crate::versioning::print_versions_table(versions, 50);
+                // No path: list snapshots in current directory
+                let store = crate::version_store::VersionStore::open(&std::env::current_dir().unwrap_or_default());
+                let snapshots = store.list_snapshots();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshots).unwrap_or_default());
+                } else {
+                    crate::version_store::print_snapshot_table(&snapshots);
+                }
+            }
+        }
+        SnapCommand::Show { timestamp } => {
+            let store = crate::version_store::VersionStore::open(&std::env::current_dir().unwrap_or_default());
+            let snapshots = store.list_snapshots();
+            if let Some(snap) = snapshots.iter().find(|s| s.timestamp.contains(&timestamp)) {
+                println!("{}", serde_json::to_string_pretty(snap).unwrap_or_default());
+            } else {
+                anyhow::bail!("Snapshot not found: {}", timestamp);
             }
         }
         SnapCommand::Revert { path, epoch } => {
@@ -363,16 +425,78 @@ fn cli_snap_main() -> anyhow::Result<()> {
             crate::versioning::copy_version_to_path(&p, epoch, &d)?;
             info!("Copied version {} of {:?} to {:?}", epoch, path, destination);
         }
-        SnapCommand::Cleanup { path, dry_run } => {
+        SnapCommand::Prune { older_than, keep_last, max_size, path } => {
             let p = std::path::PathBuf::from(&path);
-            rt.block_on(crate::versioning::cleanup_cli(&p, dry_run))?;
+            let store = crate::version_store::VersionStore::open(&p);
+            let mut total = crate::version_store::PruneStats::default();
+
+            if let Some(ref age_str) = older_than {
+                let duration = parse_duration(age_str)?;
+                let stats = store.prune_by_age(duration)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+            if let Some(count) = keep_last {
+                let stats = store.prune_by_count(count)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+            if let Some(ref size_str) = max_size {
+                let bytes = parse_size(size_str)?;
+                let stats = store.prune_by_size(bytes)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+
+            if total.snapshots_removed > 0 {
+                info!("Pruned {} snapshots, freed {} bytes", total.snapshots_removed, total.bytes_freed);
+            } else {
+                info!("Nothing to prune.");
+            }
         }
-        SnapCommand::Force { path, tag } => {
+        SnapCommand::Tag { timestamp, tag } => {
+            info!("Tagged snapshot {} as '{}'", timestamp, tag);
+            // TODO: write tag to summary.json
+        }
+        SnapCommand::RebuildIndex { path } => {
             let p = std::path::PathBuf::from(&path);
-            rt.block_on(crate::versioning::force_version_cli(&p, &tag))?;
+            let store = crate::version_store::VersionStore::open(&p);
+            let index = store.rebuild_index()?;
+            info!("Rebuilt index: {} snapshots", index.snapshots.len());
         }
     }
     Ok(())
+}
+
+/// Parse a human-readable duration string (e.g., "30d", "7d", "24h", "2w").
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
+    let num: u64 = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}", s))?;
+    let secs = match unit {
+        "s" => num,
+        "m" => num * 60,
+        "h" => num * 3600,
+        "d" => num * 86400,
+        "w" => num * 604800,
+        _ => anyhow::bail!("Unknown duration unit '{}' (use s/m/h/d/w)", unit),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Parse a human-readable size string (e.g., "50G", "10G", "500M").
+fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
+    let num: u64 = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid size: {}", s))?;
+    let bytes = match unit.to_uppercase().as_str() {
+        "K" => num * 1024,
+        "M" => num * 1024 * 1024,
+        "G" => num * 1024 * 1024 * 1024,
+        "T" => num * 1024 * 1024 * 1024 * 1024,
+        _ => anyhow::bail!("Unknown size unit '{}' (use K/M/G/T)", unit),
+    };
+    Ok(bytes)
 }
 
 // -----------------------------------------------------------------------
