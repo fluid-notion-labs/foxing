@@ -1,6 +1,6 @@
 [package]
 name = "fxcp"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 license = "GPL-2.0-or-later"
 authors = ["Joel Wirāmu Pauling <aenertia@aenertia.net>"]
@@ -15,5 +15,5 @@ name = "fxcp"
 path = "src/main.rs"
 
 [dependencies]
-fxcp-core = { path = "../fxcp-core" }
+fxcp-core = { path = "../fxcp-core", features = ["tui"] }
 anyhow = "1.0.100"

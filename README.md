@@ -1,6 +1,6 @@
 # Foxing: High-Fidelity Filesystem Replication
 
-![Version](https://img.shields.io/badge/version-0.7.1-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Copr build status](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
+![Version](https://img.shields.io/badge/version-0.7.2-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Copr build status](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
 
 **Foxing** is a high-performance filesystem replication system with two components:
 

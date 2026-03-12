@@ -426,7 +426,7 @@ fn calculate_partial_hash(path: &Path) -> Result<u64> {
 
 pub fn create_version_snapshot(path: &Path, epoch_seq: u64, root_path: &Path, inode: u64) -> Result<Option<crate::versioning::FileVersion>> {
     use std::fs;
-    let version_dir = root_path.join(".mirror").join(".versions");
+    let version_dir = root_path.join(".foxing_versions").join("live");
     if let Err(e) = fs::create_dir_all(&version_dir) {
         warn!("Versioning: Failed to create version directory {:?}: {}", version_dir, e);
         return Ok(None);

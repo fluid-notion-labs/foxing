@@ -14,6 +14,7 @@ use serde::{Serialize, Deserialize};
 use tracing::{info, warn, debug};
 
 const VERSIONS_DIR: &str = ".foxing_versions";
+const LIVE_DIR: &str = "live";
 const INDEX_FILE: &str = "index.json";
 const SUMMARY_FILE: &str = "summary.json";
 const TREE_DIR: &str = "tree";
@@ -102,8 +103,12 @@ pub struct SnapshotSummary {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoreStats {
     pub snapshots: usize,
+    pub total_files: u64,
     pub total_apparent_bytes: u64,
     pub total_disk_bytes: u64,
+    pub unique_content_bytes: u64,
+    pub cow_savings_pct: f64,
+    pub dedup_savings_pct: f64,
     pub savings_pct: f64,
     pub oldest: Option<String>,
     pub newest: Option<String>,
@@ -870,27 +875,102 @@ pub fn print_snapshot_table(snapshots: &[SnapshotEntry]) {
 }
 
 /// Compute aggregate storage statistics across all snapshots.
-pub fn compute_store_stats(snapshots: &[SnapshotEntry]) -> StoreStats {
+/// If `store_root` is provided, computes BLAKE3 content dedup across all snapshot files.
+pub fn compute_store_stats(snapshots: &[SnapshotEntry], store_root: Option<&Path>) -> StoreStats {
     let total_apparent: u64 = snapshots.iter().map(|s| s.size_bytes).sum();
     let total_disk: u64 = snapshots.iter().map(|s| s.disk_usage_bytes).sum();
+    let total_files: u64 = snapshots.iter().map(|s| s.files).sum();
+    let cow_savings = savings_percent(total_apparent, total_disk);
+
+    // BLAKE3 content dedup: hash all files across all snapshots,
+    // track unique hashes to find content-identical files
+    let (unique_content, dedup_savings) = if let Some(root) = store_root {
+        compute_blake3_dedup(root, snapshots)
+    } else {
+        (total_apparent, 0.0)
+    };
+
     StoreStats {
         snapshots: snapshots.len(),
+        total_files,
         total_apparent_bytes: total_apparent,
         total_disk_bytes: total_disk,
+        unique_content_bytes: unique_content,
+        cow_savings_pct: cow_savings,
+        dedup_savings_pct: dedup_savings,
         savings_pct: savings_percent(total_apparent, total_disk),
         oldest: snapshots.first().map(|s| s.timestamp.clone()),
         newest: snapshots.last().map(|s| s.timestamp.clone()),
     }
 }
 
+/// Walk all snapshot tree files, compute BLAKE3 hashes, return (unique_bytes, dedup_savings_pct).
+fn compute_blake3_dedup(store_root: &Path, snapshots: &[SnapshotEntry]) -> (u64, f64) {
+    use std::collections::HashSet;
+
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+    let mut unique_bytes = 0u64;
+    let mut total_bytes = 0u64;
+
+    for snap in snapshots {
+        // Parse filesystem-safe timestamp from ISO
+        let ts_fs = snap.timestamp.replace(':', "").replace("-T", "T")
+            .trim_end_matches('Z').to_string();
+        let tree_dir = store_root.join(&ts_fs).join(TREE_DIR);
+        if !tree_dir.exists() { continue; }
+
+        for entry in walkdir::WalkDir::new(&tree_dir).follow_links(false) {
+            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            if !entry.file_type().is_file() { continue; }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            total_bytes += size;
+
+            // Try to read BLAKE3 hash from xattr (fast path — already computed)
+            let hash = crate::sidecar::get_metadata(entry.path(), "user.foxing.content_hash")
+                .and_then(|b| if b.len() >= 8 { Some(hex::encode(&b[..8])) } else { None });
+
+            // Fall back to quick hash (head+tail sampling)
+            let hash = hash.or_else(|| {
+                crate::hashing::hash_file_lite(entry.path(), size)
+                    .ok()
+                    .flatten()
+                    .map(|h| hex::encode(&h.as_bytes()[..8]))
+            });
+
+            if let Some(h) = hash {
+                if seen_hashes.insert(h) {
+                    unique_bytes += size;
+                }
+            } else {
+                // Can't hash — count as unique
+                unique_bytes += size;
+            }
+        }
+    }
+
+    let dedup = if total_bytes > 0 {
+        savings_percent(total_bytes, unique_bytes)
+    } else {
+        0.0
+    };
+
+    (unique_bytes, dedup)
+}
+
 /// Print detailed storage stats.
 pub fn print_store_stats(stats: &StoreStats, path: &Path) {
     println!("Snapshot Store: {}/.foxing_versions/", path.display());
     println!("  Snapshots:      {}", stats.snapshots);
-    println!("  Total Apparent: {}  (if all copies were independent)", format_size(stats.total_apparent_bytes));
-    println!("  Total On-Disk:  {}   (actual exclusive storage)", format_size(stats.total_disk_bytes));
-    let saved = stats.total_apparent_bytes.saturating_sub(stats.total_disk_bytes);
-    println!("  CoW Savings:    {:.1}%    ({} saved via reflinks)", stats.savings_pct, format_size(saved));
+    println!("  Total Files:    {}", stats.total_files);
+    println!("  Apparent Size:  {}  (if all copies were independent)", format_size(stats.total_apparent_bytes));
+    println!("  On-Disk (CoW):  {}   (actual exclusive blocks)", format_size(stats.total_disk_bytes));
+    println!("  Unique Content: {}   (BLAKE3 distinct)", format_size(stats.unique_content_bytes));
+    let cow_saved = stats.total_apparent_bytes.saturating_sub(stats.total_disk_bytes);
+    println!("  CoW Savings:    {:.1}%    ({} via reflinks)", stats.cow_savings_pct, format_size(cow_saved));
+    if stats.dedup_savings_pct > 0.0 {
+        let dedup_saved = stats.total_apparent_bytes.saturating_sub(stats.unique_content_bytes);
+        println!("  Dedup Savings:  {:.1}%    ({} identical across snapshots)", stats.dedup_savings_pct, format_size(dedup_saved));
+    }
     if let Some(ref oldest) = stats.oldest {
         println!("  Oldest:         {}", oldest);
     }

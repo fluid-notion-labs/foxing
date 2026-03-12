@@ -1,3 +1,12 @@
+foxing (0.7.2-1) unstable; urgency=low
+
+  * fxcp snap browse: MC-style dual-pane TUI file/snapshot browser
+  * BLAKE3 content dedup stats alongside CoW reflink savings
+  * Unified MARS versioning path (.foxing_versions/live/)
+  * TUI feature-gated behind ratatui optional dependency
+
+ -- Joel Wirāmu Pauling <aenertia@aenertia.net>  Wed, 12 Mar 2026 00:00:00 +1300
+
 foxing (0.7.1-1) unstable; urgency=low
 
   * fxcp snap: dirvish-style point-in-time snapshots with JSON index

@@ -1,5 +1,5 @@
 %global crate foxing
-%global version 0.7.1
+%global version 0.7.2
 
 Name:           foxing
 Version:        %{version}
@@ -168,6 +168,12 @@ fi
 %{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
+* Wed Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.2-1
+- fxcp snap browse: MC-style dual-pane TUI file/snapshot browser
+- BLAKE3 content dedup stats alongside CoW reflink savings
+- Unified MARS versioning path (.foxing_versions/live/)
+- TUI feature-gated behind ratatui optional dependency
+
 * Wed Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.1-1
 - fxcp snap: dirvish-style point-in-time snapshots with JSON index
 - fxcp snap prune: maintenance by age, count, and size
