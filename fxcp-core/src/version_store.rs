@@ -64,6 +64,10 @@ pub struct SnapshotEntry {
     pub tag: Option<String>,
     pub files: u64,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub disk_usage_bytes: u64,
+    #[serde(default)]
+    pub savings_pct: f64,
     pub source: String,
     pub trigger: String,
     pub retention: Option<RetentionPolicy>,
@@ -86,14 +90,51 @@ pub struct SnapshotSummary {
     pub trigger: String,
     pub files: u64,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub disk_usage_bytes: u64,
+    #[serde(default)]
+    pub savings_pct: f64,
     pub reference: Option<String>,
     pub elapsed_ms: u64,
+}
+
+/// Aggregate storage statistics across all snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoreStats {
+    pub snapshots: usize,
+    pub total_apparent_bytes: u64,
+    pub total_disk_bytes: u64,
+    pub savings_pct: f64,
+    pub oldest: Option<String>,
+    pub newest: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct PruneStats {
     pub snapshots_removed: u64,
     pub bytes_freed: u64,
+}
+
+/// Compute apparent size (st_size) and actual disk usage (st_blocks * 512) for a directory tree.
+/// Returns (apparent_bytes, disk_bytes).
+pub fn compute_disk_usage(dir: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let mut apparent = 0u64;
+    let mut disk = 0u64;
+    for entry in walkdir::WalkDir::new(dir).follow_links(false) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if !entry.file_type().is_file() { continue; }
+        if let Ok(meta) = entry.metadata() {
+            apparent += meta.len();
+            disk += meta.blocks() * 512;
+        }
+    }
+    (apparent, disk)
+}
+
+fn savings_percent(apparent: u64, disk: u64) -> f64 {
+    if apparent == 0 { return 0.0; }
+    ((1.0 - (disk as f64 / apparent as f64)) * 1000.0).round() / 10.0
 }
 
 // -----------------------------------------------------------------------
@@ -177,6 +218,10 @@ impl VersionStore {
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
+        // Compute actual disk usage (CoW savings)
+        let (apparent, disk_used) = compute_disk_usage(&tree_dir);
+        let savings = savings_percent(apparent, disk_used);
+
         // Write summary.json
         let summary = SnapshotSummary {
             timestamp: ts_iso.clone(),
@@ -187,6 +232,8 @@ impl VersionStore {
             trigger: trigger.into(),
             files,
             size_bytes,
+            disk_usage_bytes: disk_used,
+            savings_pct: savings,
             reference: None,
             elapsed_ms,
         };
@@ -204,6 +251,8 @@ impl VersionStore {
             tag: tag.map(|t| t.to_string()),
             files,
             size_bytes,
+            disk_usage_bytes: disk_used,
+            savings_pct: savings,
             source: source.to_string_lossy().into(),
             trigger: trigger.into(),
             retention: None,
@@ -262,12 +311,26 @@ impl VersionStore {
             let summary_path = entry.path().join(SUMMARY_FILE);
             if let Ok(data) = fs::read_to_string(&summary_path) {
                 if let Ok(summary) = serde_json::from_str::<SnapshotSummary>(&data) {
+                    let (disk_usage, savings) = if summary.disk_usage_bytes > 0 {
+                        (summary.disk_usage_bytes, summary.savings_pct)
+                    } else {
+                        // Compute on demand for old-format summaries
+                        let tree = entry.path().join(TREE_DIR);
+                        if tree.exists() {
+                            let (app, dsk) = compute_disk_usage(&tree);
+                            (dsk, savings_percent(app, dsk))
+                        } else {
+                            (0, 0.0)
+                        }
+                    };
                     snapshots.push(SnapshotEntry {
                         timestamp: summary.timestamp,
                         snap_type: summary.snap_type,
                         tag: summary.tag,
                         files: summary.files,
                         size_bytes: summary.size_bytes,
+                        disk_usage_bytes: disk_usage,
+                        savings_pct: savings,
                         source: summary.source,
                         trigger: summary.trigger,
                         retention: None,
@@ -276,13 +339,24 @@ impl VersionStore {
                 }
             }
 
-            // Minimal entry from directory name
+            // Minimal entry — compute disk usage from tree if available
+            let tree = entry.path().join(TREE_DIR);
+            let (apparent, disk, files_count) = if tree.exists() {
+                let (a, d) = compute_disk_usage(&tree);
+                let fc = walkdir::WalkDir::new(&tree).into_iter()
+                    .filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).count() as u64;
+                (a, d, fc)
+            } else {
+                (0, 0, 0)
+            };
             snapshots.push(SnapshotEntry {
                 timestamp: name,
                 snap_type: "unknown".into(),
                 tag: None,
-                files: 0,
-                size_bytes: 0,
+                files: files_count,
+                size_bytes: apparent,
+                disk_usage_bytes: disk,
+                savings_pct: savings_percent(apparent, disk),
                 source: String::new(),
                 trigger: "unknown".into(),
                 retention: None,
@@ -462,7 +536,19 @@ impl VersionStore {
 // Display helpers
 // -----------------------------------------------------------------------
 
-/// Print snapshots as a formatted table.
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Print snapshots as a formatted table with CoW storage stats.
 pub fn print_snapshot_table(snapshots: &[SnapshotEntry]) {
     use comfy_table::{Table, Cell, CellAlignment};
 
@@ -476,32 +562,64 @@ pub fn print_snapshot_table(snapshots: &[SnapshotEntry]) {
         Cell::new("Timestamp").set_alignment(CellAlignment::Left),
         Cell::new("Type").set_alignment(CellAlignment::Left),
         Cell::new("Files").set_alignment(CellAlignment::Right),
-        Cell::new("Size").set_alignment(CellAlignment::Right),
+        Cell::new("Apparent").set_alignment(CellAlignment::Right),
+        Cell::new("On-Disk").set_alignment(CellAlignment::Right),
+        Cell::new("Savings").set_alignment(CellAlignment::Right),
         Cell::new("Tag").set_alignment(CellAlignment::Left),
-        Cell::new("Trigger").set_alignment(CellAlignment::Left),
     ]);
 
+    let mut total_apparent = 0u64;
+    let mut total_disk = 0u64;
+
     for snap in snapshots {
-        let size_str = if snap.size_bytes > 1_073_741_824 {
-            format!("{:.1} GB", snap.size_bytes as f64 / 1_073_741_824.0)
-        } else if snap.size_bytes > 1_048_576 {
-            format!("{:.1} MB", snap.size_bytes as f64 / 1_048_576.0)
-        } else {
-            format!("{} KB", snap.size_bytes / 1024)
-        };
+        total_apparent += snap.size_bytes;
+        total_disk += snap.disk_usage_bytes;
 
         table.add_row(vec![
             Cell::new(&snap.timestamp),
             Cell::new(&snap.snap_type),
             Cell::new(snap.files.to_string()),
-            Cell::new(&size_str),
+            Cell::new(format_size(snap.size_bytes)),
+            Cell::new(format_size(snap.disk_usage_bytes)),
+            Cell::new(format!("{:.1}%", snap.savings_pct)),
             Cell::new(snap.tag.as_deref().unwrap_or("")),
-            Cell::new(&snap.trigger),
         ]);
     }
 
     println!("{table}");
-    println!("\n{} snapshots.", snapshots.len());
+    let total_savings = savings_percent(total_apparent, total_disk);
+    println!("\n{} snapshots | Apparent: {} | On-Disk: {} | Savings: {:.1}%",
+             snapshots.len(), format_size(total_apparent), format_size(total_disk), total_savings);
+}
+
+/// Compute aggregate storage statistics across all snapshots.
+pub fn compute_store_stats(snapshots: &[SnapshotEntry]) -> StoreStats {
+    let total_apparent: u64 = snapshots.iter().map(|s| s.size_bytes).sum();
+    let total_disk: u64 = snapshots.iter().map(|s| s.disk_usage_bytes).sum();
+    StoreStats {
+        snapshots: snapshots.len(),
+        total_apparent_bytes: total_apparent,
+        total_disk_bytes: total_disk,
+        savings_pct: savings_percent(total_apparent, total_disk),
+        oldest: snapshots.first().map(|s| s.timestamp.clone()),
+        newest: snapshots.last().map(|s| s.timestamp.clone()),
+    }
+}
+
+/// Print detailed storage stats.
+pub fn print_store_stats(stats: &StoreStats, path: &Path) {
+    println!("Snapshot Store: {}/.foxing_versions/", path.display());
+    println!("  Snapshots:      {}", stats.snapshots);
+    println!("  Total Apparent: {}  (if all copies were independent)", format_size(stats.total_apparent_bytes));
+    println!("  Total On-Disk:  {}   (actual exclusive storage)", format_size(stats.total_disk_bytes));
+    let saved = stats.total_apparent_bytes.saturating_sub(stats.total_disk_bytes);
+    println!("  CoW Savings:    {:.1}%    ({} saved via reflinks)", stats.savings_pct, format_size(saved));
+    if let Some(ref oldest) = stats.oldest {
+        println!("  Oldest:         {}", oldest);
+    }
+    if let Some(ref newest) = stats.newest {
+        println!("  Newest:         {}", newest);
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +665,8 @@ mod tests {
             tag: Some("pre-migration".into()),
             files: 100,
             size_bytes: 1048576,
+            disk_usage_bytes: 4096,
+            savings_pct: 99.6,
             source: "/mnt/source".into(),
             trigger: "fxcp --snapshot".into(),
             retention: None,

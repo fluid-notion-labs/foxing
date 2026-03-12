@@ -258,6 +258,15 @@ pub enum SnapCommand {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Show aggregate storage statistics (apparent vs on-disk, CoW savings)
+    Stats {
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
+        path: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -463,6 +472,17 @@ fn cli_snap_main() -> anyhow::Result<()> {
             let store = crate::version_store::VersionStore::open(&p);
             let index = store.rebuild_index()?;
             info!("Rebuilt index: {} snapshots", index.snapshots.len());
+        }
+        SnapCommand::Stats { path, json } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let snapshots = store.list_snapshots();
+            let stats = crate::version_store::compute_store_stats(&snapshots);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+            } else {
+                crate::version_store::print_store_stats(&stats, &p);
+            }
         }
     }
     Ok(())
