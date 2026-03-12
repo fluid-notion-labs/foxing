@@ -84,7 +84,7 @@ impl Default for SyncOptions {
 }
 
 /// Copy statistics returned from sync operations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct SyncStats {
     pub files_copied: u64,
     pub files_reflinked: u64,
@@ -205,6 +205,10 @@ pub struct FxcpCli {
     pub zero_copy: bool,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     pub debug: bool,
+    #[arg(long, help = "Output copy results as JSON (machine-readable)")]
+    pub json: bool,
+    #[arg(long, help = "Show live progress during copy")]
+    pub progress: bool,
     #[arg(long, help = "Generate foxingd-compatible sync signatures (xattr/sidecar) for fast resync")]
     pub generate_sigs: bool,
 }
@@ -410,9 +414,44 @@ pub fn cli_main() -> anyhow::Result<()> {
         }
     }
 
-    print_summary(&total_stats);
+    if cli.json {
+        // Machine-readable JSON output
+        let total_files = total_stats.files_copied + total_stats.files_skipped;
+        let status = if total_stats.errors == 0 { "success" }
+                     else if total_stats.files_copied > 0 { "partial" }
+                     else { "failed" };
+        let json_output = serde_json::json!({
+            "status": status,
+            "files_copied": total_stats.files_copied,
+            "files_reflinked": total_stats.files_reflinked,
+            "files_skipped": total_stats.files_skipped,
+            "files_deleted": total_stats.files_deleted,
+            "dirs_created": total_stats.dirs_created,
+            "dirs_pruned": total_stats.dirs_pruned,
+            "bytes_copied": total_stats.bytes_copied,
+            "bytes_reflinked": total_stats.bytes_reflinked,
+            "errors": total_stats.errors,
+            "method_breakdown": {
+                "reflink": total_stats.files_reflinked,
+                "copy_file_range": total_stats.files_cfr,
+                "sendfile": total_stats.files_small,
+                "io_uring": total_stats.files_copied.saturating_sub(
+                    total_stats.files_reflinked + total_stats.files_cfr + total_stats.files_small
+                ),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
+    } else {
+        print_summary(&total_stats);
+    }
+
+    // Granular exit codes
     if total_stats.errors > 0 {
-        std::process::exit(1);
+        if total_stats.files_copied > 0 {
+            std::process::exit(1);  // Partial success
+        } else {
+            std::process::exit(2);  // Complete failure
+        }
     }
     Ok(())
 }

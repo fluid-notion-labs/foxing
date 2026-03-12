@@ -595,6 +595,10 @@ async fn run_runtime(
         }
     });
 
+    // Notify systemd that daemon is ready (Type=notify)
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    info!("Daemon ready (sd_notify READY=1 sent)");
+
     if one_shot_mode {
         let start_time = std::time::Instant::now();
         info!("Sync Mode: Waiting for hydration to complete...");
@@ -796,10 +800,19 @@ async fn run_runtime(
     } else {
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
-        
-        tokio::select! {
-            _ = sigterm.recv() => info!("Received SIGTERM"),
-            _ = sigint.recv() => info!("Received SIGINT"),
+        let mut sighup = signal(SignalKind::hangup())?;
+
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => { info!("Received SIGTERM"); break; },
+                _ = sigint.recv() => { info!("Received SIGINT"); break; },
+                _ = sighup.recv() => {
+                    info!("Received SIGHUP — reloading configuration");
+                    // TODO: re-parse config and update targets
+                    // For now, log the reload request
+                    warn!("Config reload not yet implemented — restart foxingd to apply changes");
+                },
+            }
         }
     }
 
