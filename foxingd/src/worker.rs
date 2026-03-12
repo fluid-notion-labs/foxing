@@ -1220,6 +1220,7 @@ async fn process_single_event_with_wal(
                 },
                 Err(e) => op_result = Err(e),
             }
+            crate::event::clear_pending_rename(event.inode);
         },
         EventType::RenameIncomplete => {
             // Best effort recovery for partial rename events
@@ -1265,6 +1266,7 @@ async fn process_single_event_with_wal(
             } else {
                  op_result = Err(FoxingError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to recover path for incomplete rename")));
             }
+            crate::event::clear_pending_rename(event.inode);
         },
         EventType::Truncate => {
             if !dirty_tracker.contains(&event.inode) {
@@ -1327,6 +1329,23 @@ async fn process_single_event_with_wal(
              // For regular file creates, do an inline copy (not just empty file).
              // Must be synchronous so subsequent rename events find the file.
              if event.event_type == EventType::Create {
+                 // Storm detection: if this inode has pending renames queued
+                 // at the dispatcher, skip the copy — the final rename in the
+                 // chain will place the file at its correct destination.
+                 let pending = crate::event::get_pending_renames(event.inode);
+                 if pending > 0 {
+                     debug!("CREATE storm-deferred: inode {} has {} pending renames, skipping copy",
+                            event.inode, pending);
+                     // Still update identity map so rename handler can resolve
+                     let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
+                     identity::update_map(
+                         &source.inode_map, &source.dir_map, event.dev_id, event.inode,
+                         rel.to_path_buf(), event.generation, false, false,
+                         event.timestamp_ns, event.seq_num
+                     );
+                     return (Ok(CopyStats::default()), smart_copier, dirty_tracker);
+                 }
+
                  let rel = target_path.strip_prefix(&target_cfg.path).unwrap_or(Path::new(""));
                  let source_path = source.mount.join(rel);
                  if source_path.exists() {
