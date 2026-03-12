@@ -48,6 +48,8 @@ pub struct SyncOptions {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub generate_sigs: bool,
+    pub snapshot: bool,
+    pub throttle: bool,
     pub cleanup: bool,
     // stdin-specific
     pub size: Option<u64>,
@@ -69,6 +71,8 @@ impl Default for SyncOptions {
             exclude: vec![],
             include: vec![],
             generate_sigs: false,
+            snapshot: false,
+            throttle: false,
             cleanup: false,
             size: None,
             checkpoint_interval: None,
@@ -159,7 +163,7 @@ pub async fn run(opts: SyncOptions) -> crate::Result<SyncStats> {
 // CLI definition (public for man page / completion generation)
 // -----------------------------------------------------------------------
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
@@ -185,6 +189,10 @@ pub struct FxcpCli {
     pub exclude_from: Option<PathBuf>,
     #[arg(long, help = "Read include patterns from FILE (one per line)")]
     pub include_from: Option<PathBuf>,
+    #[arg(long, help = "Create reflink snapshots of target files before overwriting (versioning)")]
+    pub snapshot: bool,
+    #[arg(long, help = "Enable PSI-based system stress throttling")]
+    pub throttle: bool,
     #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
     pub cleanup: bool,
     #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
@@ -201,12 +209,50 @@ pub struct FxcpCli {
     pub generate_sigs: bool,
 }
 
+/// Snapshot management subcommands (MARS versioning)
+#[derive(Parser)]
+#[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
+pub struct FxcpSnapCli {
+    #[command(subcommand)]
+    pub command: SnapCommand,
+    #[arg(long, default_value_t = false, help = "Increase verbosity")]
+    pub debug: bool,
+}
+
+#[derive(Subcommand)]
+pub enum SnapCommand {
+    /// List available versions of a file
+    List { path: String },
+    /// Revert a file to a previous version (atomic reflink swap)
+    Revert { path: String, epoch: u64 },
+    /// Copy a specific version to a new file
+    Copy { path: String, epoch: u64, destination: String },
+    /// Clean up old versions according to retention policy
+    Cleanup {
+        path: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Force a tagged snapshot of a file
+    Force {
+        path: String,
+        #[arg(short, long)]
+        tag: String,
+    },
+}
+
 // -----------------------------------------------------------------------
 // CLI entry point (for symlink dispatch from foxingd)
 // -----------------------------------------------------------------------
 
 /// Parse CLI args and run — used when foxingd is called as `fxcp` via symlink.
 pub fn cli_main() -> anyhow::Result<()> {
+    // Pre-parse: check if first arg is "snap" for subcommand dispatch
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "snap" {
+        return cli_snap_main();
+    }
+
     let cli = FxcpCli::parse();
 
     let log_filter = if cli.debug { "debug" } else { "info" };
@@ -251,6 +297,8 @@ pub fn cli_main() -> anyhow::Result<()> {
             exclude: excludes.clone(),
             include: includes.clone(),
             generate_sigs: cli.generate_sigs,
+            snapshot: cli.snapshot,
+            throttle: cli.throttle,
             cleanup: cli.cleanup,
             size: cli.size,
             checkpoint_interval: cli.checkpoint_interval,
@@ -271,6 +319,58 @@ pub fn cli_main() -> anyhow::Result<()> {
     print_summary(&total_stats);
     if total_stats.errors > 0 {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Snapshot management subcommand handler.
+fn cli_snap_main() -> anyhow::Result<()> {
+    // Re-parse with snap-aware CLI (skip argv[0], "snap" is the subcommand)
+    let snap_cli = FxcpSnapCli::parse_from(
+        std::iter::once("fxcp-snap".to_string())
+            .chain(std::env::args().skip(2))
+    );
+
+    let log_filter = if snap_cli.debug { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
+        .with_target(false)
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    match snap_cli.command {
+        SnapCommand::List { path } => {
+            let p = std::path::PathBuf::from(&path);
+            let versions = crate::versioning::list_versions(&p)?;
+            if versions.is_empty() {
+                info!("No versions found for {:?}", path);
+            } else {
+                crate::versioning::print_versions_table(versions, 50);
+            }
+        }
+        SnapCommand::Revert { path, epoch } => {
+            let p = std::path::PathBuf::from(&path);
+            crate::versioning::revert_file(&p, epoch)?;
+            info!("Reverted {:?} to epoch {}", path, epoch);
+        }
+        SnapCommand::Copy { path, epoch, destination } => {
+            let p = std::path::PathBuf::from(&path);
+            let d = std::path::PathBuf::from(&destination);
+            crate::versioning::copy_version_to_path(&p, epoch, &d)?;
+            info!("Copied version {} of {:?} to {:?}", epoch, path, destination);
+        }
+        SnapCommand::Cleanup { path, dry_run } => {
+            let p = std::path::PathBuf::from(&path);
+            rt.block_on(crate::versioning::cleanup_cli(&p, dry_run))?;
+        }
+        SnapCommand::Force { path, tag } => {
+            let p = std::path::PathBuf::from(&path);
+            rt.block_on(crate::versioning::force_version_cli(&p, &tag))?;
+        }
     }
     Ok(())
 }
