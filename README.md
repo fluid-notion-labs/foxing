@@ -39,7 +39,17 @@ fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS,
 
 See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices, tool comparisons, and [visual benchmarks](docs/graphs/).
 
-### v0.7.0 Highlights
+### v0.7.1 Highlights
+
+- **Snapshot management** — `fxcp snap list/prune/stats/export/import/restore` (dirvish-style point-in-time trees)
+- **`.fxar` archive format** — content-addressable BLAKE3 chunk dedup for portable snapshot archives
+- **CoW storage stats** — apparent vs on-disk size reporting with reflink savings percentage
+- **Selective restore** — extract specific files/dates from archives with glob patterns
+- **Full compression matrix** — zstd (default), lz4, gzip, xz for both copy and export
+- **`--snapshot` flag** — create reflink snapshots before overwriting during copy
+- **`--throttle` flag** — PSI-based system stress pacing
+
+### v0.7.0 Features
 
 - **Multi-source fxcp** — `fxcp src1 src2 src3 dest/` (cp/rsync-compatible positional args)
 - **Include/exclude filtering** — `--include`, `--exclude-from FILE`, `--include-from FILE` (rsync-compatible)
@@ -370,7 +380,25 @@ fxcp - /backup/stream.bin --checkpoint-interval 300 --checkpoint-keep 5
 
 # stdin with pre-allocated size
 fxcp - /backup/disk.img --size 10737418240
+
+# Copy with versioning (reflink snapshots before overwrite)
+fxcp -a --snapshot /source /backup
+
+# List snapshots with CoW storage stats
+fxcp snap list /backup
+fxcp snap stats /backup
+
+# Prune old snapshots
+fxcp snap prune --older-than 30d --keep-last 10 /backup
+
+# Export as portable archive (BLAKE3 chunk-dedup)
+fxcp snap export /backup -o backup.fxar
+
+# Restore specific file from archive
+fxcp snap restore backup.fxar --file 'data/*.db' --latest -o /tmp/
 ```
+
+See [Snapshots & Export Guide](docs/SNAPSHOTS.md) for comprehensive documentation.
 
 ## Capacity Planning
 
@@ -463,6 +491,7 @@ make test-compare  # Compare against saved baseline
 ## Documentation
 
 - **[API Reference (rustdoc)](https://aenertia.codeberg.page/foxing/)** — Live auto-generated API documentation
+- [Snapshots & Export](docs/SNAPSHOTS.md) — Point-in-time snapshots, .fxar archives, CoW storage, selective restore
 - [Architecture & Diagrams](docs/ARCHITECTURE.md) — Processing pipeline, mount monitoring, error handling (graphviz)
 - [Benchmarks & Comparisons](BENCHMARKS.md) — Performance data, MTTC matrices, tool comparisons
 - [Queue Marking](docs/Queue-Marking.md) — CoDel/CAKE theory applied to event dispatch
