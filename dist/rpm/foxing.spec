@@ -1,5 +1,5 @@
 %global crate foxing
-%global version 0.7.0
+%global version 0.7.1
 
 Name:           foxing
 Version:        %{version}
@@ -168,6 +168,13 @@ fi
 %{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
+* Wed Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.1-1
+- fxcp snap: dirvish-style point-in-time snapshots with JSON index
+- fxcp snap prune: maintenance by age, count, and size
+- fxcp --snapshot: reflink versioning during copy
+- fxcp --throttle: PSI-based system stress pacing
+- Machine-readable --json output for web UI integration
+
 * Thu Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.0-1
 - fxcp: multi-source CLI (fxcp src1 src2 dest/)
 - fxcp: --include, --exclude-from, --include-from filtering

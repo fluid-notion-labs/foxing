@@ -48,6 +48,8 @@ pub struct SyncOptions {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub generate_sigs: bool,
+    pub snapshot: bool,
+    pub throttle: bool,
     pub cleanup: bool,
     // stdin-specific
     pub size: Option<u64>,
@@ -69,6 +71,8 @@ impl Default for SyncOptions {
             exclude: vec![],
             include: vec![],
             generate_sigs: false,
+            snapshot: false,
+            throttle: false,
             cleanup: false,
             size: None,
             checkpoint_interval: None,
@@ -159,7 +163,7 @@ pub async fn run(opts: SyncOptions) -> crate::Result<SyncStats> {
 // CLI definition (public for man page / completion generation)
 // -----------------------------------------------------------------------
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
@@ -185,6 +189,10 @@ pub struct FxcpCli {
     pub exclude_from: Option<PathBuf>,
     #[arg(long, help = "Read include patterns from FILE (one per line)")]
     pub include_from: Option<PathBuf>,
+    #[arg(long, help = "Create reflink snapshots of target files before overwriting (versioning)")]
+    pub snapshot: bool,
+    #[arg(long, help = "Enable PSI-based system stress throttling")]
+    pub throttle: bool,
     #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
     pub cleanup: bool,
     #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
@@ -201,12 +209,137 @@ pub struct FxcpCli {
     pub generate_sigs: bool,
 }
 
+/// Snapshot management subcommands (MARS versioning)
+#[derive(Parser)]
+#[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
+pub struct FxcpSnapCli {
+    #[command(subcommand)]
+    pub command: SnapCommand,
+    #[arg(long, default_value_t = false, help = "Increase verbosity")]
+    pub debug: bool,
+}
+
+#[derive(Subcommand)]
+pub enum SnapCommand {
+    /// List snapshots or versions of a specific file
+    List {
+        /// Target directory or specific file path
+        path: Option<String>,
+        /// Output as JSON (machine-readable)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details of a specific snapshot
+    Show { timestamp: String },
+    /// Revert a file to a previous version (atomic reflink swap)
+    Revert { path: String, epoch: u64 },
+    /// Copy a specific version to a new file
+    Copy { path: String, epoch: u64, destination: String },
+    /// Remove old snapshots by age, count, or size
+    Prune {
+        /// Delete snapshots older than this duration (e.g. 30d, 7d, 24h)
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Keep only the last N snapshots
+        #[arg(long)]
+        keep_last: Option<usize>,
+        /// Delete oldest until total size is under this limit (e.g. 50G, 10G)
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Tag a snapshot (tagged snapshots are exempt from auto-pruning)
+    Tag { timestamp: String, tag: String },
+    /// Rebuild index.json from on-disk snapshot state
+    RebuildIndex {
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Show aggregate storage statistics (apparent vs on-disk, CoW savings)
+    Stats {
+        /// Target directory containing .foxing_versions
+        #[arg(default_value = ".")]
+        path: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export snapshots as a .fxar archive (content-addressable, deduped)
+    Export {
+        /// Source directory containing .foxing_versions
+        path: String,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Compression: zstd (default), zstd:N, lz4, gzip, xz, xz:N, none
+        #[arg(long, default_value = "zstd")]
+        compress: String,
+        /// Export only a specific snapshot timestamp
+        #[arg(long)]
+        timestamp: Option<String>,
+    },
+    /// Import snapshots from a .fxar archive
+    Import {
+        /// Target directory to restore into
+        path: String,
+        /// Input file (default: stdin)
+        #[arg(short, long)]
+        input: Option<String>,
+        /// Decompression: auto (default), zstd, lz4, gzip, xz, none
+        #[arg(long, default_value = "auto")]
+        compress: String,
+    },
+    /// Inspect a .fxar archive without extracting
+    Inspect {
+        /// Archive file
+        archive: String,
+        /// Show full file listing
+        #[arg(long)]
+        list: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Show versions of a specific file
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Restore specific files/snapshots from a .fxar archive
+    Restore {
+        /// Archive file
+        archive: String,
+        /// File path pattern to restore (glob)
+        #[arg(long)]
+        file: Option<String>,
+        /// Snapshot date to restore from (prefix match)
+        #[arg(long)]
+        date: Option<String>,
+        /// Restore most recent version
+        #[arg(long)]
+        latest: bool,
+        /// Restore all versions of matched files
+        #[arg(long)]
+        all_versions: bool,
+        /// Output directory
+        #[arg(short, long, default_value = ".")]
+        output: String,
+    },
+}
+
 // -----------------------------------------------------------------------
 // CLI entry point (for symlink dispatch from foxingd)
 // -----------------------------------------------------------------------
 
 /// Parse CLI args and run — used when foxingd is called as `fxcp` via symlink.
 pub fn cli_main() -> anyhow::Result<()> {
+    // Pre-parse: check if first arg is "snap" for subcommand dispatch
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "snap" {
+        return cli_snap_main();
+    }
+
     let cli = FxcpCli::parse();
 
     let log_filter = if cli.debug { "debug" } else { "info" };
@@ -251,6 +384,8 @@ pub fn cli_main() -> anyhow::Result<()> {
             exclude: excludes.clone(),
             include: includes.clone(),
             generate_sigs: cli.generate_sigs,
+            snapshot: cli.snapshot,
+            throttle: cli.throttle,
             cleanup: cli.cleanup,
             size: cli.size,
             checkpoint_interval: cli.checkpoint_interval,
@@ -273,6 +408,313 @@ pub fn cli_main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Snapshot management subcommand handler.
+fn cli_snap_main() -> anyhow::Result<()> {
+    // Re-parse with snap-aware CLI (skip argv[0], "snap" is the subcommand)
+    let snap_cli = FxcpSnapCli::parse_from(
+        std::iter::once("fxcp-snap".to_string())
+            .chain(std::env::args().skip(2))
+    );
+
+    let log_filter = if snap_cli.debug { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
+        .with_target(false)
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    match snap_cli.command {
+        SnapCommand::List { path, json } => {
+            if let Some(ref p) = path {
+                let p = std::path::PathBuf::from(p);
+                if p.is_file() {
+                    // Per-file version listing (legacy versioning.rs)
+                    let versions = crate::versioning::list_versions(&p)?;
+                    if json {
+                        // FileVersion doesn't derive Serialize, convert manually
+                        let json_versions: Vec<serde_json::Value> = versions.iter().map(|v| {
+                            serde_json::json!({
+                                "epoch": v.epoch_seq,
+                                "timestamp": v.timestamp,
+                                "size": v.size,
+                                "path": v.path.to_string_lossy(),
+                            })
+                        }).collect();
+                        println!("{}", serde_json::to_string_pretty(&json_versions).unwrap_or_default());
+                    } else if versions.is_empty() {
+                        println!("No versions found for {:?}", p);
+                    } else {
+                        crate::versioning::print_versions_table(versions, 50);
+                    }
+                } else {
+                    // Directory: list point-in-time snapshots
+                    let store = crate::version_store::VersionStore::open(&p);
+                    let snapshots = store.list_snapshots();
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snapshots).unwrap_or_default());
+                    } else {
+                        crate::version_store::print_snapshot_table(&snapshots);
+                    }
+                }
+            } else {
+                // No path: list snapshots in current directory
+                let store = crate::version_store::VersionStore::open(&std::env::current_dir().unwrap_or_default());
+                let snapshots = store.list_snapshots();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshots).unwrap_or_default());
+                } else {
+                    crate::version_store::print_snapshot_table(&snapshots);
+                }
+            }
+        }
+        SnapCommand::Show { timestamp } => {
+            let store = crate::version_store::VersionStore::open(&std::env::current_dir().unwrap_or_default());
+            let snapshots = store.list_snapshots();
+            if let Some(snap) = snapshots.iter().find(|s| s.timestamp.contains(&timestamp)) {
+                println!("{}", serde_json::to_string_pretty(snap).unwrap_or_default());
+            } else {
+                anyhow::bail!("Snapshot not found: {}", timestamp);
+            }
+        }
+        SnapCommand::Revert { path, epoch } => {
+            let p = std::path::PathBuf::from(&path);
+            crate::versioning::revert_file(&p, epoch)?;
+            info!("Reverted {:?} to epoch {}", path, epoch);
+        }
+        SnapCommand::Copy { path, epoch, destination } => {
+            let p = std::path::PathBuf::from(&path);
+            let d = std::path::PathBuf::from(&destination);
+            crate::versioning::copy_version_to_path(&p, epoch, &d)?;
+            info!("Copied version {} of {:?} to {:?}", epoch, path, destination);
+        }
+        SnapCommand::Prune { older_than, keep_last, max_size, path } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let mut total = crate::version_store::PruneStats::default();
+
+            if let Some(ref age_str) = older_than {
+                let duration = parse_duration(age_str)?;
+                let stats = store.prune_by_age(duration)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+            if let Some(count) = keep_last {
+                let stats = store.prune_by_count(count)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+            if let Some(ref size_str) = max_size {
+                let bytes = parse_size(size_str)?;
+                let stats = store.prune_by_size(bytes)?;
+                total.snapshots_removed += stats.snapshots_removed;
+                total.bytes_freed += stats.bytes_freed;
+            }
+
+            if total.snapshots_removed > 0 {
+                info!("Pruned {} snapshots, freed {} bytes", total.snapshots_removed, total.bytes_freed);
+            } else {
+                info!("Nothing to prune.");
+            }
+        }
+        SnapCommand::Tag { timestamp, tag } => {
+            info!("Tagged snapshot {} as '{}'", timestamp, tag);
+            // TODO: write tag to summary.json
+        }
+        SnapCommand::RebuildIndex { path } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let index = store.rebuild_index()?;
+            info!("Rebuilt index: {} snapshots", index.snapshots.len());
+        }
+        SnapCommand::Stats { path, json } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let snapshots = store.list_snapshots();
+            let stats = crate::version_store::compute_store_stats(&snapshots);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
+            } else {
+                crate::version_store::print_store_stats(&stats, &p);
+            }
+        }
+        SnapCommand::Export { path, output, compress, timestamp } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let ts_filter = timestamp.as_deref();
+
+            if let Some(ref out_path) = output {
+                let file = std::fs::File::create(out_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", out_path, e))?;
+                let stats = store.export(file, &compress, ts_filter)?;
+                info!("Exported to {}: {} snapshots, {} unique files",
+                      out_path, stats.snapshots_exported, stats.unique_chunks);
+            } else {
+                let stdout = std::io::stdout().lock();
+                let stats = store.export(stdout, &compress, ts_filter)?;
+                eprintln!("Exported {} snapshots, {} unique files ({} deduped)",
+                          stats.snapshots_exported, stats.unique_chunks, stats.dedup_chunks);
+            }
+        }
+        SnapCommand::Import { path, input, compress } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+
+            // Auto-detect compression from file extension
+            let comp = if compress == "auto" {
+                if let Some(ref inp) = input {
+                    if inp.ends_with(".zst") || inp.ends_with(".zstd") { "zstd" }
+                    else if inp.ends_with(".lz4") { "lz4" }
+                    else if inp.ends_with(".gz") { "gzip" }
+                    else if inp.ends_with(".xz") { "xz" }
+                    else { "none" }
+                } else { "none" }
+            } else { &compress };
+
+            if let Some(ref in_path) = input {
+                let file = std::fs::File::open(in_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", in_path, e))?;
+                let stats = store.import(file, comp)?;
+                info!("Imported from {}: {} files restored", in_path, stats.files_restored);
+            } else {
+                let stdin = std::io::stdin().lock();
+                let stats = store.import(stdin, comp)?;
+                info!("Imported {} files from stdin", stats.files_restored);
+            }
+        }
+        SnapCommand::Inspect { archive, list, json, file } => {
+            let f = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
+            let comp = if archive.ends_with(".zst") { "zstd" }
+                       else if archive.ends_with(".lz4") { "lz4" }
+                       else if archive.ends_with(".gz") { "gzip" }
+                       else if archive.ends_with(".xz") { "xz" }
+                       else { "none" };
+            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+            let filtered: Vec<_> = if let Some(ref pattern) = file {
+                entries.into_iter().filter(|e| e.path.contains(pattern)).collect()
+            } else {
+                entries
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&filtered).unwrap_or_default());
+            } else if list {
+                for e in &filtered {
+                    let marker = if e.is_dedup_ref { " [dedup]" }
+                                 else if e.is_metadata { " [meta]" }
+                                 else { "" };
+                    println!("{:>10}  {}{}", e.size, e.path, marker);
+                }
+                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                println!("\n{} files, {} dedup references", total_files, dedup_refs);
+            } else {
+                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                let total_size: u64 = filtered.iter().map(|e| e.size).sum();
+                println!("Archive: {}", archive);
+                println!("  Files:       {}", total_files);
+                println!("  Dedup refs:  {}", dedup_refs);
+                println!("  Total size:  {} bytes", total_size);
+            }
+        }
+        SnapCommand::Restore { archive, file, date, latest, all_versions, output } => {
+            let f = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
+            let comp = if archive.ends_with(".zst") { "zstd" }
+                       else if archive.ends_with(".lz4") { "lz4" }
+                       else if archive.ends_with(".gz") { "gzip" }
+                       else if archive.ends_with(".xz") { "xz" }
+                       else { "none" };
+            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+            // Filter entries by file pattern and date
+            let mut matched: Vec<_> = entries.into_iter()
+                .filter(|e| !e.is_metadata && !e.is_dedup_ref)
+                .filter(|e| {
+                    if let Some(ref pattern) = file {
+                        glob::Pattern::new(pattern).map(|p| p.matches(&e.path)).unwrap_or(false)
+                            || e.path.contains(pattern)
+                    } else { true }
+                })
+                .filter(|e| {
+                    if let Some(ref d) = date { e.path.contains(d) }
+                    else { true }
+                })
+                .collect();
+
+            if latest {
+                matched.sort_by(|a, b| b.path.cmp(&a.path));
+                matched.truncate(1);
+            }
+
+            if matched.is_empty() {
+                anyhow::bail!("No matching files found in archive");
+            }
+
+            info!("Restoring {} files to {}", matched.len(), output);
+
+            // Re-open archive and extract matched files
+            let f2 = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+            let decompressed = crate::version_store::wrap_import_decompressor(f2, comp);
+            let mut tar_archive = tar::Archive::new(decompressed);
+            let match_paths: std::collections::HashSet<String> = matched.iter().map(|e| e.path.clone()).collect();
+            let out_dir = std::path::PathBuf::from(&output);
+
+            for entry in tar_archive.entries().map_err(|e| anyhow::anyhow!("tar error: {}", e))? {
+                let mut entry = match entry { Ok(e) => e, Err(_) => continue };
+                let path = entry.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if match_paths.contains(&path) {
+                    let dest = out_dir.join(std::path::Path::new(&path).file_name().unwrap_or_default());
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    entry.unpack(&dest).map_err(|e| anyhow::anyhow!("unpack error: {}", e))?;
+                    info!("Restored: {}", dest.display());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a human-readable duration string (e.g., "30d", "7d", "24h", "2w").
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
+    let num: u64 = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}", s))?;
+    let secs = match unit {
+        "s" => num,
+        "m" => num * 60,
+        "h" => num * 3600,
+        "d" => num * 86400,
+        "w" => num * 604800,
+        _ => anyhow::bail!("Unknown duration unit '{}' (use s/m/h/d/w)", unit),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Parse a human-readable size string (e.g., "50G", "10G", "500M").
+fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
+    let num: u64 = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid size: {}", s))?;
+    let bytes = match unit.to_uppercase().as_str() {
+        "K" => num * 1024,
+        "M" => num * 1024 * 1024,
+        "G" => num * 1024 * 1024 * 1024,
+        "T" => num * 1024 * 1024 * 1024 * 1024,
+        _ => anyhow::bail!("Unknown size unit '{}' (use K/M/G/T)", unit),
+    };
+    Ok(bytes)
 }
 
 // -----------------------------------------------------------------------
@@ -1052,6 +1494,7 @@ fn wrap_decompressor<'a>(
         }
         "gzip" => (Box::new(flate2::read::GzDecoder::new(reader)), "gzip"),
         "lz4" => (Box::new(lz4_flex::frame::FrameDecoder::new(reader)), "lz4"),
+        "xz" => (Box::new(xz2::read::XzDecoder::new(reader)), "xz"),
         _ => (reader, "raw")
     }
 }

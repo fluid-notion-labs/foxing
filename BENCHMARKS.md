@@ -1,9 +1,19 @@
 # Foxing Performance Benchmarks
 
-**Version:** 0.7.0
+**Version:** 0.7.1
 **Date:** 2026-03-12
 **Rust:** nightly (1.96+), edition 2024
 **Build profiles:** `release` (opt-level 3, strip, thin LTO) · `release-debug` (same + debuginfo, no strip)
+
+## v0.7.1 Features
+
+- **Snapshot management**: `fxcp snap` subcommand — dirvish-style point-in-time tree snapshots with JSON index
+- **`.fxar` export/import**: Content-addressable BLAKE3 chunk-dedup archives with zstd/lz4/gzip/xz compression
+- **CoW storage stats**: Apparent vs on-disk size reporting; `fxcp snap stats` shows reflink savings percentage
+- **Selective restore**: `fxcp snap restore --file '*.db' --date 2026-03-12` extracts specific files from archives
+- **xz compression**: Full compress + decompress support (completes zstd/lz4/gzip/xz matrix)
+- **`--snapshot` flag**: Create reflink snapshots before overwriting during copy
+- **`--throttle` flag**: PSI-based system stress pacing for I/O-heavy operations
 
 ## v0.7.0 Features
 
