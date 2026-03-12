@@ -46,6 +46,7 @@ pub struct SyncOptions {
     pub delete: bool,
     pub dry_run: bool,
     pub exclude: Vec<String>,
+    pub include: Vec<String>,
     pub generate_sigs: bool,
     pub cleanup: bool,
     // stdin-specific
@@ -66,6 +67,7 @@ impl Default for SyncOptions {
             delete: false,
             dry_run: false,
             exclude: vec![],
+            include: vec![],
             generate_sigs: false,
             cleanup: false,
             size: None,
@@ -105,6 +107,36 @@ pub struct SyncStats {
     pub bytes_nfs_bypass: u64,
 }
 
+impl SyncStats {
+    /// Accumulate stats from another run (for multi-source operations).
+    pub fn merge(&mut self, other: &SyncStats) {
+        self.files_copied += other.files_copied;
+        self.files_reflinked += other.files_reflinked;
+        self.files_cfr += other.files_cfr;
+        self.files_small += other.files_small;
+        self.files_skipped += other.files_skipped;
+        self.files_delta += other.files_delta;
+        self.files_deleted += other.files_deleted;
+        self.dirs_created += other.dirs_created;
+        self.dirs_pruned += other.dirs_pruned;
+        self.bytes_copied += other.bytes_copied;
+        self.bytes_reflinked += other.bytes_reflinked;
+        self.bytes_cfr += other.bytes_cfr;
+        self.bytes_small += other.bytes_small;
+        self.bytes_delta += other.bytes_delta;
+        self.errors += other.errors;
+        self.sigs_stored += other.sigs_stored;
+        self.dirs_hashed += other.dirs_hashed;
+        self.files_verified += other.files_verified;
+        self.verify_failures += other.verify_failures;
+        #[cfg(feature = "nfs-bypass")]
+        {
+            self.files_nfs_bypass += other.files_nfs_bypass;
+            self.bytes_nfs_bypass += other.bytes_nfs_bypass;
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Main entry point
 // -----------------------------------------------------------------------
@@ -132,10 +164,9 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "fxcp", version, about = "Smart filesystem copy with CoW/reflink/io_uring support")]
 pub struct FxcpCli {
-    /// Source path (use '-' for stdin)
-    pub source: PathBuf,
-    /// Destination path
-    pub destination: PathBuf,
+    /// Source path(s) and destination — last argument is destination (use '-' for stdin)
+    #[arg(required = true, num_args = 2..)]
+    pub paths: Vec<PathBuf>,
     #[arg(short = 'a', long, help = "Archive mode (recursive, preserve attributes)")]
     pub archive: bool,
     #[arg(short = 'r', long, help = "Recursive copy (implied by -a)")]
@@ -148,6 +179,12 @@ pub struct FxcpCli {
     pub dry_run: bool,
     #[arg(short = 'e', long, help = "Exclude pattern (glob)")]
     pub exclude: Vec<String>,
+    #[arg(long, help = "Include pattern — override excludes (glob)")]
+    pub include: Vec<String>,
+    #[arg(long, help = "Read exclude patterns from FILE (one per line)")]
+    pub exclude_from: Option<PathBuf>,
+    #[arg(long, help = "Read include patterns from FILE (one per line)")]
+    pub include_from: Option<PathBuf>,
     #[arg(long, help = "Clean orphaned .tmp files and stale dirty flags")]
     pub cleanup: bool,
     #[arg(long, help = "Expected size in bytes (for stdin pre-allocation)")]
@@ -172,44 +209,70 @@ pub struct FxcpCli {
 pub fn cli_main() -> anyhow::Result<()> {
     let cli = FxcpCli::parse();
 
-    let filter = if cli.debug { "debug" } else { "info" };
+    let log_filter = if cli.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .with_target(false)
         .init();
 
-    let opts = SyncOptions {
-        source: cli.source,
-        destination: cli.destination,
-        archive: cli.archive,
-        recursive: cli.recursive || cli.archive,
-        delete: cli.delete,
-        dry_run: cli.dry_run,
-        exclude: cli.exclude,
-        generate_sigs: cli.generate_sigs,
-        cleanup: cli.cleanup,
-        size: cli.size,
-        checkpoint_interval: cli.checkpoint_interval,
-        checkpoint_keep: cli.checkpoint_keep,
-        zero_copy: cli.zero_copy,
-        verify: cli.verify,
-    };
+    // Split positional args: all-but-last = sources, last = destination
+    let (sources, destination) = crate::filter::split_paths(cli.paths)?;
+
+    // Merge file-based patterns into CLI patterns
+    let mut excludes = cli.exclude;
+    if let Some(ref file) = cli.exclude_from {
+        excludes.extend(crate::filter::read_patterns(file)?);
+    }
+    let mut includes = cli.include;
+    if let Some(ref file) = cli.include_from {
+        includes.extend(crate::filter::read_patterns(file)?);
+    }
+
+    // Stdin mode: only valid with a single source
+    if sources.len() > 1 && sources.iter().any(|s| s.as_os_str() == "-") {
+        anyhow::bail!("stdin (-) cannot be used with multiple sources");
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
 
-    match rt.block_on(run(opts)) {
-        Ok(stats) => {
-            print_summary(&stats);
-            Ok(())
-        }
-        Err(e) => {
-            error!("fxcp failed: {}", e);
-            std::process::exit(1);
+    let mut total_stats = SyncStats::default();
+
+    for source in &sources {
+        let opts = SyncOptions {
+            source: source.clone(),
+            destination: destination.clone(),
+            archive: cli.archive,
+            recursive: cli.recursive || cli.archive,
+            delete: cli.delete,
+            dry_run: cli.dry_run,
+            exclude: excludes.clone(),
+            include: includes.clone(),
+            generate_sigs: cli.generate_sigs,
+            cleanup: cli.cleanup,
+            size: cli.size,
+            checkpoint_interval: cli.checkpoint_interval,
+            checkpoint_keep: cli.checkpoint_keep,
+            zero_copy: cli.zero_copy,
+            verify: cli.verify,
+        };
+
+        match rt.block_on(run(opts)) {
+            Ok(stats) => total_stats.merge(&stats),
+            Err(e) => {
+                error!("fxcp failed for {}: {}", source.display(), e);
+                total_stats.errors += 1;
+            }
         }
     }
+
+    print_summary(&total_stats);
+    if total_stats.errors > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -465,9 +528,7 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
         }
     }
 
-    let exclude_patterns: Vec<glob::Pattern> = opts.exclude.iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
-        .collect();
+    let filter_rules = crate::filter::FilterRules::new(&opts.exclude, &opts.include);
 
     constants::ONE_SHOT_MODE.store(true, Ordering::Relaxed);
 
@@ -493,7 +554,7 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
             Err(_) => continue,
         };
 
-        if exclude_patterns.iter().any(|p| p.matches_path(rel)) { continue; }
+        if filter_rules.should_skip(rel) { continue; }
 
         let dst_path = destination.join(rel);
 
@@ -728,7 +789,7 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
             if !entry.file_type().is_file() { continue; }
             let src_path = entry.path();
             let rel = match src_path.strip_prefix(&source) { Ok(r) => r, Err(_) => continue };
-            if exclude_patterns.iter().any(|p| p.matches_path(rel)) { continue; }
+            if filter_rules.should_skip(rel) { continue; }
             let dst_path = destination.join(rel);
             if !dst_path.exists() { continue; }
             match verify_blake3(src_path, &dst_path) {
@@ -751,7 +812,7 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
     }
 
     if opts.delete && !opts.dry_run {
-        stats.files_deleted = delete_extra_files(&source, &destination, &exclude_patterns)?;
+        stats.files_deleted = delete_extra_files(&source, &destination, &filter_rules)?;
     }
 
     // Generate directory hashes for foxingd tree pruning
@@ -907,7 +968,7 @@ pub fn preserve_metadata(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn delete_extra_files(source: &Path, target: &Path, excludes: &[glob::Pattern]) -> crate::Result<u64> {
+fn delete_extra_files(source: &Path, target: &Path, filter: &crate::filter::FilterRules) -> crate::Result<u64> {
     // Fast path: if a tombstone journal exists on the target, replay it
     // instead of walking the entire target tree.
     let journal_path = target.join(".foxing_tombstones.jsonl");
@@ -916,7 +977,7 @@ fn delete_extra_files(source: &Path, target: &Path, excludes: &[glob::Pattern]) 
             if let Ok(entries) = journal.read_all() {
                 if !entries.is_empty() {
                     info!("Replaying {} tombstones (skipping full target walk)", entries.len());
-                    let deleted = crate::tombstone::replay_tombstones(target, &entries, excludes)?;
+                    let deleted = crate::tombstone::replay_tombstones(target, &entries, &filter.excludes)?;
                     let _ = journal.clear();
                     return Ok(deleted);
                 }
@@ -931,7 +992,7 @@ fn delete_extra_files(source: &Path, target: &Path, excludes: &[glob::Pattern]) 
         let tgt_path = entry.path();
         let rel = match tgt_path.strip_prefix(target) { Ok(r) => r, Err(_) => continue };
         if rel.as_os_str().is_empty() { continue; }
-        if excludes.iter().any(|p| p.matches_path(rel)) { continue; }
+        if filter.should_skip(rel) { continue; }
         if rel.to_string_lossy().contains(".foxing_tombstones") { continue; }
         let src_path = source.join(rel);
         if !src_path.exists() {

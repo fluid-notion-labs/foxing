@@ -10,9 +10,44 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use serde::{Serialize, Deserialize};
 use std::time::Instant;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const RENAME_NOREPLACE: u32 = 1 << 0;
+
+// Storm registry: tracks pending rename events per inode at dispatch time.
+// When a CREATE arrives at the worker and sees pending_renames > 0, it skips
+// the copy — the final rename in the chain will place the file correctly.
+lazy_static::lazy_static! {
+    pub static ref RENAME_STORM_REGISTRY: dashmap::DashMap<u64, AtomicUsize> = dashmap::DashMap::new();
+}
+
+/// Mark an inode as having a pending rename (called at dispatch time).
+pub fn mark_pending_rename(inode: u64) {
+    RENAME_STORM_REGISTRY
+        .entry(inode)
+        .or_insert_with(|| AtomicUsize::new(0))
+        .fetch_add(1, Ordering::SeqCst);
+}
+
+/// Check how many renames are pending for this inode.
+pub fn get_pending_renames(inode: u64) -> usize {
+    RENAME_STORM_REGISTRY
+        .get(&inode)
+        .map(|v| v.load(Ordering::SeqCst))
+        .unwrap_or(0)
+}
+
+/// Decrement pending rename count after processing (called by worker).
+pub fn clear_pending_rename(inode: u64) {
+    if let Some(entry) = RENAME_STORM_REGISTRY.get(&inode) {
+        let prev = entry.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 1 {
+            // Clean up entry when count reaches 0
+            drop(entry);
+            RENAME_STORM_REGISTRY.remove(&inode);
+        }
+    }
+}
 pub const RENAME_EXCHANGE: u32 = 1 << 1;
 pub const RENAME_WHITEOUT: u32 = 1 << 2;
 
@@ -158,6 +193,11 @@ impl EventQueue {
         }
         metrics::EVENTS_TOTAL.with_label_values(&[e.event_type.as_str()]).inc();
         if self.worker_count == 0 { return false; }
+
+        // Pre-register pending renames for storm detection
+        if matches!(e.event_type, EventType::Rename | EventType::RenameIncomplete) {
+            mark_pending_rename(e.inode);
+        }
 
         let pool_size = self.worker_count;
         let target_idx = if pool_size <= 1 {

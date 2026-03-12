@@ -1,9 +1,9 @@
 %global crate foxing
-%global version 0.6.1
+%global version 0.7.0
 
 Name:           foxing
 Version:        %{version}
-Release:        6%{?dist}
+Release:        1%{?dist}
 Summary:        eBPF-powered filesystem replication daemon and smart copy tool
 License:        GPL-2.0-or-later
 URL:            https://codeberg.org/aenertia/foxing
@@ -168,6 +168,13 @@ fi
 %{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
+* Thu Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.0-1
+- fxcp: multi-source CLI (fxcp src1 src2 dest/)
+- fxcp: --include, --exclude-from, --include-from filtering
+- foxingd: hydration deletes stale target files on resync
+- foxingd: post-recovery full scan for unjournaled changes
+- Test harness fixes for metric snapshot collection
+
 * Wed Mar 11 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.6.1-1
 - Expand architecture support: ppc64le, s390x, riscv64
 - Fix aarch64 build: portable pointer types in btrfs ioctls
