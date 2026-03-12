@@ -530,6 +530,283 @@ impl VersionStore {
         let _ = self.rebuild_index();
         Ok(stats)
     }
+
+    // ---- Export / Import ----
+
+    /// Export snapshots as a .fxar archive (content-addressable chunk-dedup).
+    /// Writes to the provided writer (file or stdout).
+    pub fn export<W: std::io::Write + 'static>(
+        &self,
+        writer: W,
+        compress: &str,
+        timestamp_filter: Option<&str>,
+    ) -> crate::Result<ExportStats> {
+        use std::io::Read;
+
+        let mut stats = ExportStats::default();
+        let mut builder = tar::Builder::new(wrap_compressor(writer, compress));
+
+        // Collect snapshot directories to export
+        let snap_dirs: Vec<_> = if let Some(ts) = timestamp_filter {
+            let dir = self.root.join(ts);
+            if dir.exists() { vec![dir] } else {
+                return Err(crate::error::FxcpError::Config(format!("Snapshot not found: {}", ts)));
+            }
+        } else {
+            fs::read_dir(&self.root).ok()
+                .map(|entries| entries.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .filter(|e| parse_timestamp(&e.file_name().to_string_lossy()).is_some())
+                    .map(|e| e.path())
+                    .collect())
+                .unwrap_or_default()
+        };
+
+        // Track unique chunks for dedup
+        let mut seen_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Add index.json
+        let index_path = self.root.join(INDEX_FILE);
+        if index_path.exists() {
+            builder.append_path_with_name(&index_path, INDEX_FILE)
+                .map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+        }
+
+        for snap_dir in &snap_dirs {
+            let snap_name = snap_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            // Add summary.json
+            let summary_path = snap_dir.join(SUMMARY_FILE);
+            if summary_path.exists() {
+                let archive_path = format!("meta/{}/{}", snap_name, SUMMARY_FILE);
+                builder.append_path_with_name(&summary_path, &archive_path)
+                    .map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+            }
+
+            // Walk tree and add files as chunks
+            let tree_dir = snap_dir.join(TREE_DIR);
+            if !tree_dir.exists() { continue; }
+
+            for entry in walkdir::WalkDir::new(&tree_dir).follow_links(false) {
+                let entry = match entry { Ok(e) => e, Err(_) => continue };
+                if !entry.file_type().is_file() { continue; }
+
+                let rel = match entry.path().strip_prefix(&self.root) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => continue,
+                };
+
+                stats.total_files += 1;
+                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                stats.total_apparent_bytes += file_size;
+
+                // Try to get BLAKE3 hash for chunk dedup
+                let hash = crate::hashing::hash_file_full(entry.path())
+                    .ok()
+                    .flatten()
+                    .map(|h| hex::encode(h.as_bytes()))
+                    .unwrap_or_default();
+
+                if !hash.is_empty() && seen_chunks.contains(&hash) {
+                    // Chunk already in archive — just record in manifest
+                    stats.dedup_chunks += 1;
+                    stats.dedup_bytes += file_size;
+                    // Add a small manifest entry instead of file data
+                    let manifest_entry = format!("{}|{}|{}\n", rel.display(), hash, file_size);
+                    let data = manifest_entry.as_bytes();
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(data.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    let dedup_path = format!("dedup/{}", rel.display());
+                    builder.append_data(&mut header, &dedup_path, data)
+                        .map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+                } else {
+                    // New unique chunk — add file data
+                    if !hash.is_empty() { seen_chunks.insert(hash.clone()); }
+                    stats.unique_chunks += 1;
+                    stats.unique_bytes += file_size;
+
+                    let mut file = fs::File::open(entry.path()).map_err(crate::error::FxcpError::Io)?;
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(file_size);
+                    header.set_mode(entry.metadata().map(|m| {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode()
+                    }).unwrap_or(0o644));
+                    header.set_mtime(entry.metadata().map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        m.mtime() as u64
+                    }).unwrap_or(0));
+                    header.set_cksum();
+                    builder.append_data(&mut header, rel.to_string_lossy().as_ref(), &mut file)
+                        .map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+                }
+            }
+            stats.snapshots_exported += 1;
+        }
+
+        builder.finish().map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+
+        info!("Export: {} snapshots, {} files ({} unique, {} deduped), apparent {} → archive {}",
+              stats.snapshots_exported, stats.total_files, stats.unique_chunks, stats.dedup_chunks,
+              format_size(stats.total_apparent_bytes), format_size(stats.unique_bytes));
+
+        Ok(stats)
+    }
+
+    /// Import snapshots from a .fxar archive.
+    pub fn import<R: std::io::Read + 'static>(
+        &self,
+        reader: R,
+        compress: &str,
+    ) -> crate::Result<ImportStats> {
+        let mut stats = ImportStats::default();
+        let decompressed = wrap_import_decompressor(reader, compress);
+        let mut archive = tar::Archive::new(decompressed);
+
+        self.ensure_dirs().map_err(crate::error::FxcpError::Io)?;
+
+        for entry in archive.entries().map_err(|e| crate::error::FxcpError::Io(e.into()))? {
+            let mut entry = match entry { Ok(e) => e, Err(_) => continue };
+            let path = entry.path()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let path_str = path.to_string_lossy().to_string();
+
+            if path_str == INDEX_FILE {
+                // Restore index.json
+                entry.unpack(self.root.join(INDEX_FILE))
+                    .map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+                stats.metadata_files += 1;
+            } else if path_str.starts_with("meta/") {
+                // Restore summary.json files
+                let dest = self.root.join(path_str.trim_start_matches("meta/")
+                    .split('/').next().unwrap_or(""))
+                    .join(SUMMARY_FILE);
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                entry.unpack(&dest).map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+                stats.metadata_files += 1;
+            } else if path_str.starts_with("dedup/") {
+                // Dedup reference — skip (file already exists from another snapshot)
+                stats.dedup_refs += 1;
+            } else {
+                // Regular file data — restore to version store
+                let dest = self.root.join(&path_str);
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                entry.unpack(&dest).map_err(|e| crate::error::FxcpError::Io(e.into()))?;
+                stats.files_restored += 1;
+                stats.bytes_restored += entry.header().size().unwrap_or(0);
+            }
+        }
+
+        // Rebuild index from restored state
+        let _ = self.rebuild_index();
+
+        info!("Import: {} files restored, {} bytes, {} dedup refs, {} metadata files",
+              stats.files_restored, stats.bytes_restored, stats.dedup_refs, stats.metadata_files);
+
+        Ok(stats)
+    }
+
+    /// List contents of a .fxar archive without extracting.
+    pub fn inspect_archive<R: std::io::Read + 'static>(reader: R, compress: &str) -> crate::Result<Vec<ArchiveEntry>> {
+        let decompressed = wrap_import_decompressor(reader, compress);
+        let mut archive = tar::Archive::new(decompressed);
+        let mut entries = Vec::new();
+
+        for entry in archive.entries().map_err(|e| crate::error::FxcpError::Io(e.into()))? {
+            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            let path = entry.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let size = entry.header().size().unwrap_or(0);
+            let is_dedup = path.starts_with("dedup/");
+            let is_meta = path.starts_with("meta/") || path == INDEX_FILE;
+
+            entries.push(ArchiveEntry {
+                path,
+                size,
+                is_dedup_ref: is_dedup,
+                is_metadata: is_meta,
+            });
+        }
+
+        Ok(entries)
+    }
+}
+
+// -----------------------------------------------------------------------
+// Export / Import types and compression helpers
+// -----------------------------------------------------------------------
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ExportStats {
+    pub snapshots_exported: u64,
+    pub total_files: u64,
+    pub unique_chunks: u64,
+    pub dedup_chunks: u64,
+    pub total_apparent_bytes: u64,
+    pub unique_bytes: u64,
+    pub dedup_bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ImportStats {
+    pub files_restored: u64,
+    pub bytes_restored: u64,
+    pub dedup_refs: u64,
+    pub metadata_files: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArchiveEntry {
+    pub path: String,
+    pub size: u64,
+    pub is_dedup_ref: bool,
+    pub is_metadata: bool,
+}
+
+fn wrap_compressor<W: std::io::Write + 'static>(writer: W, compress: &str) -> Box<dyn std::io::Write> {
+    match compress {
+        "none" => Box::new(writer),
+        s if s.starts_with("zstd") => {
+            let level = s.strip_prefix("zstd:").and_then(|l| l.parse().ok()).unwrap_or(3);
+            let enc = zstd::stream::Encoder::new(writer, level).expect("zstd encoder init failed");
+            Box::new(enc.auto_finish())
+        }
+        "lz4" => Box::new(lz4_flex::frame::FrameEncoder::new(writer)),
+        "gzip" => Box::new(flate2::write::GzEncoder::new(writer, flate2::Compression::default())),
+        s if s.starts_with("xz") => {
+            let level = s.strip_prefix("xz:").and_then(|l| l.parse().ok()).unwrap_or(6);
+            Box::new(xz2::write::XzEncoder::new(writer, level))
+        }
+        _ => {
+            // Default to zstd level 3
+            let enc = zstd::stream::Encoder::new(writer, 3).expect("zstd encoder init failed");
+            Box::new(enc.auto_finish())
+        }
+    }
+}
+
+pub fn wrap_import_decompressor<R: std::io::Read + 'static>(reader: R, compress: &str) -> Box<dyn std::io::Read> {
+    match compress {
+        "none" => Box::new(reader),
+        "zstd" => {
+            let dec = zstd::stream::Decoder::new(reader).expect("zstd decoder init failed");
+            Box::new(dec)
+        }
+        "lz4" => Box::new(lz4_flex::frame::FrameDecoder::new(reader)),
+        "gzip" => Box::new(flate2::read::GzDecoder::new(reader)),
+        "xz" => Box::new(xz2::read::XzDecoder::new(reader)),
+        "auto" | _ => {
+            // For auto-detect, we'd need to peek at magic bytes.
+            // Default to raw (caller should specify or use file extension).
+            Box::new(reader)
+        }
+    }
 }
 
 // -----------------------------------------------------------------------

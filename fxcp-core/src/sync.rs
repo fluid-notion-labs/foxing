@@ -267,6 +267,65 @@ pub enum SnapCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Export snapshots as a .fxar archive (content-addressable, deduped)
+    Export {
+        /// Source directory containing .foxing_versions
+        path: String,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Compression: zstd (default), zstd:N, lz4, gzip, xz, xz:N, none
+        #[arg(long, default_value = "zstd")]
+        compress: String,
+        /// Export only a specific snapshot timestamp
+        #[arg(long)]
+        timestamp: Option<String>,
+    },
+    /// Import snapshots from a .fxar archive
+    Import {
+        /// Target directory to restore into
+        path: String,
+        /// Input file (default: stdin)
+        #[arg(short, long)]
+        input: Option<String>,
+        /// Decompression: auto (default), zstd, lz4, gzip, xz, none
+        #[arg(long, default_value = "auto")]
+        compress: String,
+    },
+    /// Inspect a .fxar archive without extracting
+    Inspect {
+        /// Archive file
+        archive: String,
+        /// Show full file listing
+        #[arg(long)]
+        list: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Show versions of a specific file
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Restore specific files/snapshots from a .fxar archive
+    Restore {
+        /// Archive file
+        archive: String,
+        /// File path pattern to restore (glob)
+        #[arg(long)]
+        file: Option<String>,
+        /// Snapshot date to restore from (prefix match)
+        #[arg(long)]
+        date: Option<String>,
+        /// Restore most recent version
+        #[arg(long)]
+        latest: bool,
+        /// Restore all versions of matched files
+        #[arg(long)]
+        all_versions: bool,
+        /// Output directory
+        #[arg(short, long, default_value = ".")]
+        output: String,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -482,6 +541,145 @@ fn cli_snap_main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&stats).unwrap_or_default());
             } else {
                 crate::version_store::print_store_stats(&stats, &p);
+            }
+        }
+        SnapCommand::Export { path, output, compress, timestamp } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+            let ts_filter = timestamp.as_deref();
+
+            if let Some(ref out_path) = output {
+                let file = std::fs::File::create(out_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", out_path, e))?;
+                let stats = store.export(file, &compress, ts_filter)?;
+                info!("Exported to {}: {} snapshots, {} unique files",
+                      out_path, stats.snapshots_exported, stats.unique_chunks);
+            } else {
+                let stdout = std::io::stdout().lock();
+                let stats = store.export(stdout, &compress, ts_filter)?;
+                eprintln!("Exported {} snapshots, {} unique files ({} deduped)",
+                          stats.snapshots_exported, stats.unique_chunks, stats.dedup_chunks);
+            }
+        }
+        SnapCommand::Import { path, input, compress } => {
+            let p = std::path::PathBuf::from(&path);
+            let store = crate::version_store::VersionStore::open(&p);
+
+            // Auto-detect compression from file extension
+            let comp = if compress == "auto" {
+                if let Some(ref inp) = input {
+                    if inp.ends_with(".zst") || inp.ends_with(".zstd") { "zstd" }
+                    else if inp.ends_with(".lz4") { "lz4" }
+                    else if inp.ends_with(".gz") { "gzip" }
+                    else if inp.ends_with(".xz") { "xz" }
+                    else { "none" }
+                } else { "none" }
+            } else { &compress };
+
+            if let Some(ref in_path) = input {
+                let file = std::fs::File::open(in_path)
+                    .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", in_path, e))?;
+                let stats = store.import(file, comp)?;
+                info!("Imported from {}: {} files restored", in_path, stats.files_restored);
+            } else {
+                let stdin = std::io::stdin().lock();
+                let stats = store.import(stdin, comp)?;
+                info!("Imported {} files from stdin", stats.files_restored);
+            }
+        }
+        SnapCommand::Inspect { archive, list, json, file } => {
+            let f = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
+            let comp = if archive.ends_with(".zst") { "zstd" }
+                       else if archive.ends_with(".lz4") { "lz4" }
+                       else if archive.ends_with(".gz") { "gzip" }
+                       else if archive.ends_with(".xz") { "xz" }
+                       else { "none" };
+            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+            let filtered: Vec<_> = if let Some(ref pattern) = file {
+                entries.into_iter().filter(|e| e.path.contains(pattern)).collect()
+            } else {
+                entries
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&filtered).unwrap_or_default());
+            } else if list {
+                for e in &filtered {
+                    let marker = if e.is_dedup_ref { " [dedup]" }
+                                 else if e.is_metadata { " [meta]" }
+                                 else { "" };
+                    println!("{:>10}  {}{}", e.size, e.path, marker);
+                }
+                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                println!("\n{} files, {} dedup references", total_files, dedup_refs);
+            } else {
+                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                let total_size: u64 = filtered.iter().map(|e| e.size).sum();
+                println!("Archive: {}", archive);
+                println!("  Files:       {}", total_files);
+                println!("  Dedup refs:  {}", dedup_refs);
+                println!("  Total size:  {} bytes", total_size);
+            }
+        }
+        SnapCommand::Restore { archive, file, date, latest, all_versions, output } => {
+            let f = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
+            let comp = if archive.ends_with(".zst") { "zstd" }
+                       else if archive.ends_with(".lz4") { "lz4" }
+                       else if archive.ends_with(".gz") { "gzip" }
+                       else if archive.ends_with(".xz") { "xz" }
+                       else { "none" };
+            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+            // Filter entries by file pattern and date
+            let mut matched: Vec<_> = entries.into_iter()
+                .filter(|e| !e.is_metadata && !e.is_dedup_ref)
+                .filter(|e| {
+                    if let Some(ref pattern) = file {
+                        glob::Pattern::new(pattern).map(|p| p.matches(&e.path)).unwrap_or(false)
+                            || e.path.contains(pattern)
+                    } else { true }
+                })
+                .filter(|e| {
+                    if let Some(ref d) = date { e.path.contains(d) }
+                    else { true }
+                })
+                .collect();
+
+            if latest {
+                matched.sort_by(|a, b| b.path.cmp(&a.path));
+                matched.truncate(1);
+            }
+
+            if matched.is_empty() {
+                anyhow::bail!("No matching files found in archive");
+            }
+
+            info!("Restoring {} files to {}", matched.len(), output);
+
+            // Re-open archive and extract matched files
+            let f2 = std::fs::File::open(&archive)
+                .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+            let decompressed = crate::version_store::wrap_import_decompressor(f2, comp);
+            let mut tar_archive = tar::Archive::new(decompressed);
+            let match_paths: std::collections::HashSet<String> = matched.iter().map(|e| e.path.clone()).collect();
+            let out_dir = std::path::PathBuf::from(&output);
+
+            for entry in tar_archive.entries().map_err(|e| anyhow::anyhow!("tar error: {}", e))? {
+                let mut entry = match entry { Ok(e) => e, Err(_) => continue };
+                let path = entry.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if match_paths.contains(&path) {
+                    let dest = out_dir.join(std::path::Path::new(&path).file_name().unwrap_or_default());
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    entry.unpack(&dest).map_err(|e| anyhow::anyhow!("unpack error: {}", e))?;
+                    info!("Restored: {}", dest.display());
+                }
             }
         }
     }
@@ -1296,6 +1494,7 @@ fn wrap_decompressor<'a>(
         }
         "gzip" => (Box::new(flate2::read::GzDecoder::new(reader)), "gzip"),
         "lz4" => (Box::new(lz4_flex::frame::FrameDecoder::new(reader)), "lz4"),
+        "xz" => (Box::new(xz2::read::XzDecoder::new(reader)), "xz"),
         _ => (reader, "raw")
     }
 }
