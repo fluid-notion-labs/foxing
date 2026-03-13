@@ -678,6 +678,27 @@ impl<R: Read + Seek> FxarReader<R> {
         let index = self.read_chunk_index()?;
         let mut stats = FxarImportStats::default();
 
+        // NFS bypass: establish compound RPC session if target is NFSv4.2
+        #[cfg(feature = "nfs-bypass")]
+        let mut nfs_client: Option<crate::nfs::NfsCompoundClient> = {
+            let nfs_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
+            if nfs_env != "0" {
+                crate::nfs::mount::probe_nfs_bypass(target)
+                    .and_then(|info| {
+                        match crate::nfs::NfsCompoundClient::connect(&info) {
+                            Ok(client) => {
+                                info!("FXAR import: NFS bypass active → {}", info.server_addr);
+                                Some(client)
+                            }
+                            Err(e) => {
+                                info!("FXAR import: NFS bypass unavailable ({}), using VFS", e);
+                                None
+                            }
+                        }
+                    })
+            } else { None }
+        };
+
         for file_entry in &manifest.files {
             let dest = target.join(&file_entry.path);
             if let Some(parent) = dest.parent() {
@@ -701,15 +722,27 @@ impl<R: Read + Seek> FxarReader<R> {
                 continue;
             }
 
-            std::fs::write(&dest, &data)?;
+            // Write file — NFS bypass (1 compound RPC) or VFS fallback
+            let wrote_via_nfs = write_file_nfs_or_vfs(
+                &dest, &data, file_entry, target,
+                #[cfg(feature = "nfs-bypass")]
+                &mut nfs_client,
+            );
 
-            // Restore metadata
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
+            if !wrote_via_nfs {
+                std::fs::write(&dest, &data)?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
+                let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
+                let _ = filetime::set_file_mtime(&dest, mtime);
+            }
 
-            // Restore mtime
-            let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
-            let _ = filetime::set_file_mtime(&dest, mtime);
+            // Restore xattrs (both NFS and VFS paths)
+            for (key, hex_val) in &file_entry.xattr {
+                if let Ok(val) = hex::decode(hex_val) {
+                    let _ = xattr::set(&dest, key, &val);
+                }
+            }
 
             stats.files_restored += 1;
             stats.bytes_restored += file_entry.size;
@@ -805,6 +838,27 @@ pub fn read_archive_stream<R: Read>(
         }
     }
 
+    // NFS bypass: establish compound RPC session if target is NFSv4.2
+    #[cfg(feature = "nfs-bypass")]
+    let nfs_client: Option<parking_lot::Mutex<crate::nfs::NfsCompoundClient>> = {
+        let nfs_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
+        if nfs_env != "0" {
+            crate::nfs::mount::probe_nfs_bypass(target)
+                .and_then(|info| {
+                    match crate::nfs::NfsCompoundClient::connect(&info) {
+                        Ok(client) => {
+                            info!("FXAR stream import: NFS bypass active → {}", info.server_addr);
+                            Some(parking_lot::Mutex::new(client))
+                        }
+                        Err(e) => {
+                            info!("FXAR stream import: NFS bypass unavailable ({})", e);
+                            None
+                        }
+                    }
+                })
+        } else { None }
+    };
+
     // Reconstruct files in parallel (chunk assembly + BLAKE3 verify + write)
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -832,15 +886,48 @@ pub fn read_archive_stream<R: Read>(
             return;
         }
 
-        if std::fs::write(&dest, &data).is_err() {
-            chunks_failed.fetch_add(1, Ordering::Relaxed);
-            return;
+        // Write file — NFS bypass or VFS fallback
+        let wrote_via_nfs = {
+            #[cfg(feature = "nfs-bypass")]
+            {
+                if let Some(ref client_lock) = nfs_client {
+                    if data.len() <= crate::nfs::NFS_BYPASS_MAX_SIZE as usize {
+                        let parent = dest.parent().unwrap_or(target);
+                        let mut client = client_lock.lock();
+                        if let Ok(handle) = client.get_or_resolve_handle(parent) {
+                            let fname = dest.file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            client.write_file(
+                                &handle, &fname, &data,
+                                file_entry.mode, file_entry.uid, file_entry.gid,
+                                (file_entry.mtime, 0),
+                            ).is_ok()
+                        } else { false }
+                    } else { false }
+                } else { false }
+            }
+            #[cfg(not(feature = "nfs-bypass"))]
+            { false }
+        };
+
+        if !wrote_via_nfs {
+            if std::fs::write(&dest, &data).is_err() {
+                chunks_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
+            let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
+            let _ = filetime::set_file_mtime(&dest, mtime);
         }
 
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
-        let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
-        let _ = filetime::set_file_mtime(&dest, mtime);
+        // Restore xattrs (both paths)
+        for (key, hex_val) in &file_entry.xattr {
+            if let Ok(val) = hex::decode(hex_val) {
+                let _ = xattr::set(&dest, key, &val);
+            }
+        }
 
         files_restored.fetch_add(1, Ordering::Relaxed);
         bytes_restored.fetch_add(file_entry.size, Ordering::Relaxed);
@@ -954,6 +1041,44 @@ fn check_available_space(path: &Path) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Try to write a file via NFS compound RPC bypass.
+/// Returns true if NFS bypass succeeded (file written + metadata set in one round-trip).
+/// Returns false if NFS bypass is unavailable or failed (caller should use VFS fallback).
+#[allow(unused_variables)]
+fn write_file_nfs_or_vfs(
+    dest: &Path,
+    data: &[u8],
+    file_entry: &FxarManifestEntry,
+    target: &Path,
+    #[cfg(feature = "nfs-bypass")]
+    nfs_client: &mut Option<crate::nfs::NfsCompoundClient>,
+) -> bool {
+    #[cfg(feature = "nfs-bypass")]
+    {
+        if let Some(client) = nfs_client.as_mut() {
+            if data.len() <= crate::nfs::NFS_BYPASS_MAX_SIZE as usize {
+                let parent = dest.parent().unwrap_or(target);
+                if let Ok(handle) = client.get_or_resolve_handle(parent) {
+                    let fname = dest.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    match client.write_file(
+                        &handle, &fname, data,
+                        file_entry.mode, file_entry.uid, file_entry.gid,
+                        (file_entry.mtime, 0),
+                    ) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            tracing::debug!("NFS bypass failed for {}: {}", fname, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn compress_flag(compress: &str) -> u32 {

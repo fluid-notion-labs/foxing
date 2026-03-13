@@ -447,12 +447,12 @@ impl NfsCompoundClient {
         filename: &str,
         data: &[u8],
         mode: u32,
-        _uid: u32,
-        _gid: u32,
-        _mtime: (i64, i64),
+        uid: u32,
+        gid: u32,
+        mtime: (i64, i64),
     ) -> Result<(), NfsError> {
         for attempt in 0..3 {
-            match self.write_file_inner(parent_handle, filename, data, mode) {
+            match self.write_file_inner(parent_handle, filename, data, mode, uid, gid, mtime) {
                 Ok(()) => return Ok(()),
                 Err(NfsError::Nfs4Error { code: 10013, .. }) => {
                     // NFS4ERR_GRACE — server in grace period, retry after delay
@@ -478,6 +478,9 @@ impl NfsCompoundClient {
         filename: &str,
         data: &[u8],
         mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime: (i64, i64),
     ) -> Result<(), NfsError> {
         let xid = self.next_xid();
         let seq_id = self.next_sequence_id();
@@ -501,10 +504,18 @@ impl NfsCompoundClient {
                 mode,
             },
             Nfs4Op::Write {
-                stateid: StateId::current(), // Use current stateid from preceding OPEN
+                stateid: StateId::current(),
                 offset: 0,
                 stable: WriteStable::FileSync,
                 data: data.to_vec(),
+            },
+            // SETATTR in same compound — sets uid/gid/mtime without extra round-trip
+            Nfs4Op::SetAttr {
+                stateid: StateId::current(),
+                mode: None, // already set by OPEN
+                uid: Some(uid),
+                gid: Some(gid),
+                mtime: Some(mtime),
             },
             Nfs4Op::Close {
                 seqid: 1,
