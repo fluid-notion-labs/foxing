@@ -657,8 +657,9 @@ impl<R: Read + Seek> FxarReader<R> {
 
     /// Restore all files to a target directory.
     ///
-    /// Phase 1: Load all chunk data into memory (sequential, needs &mut self for seeks).
-    /// Phase 2: Parallel file reconstruction + BLAKE3 verify + write (rayon par_iter).
+    /// Pipelined: chunk loading overlaps with file writing.
+    /// Producer thread reads chunks sequentially; consumer rayon threads
+    /// write files as soon as their chunks become available.
     pub fn restore_all(&mut self, target: &Path) -> io::Result<FxarImportStats> {
         // Pre-flight disk space check
         let total_bytes: u64 = {
@@ -678,16 +679,9 @@ impl<R: Read + Seek> FxarReader<R> {
 
         let manifest = self.read_manifest()?;
         let index = self.read_chunk_index()?;
+        let chunk_count = index.len();
 
-        // Phase 1: Load all chunks into memory (sequential — needs &mut self for seeks)
-        let mut chunk_store: Vec<Vec<u8>> = Vec::with_capacity(index.len());
-        for entry in &index {
-            let data = self.read_chunk_data(entry)?;
-            chunk_store.push(data);
-        }
-        // reader handle no longer needed — parallel phase can proceed
-
-        // Pre-create all parent directories (sequential)
+        // Pre-create all parent directories (sequential, must happen before writes)
         for file_entry in &manifest.files {
             let dest = target.join(&file_entry.path);
             if let Some(parent) = dest.parent() {
@@ -695,11 +689,58 @@ impl<R: Read + Seek> FxarReader<R> {
             }
         }
 
+        // Pipelined chunk loading: allocate chunk store, load in background thread
+        let chunk_store: Vec<parking_lot::RwLock<Option<Vec<u8>>>> =
+            (0..chunk_count).map(|_| parking_lot::RwLock::new(None)).collect();
+        let chunk_store = std::sync::Arc::new(chunk_store);
+        let chunks_loaded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Sort files by their highest chunk index so we can process them
+        // as soon as their chunks become available
+        let mut file_order: Vec<(usize, u64)> = manifest.files.iter().enumerate()
+            .map(|(i, f)| (i, f.chunks.iter().copied().max().unwrap_or(0)))
+            .collect();
+        file_order.sort_by_key(|&(_, max_chunk)| max_chunk);
+
+        // Producer: load chunks in a background thread
+        let producer_store = chunk_store.clone();
+        let producer_loaded = chunks_loaded.clone();
+        let producer_index = index.clone();
+        // We need to move reader data out of self for the producer thread.
+        // Read all compressed chunks first (sequential seeks), decompress in producer.
+        let flags = self.header.flags;
+        let mut raw_chunks: Vec<Vec<u8>> = Vec::with_capacity(chunk_count);
+        for entry in &producer_index {
+            self.reader.seek(SeekFrom::Start(entry.offset))?;
+            let mut compressed = vec![0u8; entry.compressed_size as usize];
+            self.reader.read_exact(&mut compressed)?;
+            raw_chunks.push(compressed);
+        }
+
+        let producer_handle = std::thread::spawn(move || {
+            for (i, compressed) in raw_chunks.into_iter().enumerate() {
+                let data = match decompress_chunk(&compressed, flags) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("chunk {} decompress failed: {}", i, e);
+                        Vec::new() // empty = will fail BLAKE3 verify
+                    }
+                };
+                // Verify per-chunk BLAKE3
+                let actual = blake3::hash(&data);
+                if actual.as_bytes() != &producer_index[i].blake3_hash {
+                    warn!("chunk {} BLAKE3 mismatch", i);
+                }
+                *producer_store[i].write() = Some(data);
+                producer_loaded.store(i + 1, std::sync::atomic::Ordering::Release);
+            }
+        });
+
         // NFS bypass pool
         #[cfg(feature = "nfs-bypass")]
         let nfs_pool: Option<crate::nfs::NfsClientPool> = init_nfs_pool(target);
 
-        // Phase 2: Parallel file reconstruction + write (rayon)
+        // Consumer: process files in chunk-availability order using rayon
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -708,13 +749,28 @@ impl<R: Read + Seek> FxarReader<R> {
         let chunks_verified = AtomicU64::new(0);
         let chunks_failed = AtomicU64::new(0);
 
-        manifest.files.par_iter().enumerate().for_each(|(file_idx, file_entry)| {
+        // Process files in batches based on chunk availability
+        file_order.par_iter().for_each(|&(file_idx, max_chunk)| {
+            let file_entry = &manifest.files[file_idx];
             let dest = target.join(&file_entry.path);
 
+            // Wait for all required chunks to be loaded
+            let needed = max_chunk as usize + 1;
+            while chunks_loaded.load(Ordering::Acquire) < needed {
+                std::hint::spin_loop();
+            }
+
+            // Assemble file from chunks
             let mut data = Vec::with_capacity(file_entry.size as usize);
             for &chunk_idx in &file_entry.chunks {
-                data.extend_from_slice(&chunk_store[chunk_idx as usize]);
-                chunks_verified.fetch_add(1, Ordering::Relaxed);
+                let guard = chunk_store[chunk_idx as usize].read();
+                if let Some(chunk_data) = guard.as_ref() {
+                    data.extend_from_slice(chunk_data);
+                    chunks_verified.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    chunks_failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
 
             // Verify whole-file BLAKE3
@@ -754,6 +810,10 @@ impl<R: Read + Seek> FxarReader<R> {
             files_restored.fetch_add(1, Ordering::Relaxed);
             bytes_restored.fetch_add(file_entry.size, Ordering::Relaxed);
         });
+
+        producer_handle.join().map_err(|_|
+            io::Error::new(io::ErrorKind::Other, "chunk producer thread panicked")
+        )?;
 
         let stats = FxarImportStats {
             files_restored: files_restored.load(Ordering::Relaxed),
