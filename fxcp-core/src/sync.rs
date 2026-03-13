@@ -83,8 +83,107 @@ impl Default for SyncOptions {
     }
 }
 
+/// Progress tracking for live reporting during copy operations.
+pub struct ProgressTracker {
+    pub files_done: std::sync::atomic::AtomicU64,
+    pub files_total: std::sync::atomic::AtomicU64,
+    pub bytes_done: std::sync::atomic::AtomicU64,
+    pub bytes_total: std::sync::atomic::AtomicU64,
+    pub active: std::sync::atomic::AtomicBool,
+}
+
+impl ProgressTracker {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            files_done: std::sync::atomic::AtomicU64::new(0),
+            files_total: std::sync::atomic::AtomicU64::new(0),
+            bytes_done: std::sync::atomic::AtomicU64::new(0),
+            bytes_total: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+}
+
+/// Global progress tracker — set by cli_main when --progress is used.
+lazy_static::lazy_static! {
+    static ref ACTIVE_PROGRESS: parking_lot::Mutex<Option<std::sync::Arc<ProgressTracker>>> = parking_lot::Mutex::new(None);
+}
+
+/// Record a file completion for progress reporting.
+fn record_file_progress(bytes: u64) {
+    if let Some(ref progress) = *ACTIVE_PROGRESS.lock() {
+        progress.files_done.fetch_add(1, Ordering::Relaxed);
+        progress.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a progress reporter thread that prints updates to stderr.
+/// Returns a join handle. Set active=false to stop.
+fn spawn_progress_reporter(progress: std::sync::Arc<ProgressTracker>, json_mode: bool) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while progress.active.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(if json_mode { 1000 } else { 200 }));
+
+            let done = progress.files_done.load(Ordering::Relaxed);
+            let total = progress.files_total.load(Ordering::Relaxed);
+            let bytes_done = progress.bytes_done.load(Ordering::Relaxed);
+            let bytes_total = progress.bytes_total.load(Ordering::Relaxed);
+
+            if total == 0 { continue; }
+
+            let pct = if bytes_total > 0 { (bytes_done as f64 / bytes_total as f64) * 100.0 } else { 0.0 };
+            let elapsed = start.elapsed().as_secs_f64();
+            let throughput = if elapsed > 0.0 { bytes_done as f64 / elapsed / 1_048_576.0 } else { 0.0 };
+            let eta = if throughput > 0.0 && bytes_total > bytes_done {
+                ((bytes_total - bytes_done) as f64 / (throughput * 1_048_576.0)) as u64
+            } else { 0 };
+
+            if json_mode {
+                let json = serde_json::json!({
+                    "progress_pct": (pct * 10.0).round() / 10.0,
+                    "bytes_done": bytes_done,
+                    "bytes_total": bytes_total,
+                    "files_done": done,
+                    "files_total": total,
+                    "throughput_mbps": (throughput * 10.0).round() / 10.0,
+                    "eta_secs": eta,
+                });
+                eprintln!("{}", serde_json::to_string(&json).unwrap_or_default());
+            } else {
+                let done_str = format_size_compact(bytes_done);
+                let total_str = format_size_compact(bytes_total);
+                eprint!("\r[{:>5.1}%] {} / {} | {} / {} files | {:.0} MB/s | ETA {}s   ",
+                        pct, done_str, total_str, done, total, throughput, eta);
+            }
+        }
+        if !json_mode { eprintln!(); } // Final newline
+    })
+}
+
+/// Check available disk space on the filesystem containing `path`.
+/// Returns None if statvfs fails (e.g., FUSE without statvfs support).
+fn check_available_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc == 0 {
+        Some(stat.f_bavail * stat.f_bsize)
+    } else {
+        None
+    }
+}
+
+fn format_size_compact(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 { format!("{:.1} GB", bytes as f64 / 1_073_741_824.0) }
+    else if bytes >= 1_048_576 { format!("{:.1} MB", bytes as f64 / 1_048_576.0) }
+    else if bytes >= 1024 { format!("{:.0} KB", bytes as f64 / 1024.0) }
+    else { format!("{} B", bytes) }
+}
+
 /// Copy statistics returned from sync operations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct SyncStats {
     pub files_copied: u64,
     pub files_reflinked: u64,
@@ -205,6 +304,10 @@ pub struct FxcpCli {
     pub zero_copy: bool,
     #[arg(long, default_value_t = false, help = "Increase verbosity")]
     pub debug: bool,
+    #[arg(long, help = "Output copy results as JSON (machine-readable)")]
+    pub json: bool,
+    #[arg(long, help = "Show live progress during copy")]
+    pub progress: bool,
     #[arg(long, help = "Generate foxingd-compatible sync signatures (xattr/sidecar) for fast resync")]
     pub generate_sigs: bool,
 }
@@ -280,6 +383,9 @@ pub enum SnapCommand {
         /// Export only a specific snapshot timestamp
         #[arg(long)]
         timestamp: Option<String>,
+        /// Archive format: fxar2 (default, chunk-dedup) or tar (legacy whole-file)
+        #[arg(long, default_value = "fxar2")]
+        format: String,
     },
     /// Import snapshots from a .fxar archive
     Import {
@@ -378,6 +484,15 @@ pub fn cli_main() -> anyhow::Result<()> {
         .build()
         .expect("Failed to create tokio runtime");
 
+    // Set up progress reporting if requested
+    let progress_handle = if cli.progress {
+        let tracker = ProgressTracker::new();
+        *ACTIVE_PROGRESS.lock() = Some(tracker.clone());
+        Some(spawn_progress_reporter(tracker, cli.json))
+    } else {
+        None
+    };
+
     let mut total_stats = SyncStats::default();
 
     for source in &sources {
@@ -410,9 +525,53 @@ pub fn cli_main() -> anyhow::Result<()> {
         }
     }
 
-    print_summary(&total_stats);
+    // Stop progress reporter
+    if let Some(handle) = progress_handle {
+        if let Some(ref progress) = *ACTIVE_PROGRESS.lock() {
+            progress.active.store(false, Ordering::Relaxed);
+        }
+        let _ = handle.join();
+        *ACTIVE_PROGRESS.lock() = None;
+    }
+
+    if cli.json {
+        // Machine-readable JSON output
+        let total_files = total_stats.files_copied + total_stats.files_skipped;
+        let status = if total_stats.errors == 0 { "success" }
+                     else if total_stats.files_copied > 0 { "partial" }
+                     else { "failed" };
+        let json_output = serde_json::json!({
+            "status": status,
+            "files_copied": total_stats.files_copied,
+            "files_reflinked": total_stats.files_reflinked,
+            "files_skipped": total_stats.files_skipped,
+            "files_deleted": total_stats.files_deleted,
+            "dirs_created": total_stats.dirs_created,
+            "dirs_pruned": total_stats.dirs_pruned,
+            "bytes_copied": total_stats.bytes_copied,
+            "bytes_reflinked": total_stats.bytes_reflinked,
+            "errors": total_stats.errors,
+            "method_breakdown": {
+                "reflink": total_stats.files_reflinked,
+                "copy_file_range": total_stats.files_cfr,
+                "sendfile": total_stats.files_small,
+                "io_uring": total_stats.files_copied.saturating_sub(
+                    total_stats.files_reflinked + total_stats.files_cfr + total_stats.files_small
+                ),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
+    } else {
+        print_summary(&total_stats);
+    }
+
+    // Granular exit codes
     if total_stats.errors > 0 {
-        std::process::exit(1);
+        if total_stats.files_copied > 0 {
+            std::process::exit(1);  // Partial success
+        } else {
+            std::process::exit(2);  // Complete failure
+        }
     }
     Ok(())
 }
@@ -554,142 +713,302 @@ fn cli_snap_main() -> anyhow::Result<()> {
                 crate::version_store::print_store_stats(&stats, &p);
             }
         }
-        SnapCommand::Export { path, output, compress, timestamp } => {
+        SnapCommand::Export { path, output, compress, timestamp, format } => {
             let p = std::path::PathBuf::from(&path);
             let store = crate::version_store::VersionStore::open(&p);
             let ts_filter = timestamp.as_deref();
 
-            if let Some(ref out_path) = output {
-                let file = std::fs::File::create(out_path)
-                    .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", out_path, e))?;
-                let stats = store.export(file, &compress, ts_filter)?;
-                info!("Exported to {}: {} snapshots, {} unique files",
-                      out_path, stats.snapshots_exported, stats.unique_chunks);
+            if format == "tar" {
+                // Legacy tar format
+                if let Some(ref out_path) = output {
+                    let file = std::fs::File::create(out_path)
+                        .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", out_path, e))?;
+                    let stats = store.export(file, &compress, ts_filter)?;
+                    info!("Exported to {} (tar): {} snapshots, {} unique files",
+                          out_path, stats.snapshots_exported, stats.unique_chunks);
+                } else {
+                    let stdout = std::io::stdout().lock();
+                    let stats = store.export(stdout, &compress, ts_filter)?;
+                    eprintln!("Exported {} snapshots, {} unique files ({} deduped)",
+                              stats.snapshots_exported, stats.unique_chunks, stats.dedup_chunks);
+                }
             } else {
-                let stdout = std::io::stdout().lock();
-                let stats = store.export(stdout, &compress, ts_filter)?;
-                eprintln!("Exported {} snapshots, {} unique files ({} deduped)",
-                          stats.snapshots_exported, stats.unique_chunks, stats.dedup_chunks);
+                // FXAR v2 (default)
+                if let Some(ref out_path) = output {
+                    let file = std::fs::File::create(out_path)
+                        .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", out_path, e))?;
+                    let stats = crate::fxar::write_archive_seekable(&store, file, &compress, ts_filter)?;
+                    info!("Exported to {} (FXAR v2): {} snapshots, {} files, {} unique chunks, {:.1}% dedup",
+                          out_path, stats.snapshots_exported, stats.total_files,
+                          stats.unique_chunks, stats.dedup_ratio() * 100.0);
+                } else {
+                    let stdout = std::io::stdout().lock();
+                    let stats = crate::fxar::write_archive(&store, stdout, &compress, ts_filter)?;
+                    eprintln!("Exported {} snapshots, {} files ({} unique chunks, {:.1}% dedup)",
+                              stats.snapshots_exported, stats.total_files,
+                              stats.unique_chunks, stats.dedup_ratio() * 100.0);
+                }
             }
         }
         SnapCommand::Import { path, input, compress } => {
             let p = std::path::PathBuf::from(&path);
-            let store = crate::version_store::VersionStore::open(&p);
-
-            // Auto-detect compression from file extension
-            let comp = if compress == "auto" {
-                if let Some(ref inp) = input {
-                    if inp.ends_with(".zst") || inp.ends_with(".zstd") { "zstd" }
-                    else if inp.ends_with(".lz4") { "lz4" }
-                    else if inp.ends_with(".gz") { "gzip" }
-                    else if inp.ends_with(".xz") { "xz" }
-                    else { "none" }
-                } else { "none" }
-            } else { &compress };
 
             if let Some(ref in_path) = input {
-                let file = std::fs::File::open(in_path)
+                // Auto-detect: peek at magic bytes
+                let mut file = std::fs::File::open(in_path)
                     .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", in_path, e))?;
-                let stats = store.import(file, comp)?;
-                info!("Imported from {}: {} files restored", in_path, stats.files_restored);
+                let mut magic = [0u8; 4];
+                use std::io::Read;
+                file.read_exact(&mut magic)
+                    .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", in_path, e))?;
+
+                if &magic == b"FXAR" {
+                    // FXAR v2 format — re-open for seekable reader
+                    drop(file);
+                    let file = std::fs::File::open(in_path)
+                        .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", in_path, e))?;
+                    let mut reader = crate::fxar::FxarReader::open(file)
+                        .map_err(|e| anyhow::anyhow!("FXAR open: {}", e))?;
+                    let stats = reader.restore_all(&p)
+                        .map_err(|e| anyhow::anyhow!("FXAR import: {}", e))?;
+                    info!("Imported from {} (FXAR v2): {} files, {} bytes",
+                          in_path, stats.files_restored, stats.bytes_restored);
+                } else {
+                    // Legacy tar format — re-open
+                    drop(file);
+                    let file = std::fs::File::open(in_path)
+                        .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", in_path, e))?;
+                    let store = crate::version_store::VersionStore::open(&p);
+                    let comp = if compress == "auto" {
+                        if in_path.ends_with(".zst") || in_path.ends_with(".zstd") { "zstd" }
+                        else if in_path.ends_with(".lz4") { "lz4" }
+                        else if in_path.ends_with(".gz") { "gzip" }
+                        else if in_path.ends_with(".xz") { "xz" }
+                        else { "none" }
+                    } else { &compress };
+                    let stats = store.import(file, comp)?;
+                    info!("Imported from {} (tar): {} files restored", in_path, stats.files_restored);
+                }
             } else {
+                // stdin — try streaming FXAR first, fall back to tar
                 let stdin = std::io::stdin().lock();
-                let stats = store.import(stdin, comp)?;
-                info!("Imported {} files from stdin", stats.files_restored);
+                let mut buf_reader = std::io::BufReader::new(stdin);
+                let mut magic = [0u8; 4];
+                use std::io::Read;
+                buf_reader.read_exact(&mut magic)
+                    .map_err(|e| anyhow::anyhow!("Cannot read stdin: {}", e))?;
+
+                if &magic == b"FXAR" {
+                    // Chain magic bytes back with remaining stream
+                    let chain = std::io::Cursor::new(magic.to_vec()).chain(buf_reader);
+                    let stats = crate::fxar::read_archive_stream(chain, &p)
+                        .map_err(|e| anyhow::anyhow!("FXAR stream import: {}", e))?;
+                    info!("Imported from stdin (FXAR v2): {} files", stats.files_restored);
+                } else {
+                    // tar fallback
+                    let store = crate::version_store::VersionStore::open(&p);
+                    let comp = if compress == "auto" { "none" } else { &compress };
+                    let chain = std::io::Cursor::new(magic.to_vec()).chain(buf_reader);
+                    let stats = store.import(chain, comp)?;
+                    info!("Imported from stdin (tar): {} files", stats.files_restored);
+                }
             }
         }
         SnapCommand::Inspect { archive, list, json, file } => {
-            let f = std::fs::File::open(&archive)
+            // Auto-detect format
+            let mut f = std::fs::File::open(&archive)
                 .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
-            let comp = if archive.ends_with(".zst") { "zstd" }
-                       else if archive.ends_with(".lz4") { "lz4" }
-                       else if archive.ends_with(".gz") { "gzip" }
-                       else if archive.ends_with(".xz") { "xz" }
-                       else { "none" };
-            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+            let mut magic = [0u8; 4];
+            use std::io::Read;
+            f.read_exact(&mut magic)
+                .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", archive, e))?;
+            drop(f);
 
-            let filtered: Vec<_> = if let Some(ref pattern) = file {
-                entries.into_iter().filter(|e| e.path.contains(pattern)).collect()
-            } else {
-                entries
-            };
+            if &magic == b"FXAR" {
+                // FXAR v2 inspect
+                let f = std::fs::File::open(&archive)
+                    .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+                let result = crate::fxar::inspect_archive(f)
+                    .map_err(|e| anyhow::anyhow!("FXAR inspect: {}", e))?;
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&filtered).unwrap_or_default());
-            } else if list {
-                for e in &filtered {
-                    let marker = if e.is_dedup_ref { " [dedup]" }
-                                 else if e.is_metadata { " [meta]" }
-                                 else { "" };
-                    println!("{:>10}  {}{}", e.size, e.path, marker);
+                let filtered: Vec<_> = if let Some(ref pattern) = file {
+                    result.files.iter().filter(|f| f.path.contains(pattern)).collect()
+                } else {
+                    result.files.iter().collect()
+                };
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+                } else if list {
+                    for f in &filtered {
+                        println!("{:>10}  {}  [{}]", f.size, f.path, &f.blake3[..16]);
+                    }
+                    println!("\n{} files, {} chunks ({:.1}% dedup ratio)",
+                             filtered.len(), result.chunk_count, result.dedup_ratio * 100.0);
+                } else {
+                    println!("Archive: {} (FXAR v2)", archive);
+                    println!("  Format:      FXAR v{}", result.version);
+                    println!("  Snapshots:   {}", result.snapshots.len());
+                    println!("  Files:       {}", result.total_files);
+                    println!("  Unique files:{}", result.unique_files);
+                    println!("  Chunks:      {}", result.chunk_count);
+                    println!("  Apparent:    {} bytes", result.total_apparent_bytes);
+                    println!("  Chunk data:  {} bytes", result.total_chunk_bytes);
+                    println!("  Compressed:  {} bytes", result.total_compressed_bytes);
+                    println!("  Dedup ratio: {:.1}%", result.dedup_ratio * 100.0);
+                    for snap in &result.snapshots {
+                        println!("  Snapshot:    {}", snap);
+                    }
                 }
-                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
-                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
-                println!("\n{} files, {} dedup references", total_files, dedup_refs);
             } else {
-                let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
-                let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
-                let total_size: u64 = filtered.iter().map(|e| e.size).sum();
-                println!("Archive: {}", archive);
-                println!("  Files:       {}", total_files);
-                println!("  Dedup refs:  {}", dedup_refs);
-                println!("  Total size:  {} bytes", total_size);
+                // Legacy tar inspect
+                let f = std::fs::File::open(&archive)
+                    .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+                let comp = if archive.ends_with(".zst") { "zstd" }
+                           else if archive.ends_with(".lz4") { "lz4" }
+                           else if archive.ends_with(".gz") { "gzip" }
+                           else if archive.ends_with(".xz") { "xz" }
+                           else { "none" };
+                let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+                let filtered: Vec<_> = if let Some(ref pattern) = file {
+                    entries.into_iter().filter(|e| e.path.contains(pattern)).collect()
+                } else {
+                    entries
+                };
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&filtered).unwrap_or_default());
+                } else if list {
+                    for e in &filtered {
+                        let marker = if e.is_dedup_ref { " [dedup]" }
+                                     else if e.is_metadata { " [meta]" }
+                                     else { "" };
+                        println!("{:>10}  {}{}", e.size, e.path, marker);
+                    }
+                    let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                    let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                    println!("\n{} files, {} dedup references", total_files, dedup_refs);
+                } else {
+                    let total_files = filtered.iter().filter(|e| !e.is_dedup_ref && !e.is_metadata).count();
+                    let dedup_refs = filtered.iter().filter(|e| e.is_dedup_ref).count();
+                    let total_size: u64 = filtered.iter().map(|e| e.size).sum();
+                    println!("Archive: {} (tar)", archive);
+                    println!("  Files:       {}", total_files);
+                    println!("  Dedup refs:  {}", dedup_refs);
+                    println!("  Total size:  {} bytes", total_size);
+                }
             }
         }
-        SnapCommand::Restore { archive, file, date, latest, all_versions, output } => {
-            let f = std::fs::File::open(&archive)
+        SnapCommand::Restore { archive, file, date, latest, all_versions: _, output } => {
+            // Auto-detect format
+            let mut f = std::fs::File::open(&archive)
                 .map_err(|e| anyhow::anyhow!("Cannot open {}: {}", archive, e))?;
-            let comp = if archive.ends_with(".zst") { "zstd" }
-                       else if archive.ends_with(".lz4") { "lz4" }
-                       else if archive.ends_with(".gz") { "gzip" }
-                       else if archive.ends_with(".xz") { "xz" }
-                       else { "none" };
-            let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+            let mut magic = [0u8; 4];
+            use std::io::Read;
+            f.read_exact(&mut magic)
+                .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", archive, e))?;
+            drop(f);
 
-            // Filter entries by file pattern and date
-            let mut matched: Vec<_> = entries.into_iter()
-                .filter(|e| !e.is_metadata && !e.is_dedup_ref)
-                .filter(|e| {
-                    if let Some(ref pattern) = file {
-                        glob::Pattern::new(pattern).map(|p| p.matches(&e.path)).unwrap_or(false)
-                            || e.path.contains(pattern)
-                    } else { true }
-                })
-                .filter(|e| {
-                    if let Some(ref d) = date { e.path.contains(d) }
-                    else { true }
-                })
-                .collect();
-
-            if latest {
-                matched.sort_by(|a, b| b.path.cmp(&a.path));
-                matched.truncate(1);
-            }
-
-            if matched.is_empty() {
-                anyhow::bail!("No matching files found in archive");
-            }
-
-            info!("Restoring {} files to {}", matched.len(), output);
-
-            // Re-open archive and extract matched files
-            let f2 = std::fs::File::open(&archive)
-                .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
-            let decompressed = crate::version_store::wrap_import_decompressor(f2, comp);
-            let mut tar_archive = tar::Archive::new(decompressed);
-            let match_paths: std::collections::HashSet<String> = matched.iter().map(|e| e.path.clone()).collect();
             let out_dir = std::path::PathBuf::from(&output);
 
-            for entry in tar_archive.entries().map_err(|e| anyhow::anyhow!("tar error: {}", e))? {
-                let mut entry = match entry { Ok(e) => e, Err(_) => continue };
-                let path = entry.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                if match_paths.contains(&path) {
-                    let dest = out_dir.join(std::path::Path::new(&path).file_name().unwrap_or_default());
+            if &magic == b"FXAR" {
+                // FXAR v2 restore
+                let f = std::fs::File::open(&archive)
+                    .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+                let mut reader = crate::fxar::FxarReader::open(f)
+                    .map_err(|e| anyhow::anyhow!("FXAR open: {}", e))?;
+                let manifest = reader.read_manifest()
+                    .map_err(|e| anyhow::anyhow!("FXAR manifest: {}", e))?;
+
+                let mut matched: Vec<_> = manifest.files.iter()
+                    .filter(|e| {
+                        if let Some(ref pattern) = file {
+                            glob::Pattern::new(pattern).map(|p| p.matches(&e.path)).unwrap_or(false)
+                                || e.path.contains(pattern)
+                        } else { true }
+                    })
+                    .filter(|e| {
+                        if let Some(ref d) = date { e.path.contains(d) }
+                        else { true }
+                    })
+                    .cloned()
+                    .collect();
+
+                if latest {
+                    matched.sort_by(|a, b| b.path.cmp(&a.path));
+                    matched.truncate(1);
+                }
+
+                if matched.is_empty() {
+                    anyhow::bail!("No matching files found in archive");
+                }
+
+                info!("Restoring {} files to {}", matched.len(), output);
+
+                for entry in &matched {
+                    let data = reader.restore_file(&entry.path)
+                        .map_err(|e| anyhow::anyhow!("FXAR restore {}: {}", entry.path, e))?;
+                    let dest = out_dir.join(std::path::Path::new(&entry.path).file_name().unwrap_or_default());
                     if let Some(parent) = dest.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    entry.unpack(&dest).map_err(|e| anyhow::anyhow!("unpack error: {}", e))?;
-                    info!("Restored: {}", dest.display());
+                    std::fs::write(&dest, &data)?;
+                    info!("Restored: {} ({} bytes, BLAKE3 verified)", dest.display(), data.len());
+                }
+            } else {
+                // Legacy tar restore
+                let f = std::fs::File::open(&archive)
+                    .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+                let comp = if archive.ends_with(".zst") { "zstd" }
+                           else if archive.ends_with(".lz4") { "lz4" }
+                           else if archive.ends_with(".gz") { "gzip" }
+                           else if archive.ends_with(".xz") { "xz" }
+                           else { "none" };
+                let entries = crate::version_store::VersionStore::inspect_archive(f, comp)?;
+
+                let mut matched: Vec<_> = entries.into_iter()
+                    .filter(|e| !e.is_metadata && !e.is_dedup_ref)
+                    .filter(|e| {
+                        if let Some(ref pattern) = file {
+                            glob::Pattern::new(pattern).map(|p| p.matches(&e.path)).unwrap_or(false)
+                                || e.path.contains(pattern)
+                        } else { true }
+                    })
+                    .filter(|e| {
+                        if let Some(ref d) = date { e.path.contains(d) }
+                        else { true }
+                    })
+                    .collect();
+
+                if latest {
+                    matched.sort_by(|a, b| b.path.cmp(&a.path));
+                    matched.truncate(1);
+                }
+
+                if matched.is_empty() {
+                    anyhow::bail!("No matching files found in archive");
+                }
+
+                info!("Restoring {} files to {}", matched.len(), output);
+
+                let f2 = std::fs::File::open(&archive)
+                    .map_err(|e| anyhow::anyhow!("Cannot reopen {}: {}", archive, e))?;
+                let decompressed = crate::version_store::wrap_import_decompressor(f2, comp);
+                let mut tar_archive = tar::Archive::new(decompressed);
+                let match_paths: std::collections::HashSet<String> = matched.iter().map(|e| e.path.clone()).collect();
+
+                for entry in tar_archive.entries().map_err(|e| anyhow::anyhow!("tar error: {}", e))? {
+                    let mut entry = match entry { Ok(e) => e, Err(_) => continue };
+                    let path = entry.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    if match_paths.contains(&path) {
+                        let dest = out_dir.join(std::path::Path::new(&path).file_name().unwrap_or_default());
+                        if let Some(parent) = dest.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        entry.unpack(&dest).map_err(|e| anyhow::anyhow!("unpack error: {}", e))?;
+                        info!("Restored: {}", dest.display());
+                    }
                 }
             }
         }
@@ -929,6 +1248,17 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
     std::fs::create_dir_all(destination)?;
     let destination = destination.canonicalize()?;
 
+    // Pre-flight disk space check — abort early if target is critically low
+    if let Some(avail) = check_available_space(&destination) {
+        const MIN_FREE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB minimum
+        if avail < MIN_FREE_BYTES {
+            return Err(crate::FxcpError::Config(format!(
+                "target {:?} has only {} bytes free (need at least 10 MB)",
+                destination, avail
+            )));
+        }
+    }
+
     let _src_caps = probe_capabilities(&source);
     let dst_caps = probe_capabilities(&destination);
 
@@ -990,6 +1320,22 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
     let filter_rules = crate::filter::FilterRules::new(&opts.exclude, &opts.include);
 
     constants::ONE_SHOT_MODE.store(true, Ordering::Relaxed);
+
+    // Pre-count files and bytes for progress reporting
+    if let Some(ref progress) = *ACTIVE_PROGRESS.lock() {
+        let mut total_files = 0u64;
+        let mut total_bytes = 0u64;
+        for entry in walkdir::WalkDir::new(&source).follow_links(false) {
+            if let Ok(e) = entry {
+                if e.file_type().is_file() {
+                    total_files += 1;
+                    total_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        progress.files_total.store(total_files, Ordering::Relaxed);
+        progress.bytes_total.store(total_bytes, Ordering::Relaxed);
+    }
 
     let mut copier = create_copier(&source, &destination).await?;
     let mut stats = SyncStats::default();
@@ -1070,12 +1416,13 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
             true
         };
 
-        if !needs_copy { stats.files_skipped += 1; continue; }
+        if !needs_copy { stats.files_skipped += 1; record_file_progress(0); continue; }
 
         if opts.dry_run {
             info!("copy {:?} -> {:?} ({})", src_path, dst_path, src_meta.len());
             stats.files_copied += 1;
             stats.bytes_copied += src_meta.len();
+            record_file_progress(src_meta.len());
             continue;
         }
 
@@ -1146,7 +1493,22 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
                                     continue;
                                 }
                                 Err(e) => {
-                                    debug!("NFS bypass write failed for {:?}: {} — VFS fallback", src_path, e);
+                                    debug!("NFS bypass write failed for {:?}: {} — attempting recovery", src_path, e);
+                                    // Try session recovery + retry once
+                                    if client.recover_session().is_ok() {
+                                        if let Ok(h) = client.get_or_resolve_handle(&full_parent) {
+                                            if let Ok(()) = client.write_file(
+                                                &h, &fname, &data,
+                                                src_meta.mode(), src_meta.uid(), src_meta.gid(),
+                                                (src_meta.mtime(), src_meta.mtime_nsec()),
+                                            ) {
+                                                stats.files_nfs_bypass += 1;
+                                                stats.bytes_nfs_bypass += file_size;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    debug!("NFS bypass recovery failed — VFS fallback");
                                 }
                             }
                         }
@@ -1215,6 +1577,7 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
             Ok(copy_stats) => {
                 stats.files_copied += 1;
                 stats.bytes_copied += copy_stats.bytes_processed;
+                record_file_progress(copy_stats.bytes_processed);
                 if opts.archive { let _ = preserve_metadata(src_path, &dst_path); }
                 if opts.generate_sigs {
                     if store_foxing_signatures(&dst_path).is_ok() { stats.sigs_stored += 1; }

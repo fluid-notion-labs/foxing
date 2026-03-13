@@ -5,7 +5,7 @@ After=network.target local-fs.target
 Wants=network.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/foxingd daemon --config /etc/foxing/config.toml
 Restart=on-failure
 RestartSec=5

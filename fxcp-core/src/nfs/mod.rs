@@ -18,6 +18,7 @@ pub mod client;
 
 pub use mount::NfsBypassInfo;
 pub use client::NfsCompoundClient;
+pub use client::NfsClientPool;
 
 /// Maximum file size eligible for NFS compound bypass (16MB).
 pub const NFS_BYPASS_MAX_SIZE: u64 = 16 * 1024 * 1024;

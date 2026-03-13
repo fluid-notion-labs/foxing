@@ -1,6 +1,6 @@
 # Foxing Snapshots & Export Guide
 
-**Version:** 0.7.1
+**Version:** 0.8.1
 
 ## Overview
 
@@ -195,9 +195,42 @@ fxcp snap copy /backup/data/database.db 42 /tmp/old.db  # Extract without revert
 
 ## Export & Import (.fxar)
 
+### FXAR v2 Archive Format (v0.8.1+)
+
+FXAR v2 replaces the original tar+whole-file-dedup format with true chunk-level content-addressable storage:
+
+```
+FXAR v2 Archive (.fxar)
++----------------------------------------------+
+| HEADER (64 bytes)                            |
+|   magic: "FXAR", version: 2, flags,         |
+|   chunk params, section offsets              |
++----------------------------------------------+
+| MANIFEST (JSON, zstd-compressed)             |
+|   File metadata + chunk index references     |
++----------------------------------------------+
+| CHUNK INDEX (binary, 48 bytes per entry)     |
+|   BLAKE3 hash + size + offset + compressed   |
++----------------------------------------------+
+| CHUNK DATA (per-chunk compressed)            |
++----------------------------------------------+
+| FOOTER (32 bytes, streaming mode only)       |
++----------------------------------------------+
+```
+
+**Chunking:** Gear-hash rolling chunker with configurable boundaries (2KB min, 64KB average, 2MB max). Content-defined boundaries survive insertions/deletions for high cross-snapshot dedup.
+
+**Dedup:** In-memory `HashMap<[u8;32], u64>` tracks unique chunks by BLAKE3 hash. Identical chunks across snapshots are stored once.
+
+**Seekable mode:** Header contains section offsets for random-access file restore. **Streaming mode:** Footer appended for pipe transport (`export | ssh import`).
+
+**Format auto-detection:** Import, inspect, and restore commands detect FXAR v2 (`FXAR` magic) vs tar archives automatically.
+
+**Backward compatibility:** `--format tar` flag produces legacy tar+whole-file-dedup archives.
+
 ### Creating Archives
 
-Export snapshots as a portable `.fxar` archive with content-addressable BLAKE3 chunk deduplication:
+Export snapshots as a portable `.fxar` archive (FXAR v2 by default, chunk-level dedup):
 
 ```bash
 # Export all snapshots with zstd compression (default)

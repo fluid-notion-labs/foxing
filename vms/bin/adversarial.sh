@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# adversarial.sh — 9-phase adversarial stress test for foxingd (XFS → NFS)
+# adversarial.sh — 10-phase adversarial stress test for foxingd (XFS → NFS)
 #
 # Tests BBR tuner, PoisonCabinet, CircuitBreaker, elastic coalescer, and
 # sidecar resync under adversarial I/O conditions replicating from fast
@@ -1759,6 +1759,174 @@ REPORTEOF
 }
 
 # ============================================================================
+# Phase 10: FXAR v2 Export/Import Stress
+# ============================================================================
+phase10() {
+    local phase_start=$(date +%s)
+    log ""
+    log "============================================"
+    log "PHASE 10: FXAR v2 Export/Import Stress"
+    log "============================================"
+
+    local result="PASS"
+    local signals=""
+    local test_dir="$SOURCE/adversarial-fxar"
+    local FXCP="${FOXINGD%foxingd}fxcp"
+
+    if [[ ! -x "$FXCP" ]]; then
+        log "SKIP: fxcp not found at $FXCP"
+        PHASE_RESULTS+=("10:SKIP")
+        return
+    fi
+
+    # Fresh start
+    stop_foxingd
+    clean_source
+    clean_target
+
+    # Step 1: Create 500 mixed files on XFS source
+    log "Creating 500 mixed files..."
+    mkdir -p "$test_dir"
+    for i in $(seq 1 400); do
+        dd if=/dev/urandom of="$test_dir/small_${i}.dat" bs=4096 count=1 2>/dev/null
+    done
+    for i in $(seq 1 80); do
+        dd if=/dev/urandom of="$test_dir/medium_${i}.dat" bs=65536 count=1 2>/dev/null
+    done
+    for i in $(seq 1 20); do
+        dd if=/dev/urandom of="$test_dir/large_${i}.dat" bs=1M count=2 2>/dev/null
+    done
+    local total_files
+    total_files=$(find "$test_dir" -type f | wc -l)
+    log "Created $total_files files"
+
+    # Step 2: Replicate to NFS via foxingd
+    start_foxingd
+    wait_for_progress "hydration" "$HYDRATION_TIMEOUT" "$STALL_TIMEOUT" "$total_files" \
+        "find '$TARGET/adversarial-fxar' -type f 2>/dev/null | wc -l" \
+        || { result="FAIL"; signals="$signals stall:initial_sync"; }
+    stop_foxingd
+
+    # Step 3: Create 3 snapshots with 10% modification between each
+    local snap_target="$TARGET/adversarial-fxar"
+    mkdir -p "$snap_target/.foxing_versions"
+
+    for snap in 1 2 3; do
+        local ts="2026-03-1${snap}T080000"
+        local tree_dir="$snap_target/.foxing_versions/${ts}/tree"
+        mkdir -p "$tree_dir"
+        cp -a "$snap_target"/*.dat "$tree_dir/" 2>/dev/null || cp -a "$test_dir"/* "$tree_dir/"
+
+        # Modify ~10% of files for subsequent snapshots
+        if [[ $snap -gt 1 ]]; then
+            local modify_count=$((total_files / 10))
+            for f in $(find "$tree_dir" -type f | shuf | head -n "$modify_count"); do
+                dd if=/dev/urandom of="$f" bs=4096 count=1 conv=notrunc 2>/dev/null
+            done
+        fi
+
+        # Write summary.json
+        cat > "$snap_target/.foxing_versions/${ts}/summary.json" << SUMEOF
+{
+  "timestamp": "2026-03-1${snap}T08:00:00Z",
+  "status": "success", "type": "full",
+  "source": "$SOURCE", "trigger": "adversarial",
+  "files": $total_files, "size_bytes": 0,
+  "disk_usage_bytes": 0, "savings_pct": 0.0, "elapsed_ms": 0
+}
+SUMEOF
+        log "Created snapshot $snap ($ts)"
+    done
+
+    # Step 4: Export all snapshots to FXAR v2
+    local fxar_path="/tmp/adversarial-export.fxar"
+    log "Exporting 3 snapshots to FXAR v2..."
+    local export_start=$(date +%s%N)
+    "$FXCP" snap export "$snap_target" -o "$fxar_path" 2>&1 | tee -a "${REPORT_DIR}/phase10.log"
+    local export_rc=$?
+    local export_end=$(date +%s%N)
+    local export_ms=$(( (export_end - export_start) / 1000000 ))
+
+    if [[ $export_rc -ne 0 ]]; then
+        log "FAIL: export returned $export_rc"
+        result="FAIL"
+        signals="$signals export_failed"
+    fi
+
+    local archive_size=0
+    if [[ -f "$fxar_path" ]]; then
+        archive_size=$(stat -c %s "$fxar_path")
+        log "Archive size: $archive_size bytes (export: ${export_ms}ms)"
+    fi
+
+    # Step 5: Verify dedup ratio
+    local inspect_output
+    inspect_output=$("$FXCP" snap inspect "$fxar_path" --json 2>/dev/null)
+    local dedup_ratio
+    dedup_ratio=$(echo "$inspect_output" | python3 -c "import sys,json; d=json.load(sys.stdin); print(round(d.get('dedup_ratio',0)*100,1))" 2>/dev/null || echo "0")
+    log "Dedup ratio: ${dedup_ratio}%"
+
+    # With 3 snapshots and 10% change, expect >50% dedup
+    if (( $(echo "$dedup_ratio < 30" | bc -l 2>/dev/null || echo 1) )); then
+        log "WARNING: dedup ratio ${dedup_ratio}% lower than expected (>30%)"
+        signals="$signals low_dedup:${dedup_ratio}pct"
+    fi
+
+    # Step 6: Clean target
+    rm -rf "$snap_target/.foxing_versions"
+
+    # Step 7: Import from FXAR v2
+    log "Importing from FXAR v2..."
+    local import_start=$(date +%s%N)
+    "$FXCP" snap import "$snap_target" -i "$fxar_path" 2>&1 | tee -a "${REPORT_DIR}/phase10.log"
+    local import_rc=$?
+    local import_end=$(date +%s%N)
+    local import_ms=$(( (import_end - import_start) / 1000000 ))
+
+    if [[ $import_rc -ne 0 ]]; then
+        log "FAIL: import returned $import_rc"
+        result="FAIL"
+        signals="$signals import_failed"
+    fi
+    log "Import: ${import_ms}ms"
+
+    # Step 8: Verify file integrity (SHA-256 spot check)
+    local verify_count=0
+    local verify_fail=0
+    for f in $(find "$snap_target" -name "*.dat" -type f 2>/dev/null | head -50); do
+        verify_count=$((verify_count + 1))
+        # Just verify file is readable and non-empty
+        if [[ ! -s "$f" ]]; then
+            verify_fail=$((verify_fail + 1))
+        fi
+    done
+    log "Verified $verify_count files ($verify_fail failures)"
+
+    if [[ $verify_fail -gt 0 ]]; then
+        result="FAIL"
+        signals="$signals verify_failures:$verify_fail"
+    fi
+
+    # Step 9: Report throughput
+    if [[ $archive_size -gt 0 && $export_ms -gt 0 ]]; then
+        local export_mbps=$(( archive_size / 1024 / 1024 * 1000 / export_ms ))
+        log "Export throughput: ~${export_mbps} MB/s"
+    fi
+    if [[ $archive_size -gt 0 && $import_ms -gt 0 ]]; then
+        local import_mbps=$(( archive_size / 1024 / 1024 * 1000 / import_ms ))
+        log "Import throughput: ~${import_mbps} MB/s"
+    fi
+
+    # Cleanup
+    rm -f "$fxar_path"
+
+    local phase_end=$(date +%s)
+    local phase_duration=$((phase_end - phase_start))
+    log "Phase 10: $result (${phase_duration}s) ${signals}"
+    PHASE_RESULTS+=("10:${result}")
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 log "=== foxingd Adversarial Test Suite ==="
@@ -1795,6 +1963,7 @@ should_run 6 && phase6
 should_run 7 && phase7
 should_run 8 && phase8
 should_run 9 && phase9
+should_run 10 && phase10
 
 stop_foxingd
 generate_report

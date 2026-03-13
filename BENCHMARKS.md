@@ -1,9 +1,60 @@
 # Foxing Performance Benchmarks
 
-**Version:** 0.7.2
-**Date:** 2026-03-12
+**Version:** 0.8.1
+**Date:** 2026-03-13
 **Rust:** nightly (1.96+), edition 2024
-**Build profiles:** `release` (opt-level 3, strip, thin LTO) · `release-debug` (same + debuginfo, no strip)
+**Build profiles:** `release` (opt-level 3, strip, thin LTO, target-cpu=native) · `release-debug` (same + debuginfo, no strip)
+
+## v0.8.1 Features
+
+- **FXAR v2 archive format**: Gear-hash variable chunking (2KB min, 64KB avg, 2MB max) + BLAKE3 content-addressable storage + 64-byte binary header + fixed-size chunk index (48B/entry). Replaces v1's tar+whole-file-dedup with true chunk-level deduplication.
+- **Parallel export pipeline**: Rayon-parallelized file read + gear-hash chunking + zstd compression. Files processed concurrently, dedup merge single-threaded.
+- **Pipelined import**: Background chunk loader (sequential reads from archive) + rayon consumer threads (parallel file reconstruction + BLAKE3 verify + write). Overlaps I/O with decompression.
+- **NFS session pool**: `NfsClientPool` opens 4 independent NFSv4.2 sessions for parallel compound RPCs during import. SETATTR in write compound sets uid/gid/mtime in one round-trip.
+- **Session recovery**: NFS bypass paths (sync + FXAR import) retry once with `recover_session()` on BADSESSION/stale handle errors.
+- **Pre-flight disk space checks**: Import and sync abort early if target statvfs reports insufficient free space.
+- **`target-cpu=native`**: `.cargo/config.toml` enables AVX2/AVX-512 vectorization for Rust-generated code (memcpy, gear hash, lz4_flex). BLAKE3 and zstd already used SIMD assembly.
+- **xattr restoration**: Import restores `user.foxing.*` xattrs (BLAKE3 merkle signatures preserved across export/import).
+
+### FXAR v2 Export/Import Performance
+
+**Platform:** fox-test VM (4 vCPU Xeon Gold 6130, 16GB RAM, Fedora 43, kernel 6.18.5)
+**Source:** Snapshot trees on NFS 4.2 (HDD-backed)
+**Workload:** 1500 files across 3 snapshots, 146 MB apparent, 10% change between snapshots
+
+| Operation | Throughput | Time | Details |
+|-----------|-----------|------|---------|
+| Export | **123 MB/s** | 401ms | Rayon parallel chunking + zstd:3 compression |
+| Import (NFS, 4-session pool) | **61 MB/s** | 784ms | Pipelined chunks, NFS compound RPC |
+| Import (NFS, VFS only) | **64 MB/s** | 732ms | Pipelined chunks, kernel NFS client |
+| Import (local XFS) | >200 MB/s | <100ms | Pipelined chunks, direct write |
+
+### FXAR v2 Dedup Comparison
+
+| Format | Archive Size | Dedup Ratio | Notes |
+|--------|:-----------:|:----------:|-------|
+| tar.zst (no dedup) | ~220 MB | 0% | Full copies, zstd compressed |
+| FXAR v1 (whole-file) | ~100 MB | 50% | Identical files deduplicated |
+| **FXAR v2 (chunk CAS)** | **~50 MB** | **65.6%** | Only unique chunks stored |
+| FXAR v2 (10 snaps, 1% change) | ~5.5 MB | **96%** | Chunk boundaries survive edits |
+
+### Import Performance Evolution
+
+| Version | Import Throughput | Key Optimization |
+|---------|:----------------:|-----------------|
+| v0.8.1 initial | 26 MB/s | Single-threaded, VFS writes |
+| + rayon export | 26 MB/s | Export parallelized only |
+| + parallel restore_all | 59 MB/s | Rayon par_iter for file writes |
+| + NFS session pool (4) | 59 MB/s | 4 parallel compound RPCs |
+| + pipelining + native CPU | **61 MB/s** | Overlapped I/O + AVX2 |
+
+## v0.8.0 Features
+
+- **`fxcp -a --json`**: Structured JSON copy output (status, files_copied, bytes_copied, method_breakdown)
+- **`fxcp -a --progress`**: Live progress reporting (5Hz terminal updates, 1Hz JSON for agent consumption)
+- **Granular exit codes**: 0=success, 1=partial success (some files failed), 2=complete failure
+- **foxingd sd_notify**: `READY=1` for systemd `Type=notify` service integration
+- **SIGHUP scaffold**: Signal handler foundation for live config reload
 
 ## v0.7.1 Features
 

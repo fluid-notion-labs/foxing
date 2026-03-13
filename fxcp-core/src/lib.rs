@@ -23,6 +23,8 @@ pub mod version_store;
 pub mod browser;
 pub mod sync;
 pub mod tombstone;
+pub mod chunker;
+pub mod fxar;
 #[cfg(feature = "nfs-bypass")]
 pub mod nfs;
 

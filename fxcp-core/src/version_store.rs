@@ -536,6 +536,32 @@ impl VersionStore {
         Ok(stats)
     }
 
+    // ---- Snapshot directory enumeration ----
+
+    /// Collect snapshot directories for export. Returns paths to snapshot dirs.
+    pub fn collect_snap_dirs(&self, timestamp_filter: Option<&str>) -> crate::Result<Vec<std::path::PathBuf>> {
+        let snap_dirs: Vec<_> = if let Some(ts) = timestamp_filter {
+            let dir = self.root.join(ts);
+            if dir.exists() { vec![dir] } else {
+                return Err(crate::error::FxcpError::Config(format!("Snapshot not found: {}", ts)));
+            }
+        } else {
+            fs::read_dir(&self.root).ok()
+                .map(|entries| entries.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .filter(|e| parse_timestamp(&e.file_name().to_string_lossy()).is_some())
+                    .map(|e| e.path())
+                    .collect())
+                .unwrap_or_default()
+        };
+        Ok(snap_dirs)
+    }
+
+    /// Get the version store root path.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     // ---- Export / Import ----
 
     /// Export snapshots as a .fxar archive (content-addressable chunk-dedup).

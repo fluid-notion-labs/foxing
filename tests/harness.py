@@ -543,6 +543,107 @@ def run_workload_suite(
 
         log(f"    {result['status']} in {result['duration_ms']}ms", file=sys.stderr)
 
+    # --- FXAR Export/Import phase (fxcp only) ---
+    if "fxcp" in tool_names:
+        log(f"  [export/import] fxcp snap export→import roundtrip", file=sys.stderr)
+        src_dir = test_root / "source"
+        fxcp_dst = test_root / "target_fxcp"
+        fxar_path = test_root / "test_export.fxar"
+
+        # Ensure target has snapshots (create one if needed)
+        snap_dir = fxcp_dst / ".foxing_versions"
+        if not snap_dir.exists():
+            # Copy source files into a manual snapshot
+            snap_tree = snap_dir / "export-test" / "tree"
+            snap_tree.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["cp", "-a", f"{src_dir}/.", str(snap_tree)],
+                           capture_output=True, timeout=30)
+            # Write summary.json
+            import json as _json
+            summary = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "success", "type": "full",
+                "source": str(src_dir), "trigger": "harness",
+                "files": 0, "size_bytes": 0,
+                "disk_usage_bytes": 0, "savings_pct": 0.0, "elapsed_ms": 0
+            }
+            with open(snap_dir / "export-test" / "summary.json", "w") as f:
+                _json.dump(summary, f)
+
+        export_metrics = {}
+        try:
+            # Export to FXAR v2
+            t0 = time.monotonic()
+            export_result = subprocess.run(
+                [str(FXCP_BINARY), "snap", "export", str(fxcp_dst),
+                 "-o", str(fxar_path)],
+                capture_output=True, text=True, timeout=60
+            )
+            export_ms = round((time.monotonic() - t0) * 1000)
+            archive_size = fxar_path.stat().st_size if fxar_path.exists() else 0
+
+            export_metrics["export_duration_ms"] = export_ms
+            export_metrics["archive_size_bytes"] = archive_size
+            export_metrics["export_status"] = "PASS" if export_result.returncode == 0 else "FAIL"
+
+            # Import from FXAR v2
+            import_dst = test_root / "target_fxcp_imported"
+            import_dst.mkdir(parents=True, exist_ok=True)
+            t0 = time.monotonic()
+            import_result = subprocess.run(
+                [str(FXCP_BINARY), "snap", "import", str(import_dst),
+                 "-i", str(fxar_path)],
+                capture_output=True, text=True, timeout=60
+            )
+            import_ms = round((time.monotonic() - t0) * 1000)
+
+            export_metrics["import_duration_ms"] = import_ms
+            export_metrics["import_status"] = "PASS" if import_result.returncode == 0 else "FAIL"
+
+            # Inspect to get chunk stats
+            inspect_result = subprocess.run(
+                [str(FXCP_BINARY), "snap", "inspect", str(fxar_path), "--json"],
+                capture_output=True, text=True, timeout=30
+            )
+            if inspect_result.returncode == 0:
+                try:
+                    inspect_data = json.loads(inspect_result.stdout)
+                    export_metrics["chunk_count"] = inspect_data.get("chunk_count", 0)
+                    export_metrics["unique_files"] = inspect_data.get("unique_files", 0)
+                    export_metrics["dedup_ratio"] = inspect_data.get("dedup_ratio", 0.0)
+                    export_metrics["apparent_bytes"] = inspect_data.get("total_apparent_bytes", 0)
+                except json.JSONDecodeError:
+                    pass
+
+            overall_status = "PASS" if export_metrics.get("export_status") == "PASS" and \
+                                       export_metrics.get("import_status") == "PASS" else "FAIL"
+
+            tests.append({
+                "workload": workload_name,
+                "tool": "fxcp",
+                "phase": "export_import",
+                "status": overall_status,
+                "duration_ms": export_ms + import_ms,
+                "metrics": export_metrics,
+            })
+            comparisons_data.setdefault("export_import", {})["fxcp"] = export_ms + import_ms
+            log(f"    {overall_status} export={export_ms}ms import={import_ms}ms archive={archive_size}B", file=sys.stderr)
+
+        except (subprocess.TimeoutExpired, OSError) as e:
+            tests.append({
+                "workload": workload_name,
+                "tool": "fxcp",
+                "phase": "export_import",
+                "status": "FAIL",
+                "duration_ms": 0,
+                "error": str(e),
+            })
+            log(f"    FAIL: {e}", file=sys.stderr)
+
+        # Cleanup
+        shutil.rmtree(test_root / "target_fxcp_imported", ignore_errors=True)
+        fxar_path.unlink(missing_ok=True)
+
     # --- Build comparisons ---
     comparisons = []
     for phase, tool_times in comparisons_data.items():

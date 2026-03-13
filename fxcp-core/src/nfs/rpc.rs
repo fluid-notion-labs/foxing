@@ -267,22 +267,43 @@ fn encode_op(enc: &mut XdrEncoder, op: &Nfs4Op) {
             });
             enc.encode_opaque(data);
         }
-        Nfs4Op::SetAttr { stateid, mode, uid: _, gid: _, mtime: _ } => {
+        Nfs4Op::SetAttr { stateid, mode, uid, gid, mtime } => {
             enc.encode_u32(OP_SETATTR);
             // stateid4
             enc.encode_u32(stateid.seqid);
             enc.encode_opaque_fixed(&stateid.other);
             // fattr4 bitmap + values
+            // Attributes must be encoded in bitmap order within each word.
+            // Word 1 bit positions: MODE=1, OWNER=4, OWNER_GROUP=5, TIME_MODIFY_SET=20
             let mut bitmap_w1: u32 = 0;
             if mode.is_some() { bitmap_w1 |= 1 << (FATTR4_MODE - 32); }
+            if uid.is_some() { bitmap_w1 |= 1 << (FATTR4_OWNER - 32); }
+            if gid.is_some() { bitmap_w1 |= 1 << (FATTR4_OWNER_GROUP - 32); }
+            if mtime.is_some() { bitmap_w1 |= 1 << (FATTR4_TIME_MODIFY_SET - 32); }
             // Encode bitmap
             enc.encode_u32(2);   // 2 bitmap words
             enc.encode_u32(0);   // word 0
             enc.encode_u32(bitmap_w1); // word 1
-            // attr_vals
-            let mut attr = XdrEncoder::new(32);
+            // attr_vals — must be in bitmap bit order (MODE < OWNER < OWNER_GROUP < TIME_MODIFY_SET)
+            let mut attr = XdrEncoder::new(64);
             if let Some(m) = mode {
                 attr.encode_u32(*m);
+            }
+            if let Some(u) = uid {
+                // NFSv4 OWNER is a UTF-8 string; numeric string for AUTH_SYS
+                let owner_str = u.to_string();
+                attr.encode_string(&owner_str);
+            }
+            if let Some(g) = gid {
+                let group_str = g.to_string();
+                attr.encode_string(&group_str);
+            }
+            if let Some((secs, nsecs)) = mtime {
+                // set_it = SET_TO_CLIENT_TIME4 (1)
+                attr.encode_u32(1);
+                // nfstime4: seconds (i64) + nseconds (u32)
+                attr.encode_u64(*secs as u64);
+                attr.encode_u32(*nsecs as u32);
             }
             let attr_bytes = attr.into_bytes();
             enc.encode_opaque(&attr_bytes);
