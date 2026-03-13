@@ -1071,7 +1071,19 @@ fn write_file_with_pool(
                     ) {
                         Ok(()) => return true,
                         Err(e) => {
-                            tracing::debug!("NFS bypass failed for {}: {}", fname, e);
+                            tracing::debug!("NFS bypass failed for {}: {}, attempting recovery", fname, e);
+                            if client.recover_session().is_ok() {
+                                if let Ok(h) = client.get_or_resolve_handle(parent) {
+                                    if client.write_file(
+                                        &h, &fname, data,
+                                        file_entry.mode, file_entry.uid, file_entry.gid,
+                                        (file_entry.mtime, 0),
+                                    ).is_ok() {
+                                        return true;
+                                    }
+                                }
+                            }
+                            tracing::debug!("NFS bypass recovery failed for {}", fname);
                         }
                     }
                 }

@@ -1493,7 +1493,22 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
                                     continue;
                                 }
                                 Err(e) => {
-                                    debug!("NFS bypass write failed for {:?}: {} — VFS fallback", src_path, e);
+                                    debug!("NFS bypass write failed for {:?}: {} — attempting recovery", src_path, e);
+                                    // Try session recovery + retry once
+                                    if client.recover_session().is_ok() {
+                                        if let Ok(h) = client.get_or_resolve_handle(&full_parent) {
+                                            if let Ok(()) = client.write_file(
+                                                &h, &fname, &data,
+                                                src_meta.mode(), src_meta.uid(), src_meta.gid(),
+                                                (src_meta.mtime(), src_meta.mtime_nsec()),
+                                            ) {
+                                                stats.files_nfs_bypass += 1;
+                                                stats.bytes_nfs_bypass += file_size;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    debug!("NFS bypass recovery failed — VFS fallback");
                                 }
                             }
                         }
