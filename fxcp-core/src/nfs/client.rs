@@ -778,6 +778,47 @@ impl NfsCompoundClient {
     }
 }
 
+/// Pool of NFS compound RPC sessions for parallel writes.
+///
+/// Each session has its own TCP connection and NFSv4.1 session ID,
+/// enabling true parallel RPCs to the server (one in-flight per session).
+/// Rayon threads grab sessions by index (round-robin) to avoid contention.
+pub struct NfsClientPool {
+    clients: Vec<parking_lot::Mutex<NfsCompoundClient>>,
+}
+
+impl NfsClientPool {
+    /// Create a pool of `pool_size` independent NFS sessions.
+    pub fn new(info: &NfsBypassInfo, pool_size: usize) -> Result<Self, NfsError> {
+        let pool_size = pool_size.max(1);
+        let mut clients = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            match NfsCompoundClient::connect(info) {
+                Ok(client) => clients.push(parking_lot::Mutex::new(client)),
+                Err(e) => {
+                    if i == 0 {
+                        return Err(e); // First session must succeed
+                    }
+                    info!("NFS pool: session {} failed ({}), pool size = {}", i, e, clients.len());
+                    break; // Use whatever we got
+                }
+            }
+        }
+        info!("NFS pool: {} sessions established to {}", clients.len(), info.server_addr);
+        Ok(Self { clients })
+    }
+
+    /// Get a session by index (round-robin across pool).
+    pub fn get(&self, idx: usize) -> &parking_lot::Mutex<NfsCompoundClient> {
+        &self.clients[idx % self.clients.len()]
+    }
+
+    /// Pool size (number of active sessions).
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+}
+
 /// Fast NFS server liveness check via NULL RPC.
 ///
 /// Opens a fresh TCP connection to the NFS server and sends a NULL procedure

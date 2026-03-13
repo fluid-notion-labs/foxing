@@ -656,6 +656,9 @@ impl<R: Read + Seek> FxarReader<R> {
     }
 
     /// Restore all files to a target directory.
+    ///
+    /// Phase 1: Load all chunk data into memory (sequential, needs &mut self for seeks).
+    /// Phase 2: Parallel file reconstruction + BLAKE3 verify + write (rayon par_iter).
     pub fn restore_all(&mut self, target: &Path) -> io::Result<FxarImportStats> {
         // Pre-flight disk space check
         let total_bytes: u64 = {
@@ -663,7 +666,6 @@ impl<R: Read + Seek> FxarReader<R> {
             m.files.iter().map(|f| f.size).sum()
         };
         if let Some(avail) = check_available_space(target) {
-            // Need at least the total data size + 10MB headroom
             let needed = total_bytes + 10 * 1024 * 1024;
             if avail < needed {
                 return Err(io::Error::new(
@@ -676,77 +678,89 @@ impl<R: Read + Seek> FxarReader<R> {
 
         let manifest = self.read_manifest()?;
         let index = self.read_chunk_index()?;
-        let mut stats = FxarImportStats::default();
 
-        // NFS bypass: establish compound RPC session if target is NFSv4.2
-        #[cfg(feature = "nfs-bypass")]
-        let mut nfs_client: Option<crate::nfs::NfsCompoundClient> = {
-            let nfs_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
-            if nfs_env != "0" {
-                crate::nfs::mount::probe_nfs_bypass(target)
-                    .and_then(|info| {
-                        match crate::nfs::NfsCompoundClient::connect(&info) {
-                            Ok(client) => {
-                                info!("FXAR import: NFS bypass active → {}", info.server_addr);
-                                Some(client)
-                            }
-                            Err(e) => {
-                                info!("FXAR import: NFS bypass unavailable ({}), using VFS", e);
-                                None
-                            }
-                        }
-                    })
-            } else { None }
-        };
+        // Phase 1: Load all chunks into memory (sequential — needs &mut self for seeks)
+        let mut chunk_store: Vec<Vec<u8>> = Vec::with_capacity(index.len());
+        for entry in &index {
+            let data = self.read_chunk_data(entry)?;
+            chunk_store.push(data);
+        }
+        // reader handle no longer needed — parallel phase can proceed
 
+        // Pre-create all parent directories (sequential)
         for file_entry in &manifest.files {
             let dest = target.join(&file_entry.path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+        }
+
+        // NFS bypass pool
+        #[cfg(feature = "nfs-bypass")]
+        let nfs_pool: Option<crate::nfs::NfsClientPool> = init_nfs_pool(target);
+
+        // Phase 2: Parallel file reconstruction + write (rayon)
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let files_restored = AtomicU64::new(0);
+        let bytes_restored = AtomicU64::new(0);
+        let chunks_verified = AtomicU64::new(0);
+        let chunks_failed = AtomicU64::new(0);
+
+        manifest.files.par_iter().enumerate().for_each(|(file_idx, file_entry)| {
+            let dest = target.join(&file_entry.path);
 
             let mut data = Vec::with_capacity(file_entry.size as usize);
             for &chunk_idx in &file_entry.chunks {
-                let chunk_meta = &index[chunk_idx as usize];
-                let chunk_data = self.read_chunk_data(chunk_meta)?;
-                stats.chunks_verified += 1;
-                data.extend_from_slice(&chunk_data);
+                data.extend_from_slice(&chunk_store[chunk_idx as usize]);
+                chunks_verified.fetch_add(1, Ordering::Relaxed);
             }
 
-            // Verify whole-file hash
+            // Verify whole-file BLAKE3
             let actual = blake3::hash(&data);
             let expected = hex::decode(&file_entry.blake3).unwrap_or_default();
             if actual.as_bytes() != expected.as_slice() {
                 warn!("BLAKE3 mismatch for {}, skipping", file_entry.path);
-                stats.chunks_failed += 1;
-                continue;
+                chunks_failed.fetch_add(1, Ordering::Relaxed);
+                return;
             }
 
-            // Write file — NFS bypass (1 compound RPC) or VFS fallback
-            let wrote_via_nfs = write_file_nfs_or_vfs(
-                &dest, &data, file_entry, target,
+            // Write file — NFS pool bypass or VFS fallback
+            let wrote_via_nfs = write_file_with_pool(
+                &dest, &data, file_entry, target, file_idx,
                 #[cfg(feature = "nfs-bypass")]
-                &mut nfs_client,
+                &nfs_pool,
             );
 
             if !wrote_via_nfs {
-                std::fs::write(&dest, &data)?;
+                if std::fs::write(&dest, &data).is_err() {
+                    chunks_failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
                 let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
                 let _ = filetime::set_file_mtime(&dest, mtime);
             }
 
-            // Restore xattrs (both NFS and VFS paths)
+            // Restore xattrs
             for (key, hex_val) in &file_entry.xattr {
                 if let Ok(val) = hex::decode(hex_val) {
                     let _ = xattr::set(&dest, key, &val);
                 }
             }
 
-            stats.files_restored += 1;
-            stats.bytes_restored += file_entry.size;
-        }
+            files_restored.fetch_add(1, Ordering::Relaxed);
+            bytes_restored.fetch_add(file_entry.size, Ordering::Relaxed);
+        });
+
+        let stats = FxarImportStats {
+            files_restored: files_restored.load(Ordering::Relaxed),
+            bytes_restored: bytes_restored.load(Ordering::Relaxed),
+            chunks_verified: chunks_verified.load(Ordering::Relaxed),
+            chunks_failed: chunks_failed.load(Ordering::Relaxed),
+        };
 
         info!("FXAR v2 import: {} files, {} bytes, {} chunks verified",
               stats.files_restored, stats.bytes_restored, stats.chunks_verified);
@@ -838,26 +852,9 @@ pub fn read_archive_stream<R: Read>(
         }
     }
 
-    // NFS bypass: establish compound RPC session if target is NFSv4.2
+    // NFS bypass pool
     #[cfg(feature = "nfs-bypass")]
-    let nfs_client: Option<parking_lot::Mutex<crate::nfs::NfsCompoundClient>> = {
-        let nfs_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
-        if nfs_env != "0" {
-            crate::nfs::mount::probe_nfs_bypass(target)
-                .and_then(|info| {
-                    match crate::nfs::NfsCompoundClient::connect(&info) {
-                        Ok(client) => {
-                            info!("FXAR stream import: NFS bypass active → {}", info.server_addr);
-                            Some(parking_lot::Mutex::new(client))
-                        }
-                        Err(e) => {
-                            info!("FXAR stream import: NFS bypass unavailable ({})", e);
-                            None
-                        }
-                    }
-                })
-        } else { None }
-    };
+    let nfs_pool: Option<crate::nfs::NfsClientPool> = init_nfs_pool(target);
 
     // Reconstruct files in parallel (chunk assembly + BLAKE3 verify + write)
     use rayon::prelude::*;
@@ -868,7 +865,7 @@ pub fn read_archive_stream<R: Read>(
     let chunks_verified = AtomicU64::new(0);
     let chunks_failed = AtomicU64::new(0);
 
-    manifest.files.par_iter().for_each(|file_entry| {
+    manifest.files.par_iter().enumerate().for_each(|(file_idx, file_entry)| {
         let dest = target.join(&file_entry.path);
 
         let mut data = Vec::with_capacity(file_entry.size as usize);
@@ -886,30 +883,12 @@ pub fn read_archive_stream<R: Read>(
             return;
         }
 
-        // Write file — NFS bypass or VFS fallback
-        let wrote_via_nfs = {
+        // Write file — NFS pool bypass or VFS fallback
+        let wrote_via_nfs = write_file_with_pool(
+            &dest, &data, file_entry, target, file_idx,
             #[cfg(feature = "nfs-bypass")]
-            {
-                if let Some(ref client_lock) = nfs_client {
-                    if data.len() <= crate::nfs::NFS_BYPASS_MAX_SIZE as usize {
-                        let parent = dest.parent().unwrap_or(target);
-                        let mut client = client_lock.lock();
-                        if let Ok(handle) = client.get_or_resolve_handle(parent) {
-                            let fname = dest.file_name()
-                                .map(|f| f.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            client.write_file(
-                                &handle, &fname, &data,
-                                file_entry.mode, file_entry.uid, file_entry.gid,
-                                (file_entry.mtime, 0),
-                            ).is_ok()
-                        } else { false }
-                    } else { false }
-                } else { false }
-            }
-            #[cfg(not(feature = "nfs-bypass"))]
-            { false }
-        };
+            &nfs_pool,
+        );
 
         if !wrote_via_nfs {
             if std::fs::write(&dest, &data).is_err() {
@@ -922,7 +901,7 @@ pub fn read_archive_stream<R: Read>(
             let _ = filetime::set_file_mtime(&dest, mtime);
         }
 
-        // Restore xattrs (both paths)
+        // Restore xattrs
         for (key, hex_val) in &file_entry.xattr {
             if let Ok(val) = hex::decode(hex_val) {
                 let _ = xattr::set(&dest, key, &val);
@@ -1043,23 +1022,44 @@ fn check_available_space(path: &Path) -> Option<u64> {
     }
 }
 
-/// Try to write a file via NFS compound RPC bypass.
-/// Returns true if NFS bypass succeeded (file written + metadata set in one round-trip).
-/// Returns false if NFS bypass is unavailable or failed (caller should use VFS fallback).
+/// Initialize NFS client pool if target is NFSv4.2 and bypass is enabled.
+#[cfg(feature = "nfs-bypass")]
+fn init_nfs_pool(target: &Path) -> Option<crate::nfs::NfsClientPool> {
+    let nfs_env = std::env::var("FOXING_NFS_BYPASS").unwrap_or_else(|_| "1".to_string());
+    if nfs_env == "0" { return None; }
+    crate::nfs::mount::probe_nfs_bypass(target).and_then(|info| {
+        match crate::nfs::NfsClientPool::new(&info, 4) {
+            Ok(pool) => {
+                info!("FXAR import: NFS bypass pool ({} sessions) → {}", pool.len(), info.server_addr);
+                Some(pool)
+            }
+            Err(e) => {
+                info!("FXAR import: NFS bypass unavailable ({}), using VFS", e);
+                None
+            }
+        }
+    })
+}
+
+/// Write a file via NFS pool bypass (round-robin session selection).
+/// Returns true if NFS bypass succeeded, false for VFS fallback.
 #[allow(unused_variables)]
-fn write_file_nfs_or_vfs(
+fn write_file_with_pool(
     dest: &Path,
     data: &[u8],
     file_entry: &FxarManifestEntry,
     target: &Path,
+    thread_hint: usize,
     #[cfg(feature = "nfs-bypass")]
-    nfs_client: &mut Option<crate::nfs::NfsCompoundClient>,
+    nfs_pool: &Option<crate::nfs::NfsClientPool>,
 ) -> bool {
     #[cfg(feature = "nfs-bypass")]
     {
-        if let Some(client) = nfs_client.as_mut() {
+        if let Some(pool) = nfs_pool {
             if data.len() <= crate::nfs::NFS_BYPASS_MAX_SIZE as usize {
                 let parent = dest.parent().unwrap_or(target);
+                let client_lock = pool.get(thread_hint);
+                let mut client = client_lock.lock();
                 if let Ok(handle) = client.get_or_resolve_handle(parent) {
                     let fname = dest.file_name()
                         .map(|f| f.to_string_lossy().to_string())
