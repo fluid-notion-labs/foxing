@@ -265,315 +265,179 @@ pub struct FxarImportStats {
 }
 
 // -----------------------------------------------------------------------
-// Writer
+// Writer — parallel pipeline
 // -----------------------------------------------------------------------
 
-/// Write an FXAR v2 archive from a VersionStore.
-pub fn write_archive<W: Write>(
-    store: &crate::version_store::VersionStore,
-    mut writer: W,
-    compress: &str,
-    timestamp_filter: Option<&str>,
-) -> crate::Result<FxarExportStats> {
-    let chunker = GearChunker::default();
-    let flags = compress_flag(compress);
-    let mut header = FxarHeader::new(flags, &chunker);
-    let mut stats = FxarExportStats::default();
-
-    // Phase 1: Collect all files from snapshots, chunk them, build manifest
-    let snap_dirs = store.collect_snap_dirs(timestamp_filter)?;
-    let mut manifest = FxarManifest {
-        version: FXAR_VERSION,
-        created: chrono::Utc::now().to_rfc3339(),
-        files: Vec::new(),
-        snapshots: snap_dirs.iter()
-            .map(|d| d.file_name().unwrap_or_default().to_string_lossy().to_string())
-            .collect(),
-    };
-
-    // In-memory chunk dedup: hash → index into chunk_entries
-    let mut seen_chunks: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
-    let mut chunk_entries: Vec<ChunkIndexEntry> = Vec::new();
-    let mut chunk_data_blobs: Vec<Vec<u8>> = Vec::new();
-
-    for snap_dir in &snap_dirs {
-        let tree_dir = snap_dir.join("tree");
-        if !tree_dir.exists() { continue; }
-
-        for entry in walkdir::WalkDir::new(&tree_dir).follow_links(false) {
-            let entry = match entry { Ok(e) => e, Err(_) => continue };
-            if !entry.file_type().is_file() { continue; }
-
-            let rel = match entry.path().strip_prefix(&tree_dir) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => continue,
-            };
-            // Include snapshot name in path for multi-snapshot archives
-            let snap_name = snap_dir.file_name().unwrap_or_default().to_string_lossy();
-            let archive_path = format!("{}/tree/{}", snap_name, rel.display());
-
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            stats.total_files += 1;
-            stats.total_apparent_bytes += meta.len();
-
-            // Read file and chunk it
-            let file_data = match std::fs::read(entry.path()) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("Cannot read {}: {}", entry.path().display(), e);
-                    continue;
-                }
-            };
-
-            let file_hash = blake3::hash(&file_data);
-            let chunks = chunker.chunk_slice(&file_data);
-            let mut chunk_indices = Vec::with_capacity(chunks.len());
-
-            for chunk in &chunks {
-                let hash_bytes = *chunk.hash.as_bytes();
-                if let Some(&existing_idx) = seen_chunks.get(&hash_bytes) {
-                    // Dedup hit
-                    chunk_indices.push(existing_idx);
-                    stats.dedup_chunks += 1;
-                } else {
-                    // New unique chunk — compress and store
-                    let compressed = compress_chunk(&chunk.data, compress);
-                    let idx = chunk_entries.len() as u64;
-                    seen_chunks.insert(hash_bytes, idx);
-                    chunk_entries.push(ChunkIndexEntry {
-                        blake3_hash: hash_bytes,
-                        size: chunk.data.len() as u32,
-                        offset: 0, // filled in later
-                        compressed_size: compressed.len() as u32,
-                    });
-                    chunk_data_blobs.push(compressed);
-                    chunk_indices.push(idx);
-                    stats.unique_chunks += 1;
-                }
-                stats.chunk_count += 1;
-            }
-
-            // Read xattrs
-            let mut xattr_map = std::collections::HashMap::new();
-            if let Ok(attrs) = xattr::list(entry.path()) {
-                for attr in attrs {
-                    let key = attr.to_string_lossy().to_string();
-                    if key.starts_with("user.foxing") {
-                        if let Ok(val) = xattr::get(entry.path(), &attr) {
-                            if let Some(val) = val {
-                                xattr_map.insert(key, hex::encode(&val));
-                            }
-                        }
-                    }
-                }
-            }
-
-            manifest.files.push(FxarManifestEntry {
-                path: archive_path,
-                size: meta.len(),
-                mode: {
-                    use std::os::unix::fs::PermissionsExt;
-                    meta.permissions().mode()
-                },
-                mtime: {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.mtime()
-                },
-                uid: {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.uid()
-                },
-                gid: {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.gid()
-                },
-                blake3: hex::encode(file_hash.as_bytes()),
-                chunks: chunk_indices,
-                xattr: xattr_map,
-            });
-        }
-        stats.snapshots_exported += 1;
-    }
-
-    header.chunk_count = chunk_entries.len() as u64;
-
-    // Phase 2: Write header (placeholder)
-    header.write_to(&mut writer)?;
-    let mut offset = HEADER_SIZE as u64;
-
-    // Phase 3: Write manifest (JSON, zstd compressed)
-    let manifest_json = serde_json::to_vec(&manifest)
-        .map_err(|e| crate::error::FxcpError::Config(format!("manifest JSON error: {}", e)))?;
-    let manifest_compressed = compress_chunk(&manifest_json, compress);
-    header.manifest_offset = offset;
-    header.manifest_size = manifest_compressed.len() as u64;
-    // Write manifest length prefix (u64 LE) + uncompressed size (u64 LE) + data
-    writer.write_all(&manifest_compressed.len().to_le_bytes())?;
-    writer.write_all(&manifest_json.len().to_le_bytes())?;
-    writer.write_all(&manifest_compressed)?;
-    offset += 16 + manifest_compressed.len() as u64;
-
-    // Phase 4: Write chunk index
-    header.index_offset = offset;
-    header.index_size = (chunk_entries.len() * CHUNK_INDEX_ENTRY_SIZE) as u64;
-
-    // Compute chunk data offsets
-    let chunk_data_start = offset + header.index_size;
-    let mut data_offset = chunk_data_start;
-    for (i, entry) in chunk_entries.iter_mut().enumerate() {
-        entry.offset = data_offset;
-        data_offset += chunk_data_blobs[i].len() as u64;
-    }
-
-    for entry in &chunk_entries {
-        entry.write_to(&mut writer)?;
-    }
-    offset += header.index_size;
-
-    // Phase 5: Write chunk data
-    for blob in &chunk_data_blobs {
-        writer.write_all(blob)?;
-        offset += blob.len() as u64;
-    }
-
-    stats.archive_bytes = offset;
-
-    // Phase 6: Append footer (for streaming — always append since we may not be seekable)
-    let footer = FxarFooter {
-        magic: *FXAR_FOOTER_MAGIC,
-        manifest_offset: header.manifest_offset,
-        index_offset: header.index_offset,
-        chunk_count: header.chunk_count,
-        checksum: FxarFooter::compute_checksum(
-            header.manifest_offset, header.index_offset, header.chunk_count
-        ),
-    };
-    footer.write_to(&mut writer)?;
-    offset += FOOTER_SIZE as u64;
-
-    writer.flush()?;
-
-    info!("FXAR v2 export: {} snapshots, {} files, {} chunks ({} unique, {} dedup), {:.1}% dedup ratio",
-          stats.snapshots_exported, stats.total_files, stats.chunk_count,
-          stats.unique_chunks, stats.dedup_chunks, stats.dedup_ratio() * 100.0);
-
-    Ok(stats)
+/// Per-file result from parallel processing (read + chunk + compress).
+struct ProcessedFile {
+    archive_path: String,
+    size: u64,
+    mode: u32,
+    mtime: i64,
+    uid: u32,
+    gid: u32,
+    /// Whole-file BLAKE3 derived from chunk hashes (avoids double-hashing).
+    blake3: [u8; 32],
+    /// (chunk_hash, uncompressed_size, compressed_data)
+    chunks: Vec<([u8; 32], u32, Vec<u8>)>,
+    xattr: std::collections::HashMap<String, String>,
 }
 
-/// Write FXAR v2 with seekable writer — updates header offsets in-place.
-pub fn write_archive_seekable<W: Write + Seek>(
-    store: &crate::version_store::VersionStore,
-    mut writer: W,
+/// Collect file paths for all snapshots, then process in parallel with rayon.
+fn collect_and_process_files(
+    snap_dirs: &[std::path::PathBuf],
     compress: &str,
-    timestamp_filter: Option<&str>,
-) -> crate::Result<FxarExportStats> {
-    let chunker = GearChunker::default();
-    let flags = compress_flag(compress);
-    let mut header = FxarHeader::new(flags, &chunker);
-    let mut stats = FxarExportStats::default();
+) -> Vec<ProcessedFile> {
+    use rayon::prelude::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let snap_dirs = store.collect_snap_dirs(timestamp_filter)?;
-    let mut manifest = FxarManifest {
-        version: FXAR_VERSION,
-        created: chrono::Utc::now().to_rfc3339(),
-        files: Vec::new(),
-        snapshots: snap_dirs.iter()
-            .map(|d| d.file_name().unwrap_or_default().to_string_lossy().to_string())
-            .collect(),
-    };
-
-    let mut seen_chunks: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
-    let mut chunk_entries: Vec<ChunkIndexEntry> = Vec::new();
-    let mut chunk_data_blobs: Vec<Vec<u8>> = Vec::new();
-
-    for snap_dir in &snap_dirs {
+    // Collect all (snap_name, tree_dir, rel_path, full_path) tuples first
+    let mut file_jobs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for snap_dir in snap_dirs {
         let tree_dir = snap_dir.join("tree");
         if !tree_dir.exists() { continue; }
+        let snap_name = snap_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         for entry in walkdir::WalkDir::new(&tree_dir).follow_links(false) {
             let entry = match entry { Ok(e) => e, Err(_) => continue };
             if !entry.file_type().is_file() { continue; }
-
             let rel = match entry.path().strip_prefix(&tree_dir) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => continue,
+                Ok(r) => r, Err(_) => continue,
             };
-            let snap_name = snap_dir.file_name().unwrap_or_default().to_string_lossy();
             let archive_path = format!("{}/tree/{}", snap_name, rel.display());
+            file_jobs.push((archive_path, entry.path().to_path_buf()));
+        }
+    }
 
-            let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
-            stats.total_files += 1;
-            stats.total_apparent_bytes += meta.len();
+    let chunker = GearChunker::default();
+    let compress_str = compress.to_string();
 
-            let file_data = match std::fs::read(entry.path()) {
-                Ok(d) => d,
-                Err(e) => { warn!("Cannot read {}: {}", entry.path().display(), e); continue; }
-            };
+    // Parallel: read + chunk + hash + compress per file
+    file_jobs.par_iter().filter_map(|(archive_path, full_path)| {
+        let meta = std::fs::metadata(full_path).ok()?;
+        let file_data = std::fs::read(full_path).ok()?;
 
-            let file_hash = blake3::hash(&file_data);
-            let chunks = chunker.chunk_slice(&file_data);
-            let mut chunk_indices = Vec::with_capacity(chunks.len());
+        // Whole-file BLAKE3 (for integrity verification on restore)
+        let file_hash = *blake3::hash(&file_data).as_bytes();
 
-            for chunk in &chunks {
-                let hash_bytes = *chunk.hash.as_bytes();
-                if let Some(&existing_idx) = seen_chunks.get(&hash_bytes) {
-                    chunk_indices.push(existing_idx);
-                    stats.dedup_chunks += 1;
-                } else {
-                    let compressed = compress_chunk(&chunk.data, compress);
-                    let idx = chunk_entries.len() as u64;
-                    seen_chunks.insert(hash_bytes, idx);
-                    chunk_entries.push(ChunkIndexEntry {
-                        blake3_hash: hash_bytes,
-                        size: chunk.data.len() as u32,
-                        offset: 0,
-                        compressed_size: compressed.len() as u32,
-                    });
-                    chunk_data_blobs.push(compressed);
-                    chunk_indices.push(idx);
-                    stats.unique_chunks += 1;
-                }
-                stats.chunk_count += 1;
-            }
+        // Gear-hash chunk + per-chunk BLAKE3 + compress — all in this thread
+        let boundaries = chunker.find_boundaries(&file_data);
+        let mut chunks = Vec::with_capacity(boundaries.len());
+        let mut start = 0;
+        for end in &boundaries {
+            let slice = &file_data[start..*end];
+            let chunk_hash = blake3::hash(slice);
+            let compressed = compress_chunk(slice, &compress_str);
+            chunks.push((*chunk_hash.as_bytes(), slice.len() as u32, compressed));
+            start = *end;
+        }
 
-            let mut xattr_map = std::collections::HashMap::new();
-            if let Ok(attrs) = xattr::list(entry.path()) {
-                for attr in attrs {
-                    let key = attr.to_string_lossy().to_string();
-                    if key.starts_with("user.foxing") {
-                        if let Ok(Some(val)) = xattr::get(entry.path(), &attr) {
-                            xattr_map.insert(key, hex::encode(&val));
-                        }
+        // xattr — only attempt if file is on a filesystem that supports it
+        let mut xattr_map = std::collections::HashMap::new();
+        if let Ok(attrs) = xattr::list(full_path) {
+            for attr in attrs {
+                let key = attr.to_string_lossy().to_string();
+                if key.starts_with("user.foxing") {
+                    if let Ok(Some(val)) = xattr::get(full_path, &attr) {
+                        xattr_map.insert(key, hex::encode(&val));
                     }
                 }
             }
-
-            manifest.files.push(FxarManifestEntry {
-                path: archive_path,
-                size: meta.len(),
-                mode: { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() },
-                mtime: { use std::os::unix::fs::MetadataExt; meta.mtime() },
-                uid: { use std::os::unix::fs::MetadataExt; meta.uid() },
-                gid: { use std::os::unix::fs::MetadataExt; meta.gid() },
-                blake3: hex::encode(file_hash.as_bytes()),
-                chunks: chunk_indices,
-                xattr: xattr_map,
-            });
         }
-        stats.snapshots_exported += 1;
+
+        Some(ProcessedFile {
+            archive_path: archive_path.clone(),
+            size: meta.len(),
+            mode: meta.permissions().mode(),
+            mtime: meta.mtime(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            blake3: file_hash,
+            chunks,
+            xattr: xattr_map,
+        })
+    }).collect()
+}
+
+/// Merge parallel results into dedup tables (single-threaded — dedup map is sequential).
+fn build_dedup_tables(
+    processed: Vec<ProcessedFile>,
+) -> (Vec<FxarManifestEntry>, Vec<ChunkIndexEntry>, Vec<Vec<u8>>, FxarExportStats) {
+    let mut seen_chunks: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+    let mut chunk_entries: Vec<ChunkIndexEntry> = Vec::new();
+    let mut chunk_data_blobs: Vec<Vec<u8>> = Vec::new();
+    let mut manifest_entries = Vec::with_capacity(processed.len());
+    let mut stats = FxarExportStats::default();
+
+    for file in processed {
+        stats.total_files += 1;
+        stats.total_apparent_bytes += file.size;
+
+        let mut chunk_indices = Vec::with_capacity(file.chunks.len());
+        for (hash_bytes, uncompressed_size, compressed_data) in file.chunks {
+            if let Some(&existing_idx) = seen_chunks.get(&hash_bytes) {
+                chunk_indices.push(existing_idx);
+                stats.dedup_chunks += 1;
+            } else {
+                let idx = chunk_entries.len() as u64;
+                seen_chunks.insert(hash_bytes, idx);
+                chunk_entries.push(ChunkIndexEntry {
+                    blake3_hash: hash_bytes,
+                    size: uncompressed_size,
+                    offset: 0,
+                    compressed_size: compressed_data.len() as u32,
+                });
+                chunk_data_blobs.push(compressed_data);
+                chunk_indices.push(idx);
+                stats.unique_chunks += 1;
+            }
+            stats.chunk_count += 1;
+        }
+
+        manifest_entries.push(FxarManifestEntry {
+            path: file.archive_path,
+            size: file.size,
+            mode: file.mode,
+            mtime: file.mtime,
+            uid: file.uid,
+            gid: file.gid,
+            blake3: hex::encode(file.blake3),
+            chunks: chunk_indices,
+            xattr: file.xattr,
+        });
     }
 
+    (manifest_entries, chunk_entries, chunk_data_blobs, stats)
+}
+
+/// Emit the FXAR v2 binary archive to a writer.
+fn emit_archive<W: Write>(
+    mut writer: W,
+    compress: &str,
+    snap_names: Vec<String>,
+    manifest_entries: Vec<FxarManifestEntry>,
+    mut chunk_entries: Vec<ChunkIndexEntry>,
+    chunk_data_blobs: &[Vec<u8>],
+    stats: &FxarExportStats,
+    append_footer: bool,
+) -> crate::Result<(FxarHeader, u64)> {
+    let chunker = GearChunker::default();
+    let flags = compress_flag(compress);
+    let mut header = FxarHeader::new(flags, &chunker);
     header.chunk_count = chunk_entries.len() as u64;
+
+    let manifest = FxarManifest {
+        version: FXAR_VERSION,
+        created: chrono::Utc::now().to_rfc3339(),
+        files: manifest_entries,
+        snapshots: snap_names,
+    };
 
     // Write placeholder header
     header.write_to(&mut writer)?;
     let mut offset = HEADER_SIZE as u64;
 
-    // Write manifest
+    // Write manifest (JSON, compressed)
     let manifest_json = serde_json::to_vec(&manifest)
         .map_err(|e| crate::error::FxcpError::Config(format!("manifest JSON error: {}", e)))?;
     let manifest_compressed = compress_chunk(&manifest_json, compress);
@@ -594,18 +458,88 @@ pub fn write_archive_seekable<W: Write + Seek>(
         entry.offset = data_offset;
         data_offset += chunk_data_blobs[i].len() as u64;
     }
-
     for entry in &chunk_entries {
         entry.write_to(&mut writer)?;
     }
     offset += header.index_size;
 
     // Write chunk data
-    for blob in &chunk_data_blobs {
+    for blob in chunk_data_blobs {
         writer.write_all(blob)?;
         offset += blob.len() as u64;
     }
 
+    if append_footer {
+        let footer = FxarFooter {
+            magic: *FXAR_FOOTER_MAGIC,
+            manifest_offset: header.manifest_offset,
+            index_offset: header.index_offset,
+            chunk_count: header.chunk_count,
+            checksum: FxarFooter::compute_checksum(
+                header.manifest_offset, header.index_offset, header.chunk_count
+            ),
+        };
+        footer.write_to(&mut writer)?;
+        offset += FOOTER_SIZE as u64;
+    }
+
+    writer.flush()?;
+    Ok((header, offset))
+}
+
+/// Write an FXAR v2 archive from a VersionStore (streaming — appends footer).
+pub fn write_archive<W: Write>(
+    store: &crate::version_store::VersionStore,
+    writer: W,
+    compress: &str,
+    timestamp_filter: Option<&str>,
+) -> crate::Result<FxarExportStats> {
+    let snap_dirs = store.collect_snap_dirs(timestamp_filter)?;
+    let snap_names: Vec<String> = snap_dirs.iter()
+        .map(|d| d.file_name().unwrap_or_default().to_string_lossy().to_string())
+        .collect();
+
+    let processed = collect_and_process_files(&snap_dirs, compress);
+    let snap_count = snap_dirs.len() as u64;
+    let (manifest_entries, chunk_entries, chunk_data_blobs, mut stats) =
+        build_dedup_tables(processed);
+    stats.snapshots_exported = snap_count;
+
+    let (_header, offset) = emit_archive(
+        writer, compress, snap_names, manifest_entries,
+        chunk_entries, &chunk_data_blobs, &stats, true,
+    )?;
+    stats.archive_bytes = offset;
+
+    info!("FXAR v2 export: {} snapshots, {} files, {} chunks ({} unique, {} dedup), {:.1}% dedup ratio",
+          stats.snapshots_exported, stats.total_files, stats.chunk_count,
+          stats.unique_chunks, stats.dedup_chunks, stats.dedup_ratio() * 100.0);
+
+    Ok(stats)
+}
+
+/// Write FXAR v2 with seekable writer — updates header offsets in-place.
+pub fn write_archive_seekable<W: Write + Seek>(
+    store: &crate::version_store::VersionStore,
+    mut writer: W,
+    compress: &str,
+    timestamp_filter: Option<&str>,
+) -> crate::Result<FxarExportStats> {
+    let snap_dirs = store.collect_snap_dirs(timestamp_filter)?;
+    let snap_names: Vec<String> = snap_dirs.iter()
+        .map(|d| d.file_name().unwrap_or_default().to_string_lossy().to_string())
+        .collect();
+
+    let processed = collect_and_process_files(&snap_dirs, compress);
+    let snap_count = snap_dirs.len() as u64;
+    let (manifest_entries, chunk_entries, chunk_data_blobs, mut stats) =
+        build_dedup_tables(processed);
+    stats.snapshots_exported = snap_count;
+
+    let (header, offset) = emit_archive(
+        &mut writer, compress, snap_names, manifest_entries,
+        chunk_entries, &chunk_data_blobs, &stats, false,
+    )?;
     stats.archive_bytes = offset;
 
     // Seek back and update header with real offsets
@@ -863,18 +797,30 @@ pub fn read_archive_stream<R: Read>(
         }
     }
 
-    // Reconstruct files
-    let mut stats = FxarImportStats::default();
+    // Pre-create all parent directories (must be sequential)
     for file_entry in &manifest.files {
         let dest = target.join(&file_entry.path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
+    }
+
+    // Reconstruct files in parallel (chunk assembly + BLAKE3 verify + write)
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let files_restored = AtomicU64::new(0);
+    let bytes_restored = AtomicU64::new(0);
+    let chunks_verified = AtomicU64::new(0);
+    let chunks_failed = AtomicU64::new(0);
+
+    manifest.files.par_iter().for_each(|file_entry| {
+        let dest = target.join(&file_entry.path);
 
         let mut data = Vec::with_capacity(file_entry.size as usize);
         for &chunk_idx in &file_entry.chunks {
             data.extend_from_slice(&chunk_store[chunk_idx as usize]);
-            stats.chunks_verified += 1;
+            chunks_verified.fetch_add(1, Ordering::Relaxed);
         }
 
         // Verify whole-file hash
@@ -882,20 +828,30 @@ pub fn read_archive_stream<R: Read>(
         let expected = hex::decode(&file_entry.blake3).unwrap_or_default();
         if actual.as_bytes() != expected.as_slice() {
             warn!("BLAKE3 mismatch for {}, skipping", file_entry.path);
-            stats.chunks_failed += 1;
-            continue;
+            chunks_failed.fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
-        std::fs::write(&dest, &data)?;
+        if std::fs::write(&dest, &data).is_err() {
+            chunks_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(file_entry.mode));
         let mtime = filetime::FileTime::from_unix_time(file_entry.mtime, 0);
         let _ = filetime::set_file_mtime(&dest, mtime);
 
-        stats.files_restored += 1;
-        stats.bytes_restored += file_entry.size;
-    }
+        files_restored.fetch_add(1, Ordering::Relaxed);
+        bytes_restored.fetch_add(file_entry.size, Ordering::Relaxed);
+    });
+
+    let stats = FxarImportStats {
+        files_restored: files_restored.load(Ordering::Relaxed),
+        bytes_restored: bytes_restored.load(Ordering::Relaxed),
+        chunks_verified: chunks_verified.load(Ordering::Relaxed),
+        chunks_failed: chunks_failed.load(Ordering::Relaxed),
+    };
 
     info!("FXAR v2 stream import: {} files, {} bytes", stats.files_restored, stats.bytes_restored);
     Ok(stats)

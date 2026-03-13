@@ -73,7 +73,7 @@ impl GearChunker {
     }
 
     /// Find chunk boundaries in a byte slice using gear hash.
-    fn find_boundaries(&self, data: &[u8]) -> Vec<usize> {
+    pub fn find_boundaries(&self, data: &[u8]) -> Vec<usize> {
         let mask = (self.avg - 1) as u64;
         let mut boundaries = Vec::new();
         let mut start = 0;
