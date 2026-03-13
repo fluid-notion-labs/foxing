@@ -1,6 +1,6 @@
 # Foxing: High-Fidelity Filesystem Replication
 
-![Version](https://img.shields.io/badge/version-0.7.2-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Copr build status](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
+![Version](https://img.shields.io/badge/version-0.8.1-blue) ![License](https://img.shields.io/badge/license-GPL--2.0--or--later-green) ![Platform](https://img.shields.io/badge/platform-Linux%206.12%2B-lightgrey) ![Rust](https://img.shields.io/badge/rust-2024-orange) [![Copr build status](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/jwp/foxing/package/foxing/) [![Docs](https://img.shields.io/badge/docs-rustdoc-blue)](https://aenertia.codeberg.page/foxing/)
 
 **Foxing** is a high-performance filesystem replication system with two components:
 
@@ -38,6 +38,26 @@
 fxcp auto-selects the optimal strategy: NFS compound RPC for small files on NFS, reflink (instant CoW) for same-device, sendfile for small files, io_uring for large cross-device transfers. foxingd adds BPF event capture for 15-21ms single-file replication latency.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for comprehensive results including MTTC matrices, tool comparisons, and [visual benchmarks](docs/graphs/).
+
+### v0.8.1 Highlights
+
+- **FXAR v2 archive format** — gear-hash variable chunking (2KB-2MB, 64KB average) + BLAKE3 content-addressable storage + binary index. True chunk-level deduplication replaces v1's whole-file dedup (96% dedup ratio for slowly-changing data vs 63%)
+- **Seekable archives** — random-access file restore without reading the entire archive. Binary chunk index enables O(chunks) restore for any single file
+- **Streaming pipe support** — `fxcp snap export /backup | ssh remote fxcp snap import /restore`
+- **Parallel export** — rayon-parallelized chunking + compression (123 MB/s on 4 vCPU)
+- **Pipelined import** — chunk loading overlaps with file writing; rayon parallel reconstruction (61 MB/s on NFS, 64 MB/s on local)
+- **NFS session pool** — 4 parallel NFSv4.2 compound RPC sessions for import writes with SETATTR (uid/gid/mtime in one round-trip)
+- **Format auto-detection** — import/inspect/restore auto-detect FXAR v2 vs tar archives
+- **`--format tar`** — backward-compatible tar export for legacy workflows
+- **Pre-flight disk space checks** — abort early if target has insufficient free space
+- **`target-cpu=native`** — AVX2/AVX-512 vectorization for all Rust-generated code
+
+### v0.8.0 Highlights
+
+- **`fxcp -a --json`** — structured JSON copy results for machine consumption
+- **`fxcp -a --progress`** — live progress reporting (5Hz terminal, 1Hz JSON for agents)
+- **Granular exit codes** — 0=success, 1=partial (some files failed), 2=complete failure
+- **foxingd sd_notify** — `READY=1` for systemd `Type=notify` integration
 
 ### v0.7.1 Highlights
 
@@ -391,11 +411,23 @@ fxcp snap stats /backup
 # Prune old snapshots
 fxcp snap prune --older-than 30d --keep-last 10 /backup
 
-# Export as portable archive (BLAKE3 chunk-dedup)
+# Export as FXAR v2 archive (gear-hash chunk dedup, default)
 fxcp snap export /backup -o backup.fxar
 
-# Restore specific file from archive
+# Export as legacy tar (backward compat)
+fxcp snap export /backup -o backup.tar.zst --format tar
+
+# Inspect archive contents
+fxcp snap inspect backup.fxar --list
+
+# Restore specific file from archive (BLAKE3 verified)
 fxcp snap restore backup.fxar --file 'data/*.db' --latest -o /tmp/
+
+# Streaming export → import over SSH
+fxcp snap export /backup | ssh remote fxcp snap import /restore
+
+# JSON copy output
+fxcp -a --json /source /destination
 ```
 
 See [Snapshots & Export Guide](docs/SNAPSHOTS.md) for comprehensive documentation.
@@ -469,9 +501,9 @@ make test-json     # JSON output for CI
 make test-compare  # Compare against saved baseline
 ```
 
-### foxingd Adversarial Test Suite (v0.7.0)
+### foxingd Adversarial Test Suite (v0.8.1)
 
-10-phase stress test on XFS→NFS (16 vCPU VM → HDD-backed NFS 4.2):
+11-phase stress test on XFS→NFS (4 vCPU VM → HDD-backed NFS 4.2):
 
 | Phase | Test | Result | Key Metric |
 |-------|------|--------|------------|
@@ -485,6 +517,7 @@ make test-compare  # Compare against saved baseline
 | 7 | BLAKE3 Delta Copy on Resync | **PASS** | 10 deltas, 20MB saved (97% reduction) |
 | 8 | Directory Merkle Pruning | **PASS** | 13 dirs pruned, stale files cleaned |
 | 9 | Combined Delta + Pruning | **PASS** | Both optimizations active |
+| 10 | FXAR v2 Export/Import (1500 files) | **PASS** | Export 123MB/s, import 61MB/s, 65.6% dedup |
 
 **\*Phase 3 note:** The rename chain storm (500 BPF events in 2.5s) creates a workload density that exceeds NFS copy latency, producing transient ghost files at intermediate rename positions. Three mitigations are in place: WAL storm registry (suppresses CREATE copies during rename chains), post-copy source existence verification, and hydration delete pass (cleans all ghosts on daemon restart). Real-world rename patterns are 1-2 orders of magnitude less dense. Phase 4 passes independently (300/300); it only fails in the full suite because it inherits Phase 3's ghost state without a daemon restart. This is not an intractable issue — ghosts are transient and self-healing.
 
