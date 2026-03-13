@@ -1802,7 +1802,9 @@ phase10() {
 
     # Step 2: Replicate to NFS via foxingd
     start_foxingd
-    wait_for_convergence || { result="FAIL"; signals="$signals stall:initial_sync"; }
+    wait_for_progress "hydration" "$HYDRATION_TIMEOUT" "$STALL_TIMEOUT" "$total_files" \
+        "find '$TARGET/adversarial-fxar' -type f 2>/dev/null | wc -l" \
+        || { result="FAIL"; signals="$signals stall:initial_sync"; }
     stop_foxingd
 
     # Step 3: Create 3 snapshots with 10% modification between each
