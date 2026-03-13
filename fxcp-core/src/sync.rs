@@ -161,6 +161,20 @@ fn spawn_progress_reporter(progress: std::sync::Arc<ProgressTracker>, json_mode:
     })
 }
 
+/// Check available disk space on the filesystem containing `path`.
+/// Returns None if statvfs fails (e.g., FUSE without statvfs support).
+fn check_available_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc == 0 {
+        Some(stat.f_bavail * stat.f_bsize)
+    } else {
+        None
+    }
+}
+
 fn format_size_compact(bytes: u64) -> String {
     if bytes >= 1_073_741_824 { format!("{:.1} GB", bytes as f64 / 1_073_741_824.0) }
     else if bytes >= 1_048_576 { format!("{:.1} MB", bytes as f64 / 1_048_576.0) }
@@ -1233,6 +1247,17 @@ async fn run_sync(opts: &SyncOptions) -> crate::Result<SyncStats> {
 
     std::fs::create_dir_all(destination)?;
     let destination = destination.canonicalize()?;
+
+    // Pre-flight disk space check — abort early if target is critically low
+    if let Some(avail) = check_available_space(&destination) {
+        const MIN_FREE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB minimum
+        if avail < MIN_FREE_BYTES {
+            return Err(crate::FxcpError::Config(format!(
+                "target {:?} has only {} bytes free (need at least 10 MB)",
+                destination, avail
+            )));
+        }
+    }
 
     let _src_caps = probe_capabilities(&source);
     let dst_caps = probe_capabilities(&destination);

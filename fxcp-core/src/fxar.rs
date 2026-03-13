@@ -723,6 +723,23 @@ impl<R: Read + Seek> FxarReader<R> {
 
     /// Restore all files to a target directory.
     pub fn restore_all(&mut self, target: &Path) -> io::Result<FxarImportStats> {
+        // Pre-flight disk space check
+        let total_bytes: u64 = {
+            let m = self.read_manifest()?;
+            m.files.iter().map(|f| f.size).sum()
+        };
+        if let Some(avail) = check_available_space(target) {
+            // Need at least the total data size + 10MB headroom
+            let needed = total_bytes + 10 * 1024 * 1024;
+            if avail < needed {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("insufficient disk space: {} bytes available, {} bytes needed",
+                            avail, needed),
+                ));
+            }
+        }
+
         let manifest = self.read_manifest()?;
         let index = self.read_chunk_index()?;
         let mut stats = FxarImportStats::default();
@@ -831,6 +848,19 @@ pub fn read_archive_stream<R: Read>(
             ));
         }
         chunk_store.push(data);
+    }
+
+    // Pre-flight disk space check
+    let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+    if let Some(avail) = check_available_space(target) {
+        let needed = total_bytes + 10 * 1024 * 1024;
+        if avail < needed {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("insufficient disk space: {} bytes available, {} bytes needed",
+                        avail, needed),
+            ));
+        }
     }
 
     // Reconstruct files
@@ -956,6 +986,19 @@ pub struct FxarInspectResult {
 // -----------------------------------------------------------------------
 // Compression helpers
 // -----------------------------------------------------------------------
+
+/// Check available disk space using statvfs.
+fn check_available_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc == 0 {
+        Some(stat.f_bavail * stat.f_bsize)
+    } else {
+        None
+    }
+}
 
 fn compress_flag(compress: &str) -> u32 {
     match compress {
