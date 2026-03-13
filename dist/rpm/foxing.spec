@@ -1,5 +1,5 @@
 %global crate foxing
-%global version 0.7.2
+%global version 0.8.1
 
 Name:           foxing
 Version:        %{version}
@@ -168,6 +168,15 @@ fi
 %{_datadir}/fish/vendor_completions.d/fxcp.fish
 
 %changelog
+* Thu Mar 13 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.8.1-1
+- FXAR v2: gear-hash variable chunking + BLAKE3 CAS + binary index
+- True chunk-level deduplication (replaces whole-file tar dedup)
+- Random-access seekable archive with selective file restore
+- Streaming pipe support (export | ssh import)
+- Auto-detect archive format (FXAR v2 / tar)
+- --format tar backward compatibility for legacy exports
+- 19 new tests (66 total)
+
 * Wed Mar 12 2026 Joel Wirāmu Pauling <aenertia@aenertia.net> - 0.7.2-1
 - fxcp snap browse: MC-style dual-pane TUI file/snapshot browser
 - BLAKE3 content dedup stats alongside CoW reflink savings

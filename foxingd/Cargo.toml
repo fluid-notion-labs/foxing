@@ -1,6 +1,6 @@
 [package]
 name = "foxingd"
-version = "0.7.2"
+version = "0.8.1"
 edition = "2024"
 license = "GPL-2.0-or-later"
 authors = ["Joel Wirāmu Pauling <aenertia@aenertia.net>"]
