@@ -1,500 +1,666 @@
-# Timetraveler — Transparent FS Versioning for AI-Assisted Development
+# Timetraveler — Kernel-Level FS Time Machine for AI-Assisted Development
 
 **Branch:** `timetraveler` on `fluid-notion-labs/foxing`
-**Status:** design — supersedes previous snapshot-focused sketch (archived
-at `docs/archive/TIMETRAVELER-v1-snapshot-focused.md`)
-**Scope:** ize's original vision, re-targeted. This is the primary design.
+**Status:** design — this is the one that commits to a thesis
+**Platform:** Linux only (kernel ≥ 6.14 baseline, 7.0 preferred)
+**Language:** Rust (userspace), C (eBPF programs)
+**License:** GPL-2.0-or-later (foxing fork)
+
+Supersedes the jj-native sketch. That was correct about the product
+surface, wrong about the level of ambition at the capture layer.
 
 ---
 
-## 0. Elevator pitch
+## 0. The thesis
 
-Transparent, automatic filesystem versioning for workstations where AI
-agents and humans both edit files. Every fs mutation is captured with
-provenance (who, when, from which process). A jj-native curation
-workflow lets you reshape the raw history into proper commits for
-export to git. An MCP server lets agents introspect their own edits.
+Every existing solution for "time-travel AI edits" is implemented at
+the wrong layer:
 
-Think: **ize, without FUSE. jj, aware of agents. Claude Code's `/rewind`
-but cross-tool, cross-session, and curatable into real commits.**
+- **Claude Code `/rewind`** hooks its own Write/Edit tool. Misses Bash
+  `sed`. Misses anything outside Claude's tool call surface. Per-tool,
+  per-session.
+- **Cursor "Undo AI"** same, per-editor.
+- **Aider `/undo`** same, per-CLI.
+- **`claude-code-rewind`** (3rd party) hooks Claude's events. Same class.
+- **jj auto-snapshot** hooks the VCS layer. Coarse (Watchman-debounced).
+  Per-repo. No agent awareness.
+- **git + commit discipline** the manual version of jj. Worse.
+- **Filesystem snapshots (btrfs, NILFS2, ZFS)** coarse, whole-volume,
+  no agent attribution.
 
----
+All of them are right about the *shape* of the product. All of them
+are at the wrong level of the stack.
 
-## 1. The world as of April 2026 — honest landscape
+**The right level is the kernel.** One persistent system-level capture
+of every filesystem write on the workstation, with process provenance
+attached at the moment of the write, sourced from the VFS itself.
+Then everything else — sessions, agent attribution, jj integration,
+MCP, curation — becomes derived views over a single authoritative
+event stream.
 
-### What exists
-
-**AI-side, single-tool:**
-- **Claude Code `/rewind`** — per-session file snapshots in
-  `~/.claude/file-history/{sessionId}/`, path-hashed + versioned.
-  Only tracks Write/Edit tool ops (misses Bash `sed -i`).
-  Session-local, not cross-tool.
-- **Claude Code JSONL history** — `~/.claude/projects/{project}/*.jsonl`,
-  every tool call logged with inputs. Already the causal chain. People
-  grep this for crashed-session recovery.
-- **`claude-code-rewind`** (holasoymalva) — third-party, SQLite +
-  file snapshots, `export --format=commit` for git. Python.
-- **Cursor** "Undo AI changes", **Aider** `/undo`. Session-scoped.
-
-**VCS-side, no AI awareness:**
-- **jj** — working-copy-as-commit, auto-snapshot on every jj command.
-  Watchman integration (`fsmonitor.watchman.register-snapshot-trigger = true`)
-  auto-snaps on fs change.
-- **jj operation log** — `jj --at-op=<id>` rewinds to any past repo state.
-- **jj evolog** — per-change evolution including former working-copy revisions.
-
-**What no one does:**
-- Cross-tool fs observation (Claude + Cursor + you + cargo in one view).
-- Process-tree pid attribution ("this was Claude session X").
-- jj-as-curation-model for AI edits.
-- MCP server exposing edit history to agents.
-- Cross-repo/cross-directory coverage (Claude editing `~/.config/`
-  and your project simultaneously).
-
-**So:** this isn't greenfield, and it isn't reinventing. It's a
-**composition layer** that joins fs-event capture + jj curation + agent
-session metadata + MCP access.
-
-### What this means for scope
-
-We can and should lean heavily on existing components:
-
-| Component | Source | What we wrap / consume |
-|---|---|---|
-| FS event capture | foxing's BPF pipeline | Listen, don't rebuild |
-| Snapshot store | foxing MARS | Maybe; or go straight to jj |
-| Working copy → commit | jj | Use directly |
-| Auto-snapshot-on-change | jj + Watchman | Configure, don't rebuild |
-| Operation log | jj | Use directly |
-| Export to git | jj git push | Use directly |
-| Claude causal chain | `~/.claude/projects/*.jsonl` | Join on pid+timestamp |
-
-Our actual new work is:
-
-1. **Attribution layer.** Tag each fs mutation with process ancestry.
-2. **Session concept.** Correlate a batch of mutations with an agent
-   session (derived from pid ancestry + optional JSONL join).
-3. **jj integration.** Either auto-split jj working-copy commits by
-   session/agent, or annotate them post-hoc.
-4. **MCP server.** Expose the edit history to agents.
-5. **Curation UX.** Make the common flows (name this session's
-   changes, split by agent, commit) trivial.
+Nobody has built this because it's genuinely hard. That's the moat.
 
 ---
 
-## 2. The big architectural fork
+## 1. What "kernel-level" actually means here
 
-Before design details, one decision shapes everything:
+Not "we wrote a kernel module." Specifically:
 
-**Fork A: foxing-based.** Run foxingd in observing mode (no mirror
-target). Every fs event → foxing's pipeline → our event log. Then a
-separate component reads the log and reshapes jj working-copy commits
-to match.
+1. **Event capture in the kernel** via eBPF, attached to either LSM
+   hooks (stable ABI) or VFS kprobes (flexible, less stable). Events
+   land in a shared ring buffer the instant the kernel sees the
+   write, before any userspace debouncing.
 
-**Fork B: jj-native.** Configure jj with Watchman. Write a jj
-post-snapshot hook (or fsmonitor-trigger extension) that annotates
-each snapshot with pid/session metadata. Skip foxing entirely for this
-use case.
+2. **Process provenance attached at capture time.** `bpf_get_current_pid_tgid()`
+   runs in the probe; the pid is captured synchronously with the
+   write. No race, no "which pid was active when Watchman noticed."
 
-**Fork C: hybrid.** Use jj's snapshotting for the common case (edits
-inside a repo). Use foxing's BPF pipeline for cross-repo/out-of-repo
-visibility (Claude editing `~/.config/` or whatever). Bridge the two.
+3. **Content capture in the kernel** for the write payload itself.
+   Either via `FAN_PRE_MODIFY` (Linux 6.14+, blocks writer briefly)
+   for full fidelity, or via BPF `bpf_dynptr` copy for non-blocking
+   with per-event size caps, or via reflink-snapshot when the FS
+   supports it. Tiered by workload.
 
-### Analysis
+4. **Persistent content-addressed store.** Userspace daemon consumes
+   the ring buffer, writes to a BLAKE3-keyed CAS on local disk. This
+   is the durable ground truth. Reflinks used where the backing FS
+   supports them, so a 1 GB file that gets modified costs ~4 KB of
+   new storage.
 
-Fork A feels right given we're on the foxing fork, but it's probably
-overkill. Foxing's strength is real-time replication to a target —
-we're not replicating, just observing. And jj already auto-snapshots
-on every command; adding Watchman gets us auto-snapshot on every save.
-The foxing BPF pipeline buys little here unless we need cross-repo
-visibility.
+5. **Query as first-class.** The event log is indexed (sqlite or
+   similar): by path, time, pid, tgid, comm, session. "What changed
+   between 14:00 and 14:30" and "what did pid 12345 touch" and "show
+   me every version of this file in the last month" are all O(log N)
+   queries.
 
-Fork B is the cleanest for the 90% case. Everything a dev cares about
-is inside a repo that jj can be init'd in. The gap is:
+6. **Views on top.** The jj integration, the MCP server, the git
+   export, the TUI — all read-only consumers of the event log + CAS.
+   They don't capture anything themselves.
 
-- Claude editing files outside the repo (e.g. `~/.config/foo/bar.toml`).
-- Coverage of non-repo working directories (e.g. experimental scratch dirs).
-
-Fork C splits the difference but adds complexity.
-
-**My recommendation: start with Fork B. Prove it works for the common
-case. Add Fork A (foxing BPF) as an optional second-channel capture
-when coverage becomes the blocker.** This also gives us a natural
-reason to live on the foxing fork — we're not using foxing's pipeline
-*yet*, but the integration path is clean when we need it.
+The critical architectural property: **capture is one thing, views
+are another.** The same kernel capture drives the jj view, the MCP
+query, the "what did Claude just do" TUI. You can add views forever
+without touching the capture layer.
 
 ---
 
-## 3. Concrete architecture (Fork B, with Fork A growth path)
+## 2. Why this can't be a jj plugin / Claude Code plugin / editor plugin
+
+Because any of those plugins is missing the writes the other two
+made. You cannot get "true ground truth of what happened on my disk"
+from any single application's hook.
+
+Concretely, all of these happen in a normal dev day and need to be
+captured in one log:
+
+- Claude Code `Write` tool edits `src/lib.rs`.
+- Claude's `Bash` tool runs `sed -i 's/foo/bar/g' src/*.rs`.
+- You edit `src/lib.rs` in Zed.
+- `cargo build` writes to `target/`.
+- `rust-analyzer` creates `.cache/` files.
+- Claude Code runs `cargo fmt`, which rewrites every `.rs` file.
+- You `touch .env` to trigger a dev-server reload.
+- A sync daemon pulls something into `~/projects/foo/`.
+
+The only place you see all of these in order, with attribution, is at
+the VFS / LSM layer. Every layer above loses information.
+
+---
+
+## 3. Concrete design
+
+### 3.1 Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│ Working tree (colocated jj + git repo)                             │
-│                                                                    │
-│   user editor ───┐                                                 │
-│   Claude Code ───┼─► file writes ─► Watchman ─► jj snapshot       │
-│   Cursor      ───┤                                  │              │
-│   cargo build ───┘                                  ▼              │
-│                                          jj working-copy commit    │
-│                                                     │              │
-│                                                     ▼              │
-│                                          jj operation log (@-op)   │
-└──────────────────────────────────────────┬─────────────────────────┘
-                                           │
-              ┌────────────────────────────┼────────────────────────┐
-              │                            │                        │
-              ▼                            ▼                        ▼
-   ┌──────────────────┐       ┌──────────────────────┐    ┌──────────────────┐
-   │ ttd (daemon)     │       │ tt (CLI)             │    │ tt-mcp (server)  │
-   │                  │       │                      │    │                  │
-   │ • pid tracker    │       │ • tt sessions        │    │ • list sessions  │
-   │ • session detect │       │ • tt curate <sess>   │    │ • get edits <s>  │
-   │ • annotate jj    │       │ • tt split-by-agent  │    │ • rewind         │
-   │   snapshots      │       │ • tt export-git      │    │ • diff           │
-   └──────────┬───────┘       └──────────┬───────────┘    └──────────────────┘
-              │                          │
-              └──────────┬───────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ KERNEL                                                               │
+│                                                                      │
+│   Any process ──► VFS write path                                     │
+│                       │                                              │
+│                       ▼                                              │
+│                   ┌────────────────────────────────────┐             │
+│                   │  fwcache BPF programs              │             │
+│                   │                                    │             │
+│                   │  1. lsm/file_permission (mask)     │ fast filter │
+│                   │     OR kprobe:vfs_write_iter       │             │
+│                   │                                    │             │
+│                   │  2. match against path filter map  │             │
+│                   │     (mount-id / inode / cgroup)    │             │
+│                   │                                    │             │
+│                   │  3. capture event:                 │             │
+│                   │     { seq, ts_ns, pid, tgid,       │             │
+│                   │       mnt_id, inode, path*, op,    │             │
+│                   │       offset, len, flags }         │             │
+│                   │                                    │             │
+│                   │  4. optional payload capture:      │             │
+│                   │     dynptr reserve → copy iov →    │             │
+│                   │     submit (cap at N KB; larger    │             │
+│                   │     writes record metadata only)   │             │
+│                   │                                    │             │
+│                   │  5. bpf_ringbuf_submit             │             │
+│                   └────────────────────┬───────────────┘             │
+│                                        │                             │
+│                                        ▼                             │
+│                         ┌──────────────────────────┐                 │
+│                         │   metadata ringbuf        │                │
+│                         │   (256 MB shared, MPSC)   │                │
+│                         └──────────┬───────────────┘                 │
+│                                    │                                 │
+│                         ┌──────────▼───────────────┐                 │
+│                         │   content ringbuf        │                 │
+│                         │   (1 GB shared, MPSC)    │                 │
+│                         └──────────┬───────────────┘                 │
+└────────────────────────────────────┼────────────────────────────────┘
+                                     │ epoll / io_uring wait
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ USERSPACE DAEMON — ttd                                               │
+│                                                                      │
+│   ┌──────────────┐                                                   │
+│   │ ingest loop  │ ← drain ringbufs, never block the kernel         │
+│   └──────┬───────┘                                                   │
+│          │                                                           │
+│          ▼                                                           │
+│   ┌──────────────┐     ┌──────────────┐                              │
+│   │ enrichment   │ ──► │ pid tracker  │ ← /proc scan + procfs watch  │
+│   │              │     │ (ancestors,  │                              │
+│   │              │     │  cmdline,    │                              │
+│   │              │     │  cgroup,     │                              │
+│   │              │     │  session)    │                              │
+│   └──────┬───────┘     └──────────────┘                              │
+│          │                                                           │
+│          ▼                                                           │
+│   ┌──────────────┐     ┌──────────────┐                              │
+│   │ CAS writer   │ ──► │ BLAKE3 store │ ← reflinks where possible    │
+│   │              │     │ ~/.tt/cas/   │                              │
+│   └──────┬───────┘     └──────────────┘                              │
+│          │                                                           │
+│          ▼                                                           │
+│   ┌──────────────┐     ┌──────────────┐                              │
+│   │ indexer      │ ──► │ event DB     │ ← sqlite / fjall / rocksdb   │
+│   │              │     │ (seq, paths, │                              │
+│   │              │     │  pids, hash) │                              │
+│   └──────────────┘     └──────────────┘                              │
+└──────────────────────────────────────────────────────────────────────┘
                          │
                          ▼
-          ┌──────────────────────────────┐
-          │ .jj/timetraveler/            │
-          │   sessions.db (sqlite)       │
-          │   events.log (append-only)   │
-          │   pid-map/                   │
-          └──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ VIEW LAYER                                                           │
+│                                                                      │
+│   tt CLI     tt TUI     tt-mcp (MCP server for agents)              │
+│   jj bridge  git export                                              │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Components
+### 3.2 Capture tiers
 
-- **`ttd`** — lightweight daemon. Watches `/proc` for new processes
-  and builds a pid ancestry table (ppid → pid → cmdline). On every
-  jj snapshot, reads jj's "changed files" and correlates to which pids
-  last wrote them (via fanotify on the repo mount, cheap). Emits
-  session metadata per snapshot.
-- **`tt`** — CLI for humans. Thin wrapper around jj with added
-  `sessions`, `agent`, `split-by-agent`, `curate` subcommands.
-- **`tt-mcp`** — MCP server exposing the same queries as tt but to
-  agents. Stdio MCP; agent spawns it as a subprocess.
+Three capture modes, selectable per-workload:
 
-### Data model
+| Tier | Mechanism | Fidelity | Overhead | Kernel |
+|---|---|---|---|---|
+| **M** metadata-only | BPF kprobe `vfs_write_iter` | offset+len only, pull content later | ~µs/write | 5.8+ |
+| **P** payload via BPF dynptr | kprobe + `bpf_dynptr_write` | full bytes up to cap (~16 KB typical) | ~µs + memcpy | 5.19+ |
+| **F** full fidelity via fanotify | `FAN_CLASS_PRE_CONTENT` + `FAN_PRE_MODIFY` | pre-image + post-image, including mmap | blocks writer briefly | 6.14+ |
+
+**Default policy:**
+- tier M for everything (always on)
+- tier P for paths matching agent-written files (`~/projects/**`, not `~/target/**`)
+- tier F opt-in per-mount for correctness-critical workloads
+
+Tier M + post-hoc pull from source works 99% of the time. Tier P fills
+the gap for "the source file was rewritten before we could pull."
+Tier F is the nuclear option for e.g. a database directory where you
+cannot lose any intermediate state.
+
+### 3.3 Content-addressed store
+
+```
+~/.tt/
+├── cas/                        # BLAKE3 content store
+│   ├── ab/cd/abcd1234...ef    # sharded by first 2 bytes
+│   └── ...
+├── events/                     # append-only event log
+│   ├── 2026-04/               # sharded by month
+│   │   └── 01.log             # and day
+│   └── current.log            # current WAL
+├── index.db                    # sqlite: events by path/pid/time/hash
+├── sessions.db                 # derived: agent sessions
+├── procfs/                     # snapshot of pid tree per epoch
+│   └── 2026-04-19T12:00:00/
+└── config.toml
+```
+
+**Why CAS:**
+- Deduplication is free. If Claude rewrites the same content across
+  sessions (common for format-only churn), one physical copy.
+- Reflink integration: on btrfs/xfs/bcachefs, the CAS entries can be
+  reflinks of the real file. Zero-copy storage of "the file as it was
+  at this moment." This is what foxing's MARS already does; we reuse
+  the code.
+- On ext4 (no reflink), fall back to actual copies. Worse but works.
+- Enables `tt show <hash>` and content queries.
+
+**Content limits:**
+- Files > N MB (configurable, default 100 MB) stored as "pointer +
+  reflink OR source-path + inode-generation" rather than a snapshot.
+  You can reconstruct IF the source file is still accessible. If not,
+  you have the metadata event but not the content.
+- Binary files (target/, *.o, node_modules/) filtered at the BPF
+  layer via path prefix — never even enter the capture pipeline.
+
+### 3.4 Session model
 
 ```rust
 struct Session {
     id: Uuid,
     agent: Agent,
-    pid_root: u32,
+    root_pid: u32,              // root of process tree
+    root_cgroup: Option<String>,
     started_at: DateTime,
     ended_at: Option<DateTime>,
-    jsonl_path: Option<PathBuf>,
-}
-
-struct Event {
-    seq: u64,
-    session_id: Uuid,
-    timestamp: DateTime,
-    pid: u32,
-    comm: String,
-    path: PathBuf,
-    op: Op,
-    jj_op_id: Option<String>,
-    jj_change_id: Option<String>,
-    tool_call_id: Option<String>,
+    working_dirs: Vec<PathBuf>, // distinct cwds observed
+    jsonl_paths: Vec<PathBuf>,  // Claude Code JSONL files correlated
+    env_markers: HashMap<String, String>, // captured env vars
 }
 
 enum Agent {
     User,
     ClaudeCode { session_id: String },
     Cursor,
-    Aider,
+    Aider { model: Option<String> },
     Zed,
-    Other(String),
+    OpenCode,
+    ShellScript { path: PathBuf },
+    BuildTool { name: String },  // cargo, npm, make, ...
+    Unknown,
 }
 ```
 
-### Attribution — how `ttd` knows who did what
+**Attribution rules, composed:**
 
-Three signals, composed:
+1. **Direct pid match.** Is this pid in the known agent table?
+2. **Ancestor match.** Walk `/proc/<pid>/status` ppid chain up to
+   init or a known session root.
+3. **Cgroup match.** Some agents run under distinct cgroups (systemd
+   user services, container-run tools).
+4. **Env marker match.** `CLAUDE_SESSION_ID=...`, `CURSOR_SESSION=...`
+   etc. captured from `/proc/<pid>/environ`.
+5. **JSONL time-window join.** Claude Code writes
+   `~/.claude/projects/*/*.jsonl`. The tool call containing
+   `{ "name": "Write", "input": { "file_path": "/x" } }` at timestamp
+   T joins to fs events on path `/x` within a small window around T.
+   This attaches *tool call IDs* to fs events — unique in the whole
+   product.
+6. **Explicit MCP registration** (future). Agent calls
+   `tt-mcp.register_session({ name, pid, root })` on startup.
 
-1. **Process tree.** Walk `/proc/<pid>/stat` ppid chain up to a known
-   agent process (`claude`, `cursor`, `aider`, user shell, etc.).
-   Cheap, accurate for modern agents that spawn tool calls as direct
-   children.
+Rules 1–5 work without agent cooperation. Rule 6 is the ideal case.
 
-2. **Agent-specific markers.** Claude Code writes JSONL per session.
-   Check `~/.claude/projects/*/<uuid>.jsonl` mtime/recent tool calls
-   for correlation by (timestamp window + file path match). Cursor
-   writes its own session data — can be consumed similarly. For
-   agents that expose nothing, pid tree is it.
+### 3.5 Query layer
 
-3. **Explicit registration** (future). MCP handshake: agent calls
-   `tt-mcp register-session { name, pid }` on startup. Explicit tag,
-   no guessing. Requires agent cooperation.
+Every question the user or an agent can ask maps to indexed queries:
 
-For v1, just (1) + (2). Registration later.
+```sql
+-- "what did Claude do in the last hour?"
+SELECT * FROM events
+  WHERE session_id IN (SELECT id FROM sessions WHERE agent_type = 'claude_code')
+  AND ts > now() - interval '1 hour'
+  ORDER BY seq;
 
-### Storage
+-- "show every version of foo.rs this session"
+SELECT e.*, c.hash FROM events e JOIN content c ON e.content_id = c.id
+  WHERE e.path = '/home/nick/p/foo.rs'
+  AND e.session_id = ?
+  ORDER BY e.seq;
 
-- **`sessions.db`** — sqlite, one row per session, index on pid and
-  time range. Query: "what session was pid P doing at time T?"
-- **`events.log`** — append-only, text or binary, one event per line.
-  Cheap. For real-time tail.
-- **`pid-map/`** — pid ancestry snapshots, one per jj operation.
-  Lets us go back and answer "which pid wrote file X in jj op Y".
+-- "what pid is currently editing files in ~/projects/ize?"
+SELECT pid, comm, COUNT(*) FROM events
+  WHERE path LIKE '/home/nick/projects/ize/%'
+  AND ts > now() - interval '5 seconds'
+  GROUP BY pid, comm;
 
-`.jj/timetraveler/` is under jj's own directory but not tracked by jj
-(jj-ignored). Metadata about jj, stored beside jj.
+-- "blame a line: what write introduced the content at path X, offset Y?"
+WITH versions AS (SELECT * FROM events WHERE path = ? ORDER BY seq)
+  SELECT * FROM versions WHERE content_hash = ? LIMIT 1;
+```
 
-### How jj snapshots get annotated
+### 3.6 jj / git export
 
-jj's fsmonitor+Watchman trigger fires → jj takes a working-copy
-snapshot → new jj op recorded. `ttd` hooks via:
+jj becomes a **view**, not a capture. The bridge:
 
-- **Option 1: jj hook scripts** — if jj gains hooks (there's an issue
-  for this). Cleanest. Not available now.
-- **Option 2: jj op log poll** — `ttd` polls `jj op log --limit 1`
-  every N seconds, picks up new ops. Crude but works today.
-- **Option 3: inotify on `.jj/op_heads/`** — watch the op log
-  directly, filesystem-level. Faster, still works today.
+1. User runs `tt curate <session-id>` or `tt curate --since 1h`.
+2. ttd reads events in scope, groups them heuristically:
+   - by tool call (if Claude Code JSONL joined)
+   - by file cluster + time gap (if no JSONL)
+3. Each group becomes a proposed jj change, with a commit message
+   either generated from the tool call's prompt, or template'd.
+4. User reviews in a TUI, edits messages, splits/merges groups.
+5. ttd writes the groups as real jj changes in the target repo (jj
+   workspace must exist).
+6. User runs `jj git push` as normal.
 
-Go with Option 3 for v1. File Option 1 as an upstream feature request
-with the jj folks; Martin (jj's creator) is responsive.
+For the "no jj" case, `tt export-git` does the same thing direct to
+git via `git fast-import` stream.
 
 ---
 
-## 4. CLI sketch
+## 4. The moat — why this can't be cloned in a weekend
 
-```
-tt sessions                     # list recent sessions
-tt sessions --agent claude      # filter
-tt session <id>                 # detail view
+Eight things have to be right together, and each is non-trivial:
 
-tt log                          # like jj log, but annotated with session/agent
-tt log --agent claude           # only Claude's changes
+1. **BPF verifier dance** for variable-size write capture with
+   dynptr. Needs care to not get rejected. Not hard if you've done
+   it before; painful the first time.
+2. **Process provenance under load.** pids recycle, parents die, the
+   `/proc` scanner races the BPF events. Real systems need bounded
+   staleness and fallback heuristics.
+3. **CAS storage with reflinks** that works identically on btrfs,
+   XFS, and ext4. Foxing has this; we reuse.
+4. **Query indexing** that keeps up with fast churn. 100k events/sec
+   from a cold `cargo build` should not DoS the indexer.
+5. **Filter design** to exclude noise (build artifacts, caches) at
+   the BPF layer without user friction. Misconfigured filter =
+   either miss events or drown in them.
+6. **JSONL time-window join** to Claude Code's log. Needs to be
+   careful about clock skew and tool-call retries.
+7. **jj integration** that produces commits users will actually
+   accept without editing. This is a UX problem, not a technical one,
+   and it's where most similar tools die.
+8. **MCP ergonomics.** The agent-facing API has to be *obvious* so
+   agents use it. Too many tools = agent confusion; too few = doesn't
+   help.
 
-tt curate <session>             # open interactive curation UI
-  # groups session's changes into proposed commits by:
-  # - time gaps
-  # - file clusters
-  # - tool call grouping (from JSONL if Claude)
-  # offers squash / split / describe per group
-  # writes as jj changes
-
-tt split-by-agent               # take current jj working copy,
-                                # split into separate jj changes
-                                # per agent
-
-tt diff <session>               # aggregate diff of a session
-tt show <tool-call-id>          # specific tool call's diff (Claude)
-
-tt export-git [<rev>]           # jj git push, with optional curation
-                                # pass — adds Claude session info to
-                                # commit messages if absent
-
-tt undo <session>               # revert an entire session's changes
-                                # (as a new change on top, jj-style)
-
-tt branch-from <session>        # start a new jj change from the state
-                                # before <session> ran — "what if I'd
-                                # stopped Claude there"
-```
-
-### Relationship to jj
-
-`tt` never hides jj. Everything `tt` does corresponds to jj operations,
-and `jj` continues to work directly. `tt curate` produces named jj
-changes; `jj log` shows them normally. Users can drop to jj at any
-time and back.
-
-Think of `tt` as "jj with agent glasses on."
+Any single piece: a weekend. All eight, integrated, with good UX: six
+months. That's the moat.
 
 ---
 
-## 5. MCP server — what agents can do with their own history
+## 5. Implementation phases
 
-```
-tt-mcp — stdio MCP server
+Each phase delivers something independently valuable.
 
-tools:
-  list_sessions(agent?, since?, limit?)
-  get_session(id) -> { events, tool_calls, changed_files, diff }
-  diff(session_id, file?) -> unified diff
-  rewind(session_id) -> restore files to state before session
-  current_session() -> UUID of the calling agent's own session
-  my_edits_this_session() -> list of edits with paths + diffs
-  what_changed_file(path, since?) -> session list for that file
-```
+### Phase 0 — Kernel reconnaissance (1 week)
 
-This lets an agent ask itself "what have I changed in this session?"
-or "what did I do to `auth.rs` today?" without needing to track it
-manually. Pairs naturally with Claude Code's existing JSONL log — the
-MCP is a higher-level query interface over the combined (fs events +
-tool call log) data.
-
-Biggest potential value: an agent can **check its own work against
-what actually landed**, catching mismatches between "what I thought I
-edited" and "what actually changed on disk" (e.g. a `sed` in Bash that
-didn't match any line, a failed Write that got rolled back).
-
----
-
-## 6. Implementation phases
-
-### Phase 0 — Spikes (1 week)
-
-- Set up jj + Watchman + snapshot-trigger on Nick's dev box. Verify
-  auto-snap works on every save and what the op log looks like. ½ day.
-- Spike: Rust program that watches `.jj/op_heads/` via inotify and
-  prints new op IDs. Proves we can react to jj snapshots in real time.
+- Verify Nick's kernel version (need 6.14+ for FAN_PRE_MODIFY;
+  5.19+ for BPF dynptr). Ubuntu 26.04 ships 7.0.
+- Build foxing locally, confirm its BPF pipeline runs.
+- Spike: minimal BPF program (C + aya-rs OR libbpf-rs) attached to
+  `lsm/file_permission`, printing pid+path+size for every write. 1 day.
+- Spike: same program using `bpf_dynptr_write` to capture payloads
+  into the ring buffer. 1–2 days.
+- Spike: fanotify `FAN_PRE_MODIFY` listener that reads pre-image bytes
+  before allowing the write. 1–2 days.
+- Spike: procfs pid-tree walker with cgroup + environ enrichment.
   1 day.
-- Spike: Rust program that reads `/proc/<pid>/stat` and emits the
-  pid→ppid→cmdline tree. Proves attribution viability. 1 day.
-- Spike: parse `~/.claude/projects/*/*.jsonl` and correlate tool calls
-  to (pid, timestamp, files). Sanity check the correlation hypothesis.
-  1–2 days.
 
-**Exit:** confidence that each leg of the design is buildable in Rust
-without exotic dependencies.
+**Exit:** empirical data on event rates, payload caps, and latency
+overhead under real workloads (a kernel build, a `cargo test`, a
+Claude Code session).
 
-### Phase 1 — `ttd` + read-only `tt` (2 weeks)
+### Phase 1 — The capture daemon (3 weeks)
 
-- `ttd` daemon: op-head watcher + pid tracker + session detector.
-- `.jj/timetraveler/` store (sqlite + events.log).
-- `tt sessions` / `tt log` / `tt session <id>` / `tt diff <session>`.
-- No curation yet — just observation.
+- `ttd` daemon with tier M (metadata-only) capture, all mounts.
+- CAS store using foxing's `fxcp-core::versioning` + reflink machinery.
+- SQLite index with path/pid/time queries.
+- Path filter config (exclude `target/`, `node_modules/`, `.git/`,
+  `.jj/` by default; includable list).
+- Graceful degrade on older kernels (kprobe fallback if no LSM).
 
-**Exit:** `tt sessions` lists Claude sessions accurately across a day
-of real dev work. `tt diff <session-id>` shows exactly what Claude did.
+**Exit:** `ttd` runs as a user systemd service, captures every write
+to any file under `~/` (except filter list), and persists to
+`~/.tt/`. CAS shows reflink savings; index answers queries. No agent
+awareness yet.
 
-### Phase 2 — Curation (2 weeks)
+### Phase 2 — Tier P + session attribution (2 weeks)
 
-- `tt curate <session>` interactive TUI (or scm-diff-editor-style
-  external tool).
-- `tt split-by-agent` — common fast path.
-- `tt export-git` with session-aware commit messages.
-- `tt undo <session>`, `tt branch-from <session>`.
+- Tier P: payload capture via dynptr for writes ≤ 16 KB.
+- Fallback to pulling from source for larger writes (still in Phase 1
+  behaviour).
+- Session detection: pid-tree + cgroup + env marker attribution.
+- Basic `tt sessions`, `tt log`, `tt diff` CLI.
 
-**Exit:** workflow "work for an afternoon with Claude → `tt curate
-today` → commits landed in git" is smooth.
+**Exit:** you can ask "what did pid 12345 do" and get the answer. The
+CLI renders sessions distinctly.
 
-### Phase 3 — MCP (1 week)
+### Phase 3 — Claude Code integration (1 week)
 
-- `tt-mcp` stdio server exposing the read API.
-- Claude Code MCP config instructions.
-- Test end-to-end: Claude asks itself "what did I edit?" and gets an
-  accurate answer.
+- JSONL parser for `~/.claude/projects/*/*.jsonl`.
+- Time-window join to attach tool-call-ids to fs events.
+- `tt show <tool-call-id>` and session detail views.
 
-**Exit:** MCP server published, docs written, one tested agent
-integration.
+**Exit:** Claude Code sessions show up with full tool-call causality.
+"Show me the diff for Claude's third tool call today" works.
 
-### Phase 4 — Foxing integration (2–3 weeks, conditional)
+### Phase 4 — Curation + jj/git export (2–3 weeks)
 
-Only if Phase 1–3 show coverage gaps:
+- `tt curate` TUI.
+- Heuristic grouping by tool-call / time-gap / file-cluster.
+- jj change writer.
+- `tt export-git` direct writer.
 
-- `ttd` can optionally subscribe to foxingd events for paths outside
-  the jj repo.
-- Cross-repo session tracking.
-- The "Claude edited my ~/.config/ too" story.
+**Exit:** the full flow "work for a day → `tt curate` → commits
+landed in git" is smooth.
 
-**Exit:** cross-repo / out-of-repo fs events flow into sessions
-correctly.
+### Phase 5 — MCP server (1 week)
 
-### Phase 5 — Polish (ongoing)
+- `tt-mcp` stdio server with `list_sessions`, `get_session`,
+  `current_session`, `my_edits_this_session`, `rewind`, `diff`,
+  `what_changed_file`.
+- Docs for Claude Code config.
 
-- Other agents (Cursor, Aider, Zed) — session detection.
-- Explicit MCP-based session registration.
-- Retention / pruning policies for old sessions.
-- Multi-workspace handling.
-- Pijul export adapter (deferred).
+**Exit:** Claude can query its own edits. Pair with a Claude Code
+config that spawns `tt-mcp` as an MCP subprocess.
 
-**Total to useful MVP: 4–5 weeks.** Substantially less than the
-previous design because jj does so much of the heavy lifting.
+### Phase 6 — Tier F for correctness-critical workloads (2 weeks, optional)
 
----
+- `FAN_PRE_MODIFY` listener for opt-in paths.
+- Pre-image capture to CAS before allowing the write.
+- Configurable timeout policy (kernel auto-ALLOWs after 5s default).
 
-## 7. Open questions & risks
+**Exit:** databases, `.git/` dirs, anywhere the user enables it, get
+byte-exact pre-image history.
 
-1. **jj snapshot granularity.** Watchman debounces fs changes. Claude
-   might do 5 Write calls in 200ms; Watchman collapses them. Do we
-   lose per-call granularity? Mitigation: join with JSONL per-tool-call
-   log; jj snapshot is coarse but Claude's log is fine.
+### Phase 7 — Hardening + polish (ongoing)
 
-2. **Non-Claude tools with no native log.** Cursor, Aider, Zed.
-   Session detection via pid tree works; per-tool-call detail
-   requires per-tool integration. Acceptable: "Claude Code has rich
-   sessions; others get coarse session attribution."
+- Retention / pruning policies. Time-decay, size-bounded, pin-by-
+  session.
+- Multi-user (systemd --user per human).
+- TUI timeline view (ratatui, with scroll + filter).
+- Import from Claude Code's existing `file-history/` (migrate old
+  data into the unified store).
+- Cursor / Aider / Zed attribution heuristics.
+- Explicit MCP session registration.
 
-3. **Multiple concurrent agents.** Claude session A edits `foo.rs`
-   while Cursor session B edits `bar.rs`. `ttd` needs to correlate
-   each write to the right session via pid tree. Should work; test
-   carefully.
-
-4. **jj repo required.** This won't work in directories that aren't
-   jj-initialized. Acceptable: tell the user "run `jj git init
-   --colocate` first." Most dev workflows already have git repos.
-
-5. **Performance.** inotify on `.jj/op_heads/` + `/proc` polling —
-   both cheap. Session DB writes — cheap. MCP query latency —
-   sqlite queries, cheap. Should be fine.
-
-6. **Privacy / security.** `~/.claude/projects/*.jsonl` contains
-   prompts and tool outputs — potentially sensitive. `ttd` needs to
-   respect that (read-only, never export).
-
-7. **Upstream opportunity with jj.** Some of this is generally useful.
-   Martin (jj creator) might want to upstream session/agent metadata
-   as a first-class jj concept. Worth an early conversation.
-
-8. **Existing tools in space.** `claude-code-rewind` and Claude Code's
-   native `/rewind` both cover the single-tool case. `tt` needs to
-   articulate why cross-tool + jj + MCP makes it worth using over
-   just `/rewind`. Positioning matters.
+**Total to end-to-end useful MVP (Phases 0–5): ~10 weeks.**
+**Phases 6–7 ongoing.**
 
 ---
 
-## 8. Why this and why now
+## 6. Honest risk assessment
 
-- AI-assisted dev is now mainstream. Session-scoped undo has emerged
-  as a pattern (Cursor, Claude Code, Aider all ship it) but every
-  tool reinvents it locally and none compose.
-- jj went from "interesting" to "mainstream-adjacent" in 2025–2026.
-  Chris Krycho, Steve Klabnik, Martin's Git Merge 2024 talk. It's the
-  right substrate for a curation-heavy workflow.
-- FNL's own agent usage (Claude Code, opencode, Zed agents) generates
-  the workload this tool is for.
-- Upstreaming path is real: jj session metadata, foxing observer mode,
-  MCP reference server.
+### Things that could kill the project
 
-## 9. Relationship to earlier docs
+1. **BPF verifier edge cases.** Variable-size payload capture is at
+   the frontier. If a particular kernel version rejects our program
+   we have to either pin kernel versions or downgrade to metadata-
+   only. Mitigation: start with metadata-only (known to work, foxing
+   proves it), add payload as opt-in.
 
-- **[docs/archive/TIMETRAVELER-v1-snapshot-focused.md](archive/TIMETRAVELER-v1-snapshot-focused.md)**
-  — earlier sketch focused on snapshot/trigger policies. Those
-  features still relevant (they become `tt export-git` policy knobs
-  and session-boundary triggers), but the main architecture has
-  shifted.
-- **[research/content-capture.md](research/content-capture.md)** — the
-  six-option kernel write capture analysis. Mostly not needed for this
-  scope. We use jj's post-state snapshots; we don't need pre-image
-  capture.
-- **[research/lsm-rs.md](research/lsm-rs.md)** — the broader FS
-  observation landscape review. Still the best overall orientation to
-  the space.
+2. **Event rate explosion.** A `cargo build` can write 100k files in
+   minutes. Indexer has to keep up. Mitigation: path filters at BPF
+   level, async indexing, circuit-breaker to metadata-only mode if
+   event rate spikes.
 
-## 10. References
+3. **Disk usage runaway.** Even with CAS and reflinks, a badly
+   configured install could fill a disk. Mitigation: size-bounded
+   retention by default (e.g. 10 GB total), clear pruning tools.
 
-**jj**
-- Working copy: https://docs.jj-vcs.dev/latest/working-copy/
-- Operation log & undo: https://github.com/jj-vcs/jj
-- Watchman fsmonitor: https://docs.jj-vcs.dev/latest/config/
+4. **Claude Code JSONL format changes.** Anthropic could change the
+   format any time. Mitigation: vendor the parser, version-sniff,
+   graceful degradation to pid-only attribution.
 
-**AI tool state today**
-- Claude Code how it works: https://code.claude.com/docs/en/how-claude-code-works
-- Claude Code JSONL format: https://towardsai.net/p/machine-learning/time-travel-debugging-with-claude-codes-conversation-history
-- Claude Code storage design: https://milvus.io/blog/why-claude-code-feels-so-stable
+5. **Distribution friction.** BPF programs need recent clang, kernel
+   headers, root / CAP_BPF. Mitigation: CO-RE + libbpf + `bpftool
+   gen skeleton` → one static binary, no runtime build deps.
+
+6. **jj adoption risk.** If jj doesn't continue to gain traction,
+   our curation UX loses its best substrate. Mitigation: `tt
+   export-git` works without jj; jj is a preferred path, not required.
+
+7. **We ship something Anthropic includes in Claude Code directly.**
+   Realistic — Anthropic could extend `/rewind` to be cross-tool.
+   But: they won't do the kernel work, and they won't cover non-
+   Claude tools. We win on scope.
+
+### Things that are NOT risks, contrary to what your instinct might say
+
+- **"eBPF is scary."** It's well-documented, Rust has good bindings
+  (aya, libbpf-rs), production projects use it constantly. Foxing
+  already does this in our codebase.
+- **"Kernel module distribution."** We're not writing a module.
+  Pure BPF + userspace daemon. Installs like any other binary.
+- **"Performance overhead."** Foxing benchmarks at 15-21 ms/write
+  for full mirror. Our capture is *less* work than that (no mirror),
+  should be sub-ms per write.
+- **"Will this work on other FSes?"** Ext4, XFS, btrfs, bcachefs,
+  tmpfs all have the same VFS hooks. BPF doesn't care about the FS
+  underneath.
+
+---
+
+## 7. Why now, specifically
+
+Three things converged:
+
+1. **`FAN_PRE_MODIFY` landed in Linux 6.14 (early 2025).** First time
+   full pre-content fidelity is available via stable UAPI without
+   kernel patching. Meta ships it in production.
+2. **`bpf_dynptr` is stable (Linux 5.19+).** Variable-size payload
+   capture in BPF is no longer a research project.
+3. **AI-assisted dev is now the default.** Every serious developer
+   uses Claude / Cursor / Aider daily. The "fear of letting AI touch
+   my repo" is a real, scaled problem.
+
+Two years ago, this was impossible. Two years from now, someone will
+have built it. The window is now.
+
+---
+
+## 8. Relation to foxing
+
+We live on the foxing fork because:
+
+- Foxing's fxcp-core has CAS, reflink, BLAKE3 Merkle, governor, NFS
+  bypass — all directly reusable.
+- Foxing's BPF infrastructure (ring buffer, event pipeline, reorder
+  buffer, transient filter) is battle-tested. We extend it with
+  payload capture; we don't rewrite.
+- Foxing's MARS versioning is the spiritual ancestor of our CAS.
+- The mirror-target machinery is inert here — we set no mirror. But
+  keeping the fork means we inherit 80% of the capture infrastructure
+  for free.
+- Upstream path to aenertia exists when/if we want it.
+
+Concretely, the new code lives in a new workspace crate:
+
+```
+foxing/
+├── fxcp-core/       (existing — we use: versioning, sidecar, security)
+├── foxingd/         (existing — we use: bpf/, ringbuf, reorder)
+├── fxcp/            (existing — untouched)
+├── tt-core/         NEW: CAS extensions, query layer, session model
+├── tt-capture/      NEW: BPF programs + ttd daemon integration
+├── ttd/             NEW: daemon binary
+├── tt/              NEW: CLI binary
+├── tt-mcp/          NEW: MCP server binary
+└── xtask/           (existing)
+```
+
+If this ever spins off into its own project, the split is clean:
+copy tt-* plus the necessary fxcp-core modules, reset the git history,
+credit foxing as the parent.
+
+---
+
+## 9. What I'd commit to vs push back on
+
+**Commit:**
+- Linux only. No Windows, no macOS. Scope discipline.
+- Rust for userspace, C for BPF.
+- Kernel ≥ 6.14 baseline (Ubuntu 26.04 LTS default).
+- BPF-based capture, not a kernel module.
+- CAS with reflinks; BLAKE3.
+- jj as primary curation model, git as default export, pijul deferred.
+- MCP server from phase 5.
+- Process-tree attribution as primary, JSONL join for Claude Code,
+  explicit registration later.
+
+**Push back on:**
+- **Full kernel module.** Every reason to avoid: distribution,
+  upstream, maintenance. BPF gets us 95% with 5% of the pain.
+- **Byte-level write ordering fidelity as a *primary* goal.** Tier M
+  + post-hoc pull covers 99% of workloads. Tier F exists for the 1%
+  that actually needs it. Don't pay for fidelity no real use case
+  requires.
+- **Claude Code fork / patching.** Join to JSONL externally. Never
+  modify Claude's own code.
+- **"Replace git."** We export to git. We don't replace it.
+- **Shipping in one go.** 10 weeks of tightly scoped phased work
+  beats 6 months of everything-at-once.
+
+---
+
+## 10. First code
+
+To make this concrete, Phase 0 Day 1 looks like:
+
+```sh
+# In /home/nick/projects, colocated with foxing fork
+cd ~/p/foxing
+git checkout timetraveler
+
+# New crate scaffold
+mkdir -p tt-capture/src tt-capture/bpf
+cat > tt-capture/Cargo.toml <<'EOF'
+[package]
+name = "tt-capture"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+aya = "0.13"          # or libbpf-rs, TBD after spike
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+EOF
+
+# Minimal BPF program: trace every vfs_write_iter, print pid+path+size
+# target: "cargo run -p tt-capture" prints a line per fs write
+# target exit: first reliable ground-truth stream of "every fs write on this system"
+```
+
+If this prints clean output for 30 minutes of real dev work, the
+project is viable. If it doesn't, we learn the exact failure mode in
+days, not months.
+
+---
+
+## 11. References
+
+**Critical kernel docs**
+- BPF LSM: https://docs.kernel.org/bpf/prog_lsm.html
+- fanotify: https://www.man7.org/linux/man-pages/man7/fanotify.7.html
+- `FAN_PRE_MODIFY` patch v5: https://www.mail-archive.com/linux-bcachefs@vger.kernel.org/msg02631.html
+- `bpf_dynptr`: https://docs.ebpf.io/linux/concepts/dynptrs/
+- LWN pre-content fanotify: https://lwn.net/Articles/985013/
+
+**Adjacent tools**
+- foxing (parent project): https://codeberg.org/aenertia/foxing
+- eCapture (BPF TLS plaintext capture, 16 KB payloads): https://ecapture.cc/
+- Claude Code /rewind: https://code.claude.com/docs/en/how-claude-code-works
 - claude-code-rewind (3rd party): https://github.com/holasoymalva/claude-code-rewind
 
-**Prior art / adjacent**
-- Undo.io MCP integration: https://undo.io/resources/time-travel-ai-code-assistant/
-- Claude Code session-undo feature request: https://github.com/anthropics/claude-code/issues/21645
-
-**MCP**
-- MCP spec: https://spec.modelcontextprotocol.io/
+**Prior analyses in this repo**
+- `docs/research/lsm-rs.md` — FS observation landscape overview
+- `docs/research/content-capture.md` — kernel write capture options
+- `docs/archive/TIMETRAVELER-v1-snapshot-focused.md` — v1 sketch
+- `docs/archive/TIMETRAVELER-v2-jj-native.md` — v2 sketch (userspace-only,
+  now superseded by this)
