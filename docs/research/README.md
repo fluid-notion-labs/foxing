@@ -56,3 +56,13 @@ For the record, these documents stayed with ize and weren't copied:
 - `pijul-backend-opcode-recording-backend-rework.md` — Pijul internals.
 - `opcodes/opcode-recorder-design.md` — FsObserver trait for FUSE.
 - `old/*` — already archived in the source.
+
+## Content capture (deep dive)
+
+- **[content-capture.md](content-capture.md)** — The question "what
+  about actual content of fs writes?" answered in full. Enumerates
+  six paths from pure userspace to kernel patching, with a fidelity
+  matrix and a concrete `fwcache` design that could be built as a
+  one-week spike. Outcome: extend `CaptureFidelity` enum with
+  `BpfPayloadCapture` (Option A) and `PreContentBlocking` (Option B)
+  variants; default stays `CoalescedSnapshot`.
